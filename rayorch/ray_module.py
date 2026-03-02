@@ -1,7 +1,8 @@
 from __future__ import annotations
 from typing import Any, Callable, Dict, Generic, Optional, Protocol, Tuple, Type, TypeVar, cast
 from typing_extensions import ParamSpec
-import time
+from .nvtx_profiler import nvtx_range
+import contextlib
 
 INITP = ParamSpec("InitP")   # op_cls.__init__ 的参数
 RUNP = ParamSpec("RunP")     # op_cls.run 的参数
@@ -29,11 +30,16 @@ class RunnerActor:
         op_cls: Type[Any],                 # 运行时用 Any
         init_args: Tuple[Any, ...],
         init_kwargs: Dict[str, Any],
+        meta: Optional[Dict[str, Any]] = None,
     ):
-        self.op = op_cls(*init_args, **init_kwargs)
+        dev_nvtx_range = nvtx_range(f"op[{op_cls.__name__}].init | replica={meta.get('replica', 0)} | tag={meta.get('tag', '')}") if meta.get('dev', False) else contextlib.nullcontext()
+        with dev_nvtx_range:
+            self.op = op_cls(*init_args, **init_kwargs)
 
-    def run(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
-        return self.op.run(*args, **kwargs)
+    def run(self, args, kwargs, meta=None):
+        dev_nvtx_range = nvtx_range(f"op[{self.op.__class__.__name__}].run | rreplica={meta.get('replica', 0)} | tag={meta.get('tag', '')}") if meta.get('dev', False) else contextlib.nullcontext()
+        with dev_nvtx_range:
+            return self.op.run(*args, **kwargs)
 
 class RayModule(Generic[INITP, RUNP, R]):
     def __init__(
@@ -41,18 +47,27 @@ class RayModule(Generic[INITP, RUNP, R]):
         op_cls: Type[RunOp[INITP, RUNP, R]],
         *,
         env: Optional[str] = None,   # ✅ 允许 None
+        # Map and Reduce
         replicas: int = 1,
         num_gpus_per_replica: float = 0.0,
         dispatch_mode: DispatchMode | None = None,
         dispatch_fn : Optional[Callable[..., Any]] = None,
         collect_fn : Optional[Callable[..., Any]] = None,
-    ):
+        # Tag and Log
+        dev_mode: bool = False,
+        init_tag_fn: Optional[Callable[[Tuple[Any, ...], Dict[str, Any], int, Dict[str, Any] | None], str]] = None,
+        run_tag_fn: Optional[Callable[[Tuple[Any, ...], Dict[str, Any], int, Dict[str, Any] | None], str]] = None,
+    ) -> None:
         self._op_cls = op_cls
         self._env = env
         self._replicas = replicas
         self._num_gpus_per_replica = num_gpus_per_replica
         self.actors = []
-
+        self._itag_fn = init_tag_fn
+        self._tag_fn = run_tag_fn
+        assert not ((not dev_mode) and (self._itag_fn is not None or self._tag_fn is not None)), "dev_mode must be True if init_tag_fn or run_tag_fn is provided"
+        self._is_dev_mode = dev_mode
+        
         # 让 dispatch_fn/collect_fn 也能直接传入覆盖 registry
         if dispatch_fn is not None and collect_fn is not None:
             self._dispatch_fn = dispatch_fn
@@ -66,22 +81,31 @@ class RayModule(Generic[INITP, RUNP, R]):
             self._collect_fn = None
 
     def pre_init(self, *args: INITP.args, **kwargs: INITP.kwargs) -> "RayModule[INITP, RUNP, R]":
+        tags = [""] * self._replicas
+        if self._itag_fn:
+            tags = [self._itag_fn(args, kwargs, i) for i in range(self._replicas)]
+        metas = [{"replica": i, "tag": tags[i], "dev": self._is_dev_mode} for i in range(self._replicas)]
         self.actors = [
             RunnerActor.options(
                 runtime_env={"conda": self._env} if self._env is not None else None,
                 num_gpus=self._num_gpus_per_replica,
-            ).remote(self._op_cls, args, kwargs)
-            for _ in range(self._replicas)
+            ).remote(self._op_cls, args, kwargs, meta=metas[i])
+            for i in range(self._replicas)
         ]
         return self
 
     def _fanout(self, *args: RUNP.args, **kwargs: RUNP.kwargs):
-        # Single replica, without dispatch/collect
+        # ---- single replica ----
         if self._dispatch_fn is None or self._collect_fn is None or self._replicas == 1:
-            ref = self.actors[0].run.remote(args, kwargs)
-            out = ray.get(ref) # blocking
-            return out
-        # Multi-replica with dispatch/collect
+            args_i = args
+            kwargs_i = kwargs
+            tag = self._tag_fn(args_i, kwargs_i, 0) if self._tag_fn else ""
+            meta = {"tag": tag, "replica": 0, "dev": self._is_dev_mode}
+
+            ref = self.actors[0].run.remote(args_i, kwargs_i, meta)
+            return ray.get(ref)
+
+        # ---- multi replica ----
         per_args, per_kwargs = self._dispatch_fn(self, *args, **kwargs)
 
         # Check for correctness
@@ -92,17 +116,22 @@ class RayModule(Generic[INITP, RUNP, R]):
             if len(v) != self._replicas:
                 raise ValueError(f"Dispatched kwargs['{k}'] len ({len(v)}) != replicas ({self._replicas})")
 
-
         refs = []
+        tags = [] 
+
         for i in range(self._replicas):
             args_i = tuple(per_args[j][i] for j in range(len(per_args)))
             kwargs_i = {k: v[i] for k, v in per_kwargs.items()}
-            refs.append(self.actors[i].run.remote(args_i, kwargs_i))
 
-        output = ray.get(refs)  # blocking
-        collected = self._collect_fn(self, output)
-        return cast(R, collected)
+            tag_i = self._tag_fn(args_i, kwargs_i, i) if self._tag_fn else ""
+            tags.append(tag_i)
 
+            meta_i = {"tag": tag_i, "replica": i, "dev": self._is_dev_mode}
+            refs.append(self.actors[i].run.remote(args_i, kwargs_i, meta_i))
+
+        output = ray.get(refs)
+        return cast(R, self._collect_fn(self, output))
+    
     def __call__(self, *args: RUNP.args, **kwargs: RUNP.kwargs) -> R:
         return cast(R, self._fanout(*args, **kwargs))
 
