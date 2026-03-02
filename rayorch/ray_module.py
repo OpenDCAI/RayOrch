@@ -14,6 +14,7 @@ class RunOp(Protocol[INITP, RUNP, R]):
 import ray
 
 from .dispatch_mode import DispatchMode, get_predefined_dispatch_fn
+from .env_registry import EnvRegistry
 
 # from image_class import ImageLoadOp, ImageSaveOP
 # from yolo_class import YOLODrawOp
@@ -87,7 +88,7 @@ class RayModule(Generic[INITP, RUNP, R]):
         metas = [{"replica": i, "tag": tags[i], "dev": self._is_dev_mode} for i in range(self._replicas)]
         self.actors = [
             RunnerActor.options(
-                runtime_env={"conda": self._env} if self._env is not None else None,
+                runtime_env=EnvRegistry.get_ray_style_env(self._env) if self._env is not None else None,
                 num_gpus=self._num_gpus_per_replica,
             ).remote(self._op_cls, args, kwargs, meta=metas[i])
             for i in range(self._replicas)

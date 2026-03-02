@@ -6,6 +6,7 @@ from .dispatch_mode import (
     Dispatch
 )
 from .ray_module import RayModule
+from .env_registry import EnvRegistry
 
 
 

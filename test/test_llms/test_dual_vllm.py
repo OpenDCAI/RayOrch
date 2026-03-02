@@ -7,6 +7,8 @@ from datetime import datetime
 from rayorch import RayModule
 from ops import vLLMServingOP
 
+from rayorch import EnvRegistry
+
 
 def to_list(x):
     return x if isinstance(x, list) else [str(x)]
@@ -76,15 +78,20 @@ class DualVLLMPipeline:
 if __name__ == "__main__":
     ray.init(ignore_reinit_error=True)
 
-    VLLM_ENV = None
+    VLLM_ENV = 'df_vllm_mxc'
 
-    MODEL_A = "/vepfs-mlp2/c20250602/500050/models/Qwen3-0.6B/qwen/Qwen3-0.6B"
-    MODEL_B = "/vepfs-mlp2/c20250602/500050/models/Qwen3-0.6B/qwen/Qwen3-0.6B"
+    # MODEL_A = "/vepfs-mlp2/c20250602/500050/models/Qwen3-0.6B/qwen/Qwen3-0.6B"
+    # MODEL_B = "/vepfs-mlp2/c20250602/500050/models/Qwen3-0.6B/qwen/Qwen3-0.6B"
+    
+    MODEL_A = "/home/dataset-local/models/Qwen2.5-7B"
+    MODEL_B = "/home/dataset-local/models/Qwen2.5-7B"
+    
+    EnvRegistry.register(name = "vllm", env_input=VLLM_ENV)
 
     pipe = DualVLLMPipeline(
         model_a_path=MODEL_A,
         model_b_path=MODEL_B,
-        vllm_env=VLLM_ENV,
+        vllm_env="vllm",
         tp_size=1,
         gpu_mem_util=0.9,
     )

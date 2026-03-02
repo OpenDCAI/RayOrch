@@ -5,6 +5,7 @@ from typing import List, Tuple, Dict, Any
 
 import ray
 from rayorch import RayModule
+from rayorch import EnvRegistry
 
 from ops import SGLangServingOP, vLLMServingOP
 from pingpong_prompts import build_prompts
@@ -128,13 +129,16 @@ if __name__ == "__main__":
     ray.init(ignore_reinit_error=True)
 
     SGLANG_ENV = "df_sglang_mxc"
-    VLLM_ENV = "df-vllm-mxc"
-    MODEL_PATH = "/vepfs-mlp2/c20250602/500050/models/Qwen3-0.6B/qwen/Qwen3-0.6B"
+    VLLM_ENV = "df_vllm_mxc"
+    MODEL_PATH = "/home/dataset-local/models/Qwen2.5-7B"
+    
+    EnvRegistry.register(name = "sglang", env_input=SGLANG_ENV)
+    EnvRegistry.register(name = "vllm", env_input=VLLM_ENV)
 
     pipe = PingPongServingPipeline(
         model_path=MODEL_PATH,
-        sglang_env=SGLANG_ENV,
-        vllm_env=VLLM_ENV,
+        sglang_env='sglang',
+        vllm_env='vllm',
         sgl_tp=1,
         vllm_tp=1,
         sgl_mem=0.90,
