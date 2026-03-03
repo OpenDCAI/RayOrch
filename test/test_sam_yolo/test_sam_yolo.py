@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple, Dict, Any
 
 import ray
 from rayorch import RayModule, Dispatch  # 你现有库的接口
+from rayorch import EnvRegistry
 
 from ops import (
     ImageLoadOp,
@@ -128,12 +129,15 @@ if __name__ == "__main__":
 
     out_dir = os.path.abspath("./outputs_min")
     meta_json = os.path.join(out_dir, "meta.json")
+    
+    EnvRegistry.register(name="yolo", env_input="yolo_mxc")
+    EnvRegistry.register(name="sam", env_input="sam_mxc")
 
     pipe = YoloSamPipeline(
         yolo_weight=yolo_weight,
         sam_checkpoint=sam_ckpt,
-        yolo_env="yolo_mxc",
-        sam_env="sam_mxc",
+        yolo_env="yolo",
+        sam_env="sam",
         device="cuda",
         yolo_replicas=2,
         sam_replicas=2,

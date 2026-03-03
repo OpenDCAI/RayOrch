@@ -129,8 +129,8 @@ if __name__ == "__main__":
     ray.init(ignore_reinit_error=True)
 
     SGLANG_ENV = "df_sglang_mxc"
-    VLLM_ENV = "df_vllm_mxc"
-    MODEL_PATH = "/home/dataset-local/models/Qwen2.5-7B"
+    VLLM_ENV = "df-vllm-mxc"
+    MODEL_PATH = "/vepfs-mlp2/c20250602/500050/models/Qwen2.5-7B-Instruct"
     
     EnvRegistry.register(name = "sglang", env_input=SGLANG_ENV)
     EnvRegistry.register(name = "vllm", env_input=VLLM_ENV)
