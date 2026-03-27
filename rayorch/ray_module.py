@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generic, Optional, Protocol, Tuple, Type, TypeVar, cast
 from typing_extensions import ParamSpec
 from .nvtx_profiler import nvtx_range
@@ -43,6 +44,11 @@ class RunnerActor:
             return self.op.run(*args, **kwargs)
 
 class RayModule(Generic[INITP, RUNP, R]):
+    @dataclass(frozen=True)
+    class PendingResult:
+        refs: Any
+        collect_fn: Optional[Callable[..., Any]]
+
     def __init__(
         self,
         op_cls: Type[RunOp[INITP, RUNP, R]],
@@ -135,6 +141,36 @@ class RayModule(Generic[INITP, RUNP, R]):
     
     def __call__(self, *args: RUNP.args, **kwargs: RUNP.kwargs) -> R:
         return cast(R, self._fanout(*args, **kwargs))
+
+    def submit(self, *args: RUNP.args, **kwargs: RUNP.kwargs) -> "RayModule.PendingResult":
+        """
+        Submit task asynchronously and return a lightweight handle.
+        """
+        if self._dispatch_fn is None or self._collect_fn is None or self._replicas == 1:
+            meta = {"tag": "", "replica": 0, "dev": self._is_dev_mode}
+            ref = self.actors[0].run.remote(args, kwargs, meta)
+            return RayModule.PendingResult(refs=ref, collect_fn=None)
+
+        per_args, per_kwargs = self._dispatch_fn(self, *args, **kwargs)
+        refs = []
+        for i in range(self._replicas):
+            args_i = tuple(per_args[j][i] for j in range(len(per_args)))
+            kwargs_i = {k: v[i] for k, v in per_kwargs.items()}
+            tag_i = self._tag_fn(args_i, kwargs_i, i) if self._tag_fn else ""
+            meta_i = {"tag": tag_i, "replica": i, "dev": self._is_dev_mode}
+            refs.append(self.actors[i].run.remote(args_i, kwargs_i, meta_i))
+        return RayModule.PendingResult(refs=refs, collect_fn=self._collect_fn)
+
+    def gather(self, pending: "RayModule.PendingResult") -> R:
+        """
+        Block for a previously submitted task and return the final output.
+        """
+        if isinstance(pending.refs, list):
+            output = ray.get(pending.refs)
+            if pending.collect_fn is None:
+                return cast(R, output)
+            return cast(R, pending.collect_fn(self, output))
+        return cast(R, ray.get(pending.refs))
 
     def remote(self, *args: RUNP.args, **kwargs: RUNP.kwargs):
         # 简单版本：返回每个 replica 的 refs（或单个 ref）

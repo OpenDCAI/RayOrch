@@ -6,6 +6,7 @@ from .dispatch_mode import (
     Dispatch
 )
 from .ray_module import RayModule
+from .pipeline_executor import DagNode, DagPipelineExecutor, DummyRunPipeline, PipeRef, PipelineExecutor
 from .env_registry import EnvRegistry
 
 
@@ -20,6 +21,11 @@ __all__ = [
     'Dispatch',
     # Main RayModule
     'RayModule',
+    'DagNode',
+    'DagPipelineExecutor',
+    'DummyRunPipeline',
+    'PipeRef',
+    'PipelineExecutor',
 ]
 
 def hello():
