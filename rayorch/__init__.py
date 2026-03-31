@@ -12,7 +12,6 @@ from .dag_pipeline import (
     DagNode,
     DagPipeline,
     DagPipelineExecutor,
-    DummyRunPipeline,
     PipeRef,
     PipelineExecutor,
 )
@@ -35,7 +34,6 @@ __all__ = [
     'DagNode',
     'DagPipeline',
     'DagPipelineExecutor',
-    'DummyRunPipeline',
     'OverlappedPipeline',
     'PipelineExecutor',
     'PipeRef',

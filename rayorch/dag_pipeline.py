@@ -370,7 +370,3 @@ class PipelineExecutor:
 
     def run(self, inputs: Sequence[Any]) -> List[Any]:
         return self._dag.run(inputs, outputs=(self._tail,))
-
-
-# Backward-compatible alias
-DummyRunPipeline = DagPipeline
