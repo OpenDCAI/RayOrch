@@ -6,7 +6,17 @@ from .dispatch_mode import (
     Dispatch
 )
 from .ray_module import RayModule
-from .pipeline_executor import DagNode, DagPipelineExecutor, DummyRunPipeline, PipeRef, PipelineExecutor
+
+RayModuleFuture = RayModule.RayModuleFuture
+from .dag_pipeline import (
+    DagNode,
+    DagPipeline,
+    DagPipelineExecutor,
+    DummyRunPipeline,
+    PipeRef,
+    PipelineExecutor,
+)
+from .overlapped_pipeline import OverlappedPipeline
 from .env_registry import EnvRegistry
 
 
@@ -21,11 +31,14 @@ __all__ = [
     'Dispatch',
     # Main RayModule
     'RayModule',
+    'RayModuleFuture',
     'DagNode',
+    'DagPipeline',
     'DagPipelineExecutor',
     'DummyRunPipeline',
-    'PipeRef',
+    'OverlappedPipeline',
     'PipelineExecutor',
+    'PipeRef',
 ]
 
 def hello():
