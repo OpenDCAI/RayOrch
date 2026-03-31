@@ -28,10 +28,14 @@ class DispatchSpec:
 
 # --------- VERL 风格实现 ---------
 def dispatch_one_to_all(RayModule, *args, **kwargs):
-    ws = RayModule._replicas # hard code to avoid circular import
-    args = tuple([arg] * ws for arg in args)
-    kwargs = {k: [v] * ws for k, v in kwargs.items()}
-    return args, kwargs
+    """
+    one to all, for example with [a, b, c] args and 3 replicas, we want to dispatch:
+    [[a, b, c], [a, b, c], [a, b, c]]
+    """
+    ws = RayModule._replicas
+    per_replica_args = [tuple(args) for _ in range(ws)]
+    per_replica_kwargs = [dict(kwargs) for _ in range(ws)]
+    return per_replica_args, per_replica_kwargs
 
 
 def dispatch_all_to_all(RayModule, *args, **kwargs):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Generic, Optional, Protocol, Tuple, Type, TypeVar, cast
+from typing import Any, Callable, Dict, Generic, List, Optional, Protocol, Tuple, Type, TypeVar, cast
 from typing_extensions import ParamSpec
 from .nvtx_profiler import nvtx_range
 import contextlib
@@ -39,15 +39,45 @@ class RunnerActor:
             self.op = op_cls(*init_args, **init_kwargs)
 
     def run(self, args, kwargs, meta=None):
+        def _resolve_refs(x):
+            if isinstance(x, ray.ObjectRef):
+                return ray.get(x)
+            if isinstance(x, tuple):
+                return tuple(_resolve_refs(v) for v in x)
+            if isinstance(x, list):
+                return [_resolve_refs(v) for v in x]
+            if isinstance(x, dict):
+                return {k: _resolve_refs(v) for k, v in x.items()}
+            return x
+
         dev_nvtx_range = nvtx_range(f"op[{self.op.__class__.__name__}].run | rreplica={meta.get('replica', 0)} | tag={meta.get('tag', '')}") if meta.get('dev', False) else contextlib.nullcontext()
         with dev_nvtx_range:
-            return self.op.run(*args, **kwargs)
+            resolved_args = _resolve_refs(args)
+            resolved_kwargs = _resolve_refs(kwargs)
+            return self.op.run(*resolved_args, **resolved_kwargs)
 
 class RayModule(Generic[INITP, RUNP, R]):
     @dataclass(frozen=True)
-    class PendingResult:
+    class RayModuleFuture:
+        module: "RayModule"
         refs: Any
         collect_fn: Optional[Callable[..., Any]]
+
+        def gather(self) -> Any:
+            """
+            Block until all the refs are resolved and return the collected output.
+            """
+            if isinstance(self.refs, list):
+                output = ray.get(self.refs)
+                if self.collect_fn is None:
+                    return output
+                return self.collect_fn(self.module, output)
+            return ray.get(self.refs)
+
+        def completion_refs(self) -> List[ray.ObjectRef]:
+            """``ObjectRef`` 列表，供 ``ray.wait`` 等按 ref 驱动调度（单 ref 时包成单元素列表）。"""
+            r = self.refs
+            return [r] if not isinstance(r, list) else list(r)
 
     def __init__(
         self,
@@ -89,9 +119,12 @@ class RayModule(Generic[INITP, RUNP, R]):
 
     def pre_init(self, *args: INITP.args, **kwargs: INITP.kwargs) -> "RayModule[INITP, RUNP, R]":
         tags = [""] * self._replicas
+        # tag_fn
         if self._itag_fn:
             tags = [self._itag_fn(args, kwargs, i) for i in range(self._replicas)]
+        # metas only for for logging/profiling, passing info between actors
         metas = [{"replica": i, "tag": tags[i], "dev": self._is_dev_mode} for i in range(self._replicas)]
+        # create actors, with replica
         self.actors = [
             RunnerActor.options(
                 runtime_env=EnvRegistry.get_ray_style_env(self._env) if self._env is not None else None,
@@ -101,7 +134,7 @@ class RayModule(Generic[INITP, RUNP, R]):
         ]
         return self
 
-    def _fanout(self, *args: RUNP.args, **kwargs: RUNP.kwargs):
+    def __call__(self, *args: RUNP.args, **kwargs: RUNP.kwargs) -> R:
         # ---- single replica ----
         if self._dispatch_fn is None or self._collect_fn is None or self._replicas == 1:
             args_i = args
@@ -110,78 +143,74 @@ class RayModule(Generic[INITP, RUNP, R]):
             meta = {"tag": tag, "replica": 0, "dev": self._is_dev_mode}
 
             ref = self.actors[0].run.remote(args_i, kwargs_i, meta)
-            return ray.get(ref)
+            return cast(R, ray.get(ref))
 
         # ---- multi replica ----
-        per_args, per_kwargs = self._dispatch_fn(self, *args, **kwargs)
-
-        # Check for correctness
-        for j in range(len(per_args)):
-            if len(per_args[j]) != self._replicas:
-                raise ValueError(f"Dispatched args[{j}] len ({len(per_args[j])}) != replicas ({self._replicas})")
-        for k, v in per_kwargs.items():
-            if len(v) != self._replicas:
-                raise ValueError(f"Dispatched kwargs['{k}'] len ({len(v)}) != replicas ({self._replicas})")
+        # _dispatch_fn 约定与 dispatch_one_to_all 相同：两个 list，长度均为 replicas，
+        # per_replica_args[i] / per_replica_kwargs[i] 送给 actors[i]。
+        per_replica_args, per_replica_kwargs = self._dispatch_fn(self, *args, **kwargs)
+        if len(per_replica_args) != self._replicas or len(per_replica_kwargs) != self._replicas:
+            raise ValueError(
+                f"dispatch_fn must return per-replica lists of length {self._replicas}, "
+                f"got len(args_list)={len(per_replica_args)} len(kwargs_list)={len(per_replica_kwargs)}"
+            )
 
         refs = []
-        tags = [] 
-
         for i in range(self._replicas):
-            args_i = tuple(per_args[j][i] for j in range(len(per_args)))
-            kwargs_i = {k: v[i] for k, v in per_kwargs.items()}
-
+            args_i = per_replica_args[i]
+            kwargs_i = per_replica_kwargs[i]
             tag_i = self._tag_fn(args_i, kwargs_i, i) if self._tag_fn else ""
-            tags.append(tag_i)
-
             meta_i = {"tag": tag_i, "replica": i, "dev": self._is_dev_mode}
             refs.append(self.actors[i].run.remote(args_i, kwargs_i, meta_i))
 
-        output = ray.get(refs)
+        output = ray.get(refs) # block until all refs are resolved
         return cast(R, self._collect_fn(self, output))
-    
-    def __call__(self, *args: RUNP.args, **kwargs: RUNP.kwargs) -> R:
-        return cast(R, self._fanout(*args, **kwargs))
 
-    def submit(self, *args: RUNP.args, **kwargs: RUNP.kwargs) -> "RayModule.PendingResult":
+    def remote(self, *args: RUNP.args, **kwargs: RUNP.kwargs) -> "RayModule.RayModuleFuture":
         """
-        Submit task asynchronously and return a lightweight handle.
+        Non-blocking submit, aligned with Ray's ``actor.method.remote()`` style: returns
+        :class:`RayModuleFuture`. Use :meth:`gather` to block and apply ``collect_fn``, or
+        read ``.refs`` for raw ``ObjectRef`` / list of refs.
+
+        If a positional or keyword argument is another module's :class:`RayModuleFuture`
+        (e.g. eager pipeline wiring), it is replaced by ``completion_refs()[0]`` so the
+        downstream actor receives a single ``ObjectRef`` dependency.
         """
+        Fut = RayModule.RayModuleFuture
+
+        def _unwrap(x: Any) -> Any:
+            return x.completion_refs()[0] if isinstance(x, Fut) else x
+
+        args = tuple(_unwrap(a) for a in args)
+        kwargs = {k: _unwrap(v) for k, v in kwargs.items()}
+
         if self._dispatch_fn is None or self._collect_fn is None or self._replicas == 1:
             meta = {"tag": "", "replica": 0, "dev": self._is_dev_mode}
             ref = self.actors[0].run.remote(args, kwargs, meta)
-            return RayModule.PendingResult(refs=ref, collect_fn=None)
+            return RayModule.RayModuleFuture(module=self, refs=ref, collect_fn=None)
 
-        per_args, per_kwargs = self._dispatch_fn(self, *args, **kwargs)
+        per_replica_args, per_replica_kwargs = self._dispatch_fn(self, *args, **kwargs)
+        if len(per_replica_args) != self._replicas or len(per_replica_kwargs) != self._replicas:
+            raise ValueError(
+                f"dispatch_fn must return per-replica lists of length {self._replicas}, "
+                f"got len(args_list)={len(per_replica_args)} len(kwargs_list)={len(per_replica_kwargs)}"
+            )
         refs = []
         for i in range(self._replicas):
-            args_i = tuple(per_args[j][i] for j in range(len(per_args)))
-            kwargs_i = {k: v[i] for k, v in per_kwargs.items()}
+            args_i = per_replica_args[i]
+            kwargs_i = per_replica_kwargs[i]
             tag_i = self._tag_fn(args_i, kwargs_i, i) if self._tag_fn else ""
             meta_i = {"tag": tag_i, "replica": i, "dev": self._is_dev_mode}
             refs.append(self.actors[i].run.remote(args_i, kwargs_i, meta_i))
-        return RayModule.PendingResult(refs=refs, collect_fn=self._collect_fn)
+        return RayModule.RayModuleFuture(module=self, refs=refs, collect_fn=self._collect_fn)
 
-    def gather(self, pending: "RayModule.PendingResult") -> R:
+    submit = remote
+
+    def gather(self, pending: "RayModule.RayModuleFuture") -> R:
         """
-        Block for a previously submitted task and return the final output.
+        Block for a task previously returned by :meth:`remote` and return the final output.
         """
-        if isinstance(pending.refs, list):
-            output = ray.get(pending.refs)
-            if pending.collect_fn is None:
-                return cast(R, output)
-            return cast(R, pending.collect_fn(self, output))
-        return cast(R, ray.get(pending.refs))
-
-    def remote(self, *args: RUNP.args, **kwargs: RUNP.kwargs):
-        # 简单版本：返回每个 replica 的 refs（或单个 ref）
-        if self._dispatch_fn is None or self._collect_fn is None or self._replicas == 1:
-            return self.actors[0].run.remote(args, kwargs)
-
-        per_args, per_kwargs = self._dispatch_fn(self, *args, **kwargs)
-        refs = []
-        for i in range(self._replicas):
-            args_i = tuple(per_args[j][i] for j in range(len(per_args)))
-            kwargs_i = {k: v[i] for k, v in per_kwargs.items()}
-            refs.append(self.actors[i].run.remote(args_i, kwargs_i))
-        return refs
+        if pending.module is not self:
+            raise ValueError("RayModuleFuture was not created by this RayModule instance")
+        return cast(R, pending.gather())
 
