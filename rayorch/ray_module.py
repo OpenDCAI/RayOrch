@@ -63,7 +63,7 @@ class RayModule(Generic[INITP, RUNP, R]):
         refs: Any
         collect_fn: Optional[Callable[..., Any]]
 
-        def gather(self) -> Any:
+        def get(self) -> Any:
             """
             Block until all the refs are resolved and return the collected output.
             """
@@ -134,26 +134,19 @@ class RayModule(Generic[INITP, RUNP, R]):
         ]
         return self
 
-    def __call__(self, *args: RUNP.args, **kwargs: RUNP.kwargs) -> R:
-        # ---- single replica ----
-        if self._dispatch_fn is None or self._collect_fn is None or self._replicas == 1:
-            args_i = args
-            kwargs_i = kwargs
-            tag = self._tag_fn(args_i, kwargs_i, 0) if self._tag_fn else ""
-            meta = {"tag": tag, "replica": 0, "dev": self._is_dev_mode}
+    def _fanout_refs(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> List[ray.ObjectRef]:
+        """
+        Submit one run per replica and return the list of refs.
 
-            ref = self.actors[0].run.remote(args_i, kwargs_i, meta)
-            return cast(R, ray.get(ref))
-
-        # ---- multi replica ----
-        # Dispatch 协议（与 `dispatch_mode.py` 的实现一致）：
-        # - per_args: tuple，其中每个元素是 len=replicas 的 list，表示该参数在每个 replica 上的值
-        # - per_kwargs: dict，其中每个 value 是 len=replicas 的 list
+        Dispatch protocol (aligned with `rayorch.dispatch_mode`):
+        - per_args: tuple, each slot is a sequence of length `replicas` (column-wise)
+        - per_kwargs: dict, each value is a sequence of length `replicas` (column-wise)
+        """
         per_args, per_kwargs = self._dispatch_fn(self, *args, **kwargs)
         if not isinstance(per_args, tuple):
             raise TypeError(f"dispatch_fn must return tuple for per_args. Got {type(per_args)}")
 
-        refs = []
+        refs: List[ray.ObjectRef] = []
         for i in range(self._replicas):
             try:
                 args_i = tuple(per_args[j][i] for j in range(len(per_args)))
@@ -174,8 +167,22 @@ class RayModule(Generic[INITP, RUNP, R]):
             tag_i = self._tag_fn(args_i, kwargs_i, i) if self._tag_fn else ""
             meta_i = {"tag": tag_i, "replica": i, "dev": self._is_dev_mode}
             refs.append(self.actors[i].run.remote(args_i, kwargs_i, meta_i))
+        return refs
 
-        output = ray.get(refs) # block until all refs are resolved
+    def __call__(self, *args: RUNP.args, **kwargs: RUNP.kwargs) -> R:
+        # ---- single replica ----
+        if self._dispatch_fn is None or self._collect_fn is None or self._replicas == 1:
+            args_i = args
+            kwargs_i = kwargs
+            tag = self._tag_fn(args_i, kwargs_i, 0) if self._tag_fn else ""
+            meta = {"tag": tag, "replica": 0, "dev": self._is_dev_mode}
+
+            ref = self.actors[0].run.remote(args_i, kwargs_i, meta)
+            return cast(R, ray.get(ref))
+
+        # ---- multi replica ----
+        refs = self._fanout_refs(args, kwargs)
+        output = ray.get(refs)  # block until all refs are resolved
         return cast(R, self._collect_fn(self, output))
 
     def remote(self, *args: RUNP.args, **kwargs: RUNP.kwargs) -> "RayModule.RayModuleFuture":
@@ -190,42 +197,37 @@ class RayModule(Generic[INITP, RUNP, R]):
         """
         Fut = RayModule.RayModuleFuture
 
-        def _unwrap(x: Any) -> Any:
-            return x.completion_refs()[0] if isinstance(x, Fut) else x
+        def _unwrap_broadcast_future(x: Any) -> Any:
+            """
+            Unwrap upstream `RayModuleFuture` to a single ObjectRef dependency.
 
-        args = tuple(_unwrap(a) for a in args)
-        kwargs = {k: _unwrap(v) for k, v in kwargs.items()}
+            Note: this intentionally picks `completion_refs()[0]`. It is only semantically
+            correct when the upstream future represents BROADCAST-style identical shards,
+            or when the caller explicitly accepts using "replica 0" as the dependency.
+            """
+            if not isinstance(x, Fut):
+                return x
+            refs = x.completion_refs()
+            if len(refs) != 1 and x.collect_fn is not None:
+                # Multi-replica upstream: defaulting to ref[0] is easy to misuse.
+                # Keep behavior but fail loudly unless caller already reduced upstream.
+                raise ValueError(
+                    "RayModule.remote received an upstream RayModuleFuture with multiple "
+                    "completion refs. Default unwrapping would take only refs[0]. "
+                    "Call upstream.gather() first (reduce), or ensure upstream is "
+                    "BROADCAST/replicas=1 if you intend identical shards."
+                )
+            return refs[0]
+
+        args = tuple(_unwrap_broadcast_future(a) for a in args)
+        kwargs = {k: _unwrap_broadcast_future(v) for k, v in kwargs.items()}
 
         if self._dispatch_fn is None or self._collect_fn is None or self._replicas == 1:
             meta = {"tag": "", "replica": 0, "dev": self._is_dev_mode}
             ref = self.actors[0].run.remote(args, kwargs, meta)
             return RayModule.RayModuleFuture(module=self, refs=ref, collect_fn=None)
 
-        per_args, per_kwargs = self._dispatch_fn(self, *args, **kwargs)
-        if not isinstance(per_args, tuple):
-            raise TypeError(f"dispatch_fn must return tuple for per_args. Got {type(per_args)}")
-
-        refs = []
-        for i in range(self._replicas):
-            try:
-                args_i = tuple(per_args[j][i] for j in range(len(per_args)))
-            except Exception as e:
-                raise ValueError(
-                    f"dispatch_fn returned invalid per_args structure for replicas={self._replicas}. "
-                    f"Expected each per_args[j] to be indexable by replica i."
-                ) from e
-
-            try:
-                kwargs_i = {k: v[i] for k, v in per_kwargs.items()}
-            except Exception as e:
-                raise ValueError(
-                    f"dispatch_fn returned invalid per_kwargs structure for replicas={self._replicas}. "
-                    f"Expected each per_kwargs[k] to be indexable by replica i."
-                ) from e
-
-            tag_i = self._tag_fn(args_i, kwargs_i, i) if self._tag_fn else ""
-            meta_i = {"tag": tag_i, "replica": i, "dev": self._is_dev_mode}
-            refs.append(self.actors[i].run.remote(args_i, kwargs_i, meta_i))
+        refs = self._fanout_refs(args, kwargs)
         return RayModule.RayModuleFuture(module=self, refs=refs, collect_fn=self._collect_fn)
 
     submit = remote
@@ -236,5 +238,5 @@ class RayModule(Generic[INITP, RUNP, R]):
         """
         if pending.module is not self:
             raise ValueError("RayModuleFuture was not created by this RayModule instance")
-        return cast(R, pending.gather())
+        return cast(R, pending.get())
 

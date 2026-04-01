@@ -1,9 +1,10 @@
 import time
 
+import pytest
 import ray
 
 from rayorch import OverlappedPipeline, RayModule
-from rayorch.dispatch_mode import dispatch_broadcast
+from rayorch.dispatch_mode import collect_concat, dispatch_broadcast, dispatch_shard_all_args_mod
 
 
 def _collect_first_identical(rm, outs):
@@ -45,6 +46,16 @@ class SleepStageOp:
 class MergeSumOp:
     def run(self, a, b):
         return a + b
+
+
+class ShardPlusOneOp:
+    def run(self, xs):
+        return [x + 1 for x in xs]
+
+
+class SumListOp:
+    def run(self, xs):
+        return sum(xs)
 
 
 def _cleanup_modules(*modules: RayModule) -> None:
@@ -117,6 +128,45 @@ def test_overlapped_pipeline_complex_dag_batch8_multi_replica():
     out, elapsed = run_overlapped_complex_dag(n_items=8, replicas=3)
     assert out == [4 * x + 9 for x in range(8)]
     assert elapsed < 12.0
+
+
+def test_overlapped_pipeline_rejects_multi_ref_shard_dependency():
+    """
+    上游是 shard 多 replica（future 含多个 completion refs），下游在 graphless
+    OverlappedPipeline 中直接消费该 future 时，必须显式报错，避免静默 refs[0] 退化。
+    """
+    ray.init(ignore_reinit_error=True, num_cpus=16)
+    shard = sink = None
+    try:
+        shard = RayModule(
+            ShardPlusOneOp,
+            replicas=3,
+            dispatch_fn=dispatch_shard_all_args_mod,
+            collect_fn=collect_concat,
+        ).pre_init()
+        sink = RayModule(
+            SumListOp,
+            replicas=1,
+        ).pre_init()
+
+        class ShardThenSinkPipe(OverlappedPipeline):
+            def __init__(self):
+                self.shard = shard
+                self.sink = sink
+                super().__init__(max_inflight=2)
+
+            def forward(self, x):
+                y = self.shard(x)
+                return self.sink(y)
+
+        pipe = ShardThenSinkPipe()
+        with pytest.raises(ValueError, match="multiple completion refs"):
+            pipe([list(range(8))])
+    finally:
+        if shard is not None and sink is not None:
+            _cleanup_modules(shard, sink)
+        if ray.is_initialized():
+            ray.shutdown()
 
 
 if __name__ == "__main__":

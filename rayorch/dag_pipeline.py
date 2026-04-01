@@ -217,7 +217,7 @@ class _DagScheduler:
                 self.outstanding.discard(dr)
                 continue
 
-            gathered = pend.gather()
+            gathered = pend.get()
             self.inflight[call.node_name] -= 1
             self.outstanding.difference_update(need)
 

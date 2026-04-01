@@ -91,6 +91,6 @@ class OverlappedPipeline:
             if remaining_refs[idx] == 0:
                 pending = inflight_pending.pop(idx)
                 remaining_refs.pop(idx, None)
-                results[idx] = pending.gather()
+                results[idx] = pending.get()
 
         return results
