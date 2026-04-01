@@ -12,7 +12,7 @@ During ``forward``, each ``RayModule`` attribute is temporarily replaced by that
 module's ``remote`` bound method (same as ``actor.method.remote``). Arguments that
 are upstream :class:`RayModule.RayModuleFuture` values are unwrapped inside
 :meth:`RayModule.remote` to a single ``ObjectRef`` (``completion_refs()[0]``) per
-slot — see :meth:`RayModule.remote`. This matches ONE_TO_ALL-style identical shards;
+slot — see :meth:`RayModule.remote`. This matches BROADCAST-style identical shards;
 otherwise prefer ``DagPipeline`` or explicit gathers.
 """
 

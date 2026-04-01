@@ -21,10 +21,10 @@ import ray
 
 from rayorch import RayModule
 from rayorch.dispatch_mode import (
-    collect_all_to_all,
+    collect_identity,
     collect_concat,
-    dispatch_all_to_all,
-    dispatch_one_to_all,
+    dispatch_per_replica,
+    dispatch_broadcast,
     dispatch_shard_all_args_mod,
 )
 
@@ -109,8 +109,8 @@ def test_one_to_all_map_identical_reduce_list(ray_session):
     m = RayModule(
         ScaleSumOp,
         replicas=ws,
-        dispatch_fn=dispatch_one_to_all,
-        collect_fn=collect_all_to_all,
+        dispatch_fn=dispatch_broadcast,
+        collect_fn=collect_identity,
     ).pre_init()
     try:
         got = m(7, 4)
@@ -124,8 +124,8 @@ def test_one_to_all_many_args_kwargs_each_replica_sees_same(ray_session):
     m = RayModule(
         VarPackOp,
         replicas=ws,
-        dispatch_fn=dispatch_one_to_all,
-        collect_fn=collect_all_to_all,
+        dispatch_fn=dispatch_broadcast,
+        collect_fn=collect_identity,
     ).pre_init()
     try:
         p_args = (1, "hi", (3, 4), None)
@@ -146,7 +146,7 @@ def test_one_to_all_custom_reduce_sum(ray_session):
     m = RayModule(
         ScaleSumOp,
         replicas=ws,
-        dispatch_fn=dispatch_one_to_all,
+        dispatch_fn=dispatch_broadcast,
         collect_fn=lambda rm, outs: sum(outs),
     ).pre_init()
     try:
@@ -161,8 +161,8 @@ def test_all_to_all_map_per_rank_reduce_list(ray_session):
     m = RayModule(
         PairAddOp,
         replicas=ws,
-        dispatch_fn=dispatch_all_to_all,
-        collect_fn=collect_all_to_all,
+        dispatch_fn=dispatch_per_replica,
+        collect_fn=collect_identity,
     ).pre_init()
     try:
         got = m((1, 2, 3), (10, 100, 1000))
@@ -241,8 +241,8 @@ def test_remote_gather_same_as_call(ray_session):
     m = RayModule(
         PairAddOp,
         replicas=ws,
-        dispatch_fn=dispatch_all_to_all,
-        collect_fn=collect_all_to_all,
+        dispatch_fn=dispatch_per_replica,
+        collect_fn=collect_identity,
     ).pre_init()
     try:
         direct = m((3, 4), (30, 40))

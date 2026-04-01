@@ -6,10 +6,10 @@ from typing import Any, Callable, Dict, Mapping, Sequence, Tuple, Union, List
 
 
 class Dispatch(Enum):
-    ONE_TO_ALL = auto()
-    ALL_TO_ALL = auto()
+    BROADCAST = auto()
+    PER_REPLICA = auto()
     # DIRECT_ROLLOUT_METHOD = auto()
-    ALL_SLICED_TO_ALL = auto()
+    SHARD_CONTIGUOUS = auto()
     # ALL_SLICED_TO_TRIPLET_ALL = auto()
 
 
@@ -27,19 +27,19 @@ class DispatchSpec:
 
 
 # --------- VERL 风格实现 ---------
-def dispatch_one_to_all(RayModule, *args, **kwargs):
-    ws = RayModule._replicas # hard code to avoid circular import
+def dispatch_broadcast(rm, *args, **kwargs):
+    ws = rm._replicas  # hard code to avoid circular import
     args = tuple([arg] * ws for arg in args)
     kwargs = {k: [v] * ws for k, v in kwargs.items()}
     return args, kwargs
 
 
-def dispatch_all_to_all(RayModule, *args, **kwargs):
+def dispatch_per_replica(rm, *args, **kwargs):
     # 约定：args/kwargs 已经是 per-replica 形式
     return args, kwargs
 
 
-def collect_all_to_all(RayModule, output):
+def collect_identity(rm, output):
     return output
 
 
@@ -245,9 +245,9 @@ def collect_triplet_concat(rm, outputs):
     return mains, first_args, first_kwargs
 
 DISPATCH_MODE_FN_REGISTRY = {
-    Dispatch.ONE_TO_ALL: DispatchSpec(dispatch_one_to_all, collect_all_to_all),
-    Dispatch.ALL_TO_ALL: DispatchSpec(dispatch_all_to_all, collect_all_to_all),
-    Dispatch.ALL_SLICED_TO_ALL: DispatchSpec(dispatch_shard_all_args_mod, collect_concat),
+    Dispatch.BROADCAST: DispatchSpec(dispatch_broadcast, collect_identity),
+    Dispatch.PER_REPLICA: DispatchSpec(dispatch_per_replica, collect_identity),
+    Dispatch.SHARD_CONTIGUOUS: DispatchSpec(dispatch_shard_all_args_mod, collect_concat),
     # Dispatch.ALL_SLICED_TO_TRIPLET_ALL: DispatchSpec(dispatch_shard_all_args_mod, collect_triplet_concat),
 }
 

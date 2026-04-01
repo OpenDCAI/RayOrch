@@ -7,10 +7,10 @@ import ray
 
 from rayorch import RayModule
 from rayorch.dispatch_mode import (
-    collect_all_to_all,
+    collect_identity,
     collect_concat,
-    dispatch_all_to_all,
-    dispatch_one_to_all,
+    dispatch_per_replica,
+    dispatch_broadcast,
     dispatch_shard_all_args_mod,
 )
 
@@ -95,19 +95,19 @@ class IdentityOp:
         return x
 
 
-def test_column_dispatch_one_to_all_accepts_list_batches(ray_session):
+def test_column_dispatch_broadcast_accepts_list_batches(ray_session):
     """
-    验证 RayModule 能直接对接 `dispatch_one_to_all` 的列式输出：
+    验证 RayModule 能直接对接 `dispatch_broadcast` 的列式输出：
     - 输入是 list_of_images/list_of_texts
     - 每个 replica 都收到同一份 lists
-    - reduce 使用 collect_all_to_all，返回每个 replica 的输出列表
+    - reduce 使用 collect_identity，返回每个 replica 的输出列表
     """
     ws = 3
     m = RayModule(
         EchoPairOp,
         replicas=ws,
-        dispatch_fn=dispatch_one_to_all,
-        collect_fn=collect_all_to_all,
+        dispatch_fn=dispatch_broadcast,
+        collect_fn=collect_identity,
     ).pre_init()
     try:
         images = [{"id": i} for i in range(5)]
@@ -230,15 +230,15 @@ def test_column_collect_concat_merges_tuple_outputs(ray_session):
 
 def test_column_dispatch_all_to_all_column_style(ray_session):
     """
-    dispatch_all_to_all 约定：输入已经是列式 per-replica 形式。
+    dispatch_per_replica 约定：输入已经是列式 per-replica 形式。
     这里用一个最小 identity op 验证每个 replica 各自拿到自己的值。
     """
     ws = 3
     m = RayModule(
         IdentityOp,
         replicas=ws,
-        dispatch_fn=dispatch_all_to_all,
-        collect_fn=collect_all_to_all,
+        dispatch_fn=dispatch_per_replica,
+        collect_fn=collect_identity,
     ).pre_init()
     try:
         out = m([10, 11, 12])

@@ -3,11 +3,11 @@ import time
 import ray
 
 from rayorch import OverlappedPipeline, RayModule
-from rayorch.dispatch_mode import dispatch_one_to_all
+from rayorch.dispatch_mode import dispatch_broadcast
 
 
 def _collect_first_identical(rm, outs):
-    """ONE_TO_ALL：各 replica 结果相同，对外与 replicas=1 一致。"""
+    """BROADCAST：各 replica 结果相同，对外与 replicas=1 一致。"""
     return outs[0]
 
 
@@ -17,7 +17,7 @@ def _sleep_module(sleep_s: float, replicas: int) -> RayModule:
     return RayModule(
         SleepStageOp,
         replicas=replicas,
-        dispatch_fn=dispatch_one_to_all,
+        dispatch_fn=dispatch_broadcast,
         collect_fn=_collect_first_identical,
     ).pre_init(sleep_s)
 
@@ -28,7 +28,7 @@ def _merge_module(replicas: int) -> RayModule:
     return RayModule(
         MergeSumOp,
         replicas=replicas,
-        dispatch_fn=dispatch_one_to_all,
+        dispatch_fn=dispatch_broadcast,
         collect_fn=_collect_first_identical,
     ).pre_init()
 
