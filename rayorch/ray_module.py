@@ -146,19 +146,31 @@ class RayModule(Generic[INITP, RUNP, R]):
             return cast(R, ray.get(ref))
 
         # ---- multi replica ----
-        # _dispatch_fn 约定与 dispatch_one_to_all 相同：两个 list，长度均为 replicas，
-        # per_replica_args[i] / per_replica_kwargs[i] 送给 actors[i]。
-        per_replica_args, per_replica_kwargs = self._dispatch_fn(self, *args, **kwargs)
-        if len(per_replica_args) != self._replicas or len(per_replica_kwargs) != self._replicas:
-            raise ValueError(
-                f"dispatch_fn must return per-replica lists of length {self._replicas}, "
-                f"got len(args_list)={len(per_replica_args)} len(kwargs_list)={len(per_replica_kwargs)}"
-            )
+        # Dispatch 协议（与 `dispatch_mode.py` 的实现一致）：
+        # - per_args: tuple，其中每个元素是 len=replicas 的 list，表示该参数在每个 replica 上的值
+        # - per_kwargs: dict，其中每个 value 是 len=replicas 的 list
+        per_args, per_kwargs = self._dispatch_fn(self, *args, **kwargs)
+        if not isinstance(per_args, tuple):
+            raise TypeError(f"dispatch_fn must return tuple for per_args. Got {type(per_args)}")
 
         refs = []
         for i in range(self._replicas):
-            args_i = per_replica_args[i]
-            kwargs_i = per_replica_kwargs[i]
+            try:
+                args_i = tuple(per_args[j][i] for j in range(len(per_args)))
+            except Exception as e:
+                raise ValueError(
+                    f"dispatch_fn returned invalid per_args structure for replicas={self._replicas}. "
+                    f"Expected each per_args[j] to be indexable by replica i."
+                ) from e
+
+            try:
+                kwargs_i = {k: v[i] for k, v in per_kwargs.items()}
+            except Exception as e:
+                raise ValueError(
+                    f"dispatch_fn returned invalid per_kwargs structure for replicas={self._replicas}. "
+                    f"Expected each per_kwargs[k] to be indexable by replica i."
+                ) from e
+
             tag_i = self._tag_fn(args_i, kwargs_i, i) if self._tag_fn else ""
             meta_i = {"tag": tag_i, "replica": i, "dev": self._is_dev_mode}
             refs.append(self.actors[i].run.remote(args_i, kwargs_i, meta_i))
@@ -189,16 +201,28 @@ class RayModule(Generic[INITP, RUNP, R]):
             ref = self.actors[0].run.remote(args, kwargs, meta)
             return RayModule.RayModuleFuture(module=self, refs=ref, collect_fn=None)
 
-        per_replica_args, per_replica_kwargs = self._dispatch_fn(self, *args, **kwargs)
-        if len(per_replica_args) != self._replicas or len(per_replica_kwargs) != self._replicas:
-            raise ValueError(
-                f"dispatch_fn must return per-replica lists of length {self._replicas}, "
-                f"got len(args_list)={len(per_replica_args)} len(kwargs_list)={len(per_replica_kwargs)}"
-            )
+        per_args, per_kwargs = self._dispatch_fn(self, *args, **kwargs)
+        if not isinstance(per_args, tuple):
+            raise TypeError(f"dispatch_fn must return tuple for per_args. Got {type(per_args)}")
+
         refs = []
         for i in range(self._replicas):
-            args_i = per_replica_args[i]
-            kwargs_i = per_replica_kwargs[i]
+            try:
+                args_i = tuple(per_args[j][i] for j in range(len(per_args)))
+            except Exception as e:
+                raise ValueError(
+                    f"dispatch_fn returned invalid per_args structure for replicas={self._replicas}. "
+                    f"Expected each per_args[j] to be indexable by replica i."
+                ) from e
+
+            try:
+                kwargs_i = {k: v[i] for k, v in per_kwargs.items()}
+            except Exception as e:
+                raise ValueError(
+                    f"dispatch_fn returned invalid per_kwargs structure for replicas={self._replicas}. "
+                    f"Expected each per_kwargs[k] to be indexable by replica i."
+                ) from e
+
             tag_i = self._tag_fn(args_i, kwargs_i, i) if self._tag_fn else ""
             meta_i = {"tag": tag_i, "replica": i, "dev": self._is_dev_mode}
             refs.append(self.actors[i].run.remote(args_i, kwargs_i, meta_i))

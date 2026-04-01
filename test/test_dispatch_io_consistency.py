@@ -4,13 +4,15 @@ RayModule 与 dispatch / collect 的配合：端到端 map-reduce 行为。
 - Map：dispatch_fn 把一次调用的 *args/**kwargs 切成每 replica 一份，经 actor 上 op.run。
 - Reduce：各 replica 返回值列表交给 collect_fn，得到对外的单一结果。
 
-``dispatch_all_to_all`` / ``dispatch_shard_all_args_mod`` 返回的是 shard 风格（按参数位列），
-需 zip 成 RayModule 要求的 per-replica 两个 list；本文件用 ``zip_shard_dispatch`` 包装，属真实场景中常见的 adapter。
+RayOrch 的 dispatch_fn 采用“列式（按参数槽位）”协议：
+- per_args: tuple，每个元素是 len=replicas 的 list/sequence，表示该参数在每个 replica 上的值
+- per_kwargs: dict，每个 value 是 len=replicas 的 list/sequence
+
+RayModule 负责把列式 per_args/per_kwargs 转置成每个 actor 的 (args_i, kwargs_i)。
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any, Dict, List, Sequence, Tuple
 
 import pytest
@@ -25,43 +27,6 @@ from rayorch.dispatch_mode import (
     dispatch_one_to_all,
     dispatch_shard_all_args_mod,
 )
-
-
-def zip_shard_dispatch(rm: RayModule, *args: Any, **kwargs: Any):
-    """把 shard 列式 dispatch 输出 zip 成 RayModule 协议。"""
-    ws = rm._replicas
-    per_args, per_kw = dispatch_shard_all_args_mod(rm, *args, **kwargs)
-    for j, col in enumerate(per_args):
-        if len(col) != ws:
-            raise ValueError(f"dispatch shard: arg slot {j} len {len(col)} != replicas {ws}")
-    for k, col in per_kw.items():
-        if len(col) != ws:
-            raise ValueError(f"dispatch shard: kw {k!r} len {len(col)} != replicas {ws}")
-    ra = [tuple(per_args[j][i] for j in range(len(per_args))) for i in range(ws)]
-    rk = [{kk: per_kw[kk][i] for kk in per_kw} for i in range(ws)]
-    return ra, rk
-
-
-def zip_all_to_all_dispatch(rm: RayModule, *args: Any, **kwargs: Any):
-    per_args, per_kw = dispatch_all_to_all(rm, *args, **kwargs)
-    return zip_shard_style_columns(rm._replicas, per_args, per_kw)
-
-
-def zip_shard_style_columns(
-    ws: int,
-    per_args: Tuple[Sequence[Any], ...],
-    per_kw: Dict[str, Any],
-) -> Tuple[List[Tuple[Any, ...]], List[Dict[str, Any]]]:
-    for j, col in enumerate(per_args):
-        if len(col) != ws:
-            raise ValueError(f"arg slot {j} len {len(col)} != {ws}")
-    for k, col in per_kw.items():
-        if len(col) != ws:
-            raise ValueError(f"kw {k!r} len {len(col)} != {ws}")
-    ra = [tuple(per_args[j][i] for j in range(len(per_args))) for i in range(ws)]
-    rk = [{kk: per_kw[kk][i] for kk in per_kw} for i in range(ws)]
-    return ra, rk
-
 
 def _kill_modules(*modules: RayModule) -> None:
     for m in modules:
@@ -196,7 +161,7 @@ def test_all_to_all_map_per_rank_reduce_list(ray_session):
     m = RayModule(
         PairAddOp,
         replicas=ws,
-        dispatch_fn=zip_all_to_all_dispatch,
+        dispatch_fn=dispatch_all_to_all,
         collect_fn=collect_all_to_all,
     ).pre_init()
     try:
@@ -212,7 +177,7 @@ def test_shard_map_slice_reduce_concat_list(ray_session):
     m = RayModule(
         ChunkAccOp,
         replicas=ws,
-        dispatch_fn=zip_shard_dispatch,
+        dispatch_fn=dispatch_shard_all_args_mod,
         collect_fn=collect_concat,
     ).pre_init()
     try:
@@ -228,17 +193,26 @@ def test_shard_matches_manual_serial_reduce(ray_session):
     ws = 3
     batch = list(range(10))
     bias = 1
-    pa, pk = dispatch_shard_all_args_mod(SimpleNamespace(_replicas=ws), batch, bias)
-    ra, _ = zip_shard_style_columns(ws, pa, pk)
+    # 手写分片（与 dispatch_shard_all_args_mod 相同的区间策略）再串行执行
+    base = len(batch) // ws
+    rem = len(batch) % ws
+    sizes = [base + (1 if i < rem else 0) for i in range(ws)]
+    ranges = []
+    start = 0
+    for sz in sizes:
+        end = start + sz
+        ranges.append((start, end))
+        start = end
 
     manual: list = []
-    for args_i in ra:
-        manual.extend(ChunkAccOp().run(*args_i))
+    op = ChunkAccOp()
+    for (s, e) in ranges:
+        manual.extend(op.run(batch[s:e], bias))
 
     m = RayModule(
         ChunkAccOp,
         replicas=ws,
-        dispatch_fn=zip_shard_dispatch,
+        dispatch_fn=dispatch_shard_all_args_mod,
         collect_fn=collect_concat,
     ).pre_init()
     try:
@@ -252,7 +226,7 @@ def test_shard_dict_outputs_collect_concat(ray_session):
     m = RayModule(
         DictShardOp,
         replicas=ws,
-        dispatch_fn=zip_shard_dispatch,
+        dispatch_fn=dispatch_shard_all_args_mod,
         collect_fn=collect_concat,
     ).pre_init()
     try:
@@ -267,7 +241,7 @@ def test_remote_gather_same_as_call(ray_session):
     m = RayModule(
         PairAddOp,
         replicas=ws,
-        dispatch_fn=zip_all_to_all_dispatch,
+        dispatch_fn=dispatch_all_to_all,
         collect_fn=collect_all_to_all,
     ).pre_init()
     try:
@@ -284,7 +258,7 @@ def test_shard_length_mismatch_raises_before_actors(ray_session):
     m = RayModule(
         ChunkAccOp,
         replicas=ws,
-        dispatch_fn=zip_shard_dispatch,
+        dispatch_fn=dispatch_shard_all_args_mod,
         collect_fn=collect_concat,
     ).pre_init()
     try:
