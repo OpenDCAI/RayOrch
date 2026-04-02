@@ -1,42 +1,58 @@
+"""
+MinerU-shaped DAG integration tests for ``rayorch.dag_new_pipeline``.
+
+Validates the same operator wiring as ``Flash-MinerU/flash_mineru/main_four_rayorch_dag_new.py``
+(``MinerURayOrchDagNewPipeline``) and ``test_dummy_mineru_dag.py``, using lightweight dummy Ops so
+CI can run without GPUs or MinerU weights. Ray uses the host CPU count unless
+``RAYORCH_TEST_NUM_CPUS`` is set.
+
+Archive / design notes: ``docs/dag_new_pipeline_architecture.md`` (source: ``rayorch/dag_new_pipeline.py``).
+"""
+
 from __future__ import annotations
 
-import argparse
 import os
-import random
-import time
-from dataclasses import dataclass
 from typing import List
 
 import ray
 
-from rayorch import DagNewPipeline, DagExecutor, Dispatch, RayModule
+from rayorch import Dispatch, RayModule
+from rayorch.dag_new_pipeline import DagExecutor, DagPipeline
 
 
-def chunked(items: List[str], batch_size: int) -> List[List[str]]:
+def _ray_init_local() -> None:
+    """Initialize Ray for tests without capping below host capacity.
+
+    By default Ray detects local CPU count. Set ``RAYORCH_TEST_NUM_CPUS`` to force
+    a specific slot count (e.g. constrained CI runners).
+    """
+    if ray.is_initialized():
+        return
+    raw = os.environ.get("RAYORCH_TEST_NUM_CPUS", "").strip()
+    if raw:
+        ray.init(ignore_reinit_error=True, num_cpus=max(1, int(raw)))
+    else:
+        ray.init(ignore_reinit_error=True)
+
+
+def _chunked(items: List[str], batch_size: int) -> List[List[str]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
-def flatten(nested: List[List[str]]) -> List[str]:
+def _flatten(nested: List[List[str]]) -> List[str]:
     out: List[str] = []
     for x in nested:
         out.extend(x)
     return out
 
 
-class JitterSleepMixin:
-    """Per-actor deterministic jittered sleep for timeline visualization."""
-
-    def __init__(self, base_s: float, jitter_s: float = 0.25):
-        self.base_s = float(base_s)
-        self.jitter_s = float(jitter_s)
-        self._rng = random.Random(os.getpid())
-        self._calls = 0
-
-    def _sleep_once(self, scale: float = 1.0) -> None:
-        self._calls += 1
-        delta = self._rng.uniform(-self.jitter_s, self.jitter_s)
-        delay = max(0.02, self.base_s * scale + delta)
-        time.sleep(delay)
+def _cleanup_modules(*modules: RayModule) -> None:
+    for m in modules:
+        for actor in getattr(m, "actors", []):
+            try:
+                ray.kill(actor)
+            except Exception:
+                pass
 
 
 class DummyBlock(dict):
@@ -66,15 +82,12 @@ class DummyBlock(dict):
         self["content"] = value
 
 
-class Pdf2ImageDummyOp(JitterSleepMixin):
-    def __init__(self):
-        super().__init__(base_s=0.15, jitter_s=0.05)
-
+class Pdf2ImageDummyOp:
     def run(self, pdf_path_list: List[str]) -> List[List[dict]]:
-        self._sleep_once(scale=max(1.0, 0.2 * len(pdf_path_list)))
         out: List[List[dict]] = []
         for pdf in pdf_path_list:
-            page_n = 6 + (abs(hash(pdf)) % 12)
+            # Deterministic across processes (avoid PYTHONHASHSEED-dependent ``hash()``).
+            page_n = 2 + (sum(ord(c) for c in pdf) % 3)
             pages = []
             for i in range(page_n):
                 pages.append(
@@ -90,44 +103,30 @@ class Pdf2ImageDummyOp(JitterSleepMixin):
         return out
 
 
-class LayoutDetectionDummyOp(JitterSleepMixin):
-    def __init__(self):
-        super().__init__(base_s=0.8, jitter_s=0.35)
-        self._rng2 = random.Random(os.getpid() ^ 0xABCDEF)
-
+class LayoutDetectionDummyOp:
     def run(self, image_dict_list: List[List[dict]]) -> List[List[List[DummyBlock]]]:
-        # Emulate medium-heavy model stage with per-pdf/page variation.
-        self._sleep_once(scale=max(1.0, 0.4 * len(image_dict_list)))
         output: List[List[List[DummyBlock]]] = []
         for pdf_pages in image_dict_list:
             blocks_list = []
             for page in pdf_pages:
-                n_blocks = 3 + self._rng2.randint(0, 5)
-                page_blocks = []
-                for bi in range(n_blocks):
-                    page_blocks.append(
-                        DummyBlock(
-                            type="text",
-                            bbox=[10.0 + bi, 20.0 + bi, 300.0 + bi, 100.0 + bi],
-                            content=f"layout<{page['page_id']}>#{bi}",
-                        )
+                page_blocks = [
+                    DummyBlock(
+                        type="text",
+                        bbox=[10.0, 20.0, 300.0, 100.0],
+                        content=f"layout<{page['page_id']}>#0",
                     )
+                ]
                 blocks_list.append(page_blocks)
             output.append(blocks_list)
         return output
 
 
-class OCRDummyOp(JitterSleepMixin):
-    def __init__(self):
-        super().__init__(base_s=1.1, jitter_s=0.45)
-
+class OCRDummyOp:
     def run(
         self,
         image_dict_list: List[List[dict]],
         blocks_list_per_pdf: List[List[List[DummyBlock]]],
     ) -> List[List[List[dict]]]:
-        # Emulate heavy OCR stage.
-        self._sleep_once(scale=max(1.0, 0.5 * len(image_dict_list)))
         out: List[List[List[dict]]] = []
         for pdf_pages, per_pdf_blocks in zip(image_dict_list, blocks_list_per_pdf):
             pdf_out = []
@@ -147,12 +146,8 @@ class OCRDummyOp(JitterSleepMixin):
         return out
 
 
-class Convert2MDDummyOp(JitterSleepMixin):
-    def __init__(self):
-        super().__init__(base_s=0.2, jitter_s=0.08)
-
+class Convert2MDDummyOp:
     def run(self, model_results: List[List[List[dict]]], images: List[List[dict]]) -> List[str]:
-        self._sleep_once(scale=max(1.0, 0.2 * len(images)))
         outs: List[str] = []
         for idx, image_pages in enumerate(images):
             pdf_path = image_pages[0]["pdf_path"]
@@ -163,14 +158,10 @@ class Convert2MDDummyOp(JitterSleepMixin):
         return outs
 
 
-class DummyMineruDagPipeline(DagNewPipeline):
+class MineruShapedDummyPipeline(DagPipeline):
     """Same DAG shape as MinerU: pdf2img -> layout -> ocr -> img2md."""
 
-    def __init__(
-        self,
-        *,
-        replicas: int,
-    ):
+    def __init__(self, *, replicas: int) -> None:
         self.pdf2img = RayModule(Pdf2ImageDummyOp, replicas=1, num_gpus_per_replica=0.0).pre_init()
         self.layout = RayModule(
             LayoutDetectionDummyOp,
@@ -192,7 +183,6 @@ class DummyMineruDagPipeline(DagNewPipeline):
             num_gpus_per_replica=0.0,
             dispatch_mode=Dispatch.BROADCAST,
         ).pre_init()
-
         super().__init__()
 
     def forward(self, x):
@@ -202,50 +192,64 @@ class DummyMineruDagPipeline(DagNewPipeline):
         return self.img2md(model_results=ocr_results, images=images)
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Dummy MinerU-like DAG timeline probe.")
-    p.add_argument("--num-pdfs", type=int, default=20)
-    p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--replicas", type=int, default=4)
-    p.add_argument("--inflight", type=int, default=4, help="max_batches_inflight")
-    p.add_argument("--timeline", type=str, default="test_dummy_mineru_dag_timeline.json")
-    p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
+def test_mineru_shaped_compiled_graph_topology() -> None:
+    _ray_init_local()
+    pipe: MineruShapedDummyPipeline | None = None
+    try:
+        pipe = MineruShapedDummyPipeline(replicas=2)
+        pipe.compile()
+        g = pipe._compiled
+        assert g is not None
+        assert g.topo_order == ("pdf2img", "layout", "ocr", "img2md")
+        assert set(g.nodes) == {"pdf2img", "layout", "ocr", "img2md"}
+        assert g.input_keys == ("__input__x",)
+    finally:
+        if pipe is not None:
+            _cleanup_modules(pipe.pdf2img, pipe.layout, pipe.ocr, pipe.img2md)
+        if ray.is_initialized():
+            ray.shutdown()
 
 
-def main():
-    args = parse_args()
-    random.seed(args.seed)
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
+def test_mineru_shaped_serial_matches_dag_executor() -> None:
+    _ray_init_local()
+    pipe: MineruShapedDummyPipeline | None = None
+    try:
+        replicas = 2
+        pipe = MineruShapedDummyPipeline(replicas=replicas)
+        pdfs = [f"/tmp/mineru_test_{i}.pdf" for i in range(5)]
+        batches = _chunked(pdfs, batch_size=2)
 
-    pdfs = [f"/dummy/path/pdf_{i:04d}.pdf" for i in range(args.num_pdfs)]
-    batches = chunked(pdfs, max(1, int(args.batch_size)))
+        serial = pipe(batches)
+        dag = DagExecutor(max_batches_inflight=3).run(pipe, batches)
 
-    pipe = DummyMineruDagPipeline(
-        replicas=max(1, int(args.replicas)),
-    )
-    executor = DagExecutor(max_batches_inflight=max(1, int(args.inflight)))
-    t0 = time.perf_counter()
-    per_batch = executor.run(pipe, batches)
-    elapsed = time.perf_counter() - t0
-    all_out = flatten(per_batch)
-
-    print(
-        "done:",
-        {
-            "num_pdfs": len(pdfs),
-            "num_batches": len(batches),
-            "replicas": args.replicas,
-            "inflight": args.inflight,
-            "elapsed_sec": round(elapsed, 2),
-            "outputs": len(all_out),
-        },
-    )
-    ray.timeline(args.timeline)
-    print(f"timeline: {args.timeline}")
+        assert serial == dag
+        assert _flatten(serial) == [
+            "mineru_test_0.md (pages=2, blocks=2)",
+            "mineru_test_1.md (pages=3, blocks=3)",
+            "mineru_test_2.md (pages=4, blocks=4)",
+            "mineru_test_3.md (pages=2, blocks=2)",
+            "mineru_test_4.md (pages=3, blocks=3)",
+        ]
+    finally:
+        if pipe is not None:
+            _cleanup_modules(pipe.pdf2img, pipe.layout, pipe.ocr, pipe.img2md)
+        if ray.is_initialized():
+            ray.shutdown()
 
 
-if __name__ == "__main__":
-    main()
+def test_mineru_shaped_run_with_explicit_sequential_executor() -> None:
+    from rayorch.dag_new_pipeline import SequentialExecutor
 
+    _ray_init_local()
+    pipe: MineruShapedDummyPipeline | None = None
+    try:
+        pipe = MineruShapedDummyPipeline(replicas=1)
+        batches = [["/x/a.pdf"], ["/x/b.pdf"]]
+        out_default = pipe(batches)
+        out_explicit = pipe.run(batches, executor=SequentialExecutor())
+        assert out_default == out_explicit
+    finally:
+        if pipe is not None:
+            _cleanup_modules(pipe.pdf2img, pipe.layout, pipe.ocr, pipe.img2md)
+        if ray.is_initialized():
+            ray.shutdown()

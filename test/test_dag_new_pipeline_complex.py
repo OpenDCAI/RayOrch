@@ -16,7 +16,7 @@ from typing import Tuple
 import ray
 
 from rayorch import RayModule
-from rayorch.dag_new_pipeline import DagPipeline, PipeRef
+from rayorch.dag_new_pipeline import DagExecutor, DagPipeline, PipeRef
 
 
 def _cleanup_modules(*modules: RayModule) -> None:
@@ -160,7 +160,7 @@ class ComplexDagNewPipe(DagPipeline):
         self.tail_2 = RayModule(Tail2Op, replicas=1, max_inflight=2).pre_init(0.07)
         self.tail_3 = RayModule(Tail3Op, replicas=1, max_inflight=2).pre_init(0.04)
         self.join_b = RayModule(JoinBOp, replicas=1, max_inflight=2).pre_init(0.08)
-        super().__init__(max_batches_inflight=4)
+        super().__init__()
 
     def forward(self, x: PipeRef) -> PipeRef:
         y = self.pre(x)
@@ -189,7 +189,8 @@ def test_dag_new_pipeline_complex_multi_batch_with_timeline():
             list(range(7, 11)),
             [13, 17, 19],
         ]
-        outputs = pipe(inputs)
+        executor = DagExecutor(max_batches_inflight=4)
+        outputs = executor.run(pipe, inputs)
         expected = [_expected(b) for b in inputs]
 
         assert outputs == expected

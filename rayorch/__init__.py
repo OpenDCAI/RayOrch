@@ -16,8 +16,12 @@ from .dag_pipeline import (
     PipelineExecutor,
 )
 from .dag_new_pipeline import (
+    Pipeline,
     DagPipeline as DagNewPipeline,
     PipeRef as DagNewPipeRef,
+    Executor,
+    SequentialExecutor,
+    DagExecutor,
 )
 from .overlapped_pipeline import OverlappedPipeline
 from .env_registry import EnvRegistry
@@ -38,8 +42,12 @@ __all__ = [
     'DagNode',
     'DagPipeline',
     'DagPipelineExecutor',
+    'Pipeline',
     'DagNewPipeline',
     'DagNewPipeRef',
+    'Executor',
+    'SequentialExecutor',
+    'DagExecutor',
     'OverlappedPipeline',
     'PipelineExecutor',
     'PipeRef',

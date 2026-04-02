@@ -14,7 +14,7 @@ class SumOp:
 class MultiInputPipe(DagPipeline):
     def __init__(self):
         self.add = RayModule(SumOp, replicas=1, max_inflight=2).pre_init()
-        super().__init__(max_batches_inflight=2)
+        super().__init__()
 
     def forward(self, a: PipeRef, b: PipeRef) -> PipeRef:
         return self.add(a, b)

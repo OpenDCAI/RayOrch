@@ -6,7 +6,7 @@ from pathlib import Path
 import ray
 
 from rayorch import RayModule
-from rayorch.dag_new_pipeline import DagPipeline, PipeRef
+from rayorch.dag_new_pipeline import DagExecutor, DagPipeline, PipeRef
 
 
 def _cleanup_modules(*modules: RayModule) -> None:
@@ -32,7 +32,7 @@ class MultiInputPipe(DagPipeline):
     def __init__(self):
         self.add = RayModule(SumOp, replicas=1, max_inflight=2).pre_init()
         self.scale = RayModule(ScaleOp, replicas=1, max_inflight=2).pre_init()
-        super().__init__(max_batches_inflight=4)
+        super().__init__()
 
     def forward(self, a: PipeRef, b: PipeRef) -> PipeRef:
         return self.scale(self.add(a, b))
@@ -51,14 +51,19 @@ def test_dag_new_pipeline_multi_root_inputs_and_file_output(tmp_path: Path):
         a_batches = [[1, 2, 3], [10, 20]]
         b_batches = [[4, 5, 6], [1, 2]]
 
-        # runtime positional multi-root call
+        # serial positional multi-root call
         outputs_positional = pipe(a_batches, b_batches)
-        # runtime keyword multi-root call
+        # serial keyword multi-root call
         outputs_named = pipe(a=a_batches, b=b_batches)
         expected = [[15, 21, 27], [33, 66]]
 
         assert outputs_positional == expected
         assert outputs_named == expected
+
+        # overlapped via DagExecutor
+        dag = DagExecutor(max_batches_inflight=4)
+        outputs_dag = dag.run(pipe, a_batches, b_batches)
+        assert outputs_dag == expected
 
         out_file = tmp_path / "dag_new_multi_input_output.json"
         _dump_json(out_file, outputs_positional)

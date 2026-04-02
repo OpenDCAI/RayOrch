@@ -1,12 +1,29 @@
-"""Declarative DAG pipeline with ``ray.wait``-driven scheduling.
+"""Declarative DAG pipeline with pluggable execution strategies.
 
-Subclass :class:`DagPipeline`, attach ``RayModule`` attributes, and
+Subclass :class:`Pipeline`, attach ``RayModule`` attributes, and
 implement ``forward()`` using symbolic ``PipeRef`` wiring.
-``compile()`` traces the graph; ``__call__()`` executes batched inputs
-through a scheduler with per-node inflight caps and automatic memory release.
+``compile()`` traces the graph; ``__call__()`` runs batches serially.
+Use :class:`DagExecutor` for ``ray.wait``-driven overlapped scheduling.
+
+Example::
+
+    class MyPipe(Pipeline):
+        def __init__(self):
+            self.a = RayModule(AOp, replicas=2, ...).pre_init()
+            self.b = RayModule(BOp, replicas=1).pre_init()
+            super().__init__()
+
+        def forward(self, x: PipeRef) -> PipeRef:
+            return self.b(self.a(x))
+
+    pipe = MyPipe()
+    results = pipe(batches)                              # serial
+    results = DagExecutor(max_batches_inflight=4).run(pipe, batches)  # overlapped
+    results = pipe.run(batches, executor=DagExecutor())   # convenience
 """
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
 import inspect
@@ -42,7 +59,7 @@ class NodeSpec:
 
 @dataclass
 class CompiledGraph:
-    """Immutable DAG topology produced by :meth:`DagPipeline.compile`."""
+    """Immutable DAG topology produced by :meth:`Pipeline.compile`."""
     nodes: Dict[str, NodeSpec]
     topo_order: Tuple[str, ...]
     deps: Dict[str, Tuple[str, ...]]
@@ -177,8 +194,123 @@ class _TraceProxy:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Scheduler
+# Executors
 # ═══════════════════════════════════════════════════════════════════════════
+
+class Executor(ABC):
+    """Strategy for running a compiled :class:`Pipeline`."""
+
+    @abstractmethod
+    def execute(
+        self,
+        graph: CompiledGraph,
+        columns: Dict[str, Sequence[Any]],
+    ) -> List[Any]:
+        """Run all batches through *graph* and return results in order."""
+
+    def run(
+        self,
+        pipeline: Pipeline,
+        *inputs: Sequence[Any],
+        **named_inputs: Sequence[Any],
+    ) -> List[Any]:
+        """Compile *pipeline* (if needed), resolve inputs, and execute."""
+        return pipeline.run(*inputs, executor=self, **named_inputs)
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────
+
+def _validate_output(spec: NodeSpec, value: Any) -> None:
+    """Check that a node's return value matches its declared ``num_outputs``."""
+    if spec.num_outputs == 1:
+        if not isinstance(value, list):
+            raise TypeError(
+                f"node '{spec.name}' must return list (got {type(value).__name__})"
+            )
+        return
+    if not isinstance(value, (tuple, list)):
+        raise TypeError(
+            f"node '{spec.name}' must return tuple/list of "
+            f"{spec.num_outputs} lists (got {type(value).__name__})"
+        )
+    if len(value) != spec.num_outputs:
+        raise ValueError(
+            f"node '{spec.name}' declared num_outputs={spec.num_outputs}, "
+            f"but returned {len(value)} outputs"
+        )
+    for i, branch in enumerate(value):
+        if not isinstance(branch, list):
+            raise TypeError(
+                f"node '{spec.name}' output[{i}] must be list "
+                f"(got {type(branch).__name__})"
+            )
+
+
+def _validate_columns(
+    graph: CompiledGraph,
+    columns: Dict[str, Sequence[Any]],
+) -> int:
+    """Validate input columns and return batch count."""
+    expected = set(graph.input_keys)
+    if set(columns.keys()) != expected:
+        raise ValueError(
+            f"input keys mismatch: expected {graph.input_keys}, "
+            f"got {tuple(columns.keys())}"
+        )
+    sizes = {k: len(v) for k, v in columns.items()}
+    if not sizes:
+        raise ValueError("input columns cannot be empty")
+    unique = set(sizes.values())
+    if len(unique) != 1:
+        raise ValueError(f"all input columns must have same length, got {sizes}")
+    return next(iter(unique))
+
+
+def _materialize_outputs(
+    ctx: Dict[str, tuple],
+    graph_outputs: Tuple[PipeRef, ...],
+) -> Any:
+    """Extract final result from context for one batch."""
+    if len(graph_outputs) == 1:
+        return ctx[graph_outputs[0].node][graph_outputs[0].index]
+    return tuple(ctx[ref.node][ref.index] for ref in graph_outputs)
+
+
+# ── Sequential executor ──────────────────────────────────────────────────
+
+class SequentialExecutor(Executor):
+    """Process batches one-by-one, nodes in topological order.
+
+    No concurrency.  Uses synchronous ``RayModule.__call__`` per node.
+    Ideal for debugging, profiling individual ops, and correctness validation.
+    """
+
+    def execute(
+        self,
+        graph: CompiledGraph,
+        columns: Dict[str, Sequence[Any]],
+    ) -> List[Any]:
+        n_batches = _validate_columns(graph, columns)
+        results: List[Any] = []
+
+        for bi in range(n_batches):
+            ctx: Dict[str, tuple] = {
+                key: (columns[key][bi],) for key in graph.input_keys
+            }
+            for name in graph.topo_order:
+                spec = graph.nodes[name]
+                args = tuple(ctx[ref.node][ref.index] for ref in spec.args)
+                kw = {k: ctx[ref.node][ref.index] for k, ref in spec.kw_args.items()}
+                value = spec.module(*args, **kw)
+                _validate_output(spec, value)
+                ctx[name] = value if spec.num_outputs > 1 else (value,)
+
+            results.append(_materialize_outputs(ctx, graph.graph_outputs))
+
+        return results
+
+
+# ── DAG executor (ray.wait overlapped scheduler) ─────────────────────────
 
 @dataclass
 class _PendingResult:
@@ -200,7 +332,7 @@ class _InflightCall:
 
 
 class _Scheduler:
-    """``ray.wait``-driven event loop executing a :class:`CompiledGraph`."""
+    """``ray.wait``-driven event loop for :class:`DagExecutor`."""
 
     def __init__(
         self,
@@ -210,10 +342,8 @@ class _Scheduler:
     ) -> None:
         self._graph = graph
         self._max_inflight = max(1, int(max_batches_inflight))
-        self._n_batches = self._validate_inputs(input_columns)
+        self._n_batches = _validate_columns(graph, input_columns)
 
-        # Per-batch data: values stored as tuple for uniform slot access.
-        # Single-output -> (value,), multi-output -> (v0, v1, ...).
         self._ctx: List[Dict[str, tuple]] = [
             {key: (input_columns[key][i],) for key in graph.input_keys}
             for i in range(self._n_batches)
@@ -224,40 +354,19 @@ class _Scheduler:
         ]
         self._results: List[Any] = [None] * self._n_batches
 
-        # Node scheduling state
         self._ready_q: Dict[str, Deque[int]] = {n: deque() for n in graph.topo_order}
         self._node_inflight: Dict[str, int] = {n: 0 for n in graph.topo_order}
 
-        # Batch admission state
         self._live: set[int] = set()
         self._next_batch = 0
 
-        # Ray ref tracking
         self._ref_owner: Dict[ray.ObjectRef, _InflightCall] = {}
         self._outstanding: set[ray.ObjectRef] = set()
 
-        # Precomputed sets for fast membership tests
         self._output_nodes: frozenset[str] = frozenset(
             ref.node for ref in graph.graph_outputs
         )
         self._input_key_set: frozenset[str] = frozenset(graph.input_keys)
-
-    def _validate_inputs(self, columns: Dict[str, Sequence[Any]]) -> int:
-        expected = set(self._graph.input_keys)
-        if set(columns.keys()) != expected:
-            raise ValueError(
-                f"input keys mismatch: expected {self._graph.input_keys}, "
-                f"got {tuple(columns.keys())}"
-            )
-        sizes = {k: len(v) for k, v in columns.items()}
-        if not sizes:
-            raise ValueError("input columns cannot be empty")
-        unique = set(sizes.values())
-        if len(unique) != 1:
-            raise ValueError(f"all input columns must have same length, got {sizes}")
-        return next(iter(unique))
-
-    # ── Main loop ─────────────────────────────────────────────────────────
 
     def run(self) -> List[Any]:
         self._admit_batches()
@@ -270,7 +379,6 @@ class _Scheduler:
         return self._results
 
     def _drain_completed(self) -> List[_InflightCall]:
-        """Block for at least 1 ref, then greedily collect all other completed refs."""
         ready, _ = ray.wait(list(self._outstanding), num_returns=1)
         self._outstanding.discard(ready[0])
         if self._outstanding:
@@ -293,8 +401,6 @@ class _Scheduler:
             calls.append(call)
         return calls
 
-    # ── Batch admission ───────────────────────────────────────────────────
-
     def _admit_batches(self) -> None:
         while (self._next_batch < self._n_batches
                and len(self._live) < self._max_inflight):
@@ -304,8 +410,6 @@ class _Scheduler:
             for name in self._graph.topo_order:
                 if not self._graph.deps[name]:
                     self._mark_ready(bi, name)
-
-    # ── Dispatch ──────────────────────────────────────────────────────────
 
     def _mark_ready(self, bi: int, name: str) -> None:
         st = self._status[bi][name]
@@ -360,8 +464,6 @@ class _Scheduler:
             self._ref_owner[ref] = call
             self._outstanding.add(ref)
 
-    # ── Completion ────────────────────────────────────────────────────────
-
     def _on_complete(self, call: _InflightCall) -> None:
         bi, name = call.batch_idx, call.node_name
         spec = self._graph.nodes[name]
@@ -389,7 +491,9 @@ class _Scheduler:
         self._release_upstream(bi, name)
 
         if self._is_batch_complete(bi):
-            self._results[bi] = self._materialize(bi)
+            self._results[bi] = _materialize_outputs(
+                self._ctx[bi], self._graph.graph_outputs,
+            )
             self._live.discard(bi)
 
     def _release_upstream(self, bi: int, name: str) -> None:
@@ -399,8 +503,6 @@ class _Scheduler:
             if all(self._status[bi][c].phase == "done"
                    for c in self._graph.consumers[dep]):
                 self._ctx[bi].pop(dep, None)
-
-    # ── Queries ───────────────────────────────────────────────────────────
 
     def _all_deps_done(self, bi: int, name: str) -> bool:
         return all(
@@ -413,99 +515,40 @@ class _Scheduler:
             for ref in self._graph.graph_outputs
         )
 
-    def _materialize(self, bi: int) -> Any:
-        ctx = self._ctx[bi]
-        outs = self._graph.graph_outputs
-        if len(outs) == 1:
-            return ctx[outs[0].node][outs[0].index]
-        return tuple(ctx[ref.node][ref.index] for ref in outs)
 
+class DagExecutor(Executor):
+    """``ray.wait``-driven overlapped executor with per-node inflight caps."""
 
-def _validate_output(spec: NodeSpec, value: Any) -> None:
-    """Check that a node's return value matches its declared ``num_outputs``."""
-    if spec.num_outputs == 1:
-        if not isinstance(value, list):
-            raise TypeError(
-                f"node '{spec.name}' must return list (got {type(value).__name__})"
-            )
-        return
-    if not isinstance(value, (tuple, list)):
-        raise TypeError(
-            f"node '{spec.name}' must return tuple/list of "
-            f"{spec.num_outputs} lists (got {type(value).__name__})"
-        )
-    if len(value) != spec.num_outputs:
-        raise ValueError(
-            f"node '{spec.name}' declared num_outputs={spec.num_outputs}, "
-            f"but returned {len(value)} outputs"
-        )
-    for i, branch in enumerate(value):
-        if not isinstance(branch, list):
-            raise TypeError(
-                f"node '{spec.name}' output[{i}] must be list "
-                f"(got {type(branch).__name__})"
-            )
+    def __init__(self, *, max_batches_inflight: int = 4) -> None:
+        self.max_batches_inflight = max(1, int(max_batches_inflight))
+
+    def execute(
+        self,
+        graph: CompiledGraph,
+        columns: Dict[str, Sequence[Any]],
+    ) -> List[Any]:
+        return _Scheduler(graph, columns, self.max_batches_inflight).run()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# User API
+# Pipeline (user API)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _propagate_forward_sig(cls: type) -> None:
-    """Copy ``forward()``'s parameter names onto ``__call__`` / ``run``.
-
-    Each ``PipeRef`` annotation (or unannotated param) is replaced with
-    ``Sequence[Any]`` so that IDE tooltips and ``help()`` show the user
-    exactly which batched inputs to pass.
-    """
-    try:
-        fwd_sig = inspect.signature(cls.forward)
-    except (ValueError, TypeError):
-        return
-
-    params = [inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
-    for name, p in fwd_sig.parameters.items():
-        if name == "self":
-            continue
-        params.append(p.replace(annotation=Sequence[Any]))
-
-    sig = fwd_sig.replace(parameters=params, return_annotation=List[Any])
-
-    base_call = DagPipeline.__call__
-
-    def _typed_call(self, *args, **kwargs):
-        return base_call(self, *args, **kwargs)
-
-    _typed_call.__signature__ = sig
-    _typed_call.__name__ = "__call__"
-    _typed_call.__qualname__ = f"{cls.__qualname__}.__call__"
-    _typed_call.__module__ = cls.__module__
-    cls.__call__ = _typed_call
-    cls.run = _typed_call
-
-
-class DagPipeline:
-    """
-    Declarative DAG pipeline base class.
+class Pipeline:
+    """Declarative DAG pipeline base class.
 
     Subclass, attach ``RayModule`` attributes, implement ``forward()``
     with ``PipeRef`` wiring, then call the pipeline on batched inputs.
 
-    ``__call__`` / ``run`` signatures are automatically derived from
-    ``forward()`` via ``__init_subclass__``, so IDE autocompletion shows
-    the correct parameter names and ``Sequence[Any]`` types.
+    ``pipe(batches)`` runs serial execution (default).
+    ``pipe.run(batches, executor=DagExecutor())`` runs overlapped.
+    ``DagExecutor().run(pipe, batches)`` is equivalent.
     """
 
-    def __init__(self, *, max_batches_inflight: int = 4):
-        self.max_batches_inflight = max(1, int(max_batches_inflight))
+    def __init__(self) -> None:
         self._compiled: Optional[CompiledGraph] = None
         self._param_names: Tuple[str, ...] = ()
         self._input_keys: Tuple[str, ...] = ()
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        if "forward" in cls.__dict__:
-            _propagate_forward_sig(cls)
 
     def forward(self, x: PipeRef) -> PipeRef | Tuple[PipeRef, ...]:
         raise NotImplementedError
@@ -548,7 +591,7 @@ class DagPipeline:
 
         return pos_refs, kw_refs, tuple(names), tuple(keys)
 
-    def compile(self) -> DagPipeline:
+    def compile(self) -> Pipeline:
         tracer = _GraphTracer()
         originals: Dict[str, RayModule] = {}
         for attr, val in list(self.__dict__.items()):
@@ -603,14 +646,25 @@ class DagPipeline:
     def __call__(
         self, *inputs: Sequence[Any], **named_inputs: Sequence[Any],
     ) -> List[Any]:
+        return self.run(*inputs, **named_inputs)
+
+    def run(
+        self,
+        *inputs: Sequence[Any],
+        executor: Executor | None = None,
+        **named_inputs: Sequence[Any],
+    ) -> List[Any]:
+        """Run pipeline.  Defaults to serial; pass ``executor=DagExecutor()`` for overlap."""
         if self._compiled is None:
             self.compile()
         columns = self._resolve_inputs(inputs, named_inputs)
-        return _Scheduler(
-            self._compiled, columns, self.max_batches_inflight,
-        ).run()
+        if executor is None:
+            executor = SequentialExecutor()
+        return executor.execute(self._compiled, columns)
 
-    run = __call__
+
+# Backward-compatible alias
+DagPipeline = Pipeline
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -618,7 +672,7 @@ class DagPipeline:
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    def _cleanup_pipe_modules(pipe: DagPipeline) -> None:
+    def _cleanup_pipe_modules(pipe: Pipeline) -> None:
         for value in pipe.__dict__.values():
             if isinstance(value, RayModule):
                 for actor in getattr(value, "actors", []):
@@ -636,7 +690,7 @@ if __name__ == "__main__":
         def run(self, x: list[int]) -> list[int]:
             return [len(x)]
 
-    class ShardProbePipe(DagPipeline):
+    class ShardProbePipe(Pipeline):
         def __init__(self, replicas: int):
             self.probe = RayModule(
                 ProbeShardSizeOp,
@@ -644,7 +698,7 @@ if __name__ == "__main__":
                 dispatch_mode=Dispatch.SHARD_CONTIGUOUS,
                 max_inflight=2,
             ).pre_init()
-            super().__init__(max_batches_inflight=4)
+            super().__init__()
 
         def forward(self, x: PipeRef) -> PipeRef:
             return self.probe(x)
@@ -653,7 +707,7 @@ if __name__ == "__main__":
         def run(self, x: list[int]) -> list[int]:
             return [2 * v for v in x]
 
-    class ShardPostProcessPipe(DagPipeline):
+    class ShardPostProcessPipe(Pipeline):
         def __init__(self, replicas: int):
             self.mul2 = RayModule(
                 MultiplyBy2Op,
@@ -661,7 +715,7 @@ if __name__ == "__main__":
                 dispatch_mode=Dispatch.SHARD_CONTIGUOUS,
                 max_inflight=2,
             ).pre_init()
-            super().__init__(max_batches_inflight=4)
+            super().__init__()
 
         def forward(self, x: PipeRef) -> PipeRef:
             return self.mul2(x)
@@ -680,7 +734,7 @@ if __name__ == "__main__":
         def run(self, x: list[int]) -> list[int]:
             return [3 * v for v in x]
 
-    class MultiReplicaSplitPipe(DagPipeline):
+    class MultiReplicaSplitPipe(Pipeline):
         def __init__(self, replicas: int):
             self.split = RayModule(
                 SplitParityOp,
@@ -690,7 +744,7 @@ if __name__ == "__main__":
             ).pre_init()
             self.left = RayModule(ScaleEvenOp, replicas=1, max_inflight=2).pre_init()
             self.right = RayModule(ScaleOddOp, replicas=1, max_inflight=2).pre_init()
-            super().__init__(max_batches_inflight=4)
+            super().__init__()
 
         def forward(self, x: PipeRef) -> Tuple[PipeRef, PipeRef]:
             even_in, odd_in = self.split(x)
@@ -699,45 +753,43 @@ if __name__ == "__main__":
     ray.init(ignore_reinit_error=True, num_cpus=12)
     replicas = 3
     xs = [list(range(10)), list(range(7)), [11, 12, 13, 14, 15]]
+    dag = DagExecutor(max_batches_inflight=4)
 
-    # 1) Validate contiguous shard split + remainder(mod) behavior.
+    # 1) Serial vs DAG: shard probe
     probe_pipe = ShardProbePipe(replicas=replicas)
-    shard_out = probe_pipe(xs)
     expect_shards = [shard_sizes(len(batch), replicas) for batch in xs]
-    print("shard inputs :", [len(b) for b in xs])
-    print("shard output :", shard_out)
-    print("shard expect :", expect_shards)
-    print("shard match  :", shard_out == expect_shards)
-    if shard_out != expect_shards:
-        raise RuntimeError("Shard split/remainder behavior mismatch")
+    serial_out = probe_pipe(xs)
+    dag_out = dag.run(probe_pipe, xs)
+    print("[shard]  serial:", serial_out == expect_shards, "dag:", dag_out == expect_shards)
+    assert serial_out == dag_out == expect_shards
     _cleanup_pipe_modules(probe_pipe)
 
-    # 2) Validate shard-content correctness with an explicit post-process op.
+    # 2) Serial vs DAG: post-process
     post_pipe = ShardPostProcessPipe(replicas=replicas)
-    post_out = post_pipe(xs)
     expect_post = [[2 * v for v in batch] for batch in xs]
-    print("post output  :", post_out)
-    print("post expect  :", expect_post)
-    print("post match   :", post_out == expect_post)
-    if post_out != expect_post:
-        raise RuntimeError("Shard post-process value mismatch")
+    serial_out = post_pipe(xs)
+    dag_out = dag.run(post_pipe, xs)
+    print("[post]   serial:", serial_out == expect_post, "dag:", dag_out == expect_post)
+    assert serial_out == dag_out == expect_post
     _cleanup_pipe_modules(post_pipe)
 
-    # 3) Validate content separation and branch correctness for multi-output.
+    # 3) Serial vs DAG: multi-output split
     split_pipe = MultiReplicaSplitPipe(replicas=replicas)
-    split_out = split_pipe(xs)
     expect_split = [
-        (
-            [2 * v for v in batch if v % 2 == 0],
-            [3 * v for v in batch if v % 2 == 1],
-        )
-        for batch in xs
+        ([2 * v for v in b if v % 2 == 0], [3 * v for v in b if v % 2 == 1])
+        for b in xs
     ]
-    print("split output :", split_out)
-    print("split expect :", expect_split)
-    print("split match  :", split_out == expect_split)
-    if split_out != expect_split:
-        raise RuntimeError("Multi-output split content mismatch")
+    serial_out = split_pipe(xs)
+    dag_out = dag.run(split_pipe, xs)
+    print("[split]  serial:", serial_out == expect_split, "dag:", dag_out == expect_split)
+    assert serial_out == dag_out == expect_split
     _cleanup_pipe_modules(split_pipe)
+
+    # 4) Convenience: pipe.run(executor=...)
+    probe2 = ShardProbePipe(replicas=replicas)
+    conv_out = probe2.run(xs, executor=dag)
+    print("[conv]   match:", conv_out == expect_shards)
+    assert conv_out == expect_shards
+    _cleanup_pipe_modules(probe2)
 
     ray.shutdown()
