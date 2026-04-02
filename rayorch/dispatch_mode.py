@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Callable, Dict, Mapping, Sequence, Tuple, Union, List
 
+import ray
+
 
 class Dispatch(Enum):
     BROADCAST = auto()
@@ -24,6 +26,20 @@ CollectFn = Callable[[Any, Any], Any]
 class DispatchSpec:
     dispatch_fn: DispatchFn
     collect_fn: CollectFn
+
+
+@dataclass(frozen=True)
+class ShardedObjectRef:
+    """
+    Per-replica view of one shared ObjectRef.
+
+    The underlying ref points to a sequence-like batch (list/tuple). Each replica
+    resolves and slices its own contiguous shard at execution time.
+    """
+
+    ref: ray.ObjectRef
+    shard_idx: int
+    num_shards: int
 
 
 # --------- VERL 风格实现 ---------
@@ -51,6 +67,10 @@ def _is_shardable(x: Any) -> bool:
     return isinstance(x, (list, tuple))
 
 
+def _is_object_ref(x: Any) -> bool:
+    return isinstance(x, ray.ObjectRef)
+
+
 def dispatch_shard_all_args_mod(rm, *args, **kwargs):
     """
     将所有可切片参数（list/tuple）按「顺序连续切分」分发到不同 actor，
@@ -66,48 +86,62 @@ def dispatch_shard_all_args_mod(rm, *args, **kwargs):
     """
     ws = rm._replicas
 
-    # 1) 收集所有 shardable 参数长度
+    # 1) 收集所有 shardable 参数长度；ObjectRef 也视为“可分片输入”，但长度在 worker 端再解析。
     lengths = []
+    has_ref_input = False
     for a in args:
         if _is_shardable(a):
             lengths.append(len(a))
+        elif _is_object_ref(a):
+            has_ref_input = True
     for v in kwargs.values():
         if _is_shardable(v):
             lengths.append(len(v))
+        elif _is_object_ref(v):
+            has_ref_input = True
 
-    if not lengths:
-        # 无 shardable 参数：广播
+    if not lengths and not has_ref_input:
+        # 无 shardable 参数且无 ref 参数：广播
         per_args = tuple([a] * ws for a in args)
         per_kwargs = {k: [v] * ws for k, v in kwargs.items()}
         return per_args, per_kwargs
 
-    n = lengths[0]
-    if any(l != n for l in lengths):
-        raise ValueError(f"Shardable args/kwargs must have same length. Got lengths={lengths}")
+    ranges = None
+    if lengths:
+        n = lengths[0]
+        if any(l != n for l in lengths):
+            raise ValueError(f"Shardable args/kwargs must have same length. Got lengths={lengths}")
 
-    # 2) 计算每个 rank 的切片区间（连续）
-    #    例如 n=10, ws=3 → sizes = [4,3,3]
-    base = n // ws
-    rem = n % ws
-    sizes = [base + (1 if i < rem else 0) for i in range(ws)]
+        # 2) 计算每个 rank 的切片区间（连续）
+        #    例如 n=10, ws=3 -> sizes = [4,3,3]
+        base = n // ws
+        rem = n % ws
+        sizes = [base + (1 if i < rem else 0) for i in range(ws)]
 
-    # 生成每个 rank 的 [start, end)
-    ranges = []
-    start = 0
-    for sz in sizes:
-        end = start + sz
-        ranges.append((start, end))
-        start = end
+        # 生成每个 rank 的 [start, end)
+        ranges = []
+        start = 0
+        for sz in sizes:
+            end = start + sz
+            ranges.append((start, end))
+            start = end
 
-    # 3) 切 shardable 参数
+    # 3) 切 shardable 参数；ObjectRef 用 per-replica 视图，延迟到 worker 端解引用切片。
     def shard_seq(seq):
+        if ranges is None:
+            raise ValueError("Internal error: ranges is None for shardable sequence input.")
         return [seq[s:e] for (s, e) in ranges]
+
+    def shard_ref(ref: ray.ObjectRef):
+        return [ShardedObjectRef(ref=ref, shard_idx=i, num_shards=ws) for i in range(ws)]
 
     # 4) per_args
     per_args_list = []
     for a in args:
         if _is_shardable(a):
             per_args_list.append(shard_seq(a))
+        elif _is_object_ref(a):
+            per_args_list.append(shard_ref(a))
         else:
             per_args_list.append([a] * ws)
 
@@ -116,6 +150,8 @@ def dispatch_shard_all_args_mod(rm, *args, **kwargs):
     for k, v in kwargs.items():
         if _is_shardable(v):
             per_kwargs[k] = shard_seq(v)
+        elif _is_object_ref(v):
+            per_kwargs[k] = shard_ref(v)
         else:
             per_kwargs[k] = [v] * ws
 

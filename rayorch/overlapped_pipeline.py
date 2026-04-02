@@ -9,11 +9,11 @@ We intentionally avoid an extra ``@ray.remote``/join task for each stage boundar
 once (applying ``collect_fn``).
 
 During ``forward``, each ``RayModule`` attribute is temporarily replaced by that
-module's ``remote`` bound method (same as ``actor.method.remote``). Arguments that
-are upstream :class:`RayModule.RayModuleFuture` values are unwrapped inside
-:meth:`RayModule.remote` to a single ``ObjectRef`` (``completion_refs()[0]``) per
-slot — see :meth:`RayModule.remote`. This matches BROADCAST-style identical shards;
-otherwise prefer ``DagPipeline`` or explicit gathers.
+module's ``remote`` bound method (same as ``actor.method.remote``). Upstream
+``RayModuleFuture`` arguments are converted by :meth:`RayModule.remote` into a
+single dependency ref. For multi-replica upstreams this is done with an async
+join+collect task, so downstream stages can keep a single-ref dependency while
+preserving full-batch semantics.
 """
 
 from collections import deque

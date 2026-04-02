@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Generic, List, Optional, Protocol, Tuple, Type, TypeVar, cast
 from typing_extensions import ParamSpec
 from .nvtx_profiler import nvtx_range
@@ -14,12 +14,31 @@ class RunOp(Protocol[INITP, RUNP, R]):
 
 import ray
 
-from .dispatch_mode import DispatchMode, get_predefined_dispatch_fn
+from .dispatch_mode import DispatchMode, ShardedObjectRef, get_predefined_dispatch_fn
 from .env_registry import EnvRegistry
 
 # from image_class import ImageLoadOp, ImageSaveOP
 # from yolo_class import YOLODrawOp
 # from sam_class import SAMOp, OutputSAMMasksOp
+
+
+@ray.remote
+def _join_and_collect_refs(collect_fn, module, refs):
+    """Join a list of refs and apply module-level collect in a task."""
+    outputs = ray.get(refs)
+    return collect_fn(module, outputs)
+
+
+_JOIN_COLLECT_SUBMIT_COUNT = 0
+
+
+def _reset_join_collect_submit_count() -> None:
+    global _JOIN_COLLECT_SUBMIT_COUNT
+    _JOIN_COLLECT_SUBMIT_COUNT = 0
+
+
+def _get_join_collect_submit_count() -> int:
+    return _JOIN_COLLECT_SUBMIT_COUNT
 
 
 # --------------------------
@@ -39,14 +58,31 @@ class RunnerActor:
             self.op = op_cls(*init_args, **init_kwargs)
 
     def run(self, args, kwargs, meta=None):
+        def _slice_for_replica(seq, shard_idx: int, num_shards: int):
+            n = len(seq)
+            base = n // num_shards
+            rem = n % num_shards
+            start = shard_idx * base + min(shard_idx, rem)
+            end = start + base + (1 if shard_idx < rem else 0)
+            return seq[start:end]
+
         def _resolve_refs(x):
+            if isinstance(x, ShardedObjectRef):
+                resolved = ray.get(x.ref)
+                if isinstance(resolved, (list, tuple)):
+                    return _slice_for_replica(resolved, x.shard_idx, x.num_shards)
+                return resolved
             if isinstance(x, ray.ObjectRef):
                 return ray.get(x)
-            if isinstance(x, tuple):
+            # Only recurse into built-in containers. Some third-party payload objects
+            # (e.g. MinerU ContentBlock) behave like dict subclasses while exposing
+            # attribute access (`block.type`). Rebuilding them as plain dict would
+            # destroy their runtime protocol.
+            if type(x) is tuple:
                 return tuple(_resolve_refs(v) for v in x)
-            if isinstance(x, list):
+            if type(x) is list:
                 return [_resolve_refs(v) for v in x]
-            if isinstance(x, dict):
+            if type(x) is dict:
                 return {k: _resolve_refs(v) for k, v in x.items()}
             return x
 
@@ -57,11 +93,12 @@ class RunnerActor:
             return self.op.run(*resolved_args, **resolved_kwargs)
 
 class RayModule(Generic[INITP, RUNP, R]):
-    @dataclass(frozen=True)
+    @dataclass
     class RayModuleFuture:
         module: "RayModule"
         refs: Any
         collect_fn: Optional[Callable[..., Any]]
+        _dependency_ref_cache: Optional[ray.ObjectRef] = field(default=None, init=False, repr=False)
 
         def get(self) -> Any:
             """
@@ -78,6 +115,30 @@ class RayModule(Generic[INITP, RUNP, R]):
             """``ObjectRef`` 列表，供 ``ray.wait`` 等按 ref 驱动调度（单 ref 时包成单元素列表）。"""
             r = self.refs
             return [r] if not isinstance(r, list) else list(r)
+
+        def dependency_ref(self) -> ray.ObjectRef:
+            """
+            Return a single dependency ref for downstream stages.
+
+            - single ref: pass-through
+            - multi refs: asynchronously join+collect into one ref
+            """
+            if self._dependency_ref_cache is not None:
+                return self._dependency_ref_cache
+
+            refs = self.completion_refs()
+            if len(refs) == 1:
+                self._dependency_ref_cache = refs[0]
+                return refs[0]
+            if self.collect_fn is None:
+                raise ValueError(
+                    "Cannot build single dependency ref from multiple refs without collect_fn. "
+                    "Please gather upstream explicitly before wiring downstream."
+                )
+            global _JOIN_COLLECT_SUBMIT_COUNT
+            _JOIN_COLLECT_SUBMIT_COUNT += 1
+            self._dependency_ref_cache = _join_and_collect_refs.remote(self.collect_fn, self.module, refs)
+            return self._dependency_ref_cache
 
     def __init__(
         self,
@@ -192,35 +253,17 @@ class RayModule(Generic[INITP, RUNP, R]):
         read ``.refs`` for raw ``ObjectRef`` / list of refs.
 
         If a positional or keyword argument is another module's :class:`RayModuleFuture`
-        (e.g. eager pipeline wiring), it is replaced by ``completion_refs()[0]`` so the
-        downstream actor receives a single ``ObjectRef`` dependency.
+        (e.g. eager pipeline wiring), it is replaced by a single dependency ref:
+        - single-ref upstream: pass-through
+        - multi-ref upstream: join+collect in a lightweight Ray task.
         """
         Fut = RayModule.RayModuleFuture
 
-        def _unwrap_broadcast_future(x: Any) -> Any:
-            """
-            Unwrap upstream `RayModuleFuture` to a single ObjectRef dependency.
-
-            Note: this intentionally picks `completion_refs()[0]`. It is only semantically
-            correct when the upstream future represents BROADCAST-style identical shards,
-            or when the caller explicitly accepts using "replica 0" as the dependency.
-            """
-            if not isinstance(x, Fut):
-                return x
-            refs = x.completion_refs()
-            if len(refs) != 1 and x.collect_fn is not None:
-                # Multi-replica upstream: defaulting to ref[0] is easy to misuse.
-                # Keep behavior but fail loudly unless caller already reduced upstream.
-                raise ValueError(
-                    "RayModule.remote received an upstream RayModuleFuture with multiple "
-                    "completion refs. Default unwrapping would take only refs[0]. "
-                    "Call upstream.gather() first (reduce), or ensure upstream is "
-                    "BROADCAST/replicas=1 if you intend identical shards."
-                )
-            return refs[0]
-
-        args = tuple(_unwrap_broadcast_future(a) for a in args)
-        kwargs = {k: _unwrap_broadcast_future(v) for k, v in kwargs.items()}
+        args = tuple(a.dependency_ref() if isinstance(a, Fut) else a for a in args)
+        kwargs = {
+            k: (v.dependency_ref() if isinstance(v, Fut) else v)
+            for k, v in kwargs.items()
+        }
 
         if self._dispatch_fn is None or self._collect_fn is None or self._replicas == 1:
             meta = {"tag": "", "replica": 0, "dev": self._is_dev_mode}

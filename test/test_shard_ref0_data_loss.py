@@ -7,6 +7,7 @@ import ray
 
 from rayorch import OverlappedPipeline, RayModule
 from rayorch.dispatch_mode import collect_concat, dispatch_shard_all_args_mod
+from rayorch.ray_module import _get_join_collect_submit_count, _reset_join_collect_submit_count
 
 
 @pytest.fixture
@@ -34,6 +35,18 @@ class IdentityBatchOp:
 class CountOp:
     def run(self, xs: List[int]) -> int:
         return len(xs)
+
+
+class AddPairOp:
+    def run(self, a: List[int], b: List[int]) -> int:
+        return len(a) + len(b)
+
+
+class AssertAlignedEchoOp:
+    def run(self, a: List[int], b: List[int]) -> List[int]:
+        # a/b should be shard-aligned on each replica.
+        assert len(a) == len(b)
+        return list(a)
 
 
 def test_shard_correct_semantics_vs_ref0_shortcut(ray_session):
@@ -76,10 +89,10 @@ def test_shard_correct_semantics_vs_ref0_shortcut(ray_session):
         _kill_modules(sharder, counter)
 
 
-def test_overlapped_rejects_multi_ref_future_for_shard_chain(ray_session):
+def test_overlapped_auto_join_reduce_for_shard_chain(ray_session):
     """
-    Overlapped 链路下，stage1 为 shard 多 refs 时，不能默认 refs[0] 透传到 stage2。
-    期望：抛错，避免 silent data loss。
+    Overlapped 链路下，stage1 为 shard 多 refs 时应自动 join+reduce，
+    下游应看到完整 batch，而不是首分片。
     """
 
     class Pipe(OverlappedPipeline):
@@ -98,15 +111,15 @@ def test_overlapped_rejects_multi_ref_future_for_shard_chain(ray_session):
 
     p = Pipe()
     try:
-        with pytest.raises(ValueError, match="multiple completion refs"):
-            p([list(range(8))])
+        out = p([list(range(8))])
+        assert out == [8]
     finally:
         _kill_modules(p.s1, p.s2)
 
 
 def test_target_behavior_overlapped_shard_chain_auto_join_reduce(ray_session):
     """
-    监督用“目标行为”测试（当前预期会失败）：
+    监督用“目标行为”测试：
     - 不要求用户手工 gather
     - Overlapped 在 stage 边界自动完成 join/reduce
     - 下游应看到完整 batch（而不是 refs[0] 的首 shard）
@@ -134,4 +147,76 @@ def test_target_behavior_overlapped_shard_chain_auto_join_reduce(ray_session):
         assert out == [10]
     finally:
         _kill_modules(p.s1, p.s2)
+
+
+def test_dependency_ref_cache_reuses_single_join_for_same_future(ray_session):
+    """
+    同一个 upstream future 被同一次下游调用复用多次时，应复用同一个 dependency ref，
+    避免重复提交 join+collect task。
+    """
+
+    class Pipe(OverlappedPipeline):
+        def __init__(self):
+            self.s1 = RayModule(
+                IdentityBatchOp,
+                replicas=3,
+                dispatch_fn=dispatch_shard_all_args_mod,
+                collect_fn=collect_concat,
+            ).pre_init()
+            self.s2 = RayModule(AddPairOp, replicas=1).pre_init()
+            super().__init__(max_inflight=2)
+
+        def forward(self, x):
+            y = self.s1(x)
+            # 同一个 future 作为两个参数传递；若无缓存，会各触发一次 join task。
+            return self.s2(y, y)
+
+    p = Pipe()
+    try:
+        _reset_join_collect_submit_count()
+        out = p([list(range(10))])
+        assert out == [20]
+        assert _get_join_collect_submit_count() == 1
+    finally:
+        _kill_modules(p.s1, p.s2)
+
+
+def test_overlapped_shard_accepts_objectref_inputs_without_duplication(ray_session):
+    """
+    Regression:
+    - upstream single-ref future + upstream multi-ref future are both wired into a
+      SHARD_CONTIGUOUS downstream stage.
+    - downstream should receive aligned shards (not broadcasted full batch), and
+      final collect should preserve original batch length/order.
+    """
+
+    class Pipe(OverlappedPipeline):
+        def __init__(self):
+            self.s0 = RayModule(IdentityBatchOp, replicas=1).pre_init()
+            self.s1 = RayModule(
+                IdentityBatchOp,
+                replicas=3,
+                dispatch_fn=dispatch_shard_all_args_mod,
+                collect_fn=collect_concat,
+            ).pre_init()
+            self.s2 = RayModule(
+                AssertAlignedEchoOp,
+                replicas=3,
+                dispatch_fn=dispatch_shard_all_args_mod,
+                collect_fn=collect_concat,
+            ).pre_init()
+            super().__init__(max_inflight=2)
+
+        def forward(self, x):
+            a = self.s0(x)      # single ObjectRef future
+            b = self.s1(a)      # multi-ref future
+            return self.s2(a, b)
+
+    p = Pipe()
+    try:
+        batch = list(range(10))
+        out = p([batch])
+        assert out == [batch]
+    finally:
+        _kill_modules(p.s0, p.s1, p.s2)
 
