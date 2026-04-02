@@ -30,15 +30,9 @@ class ScaleOp:
 
 class MultiInputPipe(DagPipeline):
     def __init__(self):
-        self.add = RayModule(SumOp, replicas=1).pre_init()
-        self.scale = RayModule(ScaleOp, replicas=1).pre_init()
-        super().__init__(
-            max_batches_inflight=4,
-            stage_options={
-                "add": {"compute_inflight": 2},
-                "scale": {"compute_inflight": 2},
-            },
-        )
+        self.add = RayModule(SumOp, replicas=1, max_inflight=2).pre_init()
+        self.scale = RayModule(ScaleOp, replicas=1, max_inflight=2).pre_init()
+        super().__init__(max_batches_inflight=4)
 
     def forward(self, a: PipeRef, b: PipeRef) -> PipeRef:
         return self.scale(self.add(a, b))

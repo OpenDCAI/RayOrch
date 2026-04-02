@@ -149,33 +149,18 @@ class ComplexDagNewPipe(DagPipeline):
     """
 
     def __init__(self):
-        self.pre = RayModule(PreOp, replicas=1).pre_init(0.03)
-        self.split_a = RayModule(SplitAOp, replicas=1).pre_init(0.04)
-        self.branch_1 = RayModule(Branch1Op, replicas=1).pre_init(0.07)
-        self.branch_2 = RayModule(Branch2Op, replicas=1).pre_init(0.08)
-        self.branch_3 = RayModule(Branch3Op, replicas=1).pre_init(0.09)
-        self.join_a = RayModule(JoinAOp, replicas=1).pre_init(0.05)
-        self.split_b = RayModule(SplitBOp, replicas=1).pre_init(0.10)
-        self.tail_1 = RayModule(Tail1Op, replicas=1).pre_init(0.11)
-        self.tail_2 = RayModule(Tail2Op, replicas=1).pre_init(0.07)
-        self.tail_3 = RayModule(Tail3Op, replicas=1).pre_init(0.04)
-        self.join_b = RayModule(JoinBOp, replicas=1).pre_init(0.08)
-        super().__init__(
-            max_batches_inflight=4,
-            stage_options={
-                "pre": {"compute_inflight": 2},
-                "split_a": {"compute_inflight": 2},
-                "branch_1": {"compute_inflight": 2},
-                "branch_2": {"compute_inflight": 2},
-                "branch_3": {"compute_inflight": 2},
-                "join_a": {"compute_inflight": 2},
-                "split_b": {"compute_inflight": 2},
-                "tail_1": {"compute_inflight": 2},
-                "tail_2": {"compute_inflight": 2},
-                "tail_3": {"compute_inflight": 2},
-                "join_b": {"compute_inflight": 2},
-            },
-        )
+        self.pre = RayModule(PreOp, replicas=1, max_inflight=2).pre_init(0.03)
+        self.split_a = RayModule(SplitAOp, replicas=1, max_inflight=2).pre_init(0.04)
+        self.branch_1 = RayModule(Branch1Op, replicas=1, max_inflight=2).pre_init(0.07)
+        self.branch_2 = RayModule(Branch2Op, replicas=1, max_inflight=2).pre_init(0.08)
+        self.branch_3 = RayModule(Branch3Op, replicas=1, max_inflight=2).pre_init(0.09)
+        self.join_a = RayModule(JoinAOp, replicas=1, max_inflight=2).pre_init(0.05)
+        self.split_b = RayModule(SplitBOp, replicas=1, max_inflight=2).pre_init(0.10)
+        self.tail_1 = RayModule(Tail1Op, replicas=1, max_inflight=2).pre_init(0.11)
+        self.tail_2 = RayModule(Tail2Op, replicas=1, max_inflight=2).pre_init(0.07)
+        self.tail_3 = RayModule(Tail3Op, replicas=1, max_inflight=2).pre_init(0.04)
+        self.join_b = RayModule(JoinBOp, replicas=1, max_inflight=2).pre_init(0.08)
+        super().__init__(max_batches_inflight=4)
 
     def forward(self, x: PipeRef) -> PipeRef:
         y = self.pre(x)

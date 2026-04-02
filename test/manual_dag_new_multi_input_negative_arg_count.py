@@ -13,8 +13,8 @@ class Sum3Op:
 
 class MultiInput3Pipe(DagPipeline):
     def __init__(self):
-        self.add3 = RayModule(Sum3Op, replicas=1).pre_init()
-        super().__init__(max_batches_inflight=2, stage_options={"add3": {"compute_inflight": 2}})
+        self.add3 = RayModule(Sum3Op, replicas=1, max_inflight=2).pre_init()
+        super().__init__(max_batches_inflight=2)
 
     def forward(self, a: PipeRef, b: PipeRef, c: PipeRef) -> PipeRef:
         return self.add3(a, b, c)

@@ -178,12 +178,14 @@ class DummyMineruDagPipeline(DagNewPipeline):
             replicas=replicas,
             num_gpus_per_replica=0.0,
             dispatch_mode=Dispatch.SHARD_CONTIGUOUS,
+            max_inflight=max(1, replicas),
         ).pre_init()
         self.ocr = RayModule(
             OCRDummyOp,
             replicas=replicas,
             num_gpus_per_replica=0.0,
             dispatch_mode=Dispatch.SHARD_CONTIGUOUS,
+            max_inflight=max(1, replicas),
         ).pre_init()
         self.img2md = RayModule(
             Convert2MDDummyOp,
@@ -192,15 +194,7 @@ class DummyMineruDagPipeline(DagNewPipeline):
             dispatch_mode=Dispatch.BROADCAST,
         ).pre_init()
 
-        super().__init__(
-            max_batches_inflight=max(1, int(max_batches_inflight)),
-            stage_options={
-                "pdf2img": {"compute_inflight": 1},
-                "layout": {"compute_inflight": max(1, replicas)},
-                "ocr": {"compute_inflight": max(1, replicas)},
-                "img2md": {"compute_inflight": 1},
-            },
-        )
+        super().__init__(max_batches_inflight=max(1, int(max_batches_inflight)))
 
     def forward(self, x):
         images = self.pdf2img(x)

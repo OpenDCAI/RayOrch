@@ -1,9 +1,16 @@
+"""Declarative DAG pipeline with ``ray.wait``-driven scheduling.
+
+Subclass :class:`DagPipeline`, attach ``RayModule`` attributes, and
+implement ``forward()`` using symbolic ``PipeRef`` wiring.
+``compile()`` traces the graph; ``__call__()`` executes batched inputs
+through a scheduler with per-node inflight caps and automatic memory release.
+"""
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
 import inspect
-from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple, Union, get_args, get_origin, get_type_hints
+from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import ray
 
@@ -11,546 +18,604 @@ from .dispatch_mode import Dispatch
 from .ray_module import RayModule
 
 
-Source = Union[str, Tuple[str, int]]
-
+# ═══════════════════════════════════════════════════════════════════════════
+# Data types
+# ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class PipeRef:
-    """Symbolic handle to a node output slot used during DAG tracing."""
-    source: Source
+    """Symbolic reference to one output slot of a DAG node."""
+    node: str
+    index: int = 0
 
 
 @dataclass(frozen=True)
 class NodeSpec:
-    """Static node definition in the compiled DAG graph."""
+    """Immutable definition of a single compute node in the DAG."""
     name: str
     module: RayModule
-    args: Tuple[Source, ...]
-    kwargs: Mapping[str, Source]
+    args: Tuple[PipeRef, ...]
+    kw_args: Dict[str, PipeRef]
     max_inflight: int = 1
-    outputs: int = 1
+    num_outputs: int = 1
 
 
 @dataclass
-class NodeOutput:
-    """Runtime handle for one submitted node invocation (refs + optional multi-replica collect)."""
+class CompiledGraph:
+    """Immutable DAG topology produced by :meth:`DagPipeline.compile`."""
+    nodes: Dict[str, NodeSpec]
+    topo_order: Tuple[str, ...]
+    deps: Dict[str, Tuple[str, ...]]
+    consumers: Dict[str, Tuple[str, ...]]
+    graph_outputs: Tuple[PipeRef, ...]
+    input_keys: Tuple[str, ...]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Graph tracing
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _expect_ref(v: Any) -> PipeRef:
+    """Validate that *v* is a PipeRef (used during forward tracing)."""
+    if isinstance(v, PipeRef):
+        return v
+    raise TypeError(
+        "forward() arguments must be PipeRef values from upstream stages or inputs"
+    )
+
+
+def _validate_ref(
+    ref: PipeRef,
+    context: str,
+    input_keys: set,
+    nodes: Dict[str, NodeSpec],
+) -> None:
+    """Check that *ref* points to a valid node and slot."""
+    if ref.index < 0:
+        raise ValueError(f"'{context}': negative slot index in {ref}")
+    if ref.node in input_keys:
+        return
+    if ref.node not in nodes:
+        raise ValueError(f"'{context}': references unknown node '{ref.node}'")
+    if ref.index >= nodes[ref.node].num_outputs:
+        raise ValueError(
+            f"'{context}': reads slot {ref.index} from '{ref.node}', "
+            f"which only has {nodes[ref.node].num_outputs} outputs"
+        )
+
+
+class _GraphTracer:
+    """Records node declarations during ``forward()`` and compiles a :class:`CompiledGraph`."""
+
+    def __init__(self) -> None:
+        self._tape: List[NodeSpec] = []
+        self._name_count: Dict[str, int] = {}
+
+    def _unique_name(self, base: str) -> str:
+        n = self._name_count.get(base, 0)
+        self._name_count[base] = n + 1
+        return base if n == 0 else f"{base}_{n}"
+
+    def add_node(
+        self,
+        base_name: str,
+        module: RayModule,
+        args: Tuple[PipeRef, ...],
+        kw_args: Dict[str, PipeRef],
+    ) -> str:
+        name = self._unique_name(base_name)
+        self._tape.append(NodeSpec(
+            name=name,
+            module=module,
+            args=args,
+            kw_args=dict(kw_args),
+            max_inflight=module.max_inflight,
+            num_outputs=module.num_outputs,
+        ))
+        return name
+
+    @staticmethod
+    def make_refs(node_name: str, num_outputs: int) -> PipeRef | Tuple[PipeRef, ...]:
+        if num_outputs <= 1:
+            return PipeRef(node_name)
+        return tuple(PipeRef(node_name, i) for i in range(num_outputs))
+
+    def build(
+        self,
+        outputs: PipeRef | Tuple[PipeRef, ...],
+        input_keys: Tuple[str, ...],
+    ) -> CompiledGraph:
+        graph_outputs = (outputs,) if isinstance(outputs, PipeRef) else tuple(outputs)
+        input_key_set = set(input_keys)
+        by_name = {n.name: n for n in self._tape}
+        topo_order = tuple(n.name for n in self._tape)
+
+        deps: Dict[str, Tuple[str, ...]] = {}
+        consumers: Dict[str, List[str]] = {n: [] for n in topo_order}
+
+        for node in self._tape:
+            all_refs = list(node.args) + list(node.kw_args.values())
+            seen: set[str] = set()
+            dep_list: List[str] = []
+            for ref in all_refs:
+                _validate_ref(ref, node.name, input_key_set, by_name)
+                if ref.node in input_key_set or ref.node in seen:
+                    continue
+                seen.add(ref.node)
+                dep_list.append(ref.node)
+                consumers[ref.node].append(node.name)
+            deps[node.name] = tuple(dep_list)
+
+        for ref in graph_outputs:
+            _validate_ref(ref, "<graph_output>", input_key_set, by_name)
+
+        return CompiledGraph(
+            nodes=by_name,
+            topo_order=topo_order,
+            deps=deps,
+            consumers={k: tuple(v) for k, v in consumers.items()},
+            graph_outputs=graph_outputs,
+            input_keys=input_keys,
+        )
+
+
+class _TraceProxy:
+    """Stands in for a ``RayModule`` during ``forward()`` tracing."""
+
+    def __init__(self, tracer: _GraphTracer, attr_name: str, module: RayModule):
+        self._tracer = tracer
+        self._attr_name = attr_name
+        self._module = module
+
+    def __call__(self, *args: Any, **kwargs: Any) -> PipeRef | Tuple[PipeRef, ...]:
+        pipe_args = tuple(_expect_ref(v) for v in args)
+        pipe_kw = {k: _expect_ref(v) for k, v in kwargs.items()}
+        name = self._tracer.add_node(
+            self._attr_name, self._module, pipe_args, pipe_kw,
+        )
+        return self._tracer.make_refs(name, self._module.num_outputs)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Scheduler
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class _PendingResult:
     refs: List[ray.ObjectRef]
     collect_fn: Optional[Any]
 
+
 @dataclass
-class BatchNodeState:
-    """Per-batch state for a node in the scheduler."""
-    status: str = "waiting"
-    output: Optional[NodeOutput] = None
+class _NodeStatus:
+    phase: str = "waiting"
+    pending: Optional[_PendingResult] = None
 
 
 @dataclass
-class InflightReplica:
-    """Owner metadata for one in-flight call (possibly multiple refs)."""
+class _InflightCall:
     batch_idx: int
     node_name: str
     refs: List[ray.ObjectRef]
 
 
-@dataclass
-class CompiledGraph:
-    """Compiled immutable DAG artifacts consumed by the scheduler."""
-    nodes: Dict[str, NodeSpec]
-    order: Tuple[str, ...]
-    deps: Dict[str, Tuple[str, ...]]
-    downstream: Dict[str, Tuple[str, ...]]
-    outputs: Tuple[Source, ...]
-    input_roots: Tuple[str, ...]
-
-
-class _GraphBuilder:
-    """Builds DAG node tape and validates source wiring during compile."""
-
-    def __init__(self, pipe: "DagPipeline"):
-        self.pipe = pipe
-        self.nodes: List[NodeSpec] = []
-        self._name_id: Dict[str, int] = {}
-
-    def new_name(self, base: str) -> str:
-        idx = self._name_id.get(base, 0)
-        self._name_id[base] = idx + 1
-        return base if idx == 0 else f"{base}_{idx}"
-
-    def add_compute(
-        self,
-        *,
-        base_name: str,
-        module: RayModule,
-        args: Tuple[Source, ...],
-        kwargs: Mapping[str, Source],
-        max_inflight: int,
-        outputs: int,
-    ) -> str:
-        name = self.new_name(base_name)
-        self.nodes.append(
-            NodeSpec(
-                name=name,
-                module=module,
-                args=args,
-                kwargs=dict(kwargs),
-                max_inflight=max(1, int(max_inflight)),
-                outputs=max(1, int(outputs)),
-            )
-        )
-        return name
-
-    def output_refs(self, node_name: str, outputs: int) -> PipeRef | Tuple[PipeRef, ...]:
-        out_n = max(1, int(outputs))
-        if out_n == 1:
-            return PipeRef(node_name)
-        return tuple(PipeRef((node_name, i)) for i in range(out_n))
-
-    def finish(self, out: PipeRef | Tuple[PipeRef, ...], input_roots: Tuple[str, ...]) -> CompiledGraph:
-        if isinstance(out, tuple):
-            outputs = tuple(v.source for v in out)
-        else:
-            outputs = (out.source,)
-        input_root_set = set(input_roots)
-        by_name = {n.name: n for n in self.nodes}
-        order = tuple(n.name for n in self.nodes)
-        deps: Dict[str, Tuple[str, ...]] = {}
-        downstream: Dict[str, List[str]] = {n: [] for n in order}
-        for node in self.nodes:
-            dep_names = []
-            seen = set()
-            for src in list(node.args) + list(node.kwargs.values()):
-                base = src[0] if isinstance(src, tuple) else src
-                if isinstance(src, tuple):
-                    idx = src[1]
-                    if idx < 0:
-                        raise ValueError(f"node '{node.name}' has negative output index for source '{src}'")
-                if base in input_root_set or base in seen:
-                    continue
-                if base not in by_name:
-                    raise ValueError(f"node '{node.name}' depends on unknown source '{base}'")
-                if isinstance(src, tuple):
-                    idx = src[1]
-                    if idx >= by_name[base].outputs:
-                        raise ValueError(
-                            f"node '{node.name}' reads output {idx} from '{base}', "
-                            f"but '{base}' only has {by_name[base].outputs} outputs"
-                        )
-                seen.add(base)
-                dep_names.append(base)
-                downstream[base].append(node.name)
-            deps[node.name] = tuple(dep_names)
-        for src in outputs:
-            if isinstance(src, tuple):
-                base, idx = src
-                if base in input_root_set:
-                    if idx < 0:
-                        raise ValueError(f"graph output has negative output index for source '{src}'")
-                    continue
-                if base not in by_name:
-                    raise ValueError(f"graph output depends on unknown source '{base}'")
-                if idx < 0 or idx >= by_name[base].outputs:
-                    raise ValueError(
-                        f"graph output reads output {idx} from '{base}', "
-                        f"but '{base}' only has {by_name[base].outputs} outputs"
-                    )
-        return CompiledGraph(
-            nodes=by_name,
-            order=order,
-            deps=deps,
-            downstream={k: tuple(v) for k, v in downstream.items()},
-            outputs=outputs,
-            input_roots=input_roots,
-        )
-
-
-class _StageProxy:
-    """Proxy object that records symbolic stage calls instead of running actors."""
-
-    def __init__(self, pipe: "DagPipeline", builder: _GraphBuilder, field_name: str, module: RayModule):
-        self.pipe = pipe
-        self.builder = builder
-        self.field_name = field_name
-        self.module = module
-
-    def __call__(self, *args: Any, **kwargs: Any) -> PipeRef | Tuple[PipeRef, ...]:
-        src_args = tuple(self.pipe._to_source(v) for v in args)
-        src_kwargs = {k: self.pipe._to_source(v) for k, v in kwargs.items()}
-        spec = self.pipe._stage_option(self.field_name, self.module)
-        compute_name = self.builder.add_compute(
-            base_name=self.field_name,
-            module=self.module,
-            args=src_args,
-            kwargs=src_kwargs,
-            max_inflight=spec["compute_inflight"],
-            outputs=spec["outputs"],
-        )
-        return self.builder.output_refs(compute_name, spec["outputs"])
-
-
 class _Scheduler:
-    """Event-loop scheduler with per-node inflight caps and per-batch contexts."""
+    """``ray.wait``-driven event loop executing a :class:`CompiledGraph`."""
 
     def __init__(
         self,
         graph: CompiledGraph,
-        input_columns: Mapping[str, Sequence[Any]],
+        input_columns: Dict[str, Sequence[Any]],
         max_batches_inflight: int,
-    ):
-        self.graph = graph
-        self.max_batches_inflight = max(1, int(max_batches_inflight))
+    ) -> None:
+        self._graph = graph
+        self._max_inflight = max(1, int(max_batches_inflight))
+        self._n_batches = self._validate_inputs(input_columns)
 
-        expected_roots = set(self.graph.input_roots)
-        if set(input_columns.keys()) != expected_roots:
-            raise ValueError(
-                f"input roots mismatch: expected {self.graph.input_roots}, "
-                f"got {tuple(input_columns.keys())}"
-            )
-        sizes = {k: len(v) for k, v in input_columns.items()}
-        if not sizes:
-            raise ValueError("input_columns cannot be empty")
-        batch_sizes = set(sizes.values())
-        if len(batch_sizes) != 1:
-            raise ValueError(f"all input columns must have same batch size, got {sizes}")
-        self._n_batches = next(iter(batch_sizes))
-
-        self.contexts: List[Dict[str, Any]] = [
-            {root: input_columns[root][i] for root in self.graph.input_roots}
+        # Per-batch data: values stored as tuple for uniform slot access.
+        # Single-output -> (value,), multi-output -> (v0, v1, ...).
+        self._ctx: List[Dict[str, tuple]] = [
+            {key: (input_columns[key][i],) for key in graph.input_keys}
             for i in range(self._n_batches)
         ]
-        self.states: List[Dict[str, BatchNodeState]] = [
-            {name: BatchNodeState() for name in self.graph.order} for _ in range(self._n_batches)
+        self._status: List[Dict[str, _NodeStatus]] = [
+            {name: _NodeStatus() for name in graph.topo_order}
+            for _ in range(self._n_batches)
         ]
-        self.results: List[Any] = [None] * self._n_batches
+        self._results: List[Any] = [None] * self._n_batches
 
-        self.ready_q: Dict[str, Deque[int]] = {name: deque() for name in self.graph.order}
-        self.inflight_per_node: Dict[str, int] = {name: 0 for name in self.graph.order}
-        self.live_batches: set[int] = set()
-        self.next_batch_to_admit = 0
+        # Node scheduling state
+        self._ready_q: Dict[str, Deque[int]] = {n: deque() for n in graph.topo_order}
+        self._node_inflight: Dict[str, int] = {n: 0 for n in graph.topo_order}
 
-        self.ref_to_call: Dict[ray.ObjectRef, InflightReplica] = {}
-        self.outstanding: set[ray.ObjectRef] = set()
+        # Batch admission state
+        self._live: set[int] = set()
+        self._next_batch = 0
+
+        # Ray ref tracking
+        self._ref_owner: Dict[ray.ObjectRef, _InflightCall] = {}
+        self._outstanding: set[ray.ObjectRef] = set()
+
+        # Precomputed sets for fast membership tests
+        self._output_nodes: frozenset[str] = frozenset(
+            ref.node for ref in graph.graph_outputs
+        )
+        self._input_key_set: frozenset[str] = frozenset(graph.input_keys)
+
+    def _validate_inputs(self, columns: Dict[str, Sequence[Any]]) -> int:
+        expected = set(self._graph.input_keys)
+        if set(columns.keys()) != expected:
+            raise ValueError(
+                f"input keys mismatch: expected {self._graph.input_keys}, "
+                f"got {tuple(columns.keys())}"
+            )
+        sizes = {k: len(v) for k, v in columns.items()}
+        if not sizes:
+            raise ValueError("input columns cannot be empty")
+        unique = set(sizes.values())
+        if len(unique) != 1:
+            raise ValueError(f"all input columns must have same length, got {sizes}")
+        return next(iter(unique))
+
+    # ── Main loop ─────────────────────────────────────────────────────────
 
     def run(self) -> List[Any]:
-        """Drive the DAG until all tracked refs are completed."""
         self._admit_batches()
-        self._dispatch_ready()
-        while self.outstanding:
-            done, _ = ray.wait(list(self.outstanding), num_returns=1)
-            ref = done[0]
-            call = self.ref_to_call.pop(ref)
-            self.outstanding.discard(ref)
-
-            # Multi-replica calls complete only after all refs of that call are done.
-            if any(r in self.ref_to_call for r in call.refs):
-                continue
-
-            self._finish_node(call.batch_idx, call.node_name, call.refs)
-            self._dispatch_ready()
+        self._dispatch()
+        while self._outstanding:
+            for call in self._drain_completed():
+                self._on_complete(call)
             self._admit_batches()
-            self._dispatch_ready()
-        return self.results
+            self._dispatch()
+        return self._results
+
+    def _drain_completed(self) -> List[_InflightCall]:
+        """Block for at least 1 ref, then greedily collect all other completed refs."""
+        ready, _ = ray.wait(list(self._outstanding), num_returns=1)
+        self._outstanding.discard(ready[0])
+        if self._outstanding:
+            more, _ = ray.wait(
+                list(self._outstanding),
+                num_returns=len(self._outstanding),
+                timeout=0,
+            )
+            for r in more:
+                self._outstanding.discard(r)
+            ready.extend(more)
+
+        calls: List[_InflightCall] = []
+        for ref in ready:
+            call = self._ref_owner.pop(ref, None)
+            if call is None:
+                continue
+            if any(r in self._ref_owner for r in call.refs):
+                continue
+            calls.append(call)
+        return calls
+
+    # ── Batch admission ───────────────────────────────────────────────────
 
     def _admit_batches(self) -> None:
-        """Admit new batches into the graph under global inflight budget."""
-        while self.next_batch_to_admit < self._n_batches and len(self.live_batches) < self.max_batches_inflight:
-            bi = self.next_batch_to_admit
-            self.next_batch_to_admit += 1
-            self.live_batches.add(bi)
-            for node_name in self.graph.order:
-                if not self.graph.deps[node_name]:
-                    self._enqueue_ready(bi, node_name)
+        while (self._next_batch < self._n_batches
+               and len(self._live) < self._max_inflight):
+            bi = self._next_batch
+            self._next_batch += 1
+            self._live.add(bi)
+            for name in self._graph.topo_order:
+                if not self._graph.deps[name]:
+                    self._mark_ready(bi, name)
 
-    def _enqueue_ready(self, bi: int, node_name: str) -> None:
-        state = self.states[bi][node_name]
-        if state.status != "waiting":
+    # ── Dispatch ──────────────────────────────────────────────────────────
+
+    def _mark_ready(self, bi: int, name: str) -> None:
+        st = self._status[bi][name]
+        if st.phase != "waiting":
             return
-        state.status = "ready"
-        self.ready_q[node_name].append(bi)
+        st.phase = "ready"
+        self._ready_q[name].append(bi)
 
-    def _dispatch_ready(self) -> None:
-        """Submit ready nodes while respecting per-node inflight limits."""
+    def _dispatch(self) -> None:
         progressed = True
         while progressed:
             progressed = False
-            for node_name in self.graph.order:
-                q = self.ready_q[node_name]
-                node = self.graph.nodes[node_name]
-                while q and self.inflight_per_node[node_name] < node.max_inflight:
+            for name in self._graph.topo_order:
+                q = self._ready_q[name]
+                cap = self._graph.nodes[name].max_inflight
+                while q and self._node_inflight[name] < cap:
                     bi = q.popleft()
-                    state = self.states[bi][node_name]
-                    if state.status != "ready":
+                    if self._status[bi][name].phase != "ready":
                         continue
-                    self._submit_node(bi, node)
+                    self._submit(bi, self._graph.nodes[name])
                     progressed = True
 
-    def _submit_node(self, bi: int, node: NodeSpec) -> None:
-        refs = self._launch_node(bi, node)
-        state = self.states[bi][node.name]
-        state.status = "running"
-        self.inflight_per_node[node.name] += 1
-        call = InflightReplica(batch_idx=bi, node_name=node.name, refs=list(refs))
-        for ref in refs:
-            self.ref_to_call[ref] = call
-            self.outstanding.add(ref)
+    def _submit(self, bi: int, spec: NodeSpec) -> None:
+        ctx = self._ctx[bi]
+        args = tuple(ctx[ref.node][ref.index] for ref in spec.args)
+        kw = {k: ctx[ref.node][ref.index] for k, ref in spec.kw_args.items()}
 
-    def _launch_node(self, bi: int, node: NodeSpec) -> List[ray.ObjectRef]:
-        ctx = self.contexts[bi]
-        args = tuple(self._resolve_submit_arg(ctx, src) for src in node.args)
-        kwargs = {k: self._resolve_submit_arg(ctx, src) for k, src in node.kwargs.items()}
-        # Pipeline protocol: every edge payload is list-based micro-batch data.
         for i, v in enumerate(args):
             if not isinstance(v, list):
                 raise TypeError(
-                    f"node '{node.name}' arg[{i}] must be list[...] "
+                    f"node '{spec.name}' arg[{i}] must be list "
                     f"(got {type(v).__name__})"
                 )
-        for k, v in kwargs.items():
+        for k, v in kw.items():
             if not isinstance(v, list):
                 raise TypeError(
-                    f"node '{node.name}' kwarg '{k}' must be list[...] "
+                    f"node '{spec.name}' kwarg '{k}' must be list "
                     f"(got {type(v).__name__})"
                 )
-        pending = node.module.remote(*args, **kwargs)
-        self.states[bi][node.name].output = NodeOutput(
-            refs=pending.completion_refs(),
-            collect_fn=pending.collect_fn,
+
+        future = spec.module.remote(*args, **kw)
+        refs = future.completion_refs()
+
+        self._status[bi][spec.name].phase = "running"
+        self._status[bi][spec.name].pending = _PendingResult(
+            refs=refs, collect_fn=future.collect_fn,
         )
-        return pending.completion_refs()
+        self._node_inflight[spec.name] += 1
 
-    def _resolve_submit_arg(self, ctx: Dict[str, Any], src: Source) -> Any:
-        if isinstance(src, tuple):
-            base, idx = src
-            val = ctx[base]
-            return val[idx]
-        return ctx[src]
+        call = _InflightCall(batch_idx=bi, node_name=spec.name, refs=list(refs))
+        for ref in refs:
+            self._ref_owner[ref] = call
+            self._outstanding.add(ref)
 
-    def _validate_node_value(self, node: NodeSpec, value: Any) -> None:
-        """Enforce list-based output contract for single/multi-output nodes."""
-        if node.outputs == 1:
-            if not isinstance(value, list):
-                raise TypeError(
-                    f"node '{node.name}' must return list[...] (got {type(value).__name__})"
-                )
-            return
+    # ── Completion ────────────────────────────────────────────────────────
 
-        if not isinstance(value, (tuple, list)):
-            raise TypeError(
-                f"node '{node.name}' must return tuple/list of {node.outputs} list outputs "
-                f"(got {type(value).__name__})"
-            )
-        if len(value) != node.outputs:
-            raise ValueError(
-                f"node '{node.name}' declared outputs={node.outputs}, "
-                f"but runtime returned {len(value)} outputs"
-            )
-        for i, branch in enumerate(value):
-            if not isinstance(branch, list):
-                raise TypeError(
-                    f"node '{node.name}' output[{i}] must be list[...] "
-                    f"(got {type(branch).__name__})"
-                )
+    def _on_complete(self, call: _InflightCall) -> None:
+        bi, name = call.batch_idx, call.node_name
+        spec = self._graph.nodes[name]
+        st = self._status[bi][name]
+        pending = st.pending
+        assert pending is not None
 
-    def _finish_node(self, bi: int, node_name: str, refs: List[ray.ObjectRef]) -> None:
-        """Finalize one completed call, update context, and schedule downstream nodes."""
-        node = self.graph.nodes[node_name]
-        state = self.states[bi][node_name]
-        output = state.output
-        if output is None:
-            raise RuntimeError(f"node '{node_name}' completed without output handle")
-
-        if len(refs) == 1:
-            value = ray.get(refs[0])
+        if len(call.refs) == 1:
+            value = ray.get(call.refs[0])
         else:
-            vals = ray.get(refs)
-            value = output.collect_fn(node.module, vals) if output.collect_fn is not None else vals
+            raw = ray.get(call.refs)
+            value = pending.collect_fn(spec.module, raw) if pending.collect_fn else raw
 
-        self._validate_node_value(node, value)
-        self.contexts[bi][node_name] = value
-        state.status = "done"
-        self.inflight_per_node[node_name] -= 1
+        _validate_output(spec, value)
 
-        for child in self.graph.downstream[node_name]:
-            if self._deps_done(bi, child):
-                self._enqueue_ready(bi, child)
+        self._ctx[bi][name] = value if spec.num_outputs > 1 else (value,)
+        st.phase = "done"
+        st.pending = None
+        self._node_inflight[name] -= 1
 
-        if self._batch_outputs_ready(bi):
-            self.results[bi] = self._materialize_outputs(bi)
-            self.live_batches.discard(bi)
+        for child in self._graph.consumers[name]:
+            if self._all_deps_done(bi, child):
+                self._mark_ready(bi, child)
 
-    def _deps_done(self, bi: int, node_name: str) -> bool:
-        for dep in self.graph.deps[node_name]:
-            if self.states[bi][dep].status != "done":
-                return False
-        return True
+        self._release_upstream(bi, name)
 
-    def _batch_outputs_ready(self, bi: int) -> bool:
-        for src in self.graph.outputs:
-            base = src[0] if isinstance(src, tuple) else src
-            if self.states[bi][base].status != "done":
-                return False
-        return True
+        if self._is_batch_complete(bi):
+            self._results[bi] = self._materialize(bi)
+            self._live.discard(bi)
 
-    def _materialize_outputs(self, bi: int) -> Any:
-        ctx = self.contexts[bi]
-        if len(self.graph.outputs) == 1:
-            return self._resolve_submit_arg(ctx, self.graph.outputs[0])
-        return tuple(self._resolve_submit_arg(ctx, src) for src in self.graph.outputs)
+    def _release_upstream(self, bi: int, name: str) -> None:
+        for dep in self._graph.deps[name]:
+            if dep in self._output_nodes or dep in self._input_key_set:
+                continue
+            if all(self._status[bi][c].phase == "done"
+                   for c in self._graph.consumers[dep]):
+                self._ctx[bi].pop(dep, None)
+
+    # ── Queries ───────────────────────────────────────────────────────────
+
+    def _all_deps_done(self, bi: int, name: str) -> bool:
+        return all(
+            self._status[bi][d].phase == "done" for d in self._graph.deps[name]
+        )
+
+    def _is_batch_complete(self, bi: int) -> bool:
+        return all(
+            self._status[bi][ref.node].phase == "done"
+            for ref in self._graph.graph_outputs
+        )
+
+    def _materialize(self, bi: int) -> Any:
+        ctx = self._ctx[bi]
+        outs = self._graph.graph_outputs
+        if len(outs) == 1:
+            return ctx[outs[0].node][outs[0].index]
+        return tuple(ctx[ref.node][ref.index] for ref in outs)
+
+
+def _validate_output(spec: NodeSpec, value: Any) -> None:
+    """Check that a node's return value matches its declared ``num_outputs``."""
+    if spec.num_outputs == 1:
+        if not isinstance(value, list):
+            raise TypeError(
+                f"node '{spec.name}' must return list (got {type(value).__name__})"
+            )
+        return
+    if not isinstance(value, (tuple, list)):
+        raise TypeError(
+            f"node '{spec.name}' must return tuple/list of "
+            f"{spec.num_outputs} lists (got {type(value).__name__})"
+        )
+    if len(value) != spec.num_outputs:
+        raise ValueError(
+            f"node '{spec.name}' declared num_outputs={spec.num_outputs}, "
+            f"but returned {len(value)} outputs"
+        )
+    for i, branch in enumerate(value):
+        if not isinstance(branch, list):
+            raise TypeError(
+                f"node '{spec.name}' output[{i}] must be list "
+                f"(got {type(branch).__name__})"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# User API
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _propagate_forward_sig(cls: type) -> None:
+    """Copy ``forward()``'s parameter names onto ``__call__`` / ``run``.
+
+    Each ``PipeRef`` annotation (or unannotated param) is replaced with
+    ``Sequence[Any]`` so that IDE tooltips and ``help()`` show the user
+    exactly which batched inputs to pass.
+    """
+    try:
+        fwd_sig = inspect.signature(cls.forward)
+    except (ValueError, TypeError):
+        return
+
+    params = [inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    for name, p in fwd_sig.parameters.items():
+        if name == "self":
+            continue
+        params.append(p.replace(annotation=Sequence[Any]))
+
+    sig = fwd_sig.replace(parameters=params, return_annotation=List[Any])
+
+    base_call = DagPipeline.__call__
+
+    def _typed_call(self, *args, **kwargs):
+        return base_call(self, *args, **kwargs)
+
+    _typed_call.__signature__ = sig
+    _typed_call.__name__ = "__call__"
+    _typed_call.__qualname__ = f"{cls.__qualname__}.__call__"
+    _typed_call.__module__ = cls.__module__
+    cls.__call__ = _typed_call
+    cls.run = _typed_call
+
 
 class DagPipeline:
-    """Declarative DAG pipeline base class for explicit graph-style wiring."""
+    """
+    Declarative DAG pipeline base class.
 
-    def __init__(
-        self,
-        *,
-        max_batches_inflight: int = 4,
-        stage_options: Optional[Mapping[str, Mapping[str, int]]] = None,
-    ):
+    Subclass, attach ``RayModule`` attributes, implement ``forward()``
+    with ``PipeRef`` wiring, then call the pipeline on batched inputs.
+
+    ``__call__`` / ``run`` signatures are automatically derived from
+    ``forward()`` via ``__init_subclass__``, so IDE autocompletion shows
+    the correct parameter names and ``Sequence[Any]`` types.
+    """
+
+    def __init__(self, *, max_batches_inflight: int = 4):
         self.max_batches_inflight = max(1, int(max_batches_inflight))
-        self._stage_options = dict(stage_options or {})
         self._compiled: Optional[CompiledGraph] = None
-        self._input_param_names: Tuple[str, ...] = ()
-        self._input_root_names: Tuple[str, ...] = ()
+        self._param_names: Tuple[str, ...] = ()
+        self._input_keys: Tuple[str, ...] = ()
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if "forward" in cls.__dict__:
+            _propagate_forward_sig(cls)
 
     def forward(self, x: PipeRef) -> PipeRef | Tuple[PipeRef, ...]:
         raise NotImplementedError
 
-    def _infer_outputs_from_module(self, module: RayModule) -> int:
-        """Infer logical output arity from the op `run()` return annotation."""
-        op_cls = getattr(module, "_op_cls", None)
-        if op_cls is None:
-            return 1
-        run_fn = getattr(op_cls, "run", None)
-        if run_fn is None:
-            return 1
-        try:
-            return_hint = get_type_hints(run_fn).get("return")
-        except Exception:
-            return 1
-        if return_hint is None:
-            return 1
+    # ── Compile ───────────────────────────────────────────────────────────
 
-        origin = get_origin(return_hint)
-        if origin in (tuple, Tuple):
-            parts = [p for p in get_args(return_hint) if p is not Ellipsis]
-            return max(1, len(parts))
-        if isinstance(return_hint, type) and hasattr(return_hint, "_fields") and issubclass(return_hint, tuple):
-            return max(1, len(return_hint._fields))
-        return 1
+    @staticmethod
+    def _input_key(param: str) -> str:
+        return f"__input__{param}"
 
-    def _stage_option(self, name: str, module: RayModule) -> Dict[str, int]:
-        opts = dict(self._stage_options.get(name, {}))
-        inferred_outputs = self._infer_outputs_from_module(module)
-        configured_outputs = opts.get("outputs")
-        if configured_outputs is None:
-            outputs = inferred_outputs
-        else:
-            outputs = max(1, int(configured_outputs))
-            if outputs != inferred_outputs and inferred_outputs != 1:
-                raise ValueError(
-                    f"stage '{name}' outputs mismatch: configured outputs={outputs}, "
-                    f"but run() return annotation implies outputs={inferred_outputs}"
-                )
-        return {
-            "compute_inflight": max(1, int(opts.get("compute_inflight", opts.get("max_inflight", 1)))),
-            "outputs": outputs,
-        }
-
-    def _to_source(self, v: Any) -> Source:
-        if isinstance(v, PipeRef):
-            return v.source
-        raise TypeError("forward only accepts PipeRef values returned by upstream stages")
-
-    def _root_name(self, param_name: str) -> str:
-        # Internal namespace avoids collision with stage node names.
-        return f"__input__{param_name}"
-
-    def _build_forward_inputs(self) -> Tuple[List[PipeRef], Dict[str, PipeRef], Tuple[str, ...], Tuple[str, ...]]:
+    def _introspect_forward(self) -> Tuple[
+        List[PipeRef], Dict[str, PipeRef], Tuple[str, ...], Tuple[str, ...],
+    ]:
         sig = inspect.signature(self.forward)
         params = list(sig.parameters.values())
         if not params:
-            raise ValueError("forward must declare at least one PipeRef input parameter")
+            raise ValueError("forward() must declare at least one parameter")
 
-        args: List[PipeRef] = []
-        kwargs: Dict[str, PipeRef] = {}
+        pos_refs: List[PipeRef] = []
+        kw_refs: Dict[str, PipeRef] = {}
         names: List[str] = []
-        roots: List[str] = []
+        keys: List[str] = []
+
         for p in params:
             if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                raise TypeError("forward cannot use *args/**kwargs; declare explicit PipeRef parameters")
-            name = p.name
-            root = self._root_name(name)
-            ref = PipeRef(root)
-            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-                args.append(ref)
+                raise TypeError(
+                    "forward() cannot use *args/**kwargs; use explicit parameters"
+                )
+            key = self._input_key(p.name)
+            ref = PipeRef(key)
+            if p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                pos_refs.append(ref)
             elif p.kind == inspect.Parameter.KEYWORD_ONLY:
-                kwargs[name] = ref
-            else:
-                raise TypeError(f"unsupported forward parameter kind for '{name}': {p.kind}")
-            names.append(name)
-            roots.append(root)
-        return args, kwargs, tuple(names), tuple(roots)
+                kw_refs[p.name] = ref
+            names.append(p.name)
+            keys.append(key)
 
-    def compile(self) -> "DagPipeline":
-        builder = _GraphBuilder(self)
+        return pos_refs, kw_refs, tuple(names), tuple(keys)
+
+    def compile(self) -> DagPipeline:
+        tracer = _GraphTracer()
         originals: Dict[str, RayModule] = {}
-        for name, value in list(self.__dict__.items()):
-            if isinstance(value, RayModule):
-                originals[name] = value
-                setattr(self, name, _StageProxy(self, builder, name, value))
+        for attr, val in list(self.__dict__.items()):
+            if isinstance(val, RayModule):
+                originals[attr] = val
+                setattr(self, attr, _TraceProxy(tracer, attr, val))
         if not originals:
-            raise ValueError("No RayModule attributes on pipeline instance")
+            raise ValueError("no RayModule attributes found on pipeline")
 
-        f_args, f_kwargs, param_names, root_names = self._build_forward_inputs()
+        pos_refs, kw_refs, param_names, input_keys = self._introspect_forward()
         try:
-            out = self.forward(*f_args, **f_kwargs)
+            out = self.forward(*pos_refs, **kw_refs)
         finally:
-            for name, value in originals.items():
-                setattr(self, name, value)
+            for attr, mod in originals.items():
+                setattr(self, attr, mod)
 
-        self._input_param_names = param_names
-        self._input_root_names = root_names
-        self._compiled = builder.finish(out, root_names)
+        self._param_names = param_names
+        self._input_keys = input_keys
+        self._compiled = tracer.build(out, input_keys)
         return self
 
-    def _normalize_runtime_inputs(
+    # ── Run ───────────────────────────────────────────────────────────────
+
+    def _resolve_inputs(
         self,
-        inputs: Tuple[Sequence[Any], ...],
-        named_inputs: Mapping[str, Sequence[Any]],
+        args: Tuple[Sequence[Any], ...],
+        kwargs: Mapping[str, Sequence[Any]],
     ) -> Dict[str, Sequence[Any]]:
-        if not self._input_param_names or not self._input_root_names:
-            raise RuntimeError("pipeline is not compiled with input roots")
+        if not self._param_names:
+            raise RuntimeError("pipeline is not compiled")
+        if args and kwargs:
+            raise ValueError("pass inputs positionally or by keyword, not both")
 
-        if inputs and named_inputs:
-            raise ValueError("Pass runtime inputs either positionally or by keyword, not both")
-
-        if named_inputs:
-            expected = set(self._input_param_names)
-            got = set(named_inputs.keys())
-            if got != expected:
+        if kwargs:
+            if set(kwargs.keys()) != set(self._param_names):
                 raise ValueError(
-                    f"runtime input names mismatch: expected {self._input_param_names}, got {tuple(named_inputs.keys())}"
+                    f"keyword mismatch: expected {self._param_names}, "
+                    f"got {tuple(kwargs.keys())}"
                 )
             return {
-                self._root_name(name): named_inputs[name]
-                for name in self._input_param_names
+                self._input_key(name): kwargs[name]
+                for name in self._param_names
             }
 
-        if len(inputs) != len(self._input_param_names):
+        if len(args) != len(self._param_names):
             raise ValueError(
-                f"runtime positional input count mismatch: expected {len(self._input_param_names)}, got {len(inputs)}"
+                f"expected {len(self._param_names)} positional inputs, "
+                f"got {len(args)}"
             )
-        return {
-            root: col for root, col in zip(self._input_root_names, inputs)
-        }
+        return dict(zip(self._input_keys, args))
 
-    def __call__(self, *inputs: Sequence[Any], **named_inputs: Sequence[Any]) -> List[Any]:
+    def __call__(
+        self, *inputs: Sequence[Any], **named_inputs: Sequence[Any],
+    ) -> List[Any]:
         if self._compiled is None:
             self.compile()
-        columns = self._normalize_runtime_inputs(inputs, named_inputs)
-        return _Scheduler(self._compiled, columns, self.max_batches_inflight).run()
+        columns = self._resolve_inputs(inputs, named_inputs)
+        return _Scheduler(
+            self._compiled, columns, self.max_batches_inflight,
+        ).run()
 
     run = __call__
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Inline tests
+# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     def _cleanup_pipe_modules(pipe: DagPipeline) -> None:
@@ -569,7 +634,6 @@ if __name__ == "__main__":
 
     class ProbeShardSizeOp:
         def run(self, x: list[int]) -> list[int]:
-            # Return local shard length for this replica.
             return [len(x)]
 
     class ShardProbePipe(DagPipeline):
@@ -578,8 +642,9 @@ if __name__ == "__main__":
                 ProbeShardSizeOp,
                 replicas=replicas,
                 dispatch_mode=Dispatch.SHARD_CONTIGUOUS,
+                max_inflight=2,
             ).pre_init()
-            super().__init__(max_batches_inflight=4, stage_options={"probe": {"compute_inflight": 2}})
+            super().__init__(max_batches_inflight=4)
 
         def forward(self, x: PipeRef) -> PipeRef:
             return self.probe(x)
@@ -594,8 +659,9 @@ if __name__ == "__main__":
                 MultiplyBy2Op,
                 replicas=replicas,
                 dispatch_mode=Dispatch.SHARD_CONTIGUOUS,
+                max_inflight=2,
             ).pre_init()
-            super().__init__(max_batches_inflight=4, stage_options={"mul2": {"compute_inflight": 2}})
+            super().__init__(max_batches_inflight=4)
 
         def forward(self, x: PipeRef) -> PipeRef:
             return self.mul2(x)
@@ -620,18 +686,11 @@ if __name__ == "__main__":
                 SplitParityOp,
                 replicas=replicas,
                 dispatch_mode=Dispatch.SHARD_CONTIGUOUS,
+                max_inflight=2,
             ).pre_init()
-            self.left = RayModule(ScaleEvenOp, replicas=1).pre_init()
-            self.right = RayModule(ScaleOddOp, replicas=1).pre_init()
-            super().__init__(
-                max_batches_inflight=4,
-                stage_options={
-                    # outputs auto inferred from SplitParityOp.run -> tuple[list, list]
-                    "split": {"compute_inflight": 2},
-                    "left": {"compute_inflight": 2},
-                    "right": {"compute_inflight": 2},
-                },
-            )
+            self.left = RayModule(ScaleEvenOp, replicas=1, max_inflight=2).pre_init()
+            self.right = RayModule(ScaleOddOp, replicas=1, max_inflight=2).pre_init()
+            super().__init__(max_batches_inflight=4)
 
         def forward(self, x: PipeRef) -> Tuple[PipeRef, PipeRef]:
             even_in, odd_in = self.split(x)
