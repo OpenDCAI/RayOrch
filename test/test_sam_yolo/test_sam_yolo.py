@@ -60,7 +60,7 @@ class YoloSamPipeline:
             env=yolo_env,
             replicas=yolo_replicas,
             num_gpus_per_replica=1.0 if device.startswith("cuda") else 0.0,
-            dispatch_mode=Dispatch.ALL_SLICED_TO_ALL,
+            dispatch_mode=Dispatch.SHARD_CONTIGUOUS,
         ).pre_init(weight_path=yolo_weight, device=device, conf=0.25)
 
         # 3) sam: 多 replica
@@ -69,7 +69,7 @@ class YoloSamPipeline:
             env=sam_env,
             replicas=sam_replicas,
             num_gpus_per_replica=1.0 if device.startswith("cuda") else 0.0,
-            dispatch_mode=Dispatch.ALL_SLICED_TO_ALL,
+            dispatch_mode=Dispatch.SHARD_CONTIGUOUS,
         ).pre_init(checkpoint_path=sam_checkpoint, model_type="vit_b", device=device)
 
         # 4) render: 单 actor

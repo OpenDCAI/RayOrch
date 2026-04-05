@@ -4,12 +4,14 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Callable, Dict, Mapping, Sequence, Tuple, Union, List
 
+import ray
+
 
 class Dispatch(Enum):
-    ONE_TO_ALL = auto()
-    ALL_TO_ALL = auto()
+    BROADCAST = auto()
+    PER_REPLICA = auto()
     # DIRECT_ROLLOUT_METHOD = auto()
-    ALL_SLICED_TO_ALL = auto()
+    SHARD_CONTIGUOUS = auto()
     # ALL_SLICED_TO_TRIPLET_ALL = auto()
 
 
@@ -26,20 +28,34 @@ class DispatchSpec:
     collect_fn: CollectFn
 
 
+@dataclass(frozen=True)
+class ShardedObjectRef:
+    """
+    Per-replica view of one shared ObjectRef.
+
+    The underlying ref points to a sequence-like batch (list/tuple). Each replica
+    resolves and slices its own contiguous shard at execution time.
+    """
+
+    ref: ray.ObjectRef
+    shard_idx: int
+    num_shards: int
+
+
 # --------- VERL 风格实现 ---------
-def dispatch_one_to_all(RayModule, *args, **kwargs):
-    ws = RayModule._replicas # hard code to avoid circular import
+def dispatch_broadcast(rm, *args, **kwargs):
+    ws = rm._replicas  # hard code to avoid circular import
     args = tuple([arg] * ws for arg in args)
     kwargs = {k: [v] * ws for k, v in kwargs.items()}
     return args, kwargs
 
 
-def dispatch_all_to_all(RayModule, *args, **kwargs):
+def dispatch_per_replica(rm, *args, **kwargs):
     # 约定：args/kwargs 已经是 per-replica 形式
     return args, kwargs
 
 
-def collect_all_to_all(RayModule, output):
+def collect_identity(rm, output):
     return output
 
 
@@ -49,6 +65,10 @@ def _is_shardable(x: Any) -> bool:
     # 只把 list/tuple 当作可切片 batch；其他一律广播
     # 如果你还想支持 numpy/torch batch，可在这里扩展
     return isinstance(x, (list, tuple))
+
+
+def _is_object_ref(x: Any) -> bool:
+    return isinstance(x, ray.ObjectRef)
 
 
 def dispatch_shard_all_args_mod(rm, *args, **kwargs):
@@ -66,48 +86,62 @@ def dispatch_shard_all_args_mod(rm, *args, **kwargs):
     """
     ws = rm._replicas
 
-    # 1) 收集所有 shardable 参数长度
+    # 1) 收集所有 shardable 参数长度；ObjectRef 也视为“可分片输入”，但长度在 worker 端再解析。
     lengths = []
+    has_ref_input = False
     for a in args:
         if _is_shardable(a):
             lengths.append(len(a))
+        elif _is_object_ref(a):
+            has_ref_input = True
     for v in kwargs.values():
         if _is_shardable(v):
             lengths.append(len(v))
+        elif _is_object_ref(v):
+            has_ref_input = True
 
-    if not lengths:
-        # 无 shardable 参数：广播
+    if not lengths and not has_ref_input:
+        # 无 shardable 参数且无 ref 参数：广播
         per_args = tuple([a] * ws for a in args)
         per_kwargs = {k: [v] * ws for k, v in kwargs.items()}
         return per_args, per_kwargs
 
-    n = lengths[0]
-    if any(l != n for l in lengths):
-        raise ValueError(f"Shardable args/kwargs must have same length. Got lengths={lengths}")
+    ranges = None
+    if lengths:
+        n = lengths[0]
+        if any(l != n for l in lengths):
+            raise ValueError(f"Shardable args/kwargs must have same length. Got lengths={lengths}")
 
-    # 2) 计算每个 rank 的切片区间（连续）
-    #    例如 n=10, ws=3 → sizes = [4,3,3]
-    base = n // ws
-    rem = n % ws
-    sizes = [base + (1 if i < rem else 0) for i in range(ws)]
+        # 2) 计算每个 rank 的切片区间（连续）
+        #    例如 n=10, ws=3 -> sizes = [4,3,3]
+        base = n // ws
+        rem = n % ws
+        sizes = [base + (1 if i < rem else 0) for i in range(ws)]
 
-    # 生成每个 rank 的 [start, end)
-    ranges = []
-    start = 0
-    for sz in sizes:
-        end = start + sz
-        ranges.append((start, end))
-        start = end
+        # 生成每个 rank 的 [start, end)
+        ranges = []
+        start = 0
+        for sz in sizes:
+            end = start + sz
+            ranges.append((start, end))
+            start = end
 
-    # 3) 切 shardable 参数
+    # 3) 切 shardable 参数；ObjectRef 用 per-replica 视图，延迟到 worker 端解引用切片。
     def shard_seq(seq):
+        if ranges is None:
+            raise ValueError("Internal error: ranges is None for shardable sequence input.")
         return [seq[s:e] for (s, e) in ranges]
+
+    def shard_ref(ref: ray.ObjectRef):
+        return [ShardedObjectRef(ref=ref, shard_idx=i, num_shards=ws) for i in range(ws)]
 
     # 4) per_args
     per_args_list = []
     for a in args:
         if _is_shardable(a):
             per_args_list.append(shard_seq(a))
+        elif _is_object_ref(a):
+            per_args_list.append(shard_ref(a))
         else:
             per_args_list.append([a] * ws)
 
@@ -116,6 +150,8 @@ def dispatch_shard_all_args_mod(rm, *args, **kwargs):
     for k, v in kwargs.items():
         if _is_shardable(v):
             per_kwargs[k] = shard_seq(v)
+        elif _is_object_ref(v):
+            per_kwargs[k] = shard_ref(v)
         else:
             per_kwargs[k] = [v] * ws
 
@@ -245,9 +281,9 @@ def collect_triplet_concat(rm, outputs):
     return mains, first_args, first_kwargs
 
 DISPATCH_MODE_FN_REGISTRY = {
-    Dispatch.ONE_TO_ALL: DispatchSpec(dispatch_one_to_all, collect_all_to_all),
-    Dispatch.ALL_TO_ALL: DispatchSpec(dispatch_all_to_all, collect_all_to_all),
-    Dispatch.ALL_SLICED_TO_ALL: DispatchSpec(dispatch_shard_all_args_mod, collect_concat),
+    Dispatch.BROADCAST: DispatchSpec(dispatch_broadcast, collect_identity),
+    Dispatch.PER_REPLICA: DispatchSpec(dispatch_per_replica, collect_identity),
+    Dispatch.SHARD_CONTIGUOUS: DispatchSpec(dispatch_shard_all_args_mod, collect_concat),
     # Dispatch.ALL_SLICED_TO_TRIPLET_ALL: DispatchSpec(dispatch_shard_all_args_mod, collect_triplet_concat),
 }
 
