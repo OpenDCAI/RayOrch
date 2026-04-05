@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# Heavy / optional runtime deps for local experiments
+torch
+
+# Test and release tooling
+pytest
+build
+twine
