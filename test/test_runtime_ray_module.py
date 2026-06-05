@@ -37,9 +37,8 @@ class RuntimePdf2ImgOp:
             inputs=("pdf", "meta"),
             outputs=("images", "meta"),
             lineage=self.lineage,
-            mutates=("meta",),
         )
-        return out, bad, self.lineage.trace(out.path_ids[0]), list(self.lineage.mutations)
+        return out, bad, self.lineage.trace(out.path_ids[0])
 
 
 def test_runtime_rowwise_executes_inside_ray_module_actor() -> None:
@@ -54,7 +53,7 @@ def test_runtime_rowwise_executes_inside_ray_module_actor() -> None:
             dataset="ray-runtime-test",
         )
 
-        out, bad, trace, mutations = module(batch)
+        out, bad, trace = module(batch)
 
         assert out.columns["images"] == [
             ["img<paper0.pdf:0>", "img<paper0.pdf:1>"],
@@ -64,10 +63,6 @@ def test_runtime_rowwise_executes_inside_ray_module_actor() -> None:
         assert [record.values["pdf"] for record in bad] == ["corrupt.pdf"]
         assert bad[0].op == "pdf2img"
         assert trace == ["pdf2img"]
-        assert [(op, port) for _, op, port in mutations] == [
-            ("pdf2img", "meta"),
-            ("pdf2img", "meta"),
-        ]
     finally:
         _cleanup(module)
         if ray.is_initialized():

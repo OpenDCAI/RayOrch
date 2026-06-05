@@ -94,7 +94,6 @@ def test_flash_mineru_shaped_dummy_pipeline_quarantines_bad_pdf() -> None:
         inputs=("pdf", "meta"),
         outputs=("images", "meta"),
         lineage=lineage,
-        mutates=("meta",),
     )
     b2, more_bad = run_rowwise(
         layout,
@@ -103,7 +102,6 @@ def test_flash_mineru_shaped_dummy_pipeline_quarantines_bad_pdf() -> None:
         inputs=("images", "meta"),
         outputs=("blocks", "meta"),
         lineage=lineage,
-        mutates=("meta",),
     )
     b3, more_bad2 = run_rowwise(
         ocr,
@@ -112,7 +110,6 @@ def test_flash_mineru_shaped_dummy_pipeline_quarantines_bad_pdf() -> None:
         inputs=("blocks", "meta"),
         outputs=("text", "meta"),
         lineage=lineage,
-        mutates=("meta",),
     )
     b4, more_bad3 = run_rowwise(
         convert,
@@ -130,11 +127,3 @@ def test_flash_mineru_shaped_dummy_pipeline_quarantines_bad_pdf() -> None:
         "paper2.md pages=2 blocks=2",
     ]
     assert lineage.trace(b4.path_ids[0]) == ["pdf2img", "layout", "ocr", "convert"]
-    assert [(op, port) for _, op, port in lineage.mutations] == [
-        ("pdf2img", "meta"),
-        ("pdf2img", "meta"),
-        ("layout", "meta"),
-        ("layout", "meta"),
-        ("ocr", "meta"),
-        ("ocr", "meta"),
-    ]

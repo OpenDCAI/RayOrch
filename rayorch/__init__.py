@@ -8,16 +8,11 @@ from .dispatch_mode import (
 from .ray_module import RayModule
 
 RayModuleFuture = RayModule.RayModuleFuture
-from .dag_pipeline import (
-    DagNode,
-    DagPipeline,
-    DagPipelineExecutor,
-    PipeRef,
-    PipelineExecutor,
-)
-from .dag_new_pipeline import (
+from .dag import (
     Pipeline,
+    DagPipeline,
     DagPipeline as DagNewPipeline,
+    PipeRef,
     PipeRef as DagNewPipeRef,
     Executor,
     SequentialExecutor,
@@ -30,6 +25,13 @@ from .runtime import (
     LineageStore,
     MicroBatch,
     QuarantineRecord,
+    RuntimeNodeSpec,
+    RuntimeResult,
+    RuntimeDagExecutor,
+    RuntimeRayModule,
+    collect_runtime_results,
+    dispatch_microbatch_shard_contiguous,
+    merge_runtime_results,
     run_rowwise,
 )
 
@@ -46,9 +48,7 @@ __all__ = [
     # Main RayModule
     'RayModule',
     'RayModuleFuture',
-    'DagNode',
     'DagPipeline',
-    'DagPipelineExecutor',
     'Pipeline',
     'DagNewPipeline',
     'DagNewPipeRef',
@@ -56,13 +56,19 @@ __all__ = [
     'SequentialExecutor',
     'DagExecutor',
     'OverlappedPipeline',
-    'PipelineExecutor',
     'PipeRef',
     'BadRecordError',
     'LineageStore',
     'MicroBatch',
     'QuarantineRecord',
+    'RuntimeNodeSpec',
+    'RuntimeResult',
+    'RuntimeDagExecutor',
+    'merge_runtime_results',
     'run_rowwise',
+    'RuntimeRayModule',
+    'collect_runtime_results',
+    'dispatch_microbatch_shard_contiguous',
 ]
 
 def hello():

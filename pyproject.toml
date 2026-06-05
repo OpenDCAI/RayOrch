@@ -33,7 +33,9 @@ Github = "https://github.com/OpenDCAI/RayOrch"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["rayorch"]  # 显式指定主包
+
+[tool.setuptools.packages.find]
+include = ["rayorch*"]
 
 
 [tool.setuptools.dynamic]
