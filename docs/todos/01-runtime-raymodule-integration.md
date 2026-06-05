@@ -19,7 +19,7 @@ RayModule
 Add a runtime-aware wrapper or adapter:
 
 ```text
-RuntimeModule / RuntimeRayModule
+RuntimeRayModule
   wraps user op
   owns runtime spec
   internally uses RayModule

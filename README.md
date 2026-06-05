@@ -20,7 +20,8 @@ pip install -r requirements-dev.txt
 - `RayModule`: wraps an operator class into Ray actors with optional replica
   dispatch and collect.
 - `OverlappedPipeline`: graphless microbatch overlap with backpressure.
-- `DagPipeline` / `DagPipelineExecutor`: explicit dependency DAG scheduling.
+- `DagPipeline` / `DagExecutor`: symbolic multi-input/multi-output DAG
+  scheduling.
 
 ## Minimal Example
 

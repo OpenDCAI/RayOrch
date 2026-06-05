@@ -11,9 +11,9 @@ Runtime should produce deltas:
 ```text
 paths
 row_path updates
-mutations
 quarantined records
 future parent_edges
+future optional mutation events
 ```
 
 Executor or supervisor should commit those deltas to a sink:
