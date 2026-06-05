@@ -25,6 +25,13 @@ from .dag_new_pipeline import (
 )
 from .overlapped_pipeline import OverlappedPipeline
 from .env_registry import EnvRegistry
+from .runtime import (
+    BadRecordError,
+    LineageStore,
+    MicroBatch,
+    QuarantineRecord,
+    run_rowwise,
+)
 
 
 
@@ -51,6 +58,11 @@ __all__ = [
     'OverlappedPipeline',
     'PipelineExecutor',
     'PipeRef',
+    'BadRecordError',
+    'LineageStore',
+    'MicroBatch',
+    'QuarantineRecord',
+    'run_rowwise',
 ]
 
 def hello():
