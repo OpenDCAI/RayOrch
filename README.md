@@ -22,6 +22,11 @@ pip install -r requirements-dev.txt
 - `OverlappedPipeline`: graphless microbatch overlap with backpressure.
 - `DagPipeline` / `DagExecutor`: symbolic multi-input/multi-output DAG
   scheduling.
+- `RuntimeRayModule` / `RuntimeDagExecutor`: row-level fault isolation,
+  lineage, Ray replicas, and overlapped microbatch execution.
+
+Runtime MVP usage and current limitations are documented in
+[`docs/runtime_mvp.md`](docs/runtime_mvp.md).
 
 ## Minimal Example
 
@@ -46,6 +51,20 @@ class Pipe(OverlappedPipeline):
 
 pipe = Pipe()
 print(pipe([1, 2, 3]))  # [3, 4, 5]
+```
+
+## Runtime Tests
+
+Fast runtime correctness and overlap tests:
+
+```bash
+pytest test/test_runtime_correctness.py test/test_runtime_overlap.py
+```
+
+Long performance regressions are skipped by default. Run them explicitly with:
+
+```bash
+pytest --runslow -s test/test_runtime_benchmark_dummy.py
 ```
 
 ## License
