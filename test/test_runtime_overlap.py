@@ -69,7 +69,7 @@ def test_runtime_executor_uses_ray_replicas() -> None:
     try:
         source = MicroBatch.source({"x": list(range(16))}, dataset="replica-sleep")
         start = time.perf_counter()
-        result = RuntimeDagExecutor().run(pipe, source)
+        result = RuntimeDagExecutor(pipe).run(source)
         elapsed = time.perf_counter() - start
 
         assert result.batch.columns["y"] == [value + 1 for value in range(16)]
@@ -91,15 +91,15 @@ def test_runtime_executor_overlaps_microbatches_like_dag_executor() -> None:
         ]
 
         start = time.perf_counter()
-        sequential = RuntimeDagExecutor(max_batches_inflight=1).run(
-            runtime_pipe, runtime_batches
-        )
+        sequential = RuntimeDagExecutor(
+            runtime_pipe, max_batches_inflight=1
+        ).run(runtime_batches)
         sequential_time = time.perf_counter() - start
 
         start = time.perf_counter()
-        overlapped = RuntimeDagExecutor(max_batches_inflight=4).run(
-            runtime_pipe, runtime_batches
-        )
+        overlapped = RuntimeDagExecutor(
+            runtime_pipe, max_batches_inflight=4
+        ).run(runtime_batches)
         runtime_time = time.perf_counter() - start
 
         start = time.perf_counter()

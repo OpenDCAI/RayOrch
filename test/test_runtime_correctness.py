@@ -166,7 +166,7 @@ def test_runtime_dag_executor_runs_flash_mineru_like_pipeline() -> None:
             dataset="runtime-dag-flash-mineru",
         )
 
-        result = RuntimeDagExecutor().run(pipe, source)
+        result = RuntimeDagExecutor(pipe).run(source)
 
         assert len(result.batch) == 15
         assert result.batch.columns["markdown"][0] == "dag_0.md pages=2 blocks=2"
@@ -219,7 +219,7 @@ def test_runtime_dag_executor_localizes_errors_with_batches_inflight() -> None:
             ),
         ]
 
-        results = RuntimeDagExecutor(max_batches_inflight=4).run(pipe, batches)
+        results = RuntimeDagExecutor(pipe, max_batches_inflight=4).run(batches)
 
         assert [len(result.batch) for result in results] == [4, 3, 3, 2]
         assert [len(result.quarantined) for result in results] == [0, 1, 1, 2]
@@ -238,6 +238,51 @@ def test_runtime_dag_executor_localizes_errors_with_batches_inflight() -> None:
     finally:
         cleanup_pipeline(pipe)
         ray.shutdown()
+
+
+def test_runtime_dag_executor_wraps_column_data_into_microbatches() -> None:
+    ray.init(ignore_reinit_error=True, num_cpus=16)
+    pipe = RuntimeMineruPipe()
+    try:
+        pdfs = [f"column_{i}.pdf" for i in range(10)]
+        meta = [{"name": f"column_{i}"} for i in range(10)]
+
+        results = RuntimeDagExecutor(
+            pipe,
+            batch_size=4,
+            max_batches_inflight=3,
+            dataset="column-dataset",
+        ).run(pdf=pdfs, meta=meta)
+
+        assert isinstance(results, list)
+        assert [len(result.batch) for result in results] == [4, 4, 2]
+        assert [
+            row_id
+            for result in results
+            for row_id in result.batch.row_ids
+        ] == [f"column-dataset:{index}" for index in range(10)]
+        assert [
+            markdown
+            for result in results
+            for markdown in result.batch.columns["markdown"]
+        ] == [f"column_{index}.md pages=2 blocks=2" for index in range(10)]
+    finally:
+        cleanup_pipeline(pipe)
+        ray.shutdown()
+
+
+def test_runtime_dag_executor_rejects_invalid_column_data() -> None:
+    pipe = RuntimeMineruPipe()
+    try:
+        with pytest.raises(ValueError, match="batch_size is required"):
+            RuntimeDagExecutor(pipe).run(pdf=["a.pdf"], meta=[{"name": "a"}])
+
+        with pytest.raises(ValueError, match="column lengths must match"):
+            RuntimeDagExecutor(pipe, batch_size=2).run(
+                {"pdf": ["a.pdf", "b.pdf"], "meta": [{"name": "a"}]}
+            )
+    finally:
+        cleanup_pipeline(pipe)
 
 
 def test_runtime_module_handles_varied_microbatch_sizes() -> None:

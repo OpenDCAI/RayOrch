@@ -92,42 +92,39 @@ source = MicroBatch.source(
     dataset="papers",
 )
 
-result = RuntimeDagExecutor().run(PdfPipeline(), source)
+result = RuntimeDagExecutor(PdfPipeline()).run(source)
 
 print(result.batch.columns["markdown"])
 print(result.quarantined)
 ```
 
-## Pipeline-Level Overlap
+## Run Column Data
 
-Pass multiple source microbatches and set `max_batches_inflight`:
+For normal dataset-style usage, pass aligned input columns and let the executor
+split them into microbatches:
 
 ```python
-batches = [
-    MicroBatch.source(
-        {
-            "pdf": [f"paper-{batch_index}-{i}.pdf" for i in range(8)],
-            "meta": [
-                {"name": f"paper-{batch_index}-{i}"}
-                for i in range(8)
-            ],
-        },
-        dataset=f"papers-{batch_index}",
-    )
-    for batch_index in range(4)
-]
+pdfs = [f"paper-{i}.pdf" for i in range(32)]
+meta = [{"name": f"paper-{i}"} for i in range(32)]
 
-results = RuntimeDagExecutor(max_batches_inflight=4).run(
+results = RuntimeDagExecutor(
     PdfPipeline(),
-    batches,
-)
+    batch_size=8,
+    max_batches_inflight=4,
+    dataset="papers",
+).run(pdf=pdfs, meta=meta)
 ```
+
+`results` contains one `RuntimeResult` per generated microbatch. Row ids remain
+global within the dataset, for example `papers:0`, `papers:1`, ...
+
+## Pipeline-Level Overlap
 
 There are two independent concurrency controls:
 
 - `RuntimeRayModule(replicas=N)`: actor replicas inside one stage.
-- `RuntimeDagExecutor(max_batches_inflight=N)`: microbatches concurrently moving
-  through the whole pipeline.
+- `RuntimeDagExecutor(..., max_batches_inflight=N)`: microbatches concurrently
+  moving through the whole pipeline.
 
 `RuntimeRayModule(max_inflight=N)` limits concurrent submissions to that DAG
 node.

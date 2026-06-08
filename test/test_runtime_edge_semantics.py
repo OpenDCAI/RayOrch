@@ -77,7 +77,7 @@ def test_all_bad_microbatch_flows_as_empty_through_downstream_stage() -> None:
             dataset="all-bad",
         )
 
-        result = RuntimeDagExecutor(max_batches_inflight=2).run(pipe, source)
+        result = RuntimeDagExecutor(pipe, max_batches_inflight=2).run(source)
 
         assert len(result.batch) == 0
         assert result.batch.columns["z"] == []
@@ -109,7 +109,7 @@ def test_bad_record_without_index_uses_split_and_retry() -> None:
             dataset="split-retry",
         )
 
-        result = RuntimeDagExecutor().run(pipe, source)
+        result = RuntimeDagExecutor(pipe).run(source)
 
         assert result.batch.columns["y"] == ["split-ok:a", "split-ok:b", "split-ok:c"]
         assert [record.values["x"] for record in result.quarantined] == ["bad"]
@@ -140,7 +140,7 @@ def test_normal_exception_uses_split_and_retry() -> None:
             dataset="normal-exception",
         )
 
-        result = RuntimeDagExecutor().run(pipe, source)
+        result = RuntimeDagExecutor(pipe).run(source)
 
         assert result.batch.columns["y"] == ["exc-ok:a", "exc-ok:b"]
         assert [record.values["x"] for record in result.quarantined] == ["boom"]
@@ -171,7 +171,7 @@ def test_multiple_bad_rows_in_one_stage_are_all_quarantined() -> None:
             dataset="multi-bad",
         )
 
-        result = RuntimeDagExecutor().run(pipe, source)
+        result = RuntimeDagExecutor(pipe).run(source)
 
         assert result.batch.columns["y"] == ["split-ok:a", "split-ok:b"]
         assert [record.values["x"] for record in result.quarantined] == [
@@ -203,7 +203,7 @@ def test_reusing_same_runtime_module_uses_per_node_runtime_spec() -> None:
     try:
         source = MicroBatch.source({"x": [1, 2, 3]}, dataset="reuse-module")
 
-        result = RuntimeDagExecutor().run(pipe, source)
+        result = RuntimeDagExecutor(pipe).run(source)
 
         assert result.batch.columns["z"] == [3, 4, 5]
         assert trace_path(result.paths, result.batch.path_ids[0]) == ["add", "add_1"]
@@ -238,7 +238,7 @@ def test_fanout_allows_multiple_downstream_consumers() -> None:
     try:
         source = MicroBatch.source({"x": [1, 2]}, dataset="fanout")
 
-        result = RuntimeDagExecutor().run(pipe, source)
+        result = RuntimeDagExecutor(pipe).run(source)
 
         assert result.batch.columns["left"] == [3, 4]
         assert trace_path(result.paths, result.batch.path_ids[0]) == ["add", "left"]
@@ -274,7 +274,7 @@ def test_fanin_rejects_diverged_paths_in_mvp() -> None:
         source = MicroBatch.source({"x": [1, 2]}, dataset="fanin")
 
         with pytest.raises(ValueError, match="aligned path_ids"):
-            RuntimeDagExecutor().run(pipe, source)
+            RuntimeDagExecutor(pipe).run(source)
     finally:
         cleanup_pipeline(pipe)
         ray.shutdown()

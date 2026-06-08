@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Sequence
+from typing import Any, Deque, Dict, List, Mapping, Sequence
 
 import ray
 
@@ -13,33 +13,63 @@ from .ray_module import RuntimeRayModule
 
 
 class RuntimeDagExecutor:
-    """Run ``RuntimeRayModule`` DAGs over one or more ``MicroBatch`` objects."""
+    """Run one ``RuntimeRayModule`` DAG over microbatches or column data."""
 
-    def __init__(self, *, max_batches_inflight: int = 1) -> None:
-        self.max_batches_inflight = max(1, int(max_batches_inflight))
-
-    def run(
+    def __init__(
         self,
         pipeline: DagPipeline,
-        batches: MicroBatch | Sequence[MicroBatch],
-    ) -> RuntimeResult | List[RuntimeResult]:
+        *,
+        batch_size: int | None = None,
+        max_batches_inflight: int = 1,
+        dataset: str = "source",
+    ) -> None:
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         if pipeline._compiled is None:
             pipeline.compile()
         assert pipeline._compiled is not None
-        return self.execute(pipeline._compiled, batches)
+        self.graph = pipeline._compiled
+        self.batch_size = batch_size
+        self.max_batches_inflight = max(1, int(max_batches_inflight))
+        self.dataset = dataset
 
-    def execute(
+    def run(
         self,
-        graph: CompiledGraph,
-        batches: MicroBatch | Sequence[MicroBatch],
+        data: MicroBatch | Sequence[MicroBatch] | Mapping[str, Sequence[Any]] | None = None,
+        **columns: Sequence[Any],
     ) -> RuntimeResult | List[RuntimeResult]:
-        if isinstance(batches, MicroBatch):
-            return _RuntimeScheduler(graph, [batches], 1).run()[0]
+        if columns:
+            if data is not None:
+                raise ValueError("pass either a data mapping or keyword columns, not both")
+            data = columns
+        if data is None:
+            raise ValueError("RuntimeDagExecutor.run() requires input data")
+
+        if isinstance(data, MicroBatch):
+            return _RuntimeScheduler(self.graph, [data], 1).run()[0]
+
+        if isinstance(data, Mapping):
+            batches = _microbatches_from_columns(
+                data,
+                batch_size=self._require_batch_size(),
+                dataset=self.dataset,
+            )
+            return _RuntimeScheduler(
+                self.graph,
+                batches,
+                self.max_batches_inflight,
+            ).run()
+
         return _RuntimeScheduler(
-            graph,
-            list(batches),
+            self.graph,
+            list(data),
             self.max_batches_inflight,
         ).run()
+
+    def _require_batch_size(self) -> int:
+        if self.batch_size is None:
+            raise ValueError("batch_size is required when running column data")
+        return self.batch_size
 
 
 @dataclass
@@ -267,6 +297,36 @@ class _RuntimeScheduler:
             paths=accum.paths,
             row_path=accum.row_path,
         )
+
+
+def _microbatches_from_columns(
+    columns: Mapping[str, Sequence[Any]],
+    *,
+    batch_size: int,
+    dataset: str,
+) -> List[MicroBatch]:
+    if not columns:
+        raise ValueError("column data must contain at least one column")
+
+    materialized = {name: list(values) for name, values in columns.items()}
+    sizes = {len(values) for values in materialized.values()}
+    if len(sizes) != 1:
+        lengths = {name: len(values) for name, values in materialized.items()}
+        raise ValueError(f"column lengths must match: {lengths}")
+
+    total = sizes.pop()
+    batches: List[MicroBatch] = []
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        row_ids = [f"{dataset}:{index}" for index in range(start, end)]
+        batches.append(
+            MicroBatch(
+                {name: values[start:end] for name, values in materialized.items()},
+                row_ids,
+                ["source"] * len(row_ids),
+            )
+        )
+    return batches
 
 
 def _validate_source(graph: CompiledGraph, batch: MicroBatch) -> None:

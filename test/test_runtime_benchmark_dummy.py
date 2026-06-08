@@ -14,8 +14,6 @@ from rayorch import (
     RuntimeDagExecutor,
     RuntimeRayModule,
 )
-from rayorch.runtime import MicroBatch
-
 from test.runtime_test_utils import cleanup_modules
 
 
@@ -143,23 +141,17 @@ def test_flash_mineru_like_runtime_matches_generic_dag_executor() -> None:
     try:
         pdf_batches = []
         meta_batches = []
-        runtime_batches = []
+        runtime_pdfs = []
+        runtime_meta = []
         for batch_index in range(5):
             pdfs = [f"flash_{batch_index}_{i}.pdf" for i in range(8)]
             meta = [{"name": f"flash_{batch_index}_{i}"} for i in range(8)]
             pdf_batches.append(pdfs)
             meta_batches.append(meta)
-            runtime_batches.append(
-                MicroBatch.source(
-                    {
-                        "pdf": pdfs,
-                        "meta": [
-                            {"name": f"flash_{batch_index}_{i}"}
-                            for i in range(8)
-                        ],
-                    },
-                    dataset=f"flash-bench-{batch_index}",
-                )
+            runtime_pdfs.extend(pdfs)
+            runtime_meta.extend(
+                {"name": f"flash_{batch_index}_{i}"}
+                for i in range(8)
             )
 
         start = time.perf_counter()
@@ -169,9 +161,12 @@ def test_flash_mineru_like_runtime_matches_generic_dag_executor() -> None:
         generic_time = time.perf_counter() - start
 
         start = time.perf_counter()
-        runtime_results = RuntimeDagExecutor(max_batches_inflight=5).run(
-            runtime_pipe, runtime_batches
-        )
+        runtime_results = RuntimeDagExecutor(
+            runtime_pipe,
+            batch_size=8,
+            max_batches_inflight=5,
+            dataset="flash-bench",
+        ).run(pdf=runtime_pdfs, meta=runtime_meta)
         runtime_time = time.perf_counter() - start
 
         runtime_output = [
@@ -179,6 +174,11 @@ def test_flash_mineru_like_runtime_matches_generic_dag_executor() -> None:
         ]
         assert runtime_output == generic_output
         assert sum(len(batch) for batch in runtime_output) == 40
+        assert [
+            row_id
+            for result in runtime_results
+            for row_id in result.batch.row_ids
+        ] == [f"flash-bench:{index}" for index in range(40)]
         assert runtime_time < generic_time * 1.25 + 1.0
         assert generic_time < runtime_time * 1.25 + 1.0
         print(
