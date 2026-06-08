@@ -55,10 +55,10 @@ print(pipe([1, 2, 3]))  # [3, 4, 5]
 
 ## Runtime Tests
 
-Fast runtime correctness and overlap tests:
+Fast runtime correctness, overlap, and edge-semantics tests:
 
 ```bash
-pytest test/test_runtime_correctness.py test/test_runtime_overlap.py
+pytest test/test_runtime_correctness.py test/test_runtime_overlap.py test/test_runtime_edge_semantics.py
 ```
 
 Long performance regressions are skipped by default. Run them explicitly with:

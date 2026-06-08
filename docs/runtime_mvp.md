@@ -158,7 +158,7 @@ error. Healthy rows continue through downstream stages.
 Default runtime tests exclude long benchmarks:
 
 ```bash
-pytest test/test_runtime_correctness.py test/test_runtime_overlap.py
+pytest test/test_runtime_correctness.py test/test_runtime_overlap.py test/test_runtime_edge_semantics.py
 ```
 
 Run the Flash-MinerU-like 40-item benchmark explicitly:
