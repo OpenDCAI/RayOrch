@@ -4,15 +4,25 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import ray
 
 from .graph import CompiledGraph, NodeSpec, PipeRef
 
+if TYPE_CHECKING:
+    from .pipeline import Pipeline
+
 
 class Executor(ABC):
     """Strategy for running a compiled ``Pipeline``."""
+
+    def __init__(self, pipeline: Pipeline) -> None:
+        if pipeline._compiled is None:
+            pipeline.compile()
+        assert pipeline._compiled is not None
+        self.pipeline = pipeline
+        self.graph = pipeline._compiled
 
     @abstractmethod
     def execute(
@@ -24,11 +34,11 @@ class Executor(ABC):
 
     def run(
         self,
-        pipeline: Any,
         *inputs: Sequence[Any],
         **named_inputs: Sequence[Any],
     ) -> List[Any]:
-        return pipeline.run(*inputs, executor=self, **named_inputs)
+        columns = self.pipeline._resolve_inputs(inputs, named_inputs)
+        return self.execute(self.graph, columns)
 
 
 def validate_output(spec: NodeSpec, value: Any) -> None:
@@ -117,25 +127,46 @@ class SequentialExecutor(Executor):
 
 @dataclass
 class _PendingResult:
+    """Ray refs and reducer needed to finish one submitted node call."""
+
     refs: List[ray.ObjectRef]
     collect_fn: Optional[Any]
 
 
 @dataclass
 class _NodeStatus:
+    """Per-batch state of one DAG node: waiting -> ready -> running -> done."""
+
     phase: str = "waiting"
     pending: Optional[_PendingResult] = None
 
 
 @dataclass
 class _InflightCall:
+    """Identity of one logical node call, which may own multiple replica refs."""
+
     batch_idx: int
     node_name: str
     refs: List[ray.ObjectRef]
 
 
-class _Scheduler:
-    """``ray.wait``-driven event loop for ``DagExecutor``."""
+class _DagExecutorScheduler:
+    """Run many batches through a compiled DAG with pipeline overlap.
+
+    The scheduler is deliberately separate from ``DagExecutor``: the executor
+    owns the public API, while this class owns the mutable state for one run.
+
+    It enforces two independent limits:
+
+    - ``max_batches_inflight`` bounds how many whole batches may be active.
+    - ``NodeSpec.max_inflight`` bounds concurrent calls to each DAG node.
+
+    For every active batch, nodes move through:
+    ``waiting -> ready -> running -> done``. Completing a node may make its
+    consumers ready. ``ray.wait`` lets whichever node finishes first advance
+    the DAG, so different batches and stages can overlap without blocking in
+    topological order.
+    """
 
     def __init__(
         self,
@@ -147,6 +178,9 @@ class _Scheduler:
         self._max_inflight = max(1, int(max_batches_inflight))
         self._n_batches = validate_columns(graph, input_columns)
 
+        # Each batch has an independent value context and node state machine.
+        # Values are stored as tuples so a PipeRef can uniformly select an
+        # output slot from both single-output and multi-output nodes.
         self._ctx: List[Dict[str, tuple]] = [
             {key: (input_columns[key][i],) for key in graph.input_keys}
             for i in range(self._n_batches)
@@ -157,12 +191,18 @@ class _Scheduler:
         ]
         self._results: List[Any] = [None] * self._n_batches
 
+        # Ready queues are per node. This makes each node's max_inflight a
+        # local capacity constraint instead of one global task limit.
         self._ready_q: Dict[str, Deque[int]] = {n: deque() for n in graph.topo_order}
         self._node_inflight: Dict[str, int] = {n: 0 for n in graph.topo_order}
 
+        # ``_live`` counts admitted, unfinished batches. New batches enter only
+        # when this set is below the pipeline-level inflight limit.
         self._live: set[int] = set()
         self._next_batch = 0
 
+        # One logical module call can return one ref per replica. Mapping every
+        # ref back to its call lets completion wait for the full replica group.
         self._ref_owner: Dict[ray.ObjectRef, _InflightCall] = {}
         self._outstanding: set[ray.ObjectRef] = set()
 
@@ -172,6 +212,8 @@ class _Scheduler:
         self._input_key_set: frozenset[str] = frozenset(graph.input_keys)
 
     def run(self) -> List[Any]:
+        # Seed root nodes, submit all currently possible work, then react to
+        # completions until no Ray task remains.
         self._admit_batches()
         self._dispatch()
         while self._outstanding:
@@ -182,6 +224,7 @@ class _Scheduler:
         return self._results
 
     def _drain_completed(self) -> List[_InflightCall]:
+        """Block for one ref, then cheaply drain refs already completed."""
         ready, _ = ray.wait(list(self._outstanding), num_returns=1)
         self._outstanding.discard(ready[0])
         if self._outstanding:
@@ -199,12 +242,14 @@ class _Scheduler:
             call = self._ref_owner.pop(ref, None)
             if call is None:
                 continue
+            # A sharded call is complete only after every replica ref finishes.
             if any(pending_ref in self._ref_owner for pending_ref in call.refs):
                 continue
             calls.append(call)
         return calls
 
     def _admit_batches(self) -> None:
+        """Admit batches up to the global limit and enqueue their root nodes."""
         while (
             self._next_batch < self._n_batches
             and len(self._live) < self._max_inflight
@@ -224,6 +269,7 @@ class _Scheduler:
         self._ready_q[name].append(bi)
 
     def _dispatch(self) -> None:
+        """Submit ready nodes while their per-node capacity allows."""
         progressed = True
         while progressed:
             progressed = False
@@ -238,6 +284,7 @@ class _Scheduler:
                     progressed = True
 
     def _submit(self, bi: int, spec: NodeSpec) -> None:
+        """Resolve PipeRefs from the batch context and submit one node call."""
         ctx = self._ctx[bi]
         args = tuple(ctx[ref.node][ref.index] for ref in spec.args)
         kw = {k: ctx[ref.node][ref.index] for k, ref in spec.kw_args.items()}
@@ -271,6 +318,7 @@ class _Scheduler:
             self._outstanding.add(ref)
 
     def _on_complete(self, call: _InflightCall) -> None:
+        """Collect one logical call, publish outputs, and unlock consumers."""
         bi, name = call.batch_idx, call.node_name
         spec = self._graph.nodes[name]
         st = self._status[bi][name]
@@ -304,6 +352,7 @@ class _Scheduler:
             self._live.discard(bi)
 
     def _release_upstream(self, bi: int, name: str) -> None:
+        """Drop intermediates after every consumer has finished using them."""
         for dep in self._graph.deps[name]:
             if dep in self._output_nodes or dep in self._input_key_set:
                 continue
@@ -328,7 +377,13 @@ class _Scheduler:
 class DagExecutor(Executor):
     """``ray.wait``-driven overlapped executor with per-node inflight caps."""
 
-    def __init__(self, *, max_batches_inflight: int = 4) -> None:
+    def __init__(
+        self,
+        pipeline: Pipeline,
+        *,
+        max_batches_inflight: int = 4,
+    ) -> None:
+        super().__init__(pipeline)
         self.max_batches_inflight = max(1, int(max_batches_inflight))
 
     def execute(
@@ -336,4 +391,8 @@ class DagExecutor(Executor):
         graph: CompiledGraph,
         columns: Dict[str, Sequence[Any]],
     ) -> List[Any]:
-        return _Scheduler(graph, columns, self.max_batches_inflight).run()
+        return _DagExecutorScheduler(
+            graph,
+            columns,
+            self.max_batches_inflight,
+        ).run()

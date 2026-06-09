@@ -17,7 +17,7 @@ from typing import List
 import ray
 
 from rayorch import Dispatch, RayModule
-from rayorch.dag_new_pipeline import DagExecutor, DagPipeline
+from rayorch.dag_new_pipeline import DagExecutor, DagPipeline, SequentialExecutor
 
 
 def _ray_init_local() -> None:
@@ -219,8 +219,8 @@ def test_mineru_shaped_serial_matches_dag_executor() -> None:
         pdfs = [f"/tmp/mineru_test_{i}.pdf" for i in range(5)]
         batches = _chunked(pdfs, batch_size=2)
 
-        serial = pipe(batches)
-        dag = DagExecutor(max_batches_inflight=3).run(pipe, batches)
+        serial = SequentialExecutor(pipe).run(batches)
+        dag = DagExecutor(pipe, max_batches_inflight=3).run(batches)
 
         assert serial == dag
         assert _flatten(serial) == [
@@ -237,17 +237,16 @@ def test_mineru_shaped_serial_matches_dag_executor() -> None:
             ray.shutdown()
 
 
-def test_mineru_shaped_run_with_explicit_sequential_executor() -> None:
-    from rayorch.dag_new_pipeline import SequentialExecutor
-
+def test_mineru_shaped_sequential_executor_is_reusable() -> None:
     _ray_init_local()
     pipe: MineruShapedDummyPipeline | None = None
     try:
         pipe = MineruShapedDummyPipeline(replicas=1)
         batches = [["/x/a.pdf"], ["/x/b.pdf"]]
-        out_default = pipe(batches)
-        out_explicit = pipe.run(batches, executor=SequentialExecutor())
-        assert out_default == out_explicit
+        executor = SequentialExecutor(pipe)
+        first = executor.run(batches)
+        second = executor.run(batches)
+        assert first == second
     finally:
         if pipe is not None:
             _cleanup_modules(pipe.pdf2img, pipe.layout, pipe.ocr, pipe.img2md)

@@ -9,13 +9,20 @@ from typing import Any, Dict, List, Mapping, Tuple
 
 from ..ray_module import RayModule
 from .graph import CompiledGraph, NodeSpec, PipeRef
+from .schema import (
+    bind_typevars,
+    input_types,
+    return_types,
+    substitute_typevars,
+    type_name,
+    types_compatible,
+)
 
 
 @dataclass(frozen=True)
 class _CallHint:
-    """AST-derived names for one ``self.<module>(...)`` call in forward()."""
+    """AST-derived output names for one ``self.<module>(...)`` call."""
 
-    input_names: Tuple[str, ...] = ()
     output_names: Tuple[str, ...] = ()
 
 
@@ -23,7 +30,8 @@ def _expect_ref(value: Any) -> PipeRef:
     if isinstance(value, PipeRef):
         return value
     raise TypeError(
-        "forward() arguments must be PipeRef values from upstream stages or inputs"
+        "pipeline operators can only consume symbolic values produced by "
+        "forward() inputs or upstream operators"
     )
 
 
@@ -77,16 +85,6 @@ def _call_attr_name(node: ast.AST) -> str | None:
     return None
 
 
-def _call_input_names(node: ast.Call) -> Tuple[str, ...]:
-    names: List[str] = []
-    for i, arg in enumerate(node.args):
-        names.append(_simple_name(arg) or f"arg{i}")
-    for kw in node.keywords:
-        if kw.arg is not None:
-            names.append(kw.arg)
-    return tuple(names)
-
-
 class _ForwardHintVisitor(ast.NodeVisitor):
     """Collect ``self.op(...)`` calls in the same order Python executes them."""
 
@@ -113,7 +111,6 @@ class _ForwardHintVisitor(ast.NodeVisitor):
             ordinal = self._seen.get(attr, 0)
             self._seen[attr] = ordinal + 1
             self.hints[(attr, ordinal)] = _CallHint(
-                input_names=_call_input_names(node),
                 output_names=self._assign_outputs.get(node, ()),
             )
 
@@ -175,6 +172,7 @@ class GraphTracer:
         self._name_count: Dict[str, int] = {}
         self._call_hints = dict(call_hints or {})
         self._call_count: Dict[str, int] = {}
+        self._inferred_input_types: Dict[str, Any] = {}
 
     def _unique_name(self, base: str) -> str:
         n = self._name_count.get(base, 0)
@@ -193,7 +191,7 @@ class GraphTracer:
         self._call_count[base_name] = ordinal + 1
 
         hint = self._call_hints.get((base_name, ordinal), _CallHint())
-        input_names = hint.input_names or _input_names(module, args, kw_args)
+        input_names = _input_names(module, args, kw_args)
         output_names = hint.output_names or tuple(
             f"{name}.out{i}" for i in range(module.num_outputs)
         )
@@ -203,6 +201,39 @@ class GraphTracer:
                 f"node '{name}' assigns {num_outputs} outputs in forward(), "
                 f"but module declares num_outputs={module.num_outputs}"
             )
+        node_input_types = input_types(module, args, kw_args)
+        all_refs = args + tuple(kw_args.values())
+        type_bindings: Dict[Any, Any] = {}
+        for input_name, ref, expected_type in zip(
+            input_names, all_refs, node_input_types
+        ):
+            actual_type = ref.value_type
+            if ref.node.startswith("__input__") and actual_type is Any:
+                inferred = self._inferred_input_types.get(ref.node, Any)
+                if inferred is Any:
+                    self._inferred_input_types[ref.node] = expected_type
+                    actual_type = expected_type
+                else:
+                    actual_type = inferred
+            bind_typevars(expected_type, actual_type, type_bindings)
+            if not types_compatible(actual_type, expected_type):
+                raise TypeError(
+                    f"type mismatch at node '{name}', input '{input_name}': "
+                    f"expected {type_name(expected_type)}, got "
+                    f"{type_name(actual_type)} from '{ref.node}'"
+                )
+
+        op_cls = getattr(module, "_user_op_cls", getattr(module, "_op_cls", None))
+        run_fn = getattr(op_cls, "run", None)
+        output_types = (
+            return_types(run_fn, num_outputs)
+            if run_fn is not None
+            else (Any,) * num_outputs
+        )
+        output_types = tuple(
+            substitute_typevars(value, type_bindings)
+            for value in output_types
+        )
 
         self._tape.append(NodeSpec(
             name=name,
@@ -213,21 +244,45 @@ class GraphTracer:
             num_outputs=num_outputs,
             input_names=input_names,
             output_names=output_names,
+            input_types=node_input_types,
+            output_types=output_types,
         ))
         return name, num_outputs
 
-    @staticmethod
-    def make_refs(node_name: str, num_outputs: int) -> PipeRef | Tuple[PipeRef, ...]:
+    def make_refs(
+        self,
+        node_name: str,
+        num_outputs: int,
+    ) -> PipeRef | Tuple[PipeRef, ...]:
+        output_types = self._tape[-1].output_types
         if num_outputs <= 1:
-            return PipeRef(node_name)
-        return tuple(PipeRef(node_name, i) for i in range(num_outputs))
+            return PipeRef(node_name, value_type=output_types[0])
+        return tuple(
+            PipeRef(node_name, i, output_types[i])
+            for i in range(num_outputs)
+        )
 
     def build(
         self,
         outputs: PipeRef | Tuple[PipeRef, ...],
         input_keys: Tuple[str, ...],
+        input_types: Mapping[str, Any] | None = None,
+        expected_output_types: Tuple[Any, ...] = (),
     ) -> CompiledGraph:
         graph_outputs = (outputs,) if isinstance(outputs, PipeRef) else tuple(outputs)
+        if expected_output_types:
+            if len(expected_output_types) != len(graph_outputs):
+                raise TypeError(
+                    "forward() return annotation does not match the number "
+                    "of pipeline outputs"
+                )
+            for ref, expected_type in zip(graph_outputs, expected_output_types):
+                if not types_compatible(ref.value_type, expected_type):
+                    raise TypeError(
+                        "pipeline output type mismatch: expected "
+                        f"{type_name(expected_type)}, got "
+                        f"{type_name(ref.value_type)} from '{ref.node}'"
+                    )
         input_key_set = set(input_keys)
         by_name = {n.name: n for n in self._tape}
         topo_order = tuple(n.name for n in self._tape)
@@ -251,6 +306,11 @@ class GraphTracer:
         for ref in graph_outputs:
             _validate_ref(ref, "<graph_output>", input_key_set, by_name)
 
+        resolved_input_types = dict(input_types or {})
+        for key, inferred_type in self._inferred_input_types.items():
+            if resolved_input_types.get(key, Any) is Any:
+                resolved_input_types[key] = inferred_type
+
         graph = CompiledGraph(
             nodes=by_name,
             topo_order=topo_order,
@@ -258,6 +318,8 @@ class GraphTracer:
             consumers={k: tuple(v) for k, v in consumers.items()},
             graph_outputs=graph_outputs,
             input_keys=input_keys,
+            input_types=resolved_input_types,
+            output_types=tuple(ref.value_type for ref in graph_outputs),
         )
         for name in graph.topo_order:
             _notify_compile_hook(graph.nodes[name])

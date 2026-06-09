@@ -8,7 +8,6 @@ from .dag import (
     DagPipeline,
     Executor,
     NodeSpec,
-    PipeRef,
     Pipeline,
     SequentialExecutor,
 )
@@ -19,7 +18,6 @@ __all__ = [
     "DagPipeline",
     "Executor",
     "NodeSpec",
-    "PipeRef",
     "Pipeline",
     "SequentialExecutor",
 ]

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
 import ray
 
 from rayorch import RayModule
-from rayorch.dag_new_pipeline import DagExecutor, DagPipeline, PipeRef
+from rayorch.dag_new_pipeline import DagExecutor, DagPipeline, SequentialExecutor
 
 
 def _cleanup_modules(*modules: RayModule) -> None:
@@ -34,7 +35,7 @@ class MultiInputPipe(DagPipeline):
         self.scale = RayModule(ScaleOp, replicas=1, max_inflight=2).pre_init()
         super().__init__()
 
-    def forward(self, a: PipeRef, b: PipeRef) -> PipeRef:
+    def forward(self, a: list[int], b: list[int]) -> list[int]:
         return self.scale(self.add(a, b))
 
 
@@ -51,18 +52,22 @@ def test_dag_new_pipeline_multi_root_inputs_and_file_output(tmp_path: Path):
         a_batches = [[1, 2, 3], [10, 20]]
         b_batches = [[4, 5, 6], [1, 2]]
 
-        # serial positional multi-root call
-        outputs_positional = pipe(a_batches, b_batches)
-        # serial keyword multi-root call
-        outputs_named = pipe(a=a_batches, b=b_batches)
+        assert pipe([1, 2], [3, 4]) == [12, 18]
+        assert pipe.run([1, 2], [3, 4]) == [12, 18]
+        assert pipe._compiled is None
+        assert inspect.signature(pipe) == inspect.signature(pipe.forward)
+        assert inspect.signature(pipe.run) == inspect.signature(pipe.forward)
+
+        outputs_positional = SequentialExecutor(pipe).run(a_batches, b_batches)
+        outputs_named = SequentialExecutor(pipe).run(a=a_batches, b=b_batches)
         expected = [[15, 21, 27], [33, 66]]
 
         assert outputs_positional == expected
         assert outputs_named == expected
 
         # overlapped via DagExecutor
-        dag = DagExecutor(max_batches_inflight=4)
-        outputs_dag = dag.run(pipe, a_batches, b_batches)
+        dag = DagExecutor(pipe, max_batches_inflight=4)
+        outputs_dag = dag.run(a_batches, b_batches)
         assert outputs_dag == expected
 
         out_file = tmp_path / "dag_new_multi_input_output.json"

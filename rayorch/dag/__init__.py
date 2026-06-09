@@ -1,6 +1,6 @@
 """Declarative DAG pipeline API."""
 from .executor import DagExecutor, Executor, SequentialExecutor
-from .graph import CompiledGraph, NodeSpec, PipeRef
+from .graph import CompiledGraph, NodeSpec
 from .pipeline import DagPipeline, Pipeline
 
 __all__ = [
@@ -9,7 +9,6 @@ __all__ = [
     "DagPipeline",
     "Executor",
     "NodeSpec",
-    "PipeRef",
     "Pipeline",
     "SequentialExecutor",
 ]
