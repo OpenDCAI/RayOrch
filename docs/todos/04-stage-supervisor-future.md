@@ -1,5 +1,8 @@
 # TODO: Optional Stage Supervisor
 
+See [`../runtime_module_lifecycle.md`](../runtime_module_lifecycle.md) for the
+current executor-owned Runtime lifecycle decision.
+
 ## Goal
 
 Preserve a future path for per-stage supervisor actors without forcing them into the MVP.
@@ -7,9 +10,9 @@ Preserve a future path for per-stage supervisor actors without forcing them into
 ## Current MVP Shape
 
 ```text
-DagExecutor(driver)
-  -> RayModule(driver object)
-      -> RunnerActor replicas
+RuntimeDagExecutor(driver)
+  -> RuntimeRayModule(logical stage)
+      -> RunnerActor replicas started by the executor
 ```
 
 This is good enough while the driver is not a bottleneck and retry logic is simple.
@@ -17,7 +20,7 @@ This is good enough while the driver is not a bottleneck and retry logic is simp
 ## Future Shape
 
 ```text
-DagExecutor(driver)
+RuntimeDagExecutor(driver)
   -> StageSupervisor actor
       -> RunnerActor replicas
 ```

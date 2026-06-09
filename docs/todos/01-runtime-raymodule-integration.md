@@ -1,12 +1,15 @@
 # TODO: Runtime and RayModule Integration
 
+Status: core adapter implemented; lifecycle direction recorded in
+[`../runtime_module_lifecycle.md`](../runtime_module_lifecycle.md).
+
 ## Goal
 
 Make the runtime semantics usable through the RayModule ecosystem without turning RayModule into a lineage-heavy abstraction.
 
-## Preferred Direction
+## Current Direction
 
-Keep RayModule as the physical layer:
+Keep `RayModule` as the lightweight eager product:
 
 ```text
 RayModule
@@ -16,13 +19,15 @@ RayModule
   max_inflight
 ```
 
-Add a runtime-aware wrapper or adapter:
+Let `RuntimeRayModule` reuse selected low-level machinery without inheriting
+the eager lifecycle:
 
 ```text
 RuntimeRayModule
   wraps user op
   owns runtime spec
-  internally uses RayModule
+  shares low-level actor machinery
+  defers physical startup to Runtime Executor
 ```
 
 ## Key Design

@@ -27,6 +27,9 @@ pip install -r requirements-dev.txt
 
 Runtime MVP usage and current limitations are documented in
 [`docs/runtime_mvp.md`](docs/runtime_mvp.md).
+The lifecycle and feature boundary between lightweight `RayModule` and
+executor-managed `RuntimeRayModule` is documented in
+[`docs/runtime_module_lifecycle.md`](docs/runtime_module_lifecycle.md).
 
 ## Minimal Example
 
@@ -55,16 +58,37 @@ print(pipe([1, 2, 3]))  # [3, 4, 5]
 
 ## Runtime Tests
 
-Fast runtime correctness, overlap, and edge-semantics tests:
+Fast compile and local semantics tests do not start Ray:
 
 ```bash
-pytest test/test_runtime_correctness.py test/test_runtime_overlap.py test/test_runtime_edge_semantics.py
+pytest test/runtime/unit
+```
+
+Runtime integration tests share one local Ray cluster per test module:
+
+```bash
+pytest test/runtime/integration
 ```
 
 Long performance regressions are skipped by default. Run them explicitly with:
 
 ```bash
-pytest --runslow -s test/test_runtime_benchmark_dummy.py
+pytest --runslow -s test/runtime/performance
+```
+
+Run the 512-PDF Flash-MinerU-style fault-isolation demo. Its default topology
+simulates four layout GPU workers, four OCR GPU workers, and four microbatches
+in flight:
+
+```bash
+python examples/runtime_flash_mineru_512.py
+```
+
+Replica counts, batch size, inflight limits, and dummy inference delay are
+available as command-line options:
+
+```bash
+python examples/runtime_flash_mineru_512.py --help
 ```
 
 ## License

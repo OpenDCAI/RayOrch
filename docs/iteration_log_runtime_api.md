@@ -10,11 +10,16 @@ The MVP runtime tracks operator-level path lineage:
 
 ```text
 row_id -> path_id
-path_id -> parent_path_id + op
+path_id -> parent_path_ids + op
 quarantine -> row_id + failed_op + previous_path + error
 ```
 
 It does not track object-level mutation lineage or field-level diffs.
+
+Runtime paths may now have multiple parents. Row-preserving DAG fan-in aligns
+required inputs by `row_id` and creates an internal join lineage node whenever
+the input path heads differ. Users still receive one opaque path ID per healthy
+record.
 
 ## Rationale
 

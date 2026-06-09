@@ -2,6 +2,11 @@
 
 Date: 2026-06-05
 
+> Updated by [`runtime_module_lifecycle.md`](runtime_module_lifecycle.md) on
+> 2026-06-09. `RayModule` remains the lightweight eager foundation, while
+> `RuntimeRayModule` now has a resource-free declaration lifecycle owned by
+> Runtime Executors.
+
 ## Context
 
 RayOrch already has a working performance path:
@@ -113,8 +118,10 @@ This should be optional, likely as a `SupervisedRayModule` or `RuntimeStage`, no
 
 ## Near-Term Path
 
-1. Keep RayModule as the physical actor/dispatch/collect layer.
-2. Put one Runtime instance inside each worker replica actor.
-3. Add MicroBatch-aware dispatch and RuntimeResult-aware collect.
-4. Let DagExecutor aggregate runtime outputs, quarantines, and lineage deltas.
-5. Keep the StageSupervisor boundary in mind, but do not implement it until actor-level retry or adaptive batching requires it.
+1. Keep `RayModule` as the lightweight eager actor/dispatch/collect foundation.
+2. Keep `RuntimeRayModule` declaration and `pre_init()` resource-free.
+3. Let Runtime Executors own actor startup, placement, and cleanup.
+4. Put row-level fault isolation inside each runtime worker replica.
+5. Let Runtime Executors aggregate outputs, quarantines, and lineage deltas.
+6. Keep the StageSupervisor boundary in mind, but introduce it only when
+   actor-level recovery, adaptive batching, or stage-local queues require it.

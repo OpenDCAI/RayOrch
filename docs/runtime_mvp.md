@@ -3,6 +3,9 @@
 The Runtime MVP adds row-level fault isolation and lineage to RayOrch DAG
 pipelines while keeping the regular `DagPipeline` compiler reusable.
 
+The lifecycle and product boundary between `RayModule` and `RuntimeRayModule`
+is defined in [`runtime_module_lifecycle.md`](runtime_module_lifecycle.md).
+
 ## Core Types
 
 - `MicroBatch`: row-aligned data columns plus internal `row_ids` and `path_ids`.
@@ -46,7 +49,7 @@ are isolated with split-and-retry until the failing row is found.
 ## Define A Runtime DAG
 
 ```python
-from rayorch import DagPipeline, PipeRef, RuntimeRayModule
+from rayorch import DagPipeline, RuntimeRayModule
 
 
 class PdfPipeline(DagPipeline):
@@ -65,17 +68,39 @@ class PdfPipeline(DagPipeline):
         ).pre_init()
         super().__init__()
 
-    def forward(self, pdf: PipeRef, meta: PipeRef):
+    def forward(
+        self,
+        pdf: list[str],
+        meta: list[dict[str, object]],
+    ) -> list[str]:
         images, meta = self.pdf2image(pdf, meta)
         markdown = self.markdown(images, meta)
         return markdown
 ```
 
+For `RuntimeRayModule`, `.pre_init(...)` only stores the user operator's
+constructor arguments. It does not initialize Ray or create actors. The normal
+lifecycle is:
+
+```text
+RuntimeRayModule(...).pre_init(...)  configure
+RuntimeDagExecutor(pipeline, ...)    compile and start replicas
+executor.run(...)                    execute
+executor.close()                     stop replicas started by the executor
+```
+
+Use `module.start()` directly only when testing or running a standalone
+`RuntimeRayModule`. Repeated `start()` calls are idempotent.
+
 `DagPipeline.compile()` traces `forward()` and binds runtime ports from the
 operator signature and assignment names. Port names are local to each DAG node.
+The application-level annotations describe actual column values; internal
+symbolic references are not exposed in the user API.
 
-For multi-output operators, explicitly setting `num_outputs` is currently the
-most reviewable API even though direct tuple assignments can also be inferred.
+For multi-output operators, annotate the operator's `run()` return type. The
+compiler uses that annotation to infer output count and port types, and checks
+it against the assignment in `forward()`. Use `num_outputs` only as a fallback
+for unannotated operators.
 
 ## Run One MicroBatch
 
@@ -145,21 +170,34 @@ error. Healthy rows continue through downstream stages.
 ## Current MVP Limits
 
 - Runtime DAG nodes must be `RuntimeRayModule` instances.
-- Multi-parent joins require matching `row_ids` and `path_ids`.
+- Multi-parent joins align required branches by `row_id` and preserve diverged
+  paths through internal multi-parent lineage nodes.
+- Direct-return node calls currently use generated output names unless the
+  result is assigned to a readable local variable; deterministic direct-return
+  naming is tracked in the same TODO.
+- The current record unit is one document. Pages and blocks remain nested
+  values; explicit filter/flat-map/dedup/merge cardinality changes are deferred
+  to [`todos/07-runtime-emit-api.md`](todos/07-runtime-emit-api.md).
 - Lineage is returned in memory; persistent sinks are future work.
 - Operator/actor retries and process recovery are not yet production-grade.
 - The executor currently targets row-aligned batch transformations.
 
 ## Tests
 
-Default runtime tests exclude long benchmarks:
+Fast compile and local semantics tests do not start Ray:
 
 ```bash
-pytest test/test_runtime_correctness.py test/test_runtime_overlap.py test/test_runtime_edge_semantics.py
+pytest test/runtime/unit
+```
+
+Runtime integration tests share one Ray cluster per test module:
+
+```bash
+pytest test/runtime/integration
 ```
 
 Run the Flash-MinerU-like 40-item benchmark explicitly:
 
 ```bash
-pytest --runslow -s test/test_runtime_benchmark_dummy.py
+pytest --runslow -s test/runtime/performance
 ```
