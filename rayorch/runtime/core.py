@@ -82,14 +82,30 @@ class QuarantineRecord:
     values: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class LineageNode:
+    """One internal lineage edge with one or more upstream path heads."""
+
+    parents: tuple[str, ...]
+    op: str | None
+
+
 @dataclass
 class RuntimeResult:
     """Healthy rows plus runtime metadata emitted by one op call."""
 
     batch: MicroBatch
     quarantined: List[QuarantineRecord]
-    paths: Dict[str, tuple[str, str]]
+    paths: Dict[str, LineageNode]
     row_path: Dict[str, str]
+
+    def trace(self, path_id: str) -> List[str]:
+        """Return the de-duplicated operator history behind one path."""
+        return trace_lineage(self.paths, path_id)
+
+    def trace_row(self, row_id: str) -> List[str]:
+        """Return the operator history for one healthy output row."""
+        return self.trace(self.row_path[row_id])
 
 
 @dataclass(frozen=True)
@@ -105,7 +121,7 @@ class LineageStore:
     """Small in-memory lineage store for MVP tests and debug output."""
 
     def __init__(self) -> None:
-        self.paths: Dict[str, tuple[str, str]] = {}
+        self.paths: Dict[str, LineageNode] = {}
         self.row_path: Dict[str, str] = {}
         self.quarantined: List[QuarantineRecord] = []
 
@@ -117,7 +133,7 @@ class LineageStore:
     ) -> str:
         """Move one healthy row through a rowwise op."""
         path = _id(parent_path, op)
-        self.paths.setdefault(path, (parent_path, op))
+        self.paths.setdefault(path, LineageNode((parent_path,), op))
         self.row_path[row_id] = path
         return path
 
@@ -126,14 +142,7 @@ class LineageStore:
 
     def trace(self, path: str) -> List[str]:
         """Recover the op trajectory for a path id."""
-        ops: List[str] = []
-        seen: set[str] = set()
-        while path != "source" and path not in seen:
-            seen.add(path)
-            parent, op = self.paths[path]
-            ops.append(op)
-            path = parent
-        return list(reversed(ops))
+        return trace_lineage(self.paths, path)
 
     def result(self, batch: MicroBatch, bad: List[QuarantineRecord]) -> RuntimeResult:
         """Freeze the current in-memory delta into a Ray-serializable result."""
@@ -154,7 +163,7 @@ def merge_runtime_results(results: Sequence[RuntimeResult]) -> RuntimeResult:
     row_ids: List[str] = []
     path_ids: List[str] = []
     quarantined: List[QuarantineRecord] = []
-    paths: Dict[str, tuple[str, str]] = {}
+    paths: Dict[str, LineageNode] = {}
     row_path: Dict[str, str] = {}
 
     for result in results:
@@ -172,6 +181,41 @@ def merge_runtime_results(results: Sequence[RuntimeResult]) -> RuntimeResult:
         paths=paths,
         row_path=row_path,
     )
+
+
+def merge_lineage_heads(
+    parents: Sequence[str],
+) -> tuple[str, Dict[str, LineageNode]]:
+    """Collapse one or more upstream heads into one opaque path id."""
+    unique = tuple(dict.fromkeys(parents))
+    if not unique:
+        raise ValueError("lineage join requires at least one parent")
+    if len(unique) == 1:
+        return unique[0], {}
+
+    path = _id("join", unique)
+    return path, {path: LineageNode(unique, None)}
+
+
+def trace_lineage(paths: Mapping[str, LineageNode], path_id: str) -> List[str]:
+    """Traverse a lineage DAG and return each operator once in parent order."""
+    ops: List[str] = []
+    seen_paths: set[str] = set()
+    seen_ops: set[str] = set()
+
+    def visit(path: str) -> None:
+        if path == "source" or path in seen_paths:
+            return
+        seen_paths.add(path)
+        node = paths[path]
+        for parent in node.parents:
+            visit(parent)
+        if node.op is not None and node.op not in seen_ops:
+            seen_ops.add(node.op)
+            ops.append(node.op)
+
+    visit(path_id)
+    return ops
 
 
 def run_rowwise(

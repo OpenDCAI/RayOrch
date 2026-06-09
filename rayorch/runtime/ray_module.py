@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 
+import ray
+
 from ..ray_module import RayModule, _infer_num_outputs
 from .core import (
     LineageStore,
@@ -18,21 +20,11 @@ def dispatch_microbatch_shard_contiguous(rm, *args, **kwargs):
     """Shard MicroBatch values by row and broadcast non-MicroBatch values."""
     replicas = rm._replicas
 
-    def split_ranges(n: int) -> List[tuple[int, int]]:
-        base, rem = divmod(n, replicas)
-        start = 0
-        ranges: List[tuple[int, int]] = []
-        for rank in range(replicas):
-            end = start + base + (1 if rank < rem else 0)
-            ranges.append((start, end))
-            start = end
-        return ranges
-
     ranges: List[tuple[int, int]] | None = None
     for value in (*args, *kwargs.values()):
         if not isinstance(value, MicroBatch):
             continue
-        current = split_ranges(len(value))
+        current = _contiguous_ranges(len(value), replicas)
         if ranges is None:
             ranges = current
         elif current != ranges:
@@ -46,6 +38,17 @@ def dispatch_microbatch_shard_contiguous(rm, *args, **kwargs):
     return tuple(shard(arg) for arg in args), {
         key: shard(value) for key, value in kwargs.items()
     }
+
+
+def _contiguous_ranges(size: int, replicas: int) -> List[tuple[int, int]]:
+    base, remainder = divmod(size, replicas)
+    ranges: List[tuple[int, int]] = []
+    start = 0
+    for rank in range(replicas):
+        end = start + base + (rank < remainder)
+        ranges.append((start, end))
+        start = end
+    return ranges
 
 
 def collect_runtime_results(rm, outputs: Sequence[RuntimeResult]) -> RuntimeResult:
@@ -80,6 +83,8 @@ class _RowwiseRuntimeActorOp:
 class RuntimeRayModule(RayModule):
     """RayModule whose replicas run rowwise fault isolation inside each actor."""
 
+    requires_compiled_executor = True
+
     def __init__(
         self,
         op_cls: Type[Any],
@@ -97,6 +102,8 @@ class RuntimeRayModule(RayModule):
         self._user_op_cls = op_cls
         self._op_name = op or op_cls.__name__
         self._runtime_spec: RuntimeNodeSpec | None = None
+        self._init_args: Tuple[Any, ...] = ()
+        self._init_kwargs: Dict[str, Any] = {}
         if inputs is not None or outputs is not None:
             if inputs is None or outputs is None:
                 raise ValueError("inputs and outputs must be provided together")
@@ -126,12 +133,36 @@ class RuntimeRayModule(RayModule):
         )
 
     def pre_init(self, *args, **kwargs) -> "RuntimeRayModule":
+        """Store user-op constructor arguments without creating Ray actors."""
+        if self.is_started:
+            raise RuntimeError("cannot change init arguments after module.start()")
+        self._init_args = tuple(args)
+        self._init_kwargs = dict(kwargs)
+        return self
+
+    @property
+    def is_started(self) -> bool:
+        return bool(self.actors)
+
+    def start(self) -> "RuntimeRayModule":
+        """Create actor replicas using the arguments saved by ``pre_init()``."""
+        if self.is_started:
+            return self
         super().pre_init(
             self._user_op_cls,
-            args,
-            kwargs,
+            self._init_args,
+            self._init_kwargs,
         )
         return self
+
+    def close(self) -> None:
+        """Stop all actor replicas created by ``start()``."""
+        for actor in self.actors:
+            try:
+                ray.kill(actor)
+            except Exception:
+                pass
+        self.actors = []
 
     def bind_runtime_spec(self, spec: RuntimeNodeSpec) -> "RuntimeRayModule":
         """Bind DAG-inferred runtime ports.
@@ -165,4 +196,9 @@ class RuntimeRayModule(RayModule):
         return self._runtime_spec
 
     def remote(self, batch: MicroBatch, spec: RuntimeNodeSpec | None = None):
+        if not self.is_started:
+            raise RuntimeError(
+                "RuntimeRayModule is not started. Use "
+                "RuntimeDagExecutor(pipeline, ...) or call module.start()."
+            )
         return super().remote(batch, spec or self._require_runtime_spec())

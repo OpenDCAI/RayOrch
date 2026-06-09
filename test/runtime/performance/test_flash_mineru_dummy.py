@@ -9,12 +9,11 @@ from rayorch import (
     DagExecutor,
     DagPipeline,
     Dispatch,
-    PipeRef,
     RayModule,
     RuntimeDagExecutor,
     RuntimeRayModule,
 )
-from test.runtime_test_utils import cleanup_modules
+from test.runtime.helpers import cleanup_modules
 
 
 class Pdf2ImageDummyOp:
@@ -102,7 +101,11 @@ class GenericFlashPipe(DagPipeline):
         ).pre_init()
         super().__init__()
 
-    def forward(self, pdf: PipeRef, meta: PipeRef):
+    def forward(
+        self,
+        pdf: list[str],
+        meta: list[dict[str, object]],
+    ) -> list[str]:
         images, meta = self.pdf2img(pdf, meta)
         layouts, meta = self.layout(images, meta)
         texts, meta = self.ocr(layouts, meta)
@@ -125,7 +128,11 @@ class RuntimeFlashPipe(DagPipeline):
         ).pre_init()
         super().__init__()
 
-    def forward(self, pdf: PipeRef, meta: PipeRef):
+    def forward(
+        self,
+        pdf: list[str],
+        meta: list[dict[str, object]],
+    ) -> list[str]:
         images, meta = self.pdf2img(pdf, meta)
         layouts, meta = self.layout(images, meta)
         texts, meta = self.ocr(layouts, meta)
@@ -138,6 +145,7 @@ def test_flash_mineru_like_runtime_matches_generic_dag_executor() -> None:
     ray.init(ignore_reinit_error=True, num_cpus=24)
     generic_pipe = GenericFlashPipe()
     runtime_pipe = RuntimeFlashPipe()
+    runtime_executor = None
     try:
         pdf_batches = []
         meta_batches = []
@@ -154,19 +162,29 @@ def test_flash_mineru_like_runtime_matches_generic_dag_executor() -> None:
                 for i in range(8)
             )
 
-        start = time.perf_counter()
-        generic_output = DagExecutor(max_batches_inflight=5).run(
-            generic_pipe, pdf_batches, meta_batches
-        )
-        generic_time = time.perf_counter() - start
-
-        start = time.perf_counter()
-        runtime_results = RuntimeDagExecutor(
+        generic_executor = DagExecutor(generic_pipe, max_batches_inflight=5)
+        runtime_executor = RuntimeDagExecutor(
             runtime_pipe,
             batch_size=8,
             max_batches_inflight=5,
             dataset="flash-bench",
-        ).run(pdf=runtime_pdfs, meta=runtime_meta)
+        )
+
+        generic_executor.run(
+            [["warmup.pdf"]],
+            [[{"name": "warmup"}]],
+        )
+        runtime_executor.run(
+            pdf=["warmup.pdf"],
+            meta=[{"name": "warmup"}],
+        )
+
+        start = time.perf_counter()
+        generic_output = generic_executor.run(pdf_batches, meta_batches)
+        generic_time = time.perf_counter() - start
+
+        start = time.perf_counter()
+        runtime_results = runtime_executor.run(pdf=runtime_pdfs, meta=runtime_meta)
         runtime_time = time.perf_counter() - start
 
         runtime_output = [
@@ -187,6 +205,8 @@ def test_flash_mineru_like_runtime_matches_generic_dag_executor() -> None:
             round(runtime_time, 3),
         )
     finally:
+        if runtime_executor is not None:
+            runtime_executor.close()
         cleanup_modules(
             generic_pipe.pdf2img,
             generic_pipe.layout,

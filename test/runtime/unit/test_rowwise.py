@@ -48,6 +48,67 @@ def test_rowwise_bad_record_is_quarantined_and_healthy_rows_continue() -> None:
     assert lineage.quarantined == bad
 
 
+def test_bad_record_without_index_uses_split_and_retry() -> None:
+    batch = MicroBatch.source({"x": ["a", "bad", "b", "c"]})
+
+    def op(values):
+        if "bad" in values:
+            raise BadRecordError("bad row")
+        return [f"ok:{value}" for value in values]
+
+    out, bad = run_rowwise(
+        op,
+        batch,
+        op="split",
+        inputs=("x",),
+        outputs=("y",),
+    )
+
+    assert out.columns["y"] == ["ok:a", "ok:b", "ok:c"]
+    assert [record.values["x"] for record in bad] == ["bad"]
+
+
+def test_normal_exception_uses_split_and_retry() -> None:
+    batch = MicroBatch.source({"x": ["a", "boom", "b"]})
+
+    def op(values):
+        if "boom" in values:
+            raise RuntimeError("boom row")
+        return [f"ok:{value}" for value in values]
+
+    out, bad = run_rowwise(
+        op,
+        batch,
+        op="exception",
+        inputs=("x",),
+        outputs=("y",),
+    )
+
+    assert out.columns["y"] == ["ok:a", "ok:b"]
+    assert [record.values["x"] for record in bad] == ["boom"]
+    assert bad[0].error == "RuntimeError: boom row"
+
+
+def test_split_and_retry_quarantines_multiple_bad_rows() -> None:
+    batch = MicroBatch.source({"x": ["bad-0", "a", "bad-1", "b"]})
+
+    def op(values):
+        if any("bad" in value for value in values):
+            raise BadRecordError("bad row")
+        return values
+
+    out, bad = run_rowwise(
+        op,
+        batch,
+        op="multiple",
+        inputs=("x",),
+        outputs=("y",),
+    )
+
+    assert out.columns["y"] == ["a", "b"]
+    assert [record.values["x"] for record in bad] == ["bad-0", "bad-1"]
+
+
 def test_flash_mineru_shaped_dummy_pipeline_quarantines_bad_pdf() -> None:
     lineage = LineageStore()
     batch = MicroBatch.source(

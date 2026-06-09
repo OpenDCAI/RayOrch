@@ -4,12 +4,17 @@ import time
 
 import ray
 
-from rayorch import DagPipeline, PipeRef, RuntimeRayModule
+from rayorch import DagPipeline, RuntimeRayModule
 from rayorch.runtime import BadRecordError
+from rayorch.runtime.core import LineageNode, trace_lineage
 
 
 def cleanup_modules(*modules) -> None:
     for module in modules:
+        close = getattr(module, "close", None)
+        if close is not None:
+            close()
+            continue
         for actor in getattr(module, "actors", []):
             try:
                 ray.kill(actor)
@@ -27,25 +32,18 @@ def cleanup_pipeline(pipe: DagPipeline) -> None:
     )
 
 
-def trace_path(paths: dict[str, tuple[str, str]], path: str) -> list[str]:
-    ops: list[str] = []
-    seen: set[str] = set()
-    while path != "source" and path not in seen:
-        seen.add(path)
-        parent, op = paths[path]
-        ops.append(op)
-        path = parent
-    return list(reversed(ops))
+def trace_path(paths: dict[str, LineageNode], path: str) -> list[str]:
+    return trace_lineage(paths, path)
 
 
 class Pdf2ImgOp:
-    def run(self, pdfs, meta):
+    def run(self, pdf, meta):
         images = []
-        for i, (pdf, item) in enumerate(zip(pdfs, meta)):
-            if pdf.endswith("bad.pdf"):
+        for i, (path, item) in enumerate(zip(pdf, meta)):
+            if path.endswith("bad.pdf"):
                 raise BadRecordError("pdf parser failed", index=i)
             item["pages"] = 2
-            images.append([f"img<{pdf}:0>", f"img<{pdf}:1>"])
+            images.append([f"img<{path}:0>", f"img<{path}:1>"])
         return images, meta
 
 
@@ -114,7 +112,11 @@ class RuntimeMineruPipe(DagPipeline):
         ).pre_init()
         super().__init__()
 
-    def forward(self, pdf: PipeRef, meta: PipeRef):
+    def forward(
+        self,
+        pdf: list[str],
+        meta: list[dict[str, object]],
+    ) -> list[str]:
         images, meta = self.pdf2img(pdf, meta)
         blocks, meta = self.layout(images, meta)
         text, meta = self.ocr(blocks, meta)
@@ -183,7 +185,11 @@ class FaultPipe(DagPipeline):
         ).pre_init()
         super().__init__()
 
-    def forward(self, pdf: PipeRef, meta: PipeRef):
+    def forward(
+        self,
+        pdf: list[str],
+        meta: list[dict[str, object]],
+    ) -> list[str]:
         images, meta = self.pdf2img(pdf, meta)
         layouts, meta = self.layout(images, meta)
         texts, meta = self.ocr(layouts, meta)
