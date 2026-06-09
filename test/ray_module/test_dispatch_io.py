@@ -28,6 +28,9 @@ from rayorch.dispatch_mode import (
     dispatch_shard_all_args_mod,
 )
 
+pytestmark = pytest.mark.usefixtures("ray_cluster")
+
+
 def _kill_modules(*modules: RayModule) -> None:
     for m in modules:
         for actor in getattr(m, "actors", []):
@@ -95,15 +98,7 @@ class DictShardOp:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def ray_session():
-    ray.init(ignore_reinit_error=True, num_cpus=16)
-    yield
-    if ray.is_initialized():
-        ray.shutdown()
-
-
-def test_one_to_all_map_identical_reduce_list(ray_session):
+def test_one_to_all_map_identical_reduce_list():
     """Map：每 replica 同一 (x, scale)；Reduce：collect 原样列表。"""
     ws = 3
     m = RayModule(
@@ -119,7 +114,7 @@ def test_one_to_all_map_identical_reduce_list(ray_session):
         _kill_modules(m)
 
 
-def test_one_to_all_many_args_kwargs_each_replica_sees_same(ray_session):
+def test_one_to_all_many_args_kwargs_each_replica_sees_same():
     ws = 4
     m = RayModule(
         VarPackOp,
@@ -140,7 +135,7 @@ def test_one_to_all_many_args_kwargs_each_replica_sees_same(ray_session):
         _kill_modules(m)
 
 
-def test_one_to_all_custom_reduce_sum(ray_session):
+def test_one_to_all_custom_reduce_sum():
     """Reduce：对 map 输出做 sum（各副本标量相同也可验 reduce 被调用）。"""
     ws = 3
     m = RayModule(
@@ -155,7 +150,7 @@ def test_one_to_all_custom_reduce_sum(ray_session):
         _kill_modules(m)
 
 
-def test_all_to_all_map_per_rank_reduce_list(ray_session):
+def test_all_to_all_map_per_rank_reduce_list():
     """每 rank 不同 (a,b)；reduce 保留 list。"""
     ws = 3
     m = RayModule(
@@ -171,7 +166,7 @@ def test_all_to_all_map_per_rank_reduce_list(ray_session):
         _kill_modules(m)
 
 
-def test_shard_map_slice_reduce_concat_list(ray_session):
+def test_shard_map_slice_reduce_concat_list():
     """Map：batch 切到各 rank；Reduce：collect_concat 按 rank 拼 batch。"""
     ws = 2
     m = RayModule(
@@ -188,7 +183,7 @@ def test_shard_map_slice_reduce_concat_list(ray_session):
         _kill_modules(m)
 
 
-def test_shard_matches_manual_serial_reduce(ray_session):
+def test_shard_matches_manual_serial_reduce():
     """与手写分片 + 串行 op + 拼接对齐（map-reduce 数值预期）。"""
     ws = 3
     batch = list(range(10))
@@ -221,7 +216,7 @@ def test_shard_matches_manual_serial_reduce(ray_session):
         _kill_modules(m)
 
 
-def test_shard_dict_outputs_collect_concat(ray_session):
+def test_shard_dict_outputs_collect_concat():
     ws = 2
     m = RayModule(
         DictShardOp,
@@ -236,7 +231,7 @@ def test_shard_dict_outputs_collect_concat(ray_session):
         _kill_modules(m)
 
 
-def test_remote_gather_same_as_call(ray_session):
+def test_remote_gather_same_as_call():
     ws = 2
     m = RayModule(
         PairAddOp,
@@ -253,7 +248,7 @@ def test_remote_gather_same_as_call(ray_session):
         _kill_modules(m)
 
 
-def test_shard_length_mismatch_raises_before_actors(ray_session):
+def test_shard_length_mismatch_raises_before_actors():
     ws = 2
     m = RayModule(
         ChunkAccOp,

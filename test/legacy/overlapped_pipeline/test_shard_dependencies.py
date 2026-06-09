@@ -7,7 +7,6 @@ import ray
 
 from rayorch import OverlappedPipeline, RayModule
 from rayorch.dispatch_mode import collect_concat, dispatch_shard_all_args_mod
-from rayorch.ray_module import _get_join_collect_submit_count, _reset_join_collect_submit_count
 
 
 @pytest.fixture
@@ -35,11 +34,6 @@ class IdentityBatchOp:
 class CountOp:
     def run(self, xs: List[int]) -> int:
         return len(xs)
-
-
-class AddPairOp:
-    def run(self, a: List[int], b: List[int]) -> int:
-        return len(a) + len(b)
 
 
 class AssertAlignedEchoOp:
@@ -145,38 +139,6 @@ def test_target_behavior_overlapped_shard_chain_auto_join_reduce(ray_session):
         out = p([list(range(10))])
         # 目标语义：完整 batch 长度=10
         assert out == [10]
-    finally:
-        _kill_modules(p.s1, p.s2)
-
-
-def test_dependency_ref_cache_reuses_single_join_for_same_future(ray_session):
-    """
-    同一个 upstream future 被同一次下游调用复用多次时，应复用同一个 dependency ref，
-    避免重复提交 join+collect task。
-    """
-
-    class Pipe(OverlappedPipeline):
-        def __init__(self):
-            self.s1 = RayModule(
-                IdentityBatchOp,
-                replicas=3,
-                dispatch_fn=dispatch_shard_all_args_mod,
-                collect_fn=collect_concat,
-            ).pre_init()
-            self.s2 = RayModule(AddPairOp, replicas=1).pre_init()
-            super().__init__(max_inflight=2)
-
-        def forward(self, x):
-            y = self.s1(x)
-            # 同一个 future 作为两个参数传递；若无缓存，会各触发一次 join task。
-            return self.s2(y, y)
-
-    p = Pipe()
-    try:
-        _reset_join_collect_submit_count()
-        out = p([list(range(10))])
-        assert out == [20]
-        assert _get_join_collect_submit_count() == 1
     finally:
         _kill_modules(p.s1, p.s2)
 

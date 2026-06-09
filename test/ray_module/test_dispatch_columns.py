@@ -14,13 +14,7 @@ from rayorch.dispatch_mode import (
     dispatch_shard_all_args_mod,
 )
 
-
-@pytest.fixture
-def ray_session():
-    ray.init(ignore_reinit_error=True, num_cpus=16)
-    yield
-    if ray.is_initialized():
-        ray.shutdown()
+pytestmark = pytest.mark.usefixtures("ray_cluster")
 
 
 def _kill_modules(*modules: RayModule) -> None:
@@ -95,7 +89,7 @@ class IdentityOp:
         return x
 
 
-def test_column_dispatch_broadcast_accepts_list_batches(ray_session):
+def test_column_dispatch_broadcast_accepts_list_batches():
     """
     验证 RayModule 能直接对接 `dispatch_broadcast` 的列式输出：
     - 输入是 list_of_images/list_of_texts
@@ -121,7 +115,7 @@ def test_column_dispatch_broadcast_accepts_list_batches(ray_session):
         _kill_modules(m)
 
 
-def test_column_dispatch_shard_all_args_mod_shards_and_collects(ray_session):
+def test_column_dispatch_shard_all_args_mod_shards_and_collects():
     """
     验证 RayModule 能直接对接 `dispatch_shard_all_args_mod` 的列式输出：
     - 输入是等长的 list_of_images/list_of_texts
@@ -151,7 +145,7 @@ def test_column_dispatch_shard_all_args_mod_shards_and_collects(ray_session):
         _kill_modules(m)
 
 
-def test_column_dispatch_shard_supports_kwargs_shard_and_args_broadcast(ray_session):
+def test_column_dispatch_shard_supports_kwargs_shard_and_args_broadcast():
     """
     - shardable 参数放在 kwargs（idx/payload）
     - args 中 tag 是广播参数
@@ -173,7 +167,7 @@ def test_column_dispatch_shard_supports_kwargs_shard_and_args_broadcast(ray_sess
         _kill_modules(m)
 
 
-def test_column_dispatch_shard_length_mismatch_raises(ray_session):
+def test_column_dispatch_shard_length_mismatch_raises():
     """
     shardable 参数长度不一致要在 dispatch 阶段报错（不应进入 actor.run）。
     """
@@ -191,7 +185,7 @@ def test_column_dispatch_shard_length_mismatch_raises(ray_session):
         _kill_modules(m)
 
 
-def test_column_collect_concat_merges_dict_batch_fields(ray_session):
+def test_column_collect_concat_merges_dict_batch_fields():
     """
     collect_concat 对 dict 输出：
     - items: batch list 要按 rank 顺序拼接回完整 list
@@ -212,7 +206,7 @@ def test_column_collect_concat_merges_dict_batch_fields(ray_session):
         _kill_modules(m)
 
 
-def test_column_collect_concat_merges_tuple_outputs(ray_session):
+def test_column_collect_concat_merges_tuple_outputs():
     ws = 3
     m = RayModule(
         TupleOutOp,
@@ -228,7 +222,7 @@ def test_column_collect_concat_merges_tuple_outputs(ray_session):
         _kill_modules(m)
 
 
-def test_column_dispatch_all_to_all_column_style(ray_session):
+def test_column_dispatch_all_to_all_column_style():
     """
     dispatch_per_replica 约定：输入已经是列式 per-replica 形式。
     这里用一个最小 identity op 验证每个 replica 各自拿到自己的值。
@@ -247,7 +241,7 @@ def test_column_dispatch_all_to_all_column_style(ray_session):
         _kill_modules(m)
 
 
-def test_column_remote_gather_path(ray_session):
+def test_column_remote_gather_path():
     """
     remote()/gather() 路径也必须兼容列式 dispatch。
     """

@@ -3,7 +3,7 @@ from __future__ import annotations
 import ray
 
 from rayorch import RayModule
-from rayorch.dag_new_pipeline import DagPipeline, PipeRef
+from rayorch.dag_new_pipeline import DagPipeline, SequentialExecutor
 
 
 class Sum3Op:
@@ -16,7 +16,12 @@ class MultiInput3Pipe(DagPipeline):
         self.add3 = RayModule(Sum3Op, replicas=1, max_inflight=2).pre_init()
         super().__init__()
 
-    def forward(self, a: PipeRef, b: PipeRef, c: PipeRef) -> PipeRef:
+    def forward(
+        self,
+        a: list[int],
+        b: list[int],
+        c: list[int],
+    ) -> list[int]:
         return self.add3(a, b, c)
 
 
@@ -38,7 +43,7 @@ def main() -> None:
         c_batches = [[100, 200], [300, 400]]
         d_batches = [[1000, 2000], [3000, 4000]]
         # 预期抛 ValueError 并打印完整 traceback
-        pipe(a_batches, b_batches, c_batches, d_batches)
+        SequentialExecutor(pipe).run(a_batches, b_batches, c_batches, d_batches)
     finally:
         _cleanup(pipe)
         if ray.is_initialized():
