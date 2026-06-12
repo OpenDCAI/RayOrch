@@ -26,6 +26,11 @@ executor = RuntimeDagExecutor(
 )
 ```
 
+The concrete names in this example are illustrative: the important contract is
+that each injected object satisfies the corresponding `*Provider` abstraction,
+even if the shipped implementation is named `S3ArtifactStore`,
+`SQLMetadataStore`, or similar.
+
 Omitted providers default to their no-op or in-memory stubs.
 
 ## ArtifactStoreProvider

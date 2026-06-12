@@ -85,7 +85,7 @@ at runtime:
 ```python
 from rayorch.compiler.ast_version import get_ast_provider
 
-provider = get_ast_provider()          # picks Py310Provider, Py311Provider, …
+provider = get_ast_provider()          # picks Py310ASTProvider, Py311ASTProvider, …
 ast_tree = provider.parse(source, filename="pipeline.py")
 ```
 

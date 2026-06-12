@@ -213,6 +213,7 @@ class ArtifactStoreProvider:
         ...
 
     def delete(self, ref: str) -> None: ...
+    def exists(self, ref: str) -> bool: ...
 ```
 
 Operators pass lightweight reference strings through the DAG; the heavy bytes
@@ -257,6 +258,8 @@ class LineageSinkProvider:
     def commit(self, delta: LineageDelta) -> None:
         """Flush paths, row_path updates, and quarantine records."""
         ...
+
+    def flush(self) -> None: ...
 ```
 
 Built-in sinks: `InMemoryLineageSink` (MVP default), `SQLLineageSink` (SQL
