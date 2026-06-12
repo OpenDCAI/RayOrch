@@ -215,7 +215,11 @@ class ArtifactStoreProvider:
     def delete(self, ref: str) -> None: ...
 
     def exists(self, ref: str) -> bool:
-        """Return whether the artifact reference already exists."""
+        """
+        Return True only when `ref` resolves to readable artifact bytes in the
+        backing store.  Invalid references return False; transport or backend
+        availability failures should still raise.
+        """
         ...
 ```
 
@@ -263,7 +267,10 @@ class LineageSinkProvider:
         ...
 
     def flush(self) -> None:
-        """Force any buffered lineage records to durable storage."""
+        """
+        Force any buffered lineage records to durable storage.
+        Raises if the sink cannot durably persist the buffered records.
+        """
         ...
 ```
 
