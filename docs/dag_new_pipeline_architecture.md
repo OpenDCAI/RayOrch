@@ -5,6 +5,57 @@ Date: 2026-06-05
 The DAG implementation now lives under `rayorch/dag/`.  The old
 `rayorch.dag_new_pipeline` module is kept as a compatibility re-export.
 
+## Infrastructure Layers
+
+RayOrch organizes system concerns into three planes so that each layer can
+evolve or be replaced independently.
+
+### Control Plane
+
+The control plane governs what should run, when it should run, and what the
+outcome was.
+
+- **PostgreSQL / MySQL** – persistent source of truth for DAG definitions, job
+  and stage state, block metadata, image references, OCR result indexes, and
+  audit logs.  The database is the record that survives process restarts.
+- **MetadataStoreProvider** – abstraction over the relational store (see
+  [`provider_abstractions.md`](provider_abstractions.md)).  The MVP ships an
+  in-memory stub; production swaps in a SQL backend.
+
+### Execution Plane
+
+The execution plane owns scheduling, dispatch, and in-flight state.
+
+- **Ray** – distributed actor scheduling, task dispatch, and in-flight state
+  tracking.  Ray is the source of truth for *whether a task is currently
+  running*, but not for durable job history.
+- **RuntimeDagExecutor / RayModule / RuntimeRayModule** – executor objects that
+  translate compiled DAG nodes into Ray actor calls, enforce inflight limits,
+  and collect outputs, quarantine records, and lineage deltas.
+
+### Storage Plane
+
+The storage plane holds raw inputs and large intermediate artifacts.
+
+- **S3 / MinIO** – object store for raw PDF/docx files, extracted images, and
+  OCR input/output intermediates.
+- **ArtifactStoreProvider** – abstraction over the object store (see
+  [`provider_abstractions.md`](provider_abstractions.md)).  References to
+  stored objects are small strings that travel through the DAG; the heavy bytes
+  live in the object store.
+
+### Observability (future)
+
+- **Prometheus / Grafana** – metrics collection and dashboards via
+  **MetricsProvider**.
+- **Kafka** – event streaming to offload high-volume write pressure from the
+  RDBMS via **EventBusProvider**.
+
+Both are abstracted as pluggable providers so that early phases can use no-op
+or in-memory stubs without changing operator or executor code.  See
+[`provider_abstractions.md`](provider_abstractions.md) for the full interface
+catalogue.
+
 ## File Layout
 
 ```text
