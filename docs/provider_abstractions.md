@@ -2,6 +2,12 @@
 
 Date: 2026-06-12
 
+> **Status: Design draft — planned for Phase 1 and Phase 3 of the
+> [roadmap](roadmap.md).**  The interfaces described here do not yet exist in
+> the current codebase.  Concrete implementations backed by SQL, MinIO, and
+> Kafka are Phase 3 deliverables; the no-op / in-memory stubs are Phase 1
+> deliverables.
+
 RayOrch separates *what to store* from *where to store it* through a set of
 provider interfaces.  Each provider has a no-op or in-memory default so early
 development does not require external services.  Production deployments replace
@@ -109,10 +115,10 @@ Built-in implementations:
 
 | Class | Backing store |
 |---|---|
-| `InMemoryLineageSink` | Python list (default) |
+| `InMemoryLineageSink` | Python dict (default) |
 | `SQLLineageSink` | PostgreSQL / MySQL (extra: `rayorch[sql]`) |
 | `ParquetLineageSink` | S3 / MinIO Parquet files (extra: `rayorch[parquet]`) |
-| `RayActorLineageSink` | Ray actor buffer |
+| `RayActorLineageSink` | Ray actor buffer (extra: `rayorch[ray-sink]`) |
 
 ## MetricsProvider
 

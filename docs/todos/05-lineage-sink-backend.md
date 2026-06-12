@@ -20,7 +20,7 @@ Executor or supervisor should commit those deltas to a sink:
 
 ```text
 InMemoryLineageSink      (MVP default)
-RayLineageActorSink
+RayActorLineageSink
 SQLite/DuckDB sink
 Parquet/object-store sink
 Postgres sink

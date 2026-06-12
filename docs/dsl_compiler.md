@@ -2,6 +2,11 @@
 
 Date: 2026-06-12
 
+> **Status: Design draft — not yet implemented.**  Module paths, exception
+> names, and API signatures described here do not exist in the current
+> codebase.  This document records the target architecture for Phase 2 of the
+> [roadmap](roadmap.md).
+
 RayOrch pipelines are defined in a constrained subset of standard Python.  The
 compiler translates that DSL into a backend-agnostic JSON IR, then dispatches
 to one or more backend code generators.
@@ -22,23 +27,91 @@ already backend-agnostic at the Python level.  Surfacing an explicit IR layer:
 ```text
 Python DSL source
       │
-      ▼ (1) AST parse  ── Python `ast` standard library
+      ▼ (1) AST parse  ── ASTVersionProvider (wraps Python `ast` std lib)
 Python AST
       │
       ▼ (2) Semantic analysis  ── type inference, symbolic tracing
-Typed DAG graph
+Typed DAG graph (with inferred / annotated types per port)
       │
       ▼ (3) IR emit
-JSON IR
+JSON IR (includes type metadata per input/output port)
       │
       ├─▶ (4a) RayBackend  ── RuntimeDagExecutor + Ray actors
       └─▶ (4b) TorchBackend  ── torch.fx / torch.compile graph
 ```
 
+## Python AST Version Adaptation
+
+Python's `ast` module changes between minor releases: new node types are added
+(e.g. `ast.TypeAlias` in 3.12), existing nodes gain or lose fields, and the
+concrete grammar for certain constructs differs.  The compiler shields the rest
+of the pipeline from these differences through a thin **`ASTVersionProvider`**
+abstraction.
+
+```python
+class ASTVersionProvider:
+    """Wraps the `ast` standard library for a specific CPython minor version."""
+
+    @property
+    def version(self) -> tuple[int, int]:
+        """Return the (major, minor) Python version this provider targets."""
+        ...
+
+    def parse(self, source: str, filename: str = "<string>") -> ast.AST:
+        """
+        Parse `source` into an AST, applying any version-specific pre-processing.
+        Raises `DSLSyntaxError` on parse failure.
+        """
+        ...
+
+    def iter_function_body(self, func_def: ast.FunctionDef) -> list[ast.stmt]:
+        """
+        Return the statement list for `func_def`, normalising version-specific
+        differences in how the body is represented.
+        """
+        ...
+
+    def get_annotation(self, node: ast.arg | ast.AnnAssign) -> str | None:
+        """
+        Extract a type annotation string from an argument or annotated assignment,
+        handling differences in how annotations are stored across versions.
+        """
+        ...
+```
+
+Concrete providers are registered by Python version and selected automatically
+at runtime:
+
+```python
+from rayorch.compiler.ast_version import get_ast_provider
+
+provider = get_ast_provider()          # picks Py310Provider, Py311Provider, …
+ast_tree = provider.parse(source, filename="pipeline.py")
+```
+
+Bundled providers:
+
+| Class | Target Python | Notes |
+|---|---|---|
+| `Py310ASTProvider` | 3.10.x | Baseline |
+| `Py311ASTProvider` | 3.11.x | Handles `ast.TryStar` (PEP 654) |
+| `Py312ASTProvider` | 3.12.x | Handles `ast.TypeAlias` (PEP 695) |
+
+Adding support for a new Python release requires only a new `ASTVersionProvider`
+subclass; the rest of the compiler pipeline is unchanged.
+
 ## Python DSL
 
-The DSL is valid Python that `python -c` can parse.  The compiler enforces
-additional restrictions at the semantic analysis stage.
+The DSL is **strictly a subset of standard Python syntax**.  Every valid DSL
+file is also a syntactically valid Python file; the compiler only adds semantic
+restrictions on top of the standard grammar.  This means:
+
+- `python -m py_compile pipeline.py` must succeed.
+- Any Python 3.10+ interpreter can import the file; the compiler is not
+  required to evaluate it.
+- DSL-specific constraints are enforced at semantic analysis (stage 2), not at
+  the syntax level, so error messages always reference the offending Python
+  construct.
 
 ### Allowed constructs inside `forward()`
 
@@ -71,7 +144,10 @@ methods, not in the pipeline definition.  The compiler raises a
 
 ## JSON IR Schema
 
-The IR is a JSON object with the following top-level keys.
+The IR is a JSON object with the following top-level keys.  Type annotations
+from the DSL source are extracted during semantic analysis and recorded in the
+IR so that downstream backends and tooling can use them for optimization,
+validation, and code generation without re-parsing the source.
 
 ```json
 {
@@ -81,32 +157,72 @@ The IR is a JSON object with the following top-level keys.
     {"name": "pdf",  "type": "list[str]"},
     {"name": "meta", "type": "list[dict]"}
   ],
-  "outputs": ["render.out0"],
+  "outputs": [
+    {"ref": "render.out0", "type": "list[str]"}
+  ],
   "nodes": [
     {
       "id":      "pdf2img",
       "op":      "MyPipeline.pdf2img",
-      "inputs":  ["$pdf", "$meta"],
-      "outputs": ["images", "meta"],
+      "inputs":  [
+        {"ref": "$pdf",  "type": "list[str]"},
+        {"ref": "$meta", "type": "list[dict]"}
+      ],
+      "outputs": [
+        {"name": "images", "type": "list[list[str]]"},
+        {"name": "meta",   "type": "list[dict]"}
+      ],
       "config":  {"replicas": 2, "max_inflight": 4}
     },
     {
       "id":      "ocr",
       "op":      "MyPipeline.ocr",
-      "inputs":  ["images"],
-      "outputs": ["text"],
+      "inputs":  [
+        {"ref": "images", "type": "list[list[str]]"}
+      ],
+      "outputs": [
+        {"name": "text", "type": "list[str]"}
+      ],
       "config":  {"replicas": 4, "max_inflight": 4}
     },
     {
       "id":      "render",
       "op":      "MyPipeline.render",
-      "inputs":  ["text", "meta"],
-      "outputs": ["render.out0"],
+      "inputs":  [
+        {"ref": "text", "type": "list[str]"},
+        {"ref": "meta", "type": "list[dict]"}
+      ],
+      "outputs": [
+        {"name": "render.out0", "type": "list[str]"}
+      ],
       "config":  {"replicas": 2, "max_inflight": 2}
     }
   ]
 }
 ```
+
+### Type information in the IR
+
+Type strings use PEP 484 annotation syntax (`list[str]`, `dict[str, Any]`,
+`tuple[int, ...]`) as they appear in the source.  The semantic analysis stage
+resolves types through the following priority order:
+
+1. **Explicit annotation** — the `run()` method signature of the concrete
+   operator class (most authoritative).
+2. **Inferred from `forward()` annotations** — input/output names that appear
+   in `forward()` carry over their annotated types.
+3. **`"unknown"` sentinel** — when no annotation is found, the type is recorded
+   as the string `"unknown"`.  Backends treat `"unknown"` as opaque and skip
+   any type-dependent optimisation.
+
+Type information is recorded per-port so that backends can:
+
+- validate that connected ports carry compatible types at build time;
+- select device placement (e.g. push `"torch.Tensor"` ports to GPU);
+- generate typed stubs for IDE support.
+
+Type inference is **advisory**: the runtime does not enforce types at execution
+time.  Production correctness still depends on operator implementations.
 
 ### Field reference syntax
 
@@ -201,7 +317,7 @@ class MyBackend:
 Backends are registered by name for use from the CLI or config files:
 
 ```python
-from rayorch.compiler.registry import register_backend
+from rayorch.compiler.backends.registry import register_backend
 
 register_backend("mybackend", MyBackend)
 ```

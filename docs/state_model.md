@@ -2,6 +2,11 @@
 
 Date: 2026-06-12
 
+> **Status: Target architecture — not yet fully enforced.**  Provider-based
+> persistence (RDBMS, lineage sinks) is a Phase 1 / Phase 3 deliverable.  The
+> consistency rules and state machines below describe the intended behaviour
+> once providers are wired into `RuntimeDagExecutor`.
+
 This document defines the authoritative state transitions for jobs, stages, and
 blocks.  The rule is simple: **Ray owns in-flight execution state; the RDBMS
 owns durable, queryable state**.  The two are never silently out of sync for

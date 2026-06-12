@@ -185,10 +185,16 @@ error. Healthy rows continue through downstream stages.
 
 ## Persistence Provider Abstractions
 
-Runtime outputs (artifacts, metadata, lineage) are committed through provider
-interfaces so that the execution engine does not depend on a specific storage
-backend.  All providers are injected into `RuntimeDagExecutor` and default to
-no-op or in-memory stubs in the MVP.
+> **Planned — not yet implemented.**  Provider injection into
+> `RuntimeDagExecutor` is a Phase 1 deliverable.  The interfaces below
+> describe the target API; the current MVP returns lineage in memory only.
+
+Runtime outputs (artifacts, metadata, lineage) will be committed through
+provider interfaces so that the execution engine does not depend on a specific
+storage backend.  All providers will be injected into `RuntimeDagExecutor` and
+default to no-op or in-memory stubs.  See
+[`provider_abstractions.md`](provider_abstractions.md) for the canonical
+interface definitions.
 
 ### ArtifactStoreProvider
 
@@ -220,12 +226,24 @@ PostgreSQL or MySQL; early development uses an in-memory dict.
 
 ```python
 class MetadataStoreProvider:
-    def save_job(self, job: JobRecord) -> None: ...
+    # Job lifecycle
+    def create_job(self, job: JobRecord) -> None: ...
     def update_job_state(self, job_id: str, state: JobState) -> None: ...
+    def get_job(self, job_id: str) -> JobRecord | None: ...
+    def list_jobs(self, state: JobState | None = None) -> list[JobRecord]: ...
+
+    # Stage lifecycle
+    def create_stage(self, stage: StageRecord) -> None: ...
+    def update_stage_state(self, stage_id: str, state: StageState) -> None: ...
+
+    # Block metadata
     def save_block(self, block: BlockRecord) -> None: ...
+    def query_blocks(self, job_id: str) -> list[BlockRecord]: ...
+
+    # Artifact references
     def save_image_ref(self, ref: ImageRef) -> None: ...
     def save_ocr_result(self, result: OcrResult) -> None: ...
-    def query_blocks(self, job_id: str) -> list[BlockRecord]: ...
+    def query_ocr_results(self, block_id: str) -> list[OcrResult]: ...
 ```
 
 ### LineageSinkProvider
