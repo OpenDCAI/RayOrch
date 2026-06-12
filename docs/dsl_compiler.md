@@ -57,14 +57,14 @@ class ASTVersionProvider:
         """Return the (major, minor) Python version this provider targets."""
         ...
 
-    def parse(self, source: str, filename: str = "<string>") -> ast.AST:
+    def parse(self, source: str, filename: str = "<string>") -> ast.Module:
         """
         Parse `source` into an AST, applying any version-specific pre-processing.
         Raises `DSLSyntaxError` on parse failure.
         """
         ...
 
-    def iter_function_body(self, func_def: ast.FunctionDef) -> list[ast.stmt]:
+    def get_function_body(self, func_def: ast.FunctionDef) -> list[ast.stmt]:
         """
         Return the statement list for `func_def`, normalising version-specific
         differences in how the body is represented.
@@ -226,9 +226,17 @@ time.  Production correctness still depends on operator implementations.
 
 ### Field reference syntax
 
-Source inputs use `$name`.  Node outputs use `node_id.port_name` or the local
-alias assigned in `forward()`.  The IR uses fully-qualified references; local
-aliases from `forward()` are resolved during semantic analysis.
+The IR distinguishes **declarations** (`"name"`) from **references** (`"ref"`):
+
+- **`"name"`** — declares a new port.  Used in top-level `inputs` (pipeline
+  input port definitions) and in node `outputs` (ports produced by a node).
+- **`"ref"`** — references an existing port.  Used in top-level `outputs`
+  (pointing at node output ports that become pipeline outputs) and in node
+  `inputs` (consuming outputs of upstream nodes or pipeline inputs).
+
+Source inputs are referenced with a `$` prefix (`$pdf`).  Node outputs are
+referenced as `node_id.port_name` or the local alias assigned in `forward()`;
+all aliases are resolved to fully-qualified references during semantic analysis.
 
 ### Node `config`
 
