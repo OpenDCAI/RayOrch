@@ -178,9 +178,71 @@ error. Healthy rows continue through downstream stages.
 - The current record unit is one document. Pages and blocks remain nested
   values; explicit filter/flat-map/dedup/merge cardinality changes are deferred
   to [`todos/07-runtime-emit-api.md`](todos/07-runtime-emit-api.md).
-- Lineage is returned in memory; persistent sinks are future work.
+- Lineage is returned in memory; persistent sinks are future work tracked in
+  [`todos/05-lineage-sink-backend.md`](todos/05-lineage-sink-backend.md).
 - Operator/actor retries and process recovery are not yet production-grade.
 - The executor currently targets row-aligned batch transformations.
+
+## Persistence Provider Abstractions
+
+Runtime outputs (artifacts, metadata, lineage) are committed through provider
+interfaces so that the execution engine does not depend on a specific storage
+backend.  All providers are injected into `RuntimeDagExecutor` and default to
+no-op or in-memory stubs in the MVP.
+
+### ArtifactStoreProvider
+
+Stores and retrieves large binary artifacts (PDFs, images, OCR intermediates).
+Implementations target S3-compatible object stores (MinIO for local
+development, AWS S3 / GCS for production).
+
+```python
+class ArtifactStoreProvider:
+    def put(self, key: str, data: bytes, content_type: str = "") -> str:
+        """Upload artifact and return its canonical reference URI."""
+        ...
+
+    def get(self, ref: str) -> bytes:
+        """Download artifact by its reference URI."""
+        ...
+
+    def delete(self, ref: str) -> None: ...
+```
+
+Operators pass lightweight reference strings through the DAG; the heavy bytes
+live exclusively in the object store.
+
+### MetadataStoreProvider
+
+Persists DAG definitions, job and stage records, block metadata, image
+references, and OCR result indexes.  The primary implementation targets
+PostgreSQL or MySQL; early development uses an in-memory dict.
+
+```python
+class MetadataStoreProvider:
+    def save_job(self, job: JobRecord) -> None: ...
+    def update_job_state(self, job_id: str, state: JobState) -> None: ...
+    def save_block(self, block: BlockRecord) -> None: ...
+    def save_image_ref(self, ref: ImageRef) -> None: ...
+    def save_ocr_result(self, result: OcrResult) -> None: ...
+    def query_blocks(self, job_id: str) -> list[BlockRecord]: ...
+```
+
+### LineageSinkProvider
+
+Commits lineage deltas produced by each microbatch.  See
+[`todos/05-lineage-sink-backend.md`](todos/05-lineage-sink-backend.md) for the
+full evolution plan.
+
+```python
+class LineageSinkProvider:
+    def commit(self, delta: LineageDelta) -> None:
+        """Flush paths, row_path updates, and quarantine records."""
+        ...
+```
+
+Built-in sinks: `InMemoryLineageSink` (MVP default), `SQLLineageSink` (SQL
+backend), `ParquetLineageSink` (object-store columnar).
 
 ## Tests
 
