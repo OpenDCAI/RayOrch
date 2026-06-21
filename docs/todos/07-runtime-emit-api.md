@@ -3,6 +3,11 @@
 Status: future design direction. Do not block the current document-level
 record-preserving Runtime MVP.
 
+The default cardinality and mixed-grain port API is now refined in
+[`09-multi-grain-port-cardinality-api.md`](09-multi-grain-port-cardinality-api.md).
+This document remains focused on the advanced command-style `ctx.emit()` path
+and its shared buffered execution protocol.
+
 ## Goal
 
 Support filter, flat-map, deduplication, merge, clustering, and general `N:M`
@@ -33,7 +38,7 @@ actor receives MicroBatch
 `ctx.emit()` must not perform RPC, object-store writes, or immediate downstream
 dispatch.
 
-## Proposed User API
+## Advanced User API
 
 ```python
 @orch.emit_op(outputs=("doc",), record_local=False)
@@ -120,9 +125,10 @@ The current `1:1` Runtime should avoid assumptions that would block emit:
 - fan-in should align records by identity rather than require identical paths;
 - nested page/block values must not be confused with independent Runtime rows.
 
-Do not add `record_id`, `alignment_id`, emit decorators, or shuffle APIs until a
-real page-level or dataset-governance workload defines their required
-semantics.
+Do not expose `record_id` or `alignment_id` to users. Static cardinality
+decorators, runtime-aware return helpers, and per-port batches are specified in
+the multi-grain port design. Shuffle APIs remain deferred until a real
+dataset-global workload defines their semantics.
 
 ## Initial Acceptance Workload
 

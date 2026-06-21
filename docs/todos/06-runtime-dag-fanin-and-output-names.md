@@ -27,7 +27,9 @@ list[list[block]]
 ```
 
 Page-level scheduling and arbitrary record cardinality changes are deferred to
-the emit API tracked in
+the multi-grain port API tracked in
+[`09-multi-grain-port-cardinality-api.md`](09-multi-grain-port-cardinality-api.md).
+Advanced command-style emission remains tracked separately in
 [`07-runtime-emit-api.md`](07-runtime-emit-api.md).
 
 ## Problem 1: Fan-In After Path Divergence

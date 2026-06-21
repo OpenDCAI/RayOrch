@@ -177,7 +177,10 @@ error. Healthy rows continue through downstream stages.
   naming is tracked in the same TODO.
 - The current record unit is one document. Pages and blocks remain nested
   values; explicit filter/flat-map/dedup/merge cardinality changes are deferred
-  to [`todos/07-runtime-emit-api.md`](todos/07-runtime-emit-api.md).
+  to the
+  [`multi-grain port design`](todos/09-multi-grain-port-cardinality-api.md).
+  Advanced command-style emission is tracked separately in
+  [`todos/07-runtime-emit-api.md`](todos/07-runtime-emit-api.md).
 - Lineage is returned in memory; persistent sinks are future work.
 - Operator/actor retries and process recovery are not yet production-grade.
 - The executor currently targets row-aligned batch transformations.
