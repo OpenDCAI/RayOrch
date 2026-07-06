@@ -33,7 +33,7 @@ import ray
 
 from .dispatch_mode import Dispatch
 from .container_ops import is_sliceable as _is_sliceable
-from .ray_module import RayModule
+from .ray_module import RayModule, SOURCE_EXHAUSTED, _SourceExhausted
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -361,13 +361,28 @@ class _Scheduler:
                 f"input keys mismatch: expected {graph.input_keys}, "
                 f"got {tuple(input_columns.keys())}"
             )
-        if not graph.input_keys:
-            raise ValueError("input columns cannot be empty")
+        # input_keys 允许为空:纯「自驱动 source」图(每个 root 是有状态流式 reader,自产 batch、
+        # 迭代器枯竭时其 run 抛 StopIteration → RunnerActor 转成 SOURCE_EXHAUSTED 哨兵)。此时无 driver
+        # 侧输入,batch 由 root source 乐观 admit、靠哨兵终止(见 _on_complete)。约束:空 input_keys 的图
+        # **必须**至少有一个终会枯竭的 source root,否则 admit 循环不会停(无外部输入 + 无枯竭信号 = 无限图)。
         # 每个 input_key 一个迭代器（list/生成器/任意 iterable 统一 iter()）
         self._iters: Dict[str, "Iterator[Any]"] = {
             k: iter(v) for k, v in input_columns.items()
         }
         self._source_exhausted = False
+        self._void: set[int] = set()                 # 已 admit 但因 source 枯竭而作废、不产出的 batch
+
+        # ── 自驱动图(空 input_keys):source root 是有状态 reader,枯竭信号异步(reader run 回哨兵)──
+        # 与 driver 侧 input_keys 不同:那边 admit 前同步 next()、当场知枯竭,不会过度 admit。自驱动这边
+        # 枯竭要等 actor 跑完才知,若乐观 admit 满 max_inflight 会在哨兵回来前级联多 spawn 出界的 tick。
+        # 故门控:**同一时刻至多 1 批「source 未跑完」的 tick**(1-ahead)。单 actor reader 的 tick 本就在
+        # actor 上串行,提前 admit 多个 source tick 不加速读;下游 pipeline overlap 只需「reader[N] 完成即
+        # admit N+1、同时 N 的下游在跑」,1-ahead 不损 overlap。代价仅 1 个探测 tick(≈driver 侧 next() 撞
+        # StopIteration 那一下)。非自驱动图 self._self_driven=False,门控不触发,老行为逐字节不变。
+        # _src_left[bi]=该 batch 尚未完成的 source 节点数;keys 即「source 未跑完」的 batch(门控依据)。
+        self._self_driven = not graph.input_keys
+        self._source_nodes = tuple(n for n in graph.topo_order if not graph.deps[n])
+        self._src_left: Dict[int, int] = {}
 
         # 按 batch 懒建(dict[bi] 而非 list[N])——不预知总数、完成即可释放
         self._ctx: Dict[int, Dict[str, tuple]] = {}
@@ -379,6 +394,7 @@ class _Scheduler:
 
         self._live: set[int] = set()
         self._next_batch = 0
+        self._batch_inflight: Dict[int, int] = {}    # per-batch 未完成调用数(作废 batch 收尾用)
 
         self._ref_owner: Dict[ray.ObjectRef, _InflightCall] = {}
         self._outstanding: set[ray.ObjectRef] = set()
@@ -438,6 +454,10 @@ class _Scheduler:
     def _admit_batches(self) -> None:
         # 迭代器驱动:边拉边 admit,拿不到(源枯竭)就停;不依赖 len(columns)。
         while len(self._live) < self._max_inflight:
+            # 自驱动图 1-ahead 门控:已有一批 source 未跑完(枯竭未知)→ 先别再 admit,避免哨兵回来
+            # 前级联过度 spawn。等那批 source 完成(_on_complete 里清 _src_left)再放行下一批。
+            if self._self_driven and self._src_left:
+                break
             row = self._next_input_row()
             if row is None:
                 break
@@ -446,6 +466,8 @@ class _Scheduler:
             self._live.add(bi)
             self._ctx[bi] = {key: (row[key],) for key in self._graph.input_keys}
             self._status[bi] = {name: _NodeStatus() for name in self._graph.topo_order}
+            if self._self_driven:
+                self._src_left[bi] = len(self._source_nodes)
             for name in self._graph.topo_order:
                 if not self._graph.deps[name]:
                     self._mark_ready(bi, name)
@@ -466,6 +488,10 @@ class _Scheduler:
                 cap = self._graph.nodes[name].max_inflight
                 while q and self._node_inflight[name] < cap:
                     bi = q.popleft()
+                    # batch 可能在入队后被作废(某 source 回哨兵)——跳过:不提交作废 batch 的下游,
+                    # 且其 ctx/status 可能已被 _retire_if_drained 清掉,再 _submit 会 KeyError。
+                    if bi in self._void or bi not in self._status:
+                        continue
                     if self._status[bi][name].phase != "ready":
                         continue
                     self._submit(bi, self._graph.nodes[name])
@@ -497,6 +523,7 @@ class _Scheduler:
             refs=refs, collect_fn=future.collect_fn,
         )
         self._node_inflight[spec.name] += 1
+        self._batch_inflight[bi] = self._batch_inflight.get(bi, 0) + 1
 
         call = _InflightCall(batch_idx=bi, node_name=spec.name, refs=list(refs))
         for ref in refs:
@@ -516,12 +543,39 @@ class _Scheduler:
             raw = ray.get(call.refs)
             value = pending.collect_fn(spec.module, raw) if pending.collect_fn else raw
 
+        # per-batch / per-node in-flight 记账(哨兵与正常路径都要减,否则收尾判据错)。
+        # _submit 保证已先 +1,故 bi 必在字典中——缺失是真 bug,让它 KeyError 暴露而非静默兜底。
+        self._node_inflight[name] -= 1
+        self._batch_inflight[bi] -= 1
+        st.phase = "done"
+        st.pending = None
+
+        # 自驱动 1-ahead 门控:source 节点完成(不论出数据还是哨兵)即消 _src_left;本 batch 的 source 全
+        # 完成 → 从 _src_left 移除,放行 _admit_batches 下一批。放在两个分支之前,确保哨兵路径也解锁。
+        if self._self_driven and bi in self._src_left and not self._graph.deps[name]:
+            self._src_left[bi] -= 1
+            if self._src_left[bi] <= 0:
+                self._src_left.pop(bi, None)
+
+        # ── 流式 source 枯竭:该 source 节点的 run 抛 StopIteration，RunnerActor 已转成哨兵 ──
+        # 语义 = 「任一 source 枯竭 → 全图停」(与 driver 侧 _next_input_row 任一迭代器 StopIteration
+        # 即停完全对称)。做两件事:① 置枯竭 → _admit_batches 不再 admit 新 batch;② 作废本 batch——
+        # 它是「乐观 admit」出来的、上游已无数据,不该产出结果、也不该往下游 dispatch。已在途的兄弟
+        # 节点调用完成后同样落进 void 分支被清理,batch 收尾靠 _batch_inflight 归零。
+        if isinstance(value, _SourceExhausted):
+            self._source_exhausted = True
+            self._void.add(bi)
+            self._retire_if_drained(bi)
+            return
+
+        # 本 batch 已被作废(某 source 先枯竭):不再产出/下推,仅做 in-flight 收尾。
+        if bi in self._void:
+            self._retire_if_drained(bi)
+            return
+
         _validate_output(spec, value)
 
         self._ctx[bi][name] = value if spec.num_outputs > 1 else (value,)
-        st.phase = "done"
-        st.pending = None
-        self._node_inflight[name] -= 1
 
         for child in self._graph.consumers[name]:
             if self._all_deps_done(bi, child):
@@ -537,6 +591,21 @@ class _Scheduler:
             # 流式:完成的 batch ctx/status 即刻释放(不全程持有 → TB 级不堆内存)
             self._ctx.pop(bi, None)
             self._status.pop(bi, None)
+            self._batch_inflight.pop(bi, None)
+
+    def _retire_if_drained(self, bi: int) -> None:
+        """作废 batch 的收尾:等它所有在途调用回来(_batch_inflight 归零)再释放状态。
+
+        不能在遇到哨兵的瞬间就 pop——同一 batch 的兄弟 source/节点可能仍在途(fan-out 并行 admit),
+        它们的 ObjectRef 还在 _outstanding 里、完成时要能查到自己的 ctx/status。故按未完成调用计数收尾。
+        """
+        if self._batch_inflight.get(bi, 0) > 0:
+            return
+        self._live.discard(bi)
+        self._ctx.pop(bi, None)
+        self._status.pop(bi, None)
+        self._batch_inflight.pop(bi, None)
+        self._src_left.pop(bi, None)
 
     def _release_upstream(self, bi: int, name: str) -> None:
         for dep in self._graph.deps[name]:

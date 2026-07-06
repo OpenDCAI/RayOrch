@@ -24,6 +24,31 @@ from .env_registry import EnvRegistry
 
 
 # --------------------------
+# 流式 source 枯竭哨兵
+# --------------------------
+class _SourceExhausted:
+    """Sentinel: a source node's ``run`` raised ``StopIteration`` (a stateful
+    stream reader, e.g. ``return next(self._it)``, hit end-of-stream).
+
+    :class:`RunnerActor` catches that ``StopIteration`` and returns this sentinel
+    instead of letting it surface as a ``RayTaskError``; the DAG scheduler
+    (:class:`~rayorch.dag_new_pipeline._Scheduler`) recognizes it to stop
+    admitting new batches. **Zero operator coupling**: an op just does
+    ``return next(self._it)`` — it never imports or references this sentinel.
+    Identity survives Ray (de)serialization via ``isinstance`` (the class is
+    referenced by module path, not object identity).
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return "<SOURCE_EXHAUSTED>"
+
+
+SOURCE_EXHAUSTED = _SourceExhausted()
+
+
+# --------------------------
 # Actor：运行时不要 Generic/ParamSpec, 否则会报serialize的错误
 # --------------------------
 @ray.remote
@@ -76,7 +101,14 @@ class RunnerActor:
         with dev_nvtx_range:
             resolved_args = _resolve_refs(args)
             resolved_kwargs = _resolve_refs(kwargs)
-            return self.op.run(*resolved_args, **resolved_kwargs)
+            try:
+                return self.op.run(*resolved_args, **resolved_kwargs)
+            except StopIteration:
+                # Stateful stream reader hit end-of-stream (`return next(self._it)`).
+                # Surface as a sentinel value, not a RayTaskError, so the DAG
+                # scheduler can stop admitting batches. StopIteration must not
+                # escape a remote task anyway (it would become a RayTaskError).
+                return SOURCE_EXHAUSTED
 
 
 def _infer_num_outputs(op_cls: type) -> int:
