@@ -15,11 +15,37 @@ class RunOp(Protocol[INITP, RUNP, R]):
 import ray
 
 from .dispatch_mode import DispatchMode, ShardedObjectRef, get_predefined_dispatch_fn
+from .container_ops import is_sliceable, uni_slice
 from .env_registry import EnvRegistry
 
 # from image_class import ImageLoadOp, ImageSaveOP
 # from yolo_class import YOLODrawOp
 # from sam_class import SAMOp, OutputSAMMasksOp
+
+
+# --------------------------
+# 流式 source 枯竭哨兵
+# --------------------------
+class _SourceExhausted:
+    """Sentinel: a source node's ``run`` raised ``StopIteration`` (a stateful
+    stream reader, e.g. ``return next(self._it)``, hit end-of-stream).
+
+    :class:`RunnerActor` catches that ``StopIteration`` and returns this sentinel
+    instead of letting it surface as a ``RayTaskError``; the DAG scheduler
+    (:class:`~rayorch.dag_new_pipeline._Scheduler`) recognizes it to stop
+    admitting new batches. **Zero operator coupling**: an op just does
+    ``return next(self._it)`` — it never imports or references this sentinel.
+    Identity survives Ray (de)serialization via ``isinstance`` (the class is
+    referenced by module path, not object identity).
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return "<SOURCE_EXHAUSTED>"
+
+
+SOURCE_EXHAUSTED = _SourceExhausted()
 
 
 # --------------------------
@@ -45,14 +71,14 @@ class RunnerActor:
             rem = n % num_shards
             start = shard_idx * base + min(shard_idx, rem)
             end = start + base + (1 if shard_idx < rem else 0)
-            return seq[start:end]
+            return uni_slice(seq, start, end)   # arrow .slice / 其余 [s:e]
 
         def _resolve_refs(x):
             # ShardedObjectRef: core path for SHARD_* dispatch — each replica
             # resolves the shared ref and slices its own partition.
             if isinstance(x, ShardedObjectRef):
                 resolved = ray.get(x.ref)
-                if isinstance(resolved, (list, tuple)):
+                if is_sliceable(resolved):
                     return _slice_for_replica(resolved, x.shard_idx, x.num_shards)
                 return resolved
             # Raw ObjectRef: in DAG runtime the scheduler materializes values
@@ -75,7 +101,14 @@ class RunnerActor:
         with dev_nvtx_range:
             resolved_args = _resolve_refs(args)
             resolved_kwargs = _resolve_refs(kwargs)
-            return self.op.run(*resolved_args, **resolved_kwargs)
+            try:
+                return self.op.run(*resolved_args, **resolved_kwargs)
+            except StopIteration:
+                # Stateful stream reader hit end-of-stream (`return next(self._it)`).
+                # Surface as a sentinel value, not a RayTaskError, so the DAG
+                # scheduler can stop admitting batches. StopIteration must not
+                # escape a remote task anyway (it would become a RayTaskError).
+                return SOURCE_EXHAUSTED
 
 
 def _infer_num_outputs(op_cls: type) -> int:
