@@ -195,6 +195,23 @@ Pipeline 负责"是什么"（图定义），Executor 负责"怎么跑"（调度�
 - Greedy drain：block for 1 ref，然后 timeout=0 捞取所有已完成 ref
 - 上游释放：当某 node 的所有 consumer 都完成时，从 ctx 中删除该 node 的数据
 
+#### ★ per-node `max_inflight` 默认 1 的瓶颈(待讨论/待改)
+
+`NodeSpec.max_inflight` 默认 **1**——即一个节点正跑 batch0 时,batch1 **进不了该节点**、在其 `_ready_q` 排队
+(`_dispatch`: `while q and self._node_inflight[name] < cap`)。这与全局 `max_batches_inflight` 是**两级闸门,取更
+严者**:全局放 N 个 batch 存活,但若某慢节点 per-node=1,后续 batch 卡在它门口,**跨 batch 流水线重叠被掐深度**。
+
+**实测暴露**(2026-07,hydp-dataflow mineru 368 PDF 回归):每节点默认 `max_inflight=1` 的图,比每节点显式设 4
+的等价图慢 **~9.5%**(924s vs 844s)——vLLM 重段成为流水线深度瓶颈,即使全局 inflight=4 也拿不到充分重叠。
+
+**问题**:per-node 默认 1 是否合理?
+- **支持 1**:安全保守——不显式声明并发就不堆积、背压天然紧。对内存/显存敏感的重算子友好。
+- **反对**:与全局 `max_batches_inflight` **语义割裂**——用户设了全局 4、以为有 4 深流水线,却因节点默认 1 拿不到,
+  **反直觉、静默变慢**(正是那 9.5% 的来源,且难自查)。更合理的默认或许是 **per-node 缺省 = `max_batches_inflight`**
+  (节点不额外收紧;要更紧才显式调小),让「全局设多少就真有多深流水线」成立。
+- **折中**:至少在文档/API 显著提示「per-node 默认 1 会限制流水线深度,重段请显式放宽」;或上层框架(如
+  hydp-dataflow 翻译层)把缺省对齐全局。**此默认值的取舍待定,记此 TODO。**
+
 ### 上下文存储
 
 所有 node 输出统一存为 tuple：
