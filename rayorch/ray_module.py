@@ -40,19 +40,21 @@ class RunnerActor:
 
     def run(self, args, kwargs, meta=None):
         def _slice_for_replica(seq, shard_idx: int, num_shards: int):
+            from .container_ops import uni_slice
             n = len(seq)
             base = n // num_shards
             rem = n % num_shards
             start = shard_idx * base + min(shard_idx, rem)
             end = start + base + (1 if shard_idx < rem else 0)
-            return seq[start:end]
+            return uni_slice(seq, start, end)   # arrow .slice / 其余 [s:e]
 
         def _resolve_refs(x):
             # ShardedObjectRef: core path for SHARD_* dispatch — each replica
             # resolves the shared ref and slices its own partition.
             if isinstance(x, ShardedObjectRef):
+                from .container_ops import is_sliceable
                 resolved = ray.get(x.ref)
-                if isinstance(resolved, (list, tuple)):
+                if is_sliceable(resolved):
                     return _slice_for_replica(resolved, x.shard_idx, x.num_shards)
                 return resolved
             # Raw ObjectRef: in DAG runtime the scheduler materializes values

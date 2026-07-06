@@ -32,6 +32,7 @@ from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 import ray
 
 from .dispatch_mode import Dispatch
+from .container_ops import is_sliceable as _is_sliceable
 from .ray_module import RayModule
 
 
@@ -223,9 +224,10 @@ class Executor(ABC):
 def _validate_output(spec: NodeSpec, value: Any) -> None:
     """Check that a node's return value matches its declared ``num_outputs``."""
     if spec.num_outputs == 1:
-        if not isinstance(value, list):
+        if not _is_sliceable(value):
             raise TypeError(
-                f"node '{spec.name}' must return list (got {type(value).__name__})"
+                f"node '{spec.name}' must return a sliceable batch "
+                f"(list/tuple/DataFrame/Table/ndarray, got {type(value).__name__})"
             )
         return
     if not isinstance(value, (tuple, list)):
@@ -239,9 +241,9 @@ def _validate_output(spec: NodeSpec, value: Any) -> None:
             f"but returned {len(value)} outputs"
         )
     for i, branch in enumerate(value):
-        if not isinstance(branch, list):
+        if not _is_sliceable(branch):
             raise TypeError(
-                f"node '{spec.name}' output[{i}] must be list "
+                f"node '{spec.name}' output[{i}] must be a sliceable batch "
                 f"(got {type(branch).__name__})"
             )
 
@@ -438,16 +440,16 @@ class _Scheduler:
         kw = {k: ctx[ref.node][ref.index] for k, ref in spec.kw_args.items()}
 
         for i, v in enumerate(args):
-            if not isinstance(v, list):
+            if not _is_sliceable(v):
                 raise TypeError(
-                    f"node '{spec.name}' arg[{i}] must be list "
-                    f"(got {type(v).__name__})"
+                    f"node '{spec.name}' arg[{i}] must be a sliceable batch "
+                    f"(list/tuple/DataFrame/Table/ndarray, got {type(v).__name__})"
                 )
         for k, v in kw.items():
-            if not isinstance(v, list):
+            if not _is_sliceable(v):
                 raise TypeError(
-                    f"node '{spec.name}' kwarg '{k}' must be list "
-                    f"(got {type(v).__name__})"
+                    f"node '{spec.name}' kwarg '{k}' must be a sliceable batch "
+                    f"(list/tuple/DataFrame/Table/ndarray, got {type(v).__name__})"
                 )
 
         future = spec.module.remote(*args, **kw)
