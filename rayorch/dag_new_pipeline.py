@@ -27,7 +27,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
 import inspect
-from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import ray
 
@@ -334,27 +334,45 @@ class _InflightCall:
 
 
 class _Scheduler:
-    """``ray.wait``-driven event loop for :class:`DagExecutor`."""
+    """``ray.wait``-driven event loop for :class:`DagExecutor`.
+
+    **流式驱动(不预知 batch 总数)**：input_columns 的每个 value 只需是 *iterable*（list 或任意迭代器/
+    生成器）。调度器按 ``max_batches_inflight`` 边拉边 admit——从每个 input_key 的迭代器**同步取一批**
+    （所有 key 都还有下一个才 admit 新 batch；任一耗尽即源枯竭）。终止条件是「源枯竭 且 in-flight 清空」，
+    **不依赖 len(columns)**。这让 hydp-dataflow 的「有状态流式 reader」(每次 run 吐一 batch、迭代器枯竭即停)
+    天然可跑，TB 级/未知长度源不 OOM、不预扫。``_ctx``/``_status`` 按 batch 懒建、完成即释放。
+
+    向后兼容：value 传 list 时 ``iter(list)`` 即可，老行为不变（同步同长、结果按 admit 序返回）。
+    """
 
     def __init__(
         self,
         graph: CompiledGraph,
-        input_columns: Dict[str, Sequence[Any]],
+        input_columns: Dict[str, "Iterable[Any]"],
         max_batches_inflight: int,
     ) -> None:
         self._graph = graph
         self._max_inflight = max(1, int(max_batches_inflight))
-        self._n_batches = _validate_columns(graph, input_columns)
 
-        self._ctx: List[Dict[str, tuple]] = [
-            {key: (input_columns[key][i],) for key in graph.input_keys}
-            for i in range(self._n_batches)
-        ]
-        self._status: List[Dict[str, _NodeStatus]] = [
-            {name: _NodeStatus() for name in graph.topo_order}
-            for _ in range(self._n_batches)
-        ]
-        self._results: List[Any] = [None] * self._n_batches
+        # input_keys 校验(只查键集一致，不再要求等长/已知长度）
+        expected = set(graph.input_keys)
+        if set(input_columns.keys()) != expected:
+            raise ValueError(
+                f"input keys mismatch: expected {graph.input_keys}, "
+                f"got {tuple(input_columns.keys())}"
+            )
+        if not graph.input_keys:
+            raise ValueError("input columns cannot be empty")
+        # 每个 input_key 一个迭代器（list/生成器/任意 iterable 统一 iter()）
+        self._iters: Dict[str, "Iterator[Any]"] = {
+            k: iter(v) for k, v in input_columns.items()
+        }
+        self._source_exhausted = False
+
+        # 按 batch 懒建(dict[bi] 而非 list[N])——不预知总数、完成即可释放
+        self._ctx: Dict[int, Dict[str, tuple]] = {}
+        self._status: Dict[int, Dict[str, _NodeStatus]] = {}
+        self._results: Dict[int, Any] = {}
 
         self._ready_q: Dict[str, Deque[int]] = {n: deque() for n in graph.topo_order}
         self._node_inflight: Dict[str, int] = {n: 0 for n in graph.topo_order}
@@ -378,7 +396,21 @@ class _Scheduler:
                 self._on_complete(call)
             self._admit_batches()
             self._dispatch()
-        return self._results
+        # 结果按 admit 序(batch idx 升序)还原成 list
+        return [self._results[i] for i in sorted(self._results)]
+
+    def _next_input_row(self) -> "Dict[str, Any] | None":
+        """从每个 input_key 的迭代器同步取一批;任一耗尽 → 源枯竭,返回 None。"""
+        if self._source_exhausted:
+            return None
+        row: Dict[str, Any] = {}
+        for key, it in self._iters.items():
+            try:
+                row[key] = next(it)
+            except StopIteration:
+                self._source_exhausted = True
+                return None
+        return row
 
     def _drain_completed(self) -> List[_InflightCall]:
         ready, _ = ray.wait(list(self._outstanding), num_returns=1)
@@ -404,14 +436,20 @@ class _Scheduler:
         return calls
 
     def _admit_batches(self) -> None:
-        while (self._next_batch < self._n_batches
-               and len(self._live) < self._max_inflight):
+        # 迭代器驱动:边拉边 admit,拿不到(源枯竭)就停;不依赖 len(columns)。
+        while len(self._live) < self._max_inflight:
+            row = self._next_input_row()
+            if row is None:
+                break
             bi = self._next_batch
             self._next_batch += 1
             self._live.add(bi)
+            self._ctx[bi] = {key: (row[key],) for key in self._graph.input_keys}
+            self._status[bi] = {name: _NodeStatus() for name in self._graph.topo_order}
             for name in self._graph.topo_order:
                 if not self._graph.deps[name]:
                     self._mark_ready(bi, name)
+
 
     def _mark_ready(self, bi: int, name: str) -> None:
         st = self._status[bi][name]
@@ -497,6 +535,9 @@ class _Scheduler:
                 self._ctx[bi], self._graph.graph_outputs,
             )
             self._live.discard(bi)
+            # 流式:完成的 batch ctx/status 即刻释放(不全程持有 → TB 级不堆内存)
+            self._ctx.pop(bi, None)
+            self._status.pop(bi, None)
 
     def _release_upstream(self, bi: int, name: str) -> None:
         for dep in self._graph.deps[name]:
@@ -527,7 +568,7 @@ class DagExecutor(Executor):
     def execute(
         self,
         graph: CompiledGraph,
-        columns: Dict[str, Sequence[Any]],
+        columns: Dict[str, "Iterable[Any]"],
     ) -> List[Any]:
         return _Scheduler(graph, columns, self.max_batches_inflight).run()
 
