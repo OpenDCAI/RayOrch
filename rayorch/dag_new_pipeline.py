@@ -450,7 +450,6 @@ class _Scheduler:
                 if not self._graph.deps[name]:
                     self._mark_ready(bi, name)
 
-
     def _mark_ready(self, bi: int, name: str) -> None:
         st = self._status[bi][name]
         if st.phase != "waiting":

@@ -6,6 +6,8 @@ from typing import Any, Callable, Dict, Mapping, Sequence, Tuple, Union, List
 
 import ray
 
+from .container_ops import is_sliceable, uni_concat, uni_slice
+
 
 class Dispatch(Enum):
     BROADCAST = auto()
@@ -64,7 +66,6 @@ def collect_identity(rm, output):
 def _is_shardable(x: Any) -> bool:
     # 可当 batch 切分的容器:list/tuple + DataFrame/arrow/numpy(见 container_ops.is_sliceable)。
     # 表 + 多模态 object 统一(hydp-dataflow §4.5 坐实);其余(标量/ObjectRef 另处理)一律广播。
-    from .container_ops import is_sliceable
     return is_sliceable(x)
 
 
@@ -131,7 +132,6 @@ def dispatch_shard_all_args_mod(rm, *args, **kwargs):
     def shard_seq(seq):
         if ranges is None:
             raise ValueError("Internal error: ranges is None for shardable sequence input.")
-        from .container_ops import uni_slice
         return [uni_slice(seq, s, e) for (s, e) in ranges]   # arrow .slice / 其余 [s:e]
 
     def shard_ref(ref: ray.ObjectRef):
@@ -214,10 +214,8 @@ def collect_concat(rm, outputs):
 
         # 0) DataFrame/arrow/numpy 等非 list/tuple 的可切片容器:直接按类型拼(container_ops)。
         #    (表 + 多模态 object 统一;list/tuple 仍走下面原路径,向后兼容)
-        if not isinstance(x0, (list, tuple, dict)):
-            from .container_ops import is_sliceable, uni_concat
-            if is_sliceable(x0):
-                return uni_concat(seq)
+        if not isinstance(x0, (list, tuple, dict)) and is_sliceable(x0):
+            return uni_concat(seq)
 
         # 1) dict：对每个 key 递归 merge
         if isinstance(x0, dict):

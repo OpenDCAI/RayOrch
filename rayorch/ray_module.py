@@ -15,6 +15,7 @@ class RunOp(Protocol[INITP, RUNP, R]):
 import ray
 
 from .dispatch_mode import DispatchMode, ShardedObjectRef, get_predefined_dispatch_fn
+from .container_ops import is_sliceable, uni_slice
 from .env_registry import EnvRegistry
 
 # from image_class import ImageLoadOp, ImageSaveOP
@@ -40,7 +41,6 @@ class RunnerActor:
 
     def run(self, args, kwargs, meta=None):
         def _slice_for_replica(seq, shard_idx: int, num_shards: int):
-            from .container_ops import uni_slice
             n = len(seq)
             base = n // num_shards
             rem = n % num_shards
@@ -52,7 +52,6 @@ class RunnerActor:
             # ShardedObjectRef: core path for SHARD_* dispatch — each replica
             # resolves the shared ref and slices its own partition.
             if isinstance(x, ShardedObjectRef):
-                from .container_ops import is_sliceable
                 resolved = ray.get(x.ref)
                 if is_sliceable(resolved):
                     return _slice_for_replica(resolved, x.shard_idx, x.num_shards)
