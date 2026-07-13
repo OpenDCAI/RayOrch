@@ -145,3 +145,67 @@ def test_key_join_pipeline_is_reordering_invariant(seed: int) -> None:
 
     (out_ref,) = graph.graph_outputs
     _assert_ordered_equal(phys[out_ref], ser[out_ref])
+
+
+# ---------------------------------------------------------------------------
+# Nested Expand: doc -> page -> block -> Reduce must restore the full path
+# ---------------------------------------------------------------------------
+class _NestedPages:
+    def run(self, docs):
+        return [
+            [
+                {"doc": doc["name"], "page": page_index, "blocks": blocks}
+                for page_index, blocks in enumerate(doc["pages"])
+            ]
+            for doc in docs
+        ]
+
+
+class _NestedBlocks:
+    def run(self, pages):
+        return [
+            [
+                f"{page['doc']}#p{page['page']}#b{block_index}:{value}"
+                for block_index, value in enumerate(page["blocks"])
+            ]
+            for page in pages
+        ]
+
+
+class _AssembleNested:
+    def run(self, docs, groups):
+        return [
+            (doc["name"], tuple(group))
+            for doc, group in zip(docs, groups)
+        ]
+
+
+class _NestedPipe(mg.Pipeline):
+    def __init__(self):
+        super().__init__()
+        self.pages = mg.Expand(_NestedPages, parent=0)
+        self.blocks = mg.Expand(_NestedBlocks, parent=0)
+        self.assemble = mg.Reduce(_AssembleNested)
+
+    def forward(self, docs):
+        blocks = self.blocks(self.pages(docs))
+        return self.assemble(mg.group_by(docs, blocks))
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_nested_expand_reduce_restores_full_ordinal_path(seed: int) -> None:
+    graph = _NestedPipe().compile()
+    docs = mg.source(
+        [
+            {"name": "a", "pages": [["a0", "a1", "a2"], ["a3", "a4"]]},
+            {"name": "b", "pages": [["b0"], ["b1", "b2", "b3"]]},
+        ],
+        name="docs",
+    )
+    rng = random.Random(seed)
+
+    serial = _run(graph, {"docs": docs}, rng, shard=False)
+    physical = _run(graph, {"docs": docs}, rng, shard=True)
+
+    (out_ref,) = graph.graph_outputs
+    _assert_ordered_equal(physical[out_ref], serial[out_ref])

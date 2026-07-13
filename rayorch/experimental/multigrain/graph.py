@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 import inspect
+import math
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 
@@ -50,6 +51,37 @@ class MissingChildPolicy(str, Enum):
     FAIL_CLOSED = "fail_closed"
     RETRY_FIRST = "retry_first"
     PARTIAL = "partial"
+
+
+class RetryTiming(str, Enum):
+    INLINE = "inline"
+    DEFERRED = "deferred"
+
+
+class DrainScope(str, Enum):
+    SHARD_LOCAL = "shard_local"
+    STAGE_GLOBAL = "stage_global"
+
+
+class ShardExhaustedAction(str, Enum):
+    ABORT = "abort"
+    DEGRADE = "degrade"
+
+
+class IsolationExhaustedAction(str, Enum):
+    QUARANTINE = "quarantine"
+    ABORT = "abort"
+
+
+class RecordRecoveryAction(str, Enum):
+    RETRY = "retry_record"
+    ISOLATE = "isolate_record"
+
+
+class ShardRecoveryAction(str, Enum):
+    RETRY = "retry_shard"
+    DEGRADE = "degrade_shard"
+    ABORT = "abort"
 
 
 class MaterializePolicy(str, Enum):
@@ -185,6 +217,79 @@ class PhysicalHints:
 
 
 @dataclass(frozen=True)
+class IsolationBudget:
+    """Hard bound for adaptive localization after shard retries are exhausted."""
+
+    max_work_factor: float = 3.0
+    max_calls: int = 64
+    on_exhausted: IsolationExhaustedAction = IsolationExhaustedAction.QUARANTINE
+
+    def __post_init__(self) -> None:
+        factor = float(self.max_work_factor)
+        if not math.isfinite(factor) or factor < 0:
+            raise ValueError("max_work_factor must be finite and >= 0")
+        if self.max_calls < 0:
+            raise ValueError("max_calls must be >= 0")
+        object.__setattr__(self, "max_work_factor", factor)
+        object.__setattr__(
+            self,
+            "on_exhausted",
+            IsolationExhaustedAction(self.on_exhausted),
+        )
+
+
+@dataclass(frozen=True)
+class RecoveryPolicy:
+    """Passive per-node recovery policy.
+
+    The interface is complete up front; executors may implement policy
+    combinations incrementally and must reject unsupported combinations
+    explicitly rather than silently changing semantics.
+    """
+
+    max_record_retries: int = 0
+    retry_timing: RetryTiming = RetryTiming.INLINE
+    max_shard_retries: int = 2
+    on_shard_exhausted: ShardExhaustedAction = ShardExhaustedAction.ABORT
+    isolation: IsolationBudget = field(default_factory=IsolationBudget)
+    drain_scope: DrainScope = DrainScope.STAGE_GLOBAL
+
+    def __post_init__(self) -> None:
+        if self.max_record_retries < 0:
+            raise ValueError("max_record_retries must be >= 0")
+        if self.max_shard_retries < 0:
+            raise ValueError("max_shard_retries must be >= 0")
+        object.__setattr__(self, "retry_timing", RetryTiming(self.retry_timing))
+        object.__setattr__(
+            self,
+            "on_shard_exhausted",
+            ShardExhaustedAction(self.on_shard_exhausted),
+        )
+        if isinstance(self.isolation, Mapping):
+            object.__setattr__(self, "isolation", IsolationBudget(**self.isolation))
+        elif not isinstance(self.isolation, IsolationBudget):
+            raise TypeError("isolation must be an IsolationBudget or mapping")
+        object.__setattr__(self, "drain_scope", DrainScope(self.drain_scope))
+
+    def decide_record(
+        self,
+        *,
+        retryable: bool,
+        attempt: int,
+    ) -> RecordRecoveryAction:
+        if retryable and attempt < self.max_record_retries:
+            return RecordRecoveryAction.RETRY
+        return RecordRecoveryAction.ISOLATE
+
+    def decide_shard(self, *, attempt: int) -> ShardRecoveryAction:
+        if attempt < self.max_shard_retries:
+            return ShardRecoveryAction.RETRY
+        if self.on_shard_exhausted is ShardExhaustedAction.DEGRADE:
+            return ShardRecoveryAction.DEGRADE
+        return ShardRecoveryAction.ABORT
+
+
+@dataclass(frozen=True)
 class MaterializationSpec:
     port: IRPortRef
     policy: MaterializePolicy
@@ -238,6 +343,7 @@ class IRNode:
     op: OperatorRecipe
     properties: OperatorProperties = field(default_factory=OperatorProperties)
     physical: PhysicalHints = field(default_factory=PhysicalHints)
+    recovery: RecoveryPolicy = field(default_factory=RecoveryPolicy)
     parent_input: int | None = None
     grouped: bool = False
 
@@ -411,6 +517,7 @@ class GraphTracer:
         op: OperatorRecipe | None = None,
         properties: OperatorProperties | None = None,
         physical: PhysicalHints | None = None,
+        recovery: RecoveryPolicy | None = None,
         relation_roles: Sequence[str] = (),
     ) -> SymbolicPort | tuple[SymbolicPort, ...]:
         if not inputs:
@@ -466,6 +573,7 @@ class GraphTracer:
                 op=op or OperatorRecipe(cls_ref=name),
                 properties=properties or OperatorProperties(),
                 physical=physical or PhysicalHints(),
+                recovery=recovery or RecoveryPolicy(),
                 parent_input=parent_input,
                 grouped=grouped,
             )
@@ -596,6 +704,7 @@ def _node_to_dict(node: IRNode) -> dict[str, Any]:
         "op": asdict(node.op),
         "properties": asdict(node.properties),
         "physical": asdict(node.physical),
+        "recovery": asdict(node.recovery),
         "parent_input": node.parent_input,
         "grouped": node.grouped,
     }
@@ -605,10 +714,13 @@ __all__ = [
     "CardinalityContract",
     "CompiledGraph",
     "DisplayKeySpec",
+    "DrainScope",
     "GraphTracer",
     "IRNode",
     "IRPortRef",
     "IRPortSpec",
+    "IsolationBudget",
+    "IsolationExhaustedAction",
     "MaterializationSpec",
     "MaterializePolicy",
     "MaterializeReason",
@@ -622,9 +734,14 @@ __all__ = [
     "OrdinalPolicy",
     "PayloadKind",
     "PhysicalHints",
+    "RecordRecoveryAction",
+    "RecoveryPolicy",
     "Pipeline",
     "RelationKind",
     "RelationSpec",
+    "RetryTiming",
+    "ShardExhaustedAction",
+    "ShardRecoveryAction",
     "SymbolicPort",
     "ensure_symbolic_ports",
 ]

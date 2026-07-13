@@ -242,22 +242,26 @@ whitespace collapsed); byte identity is impossible because even the baseline is 
 self-reproducible (VLM batching jitter). Comparator: `Flash-mineru/mg_bridge/compare_md.py`.
 
 **E2E performance (368 PDFs / 7072 pages / 4×H20, LPT planner).**
+The current run uses only the public framework path:
+`MinerUReal.compile()` → `MultigrainRayExecutor.execute_stream`; the benchmark
+contains no `_pool_for`, `run_shard`, manual concat, or hand-written
+render/OCR/assemble scheduler.
 
 | metric | value |
 |---|---|
-| wall | **585.1 s** (all 368 docs assembled) |
-| vs measured baseline (891.98 s) | **1.52×** |
-| OCR bubble fraction | **0.062** (LPT kills the long-tail idle) |
-| throughput | 12.1 pages/s, 0.63 pdf/s |
+| wall | **519.95 s** (all 368 docs assembled) |
+| vs measured baseline (891.98 s) | **1.72×** |
+| vs previous benchmark-specific scheduler (585.13 s) | **1.13×** |
+| OCR bubble fraction | **0.0653** (LPT keeps the long-tail idle low) |
+| throughput | 13.6 pages/s, 0.708 pdf/s |
 
 **Output equivalence, fault-free (368 vs baseline).** matched 368/368, 0 missing,
-0 extra. token Jaccard median **0.9961**, mean 0.9922; **100 % ≥ 0.90, 99.7 % ≥ 0.95,
-88 % ≥ 0.98**; seq-ratio median 0.9996. The low-Jaccard tail is pure jitter (e.g.
-`DuoAttention*`: −0.1 % char delta). ~15 `hyper-connection*` docs show a large char
-gap **but identical page count (105) and identical structure (#`$$`, #code-fences,
-#blank-lines)** — the delta is one dense-table page the VLM garbles differently each
-run (baseline's longest line = a 96 766-char `<table>` of empty `<td></td>` padding vs
-ours 59 011). No pages/content dropped by the framework. Detail: `logs/cmp_lpt_fresh.jsonl`.
+0 extra. token Jaccard median **0.9957**, mean 0.9922; **100 % ≥ 0.90,
+98.9 % ≥ 0.95, 89.4 % ≥ 0.98**; seq-ratio median 0.9996. The low-Jaccard
+tail remains the same OCR/table-jitter families seen in independent baseline
+runs (`DuoAttention`, `hyper-connection`, dense malformed tables); all 7072
+pages and 368 document outputs are present. No framework-level content loss.
+Detail: `logs/cmp_engine_full_lpt_20260712.jsonl`.
 
 **Output equivalence after record-level recovery (48-PDF subset, 1 poison page).**
 Driver `Flash-mineru/mg_bridge/run_recovery_md.py` runs the full pipeline with a
@@ -273,7 +277,8 @@ Driver `Flash-mineru/mg_bridge/run_recovery_md.py` runs the full pipeline with a
 happy path and after a record-level fault; a permanently-lost page cascades to a *flagged,
 unwritten* document rather than a silently-truncated one. Artifacts:
 `Flash-mineru/mg_bridge/{compare_md.py,run_recovery_md.py}`,
-`logs/{perf_full_lpt.log,cmp_lpt_fresh.jsonl,recover_md_result.json,cmp_recover.jsonl}`.
+`logs/{cmp_engine_full_lpt_20260712.jsonl,recover_md_result.json,cmp_recover.jsonl}`,
+`outputs_engine_full_lpt_20260712`.
 
 ## 6. Risks & mitigations
 

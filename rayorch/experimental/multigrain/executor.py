@@ -6,8 +6,8 @@ import time
 from typing import Any, Callable, Mapping
 
 from ._op_utils import take_with_lineage
-from .core import PortBatch, group_by
-from .graph import IRNode, IRPortRef, MultigrainIR, NodeKind
+from .core import NodeExecution, PortBatch, group_by
+from .graph import IRNode, IRPortRef, MultigrainIR, NodeKind, RetryTiming
 from .metrics import NodeMetric, RunMetrics
 from .ops import Expand, Filter, Map, Reduce, Relate
 
@@ -33,12 +33,27 @@ class MultigrainExecutor:
         # (LazyOp), a model-holding op loads exactly once per executor instance
         # -- which, inside a persistent Ray actor, means once per replica.
         self._wrappers: dict[str, Any] = {}
+        self._wrapper_nodes: dict[str, IRNode] = {}
 
     def execute(
         self,
         graph: MultigrainIR,
         inputs: Mapping[str, PortBatch],
     ) -> PortBatch | tuple[PortBatch, ...]:
+        unsupported = [
+            node.name
+            for node in graph.nodes
+            if node.recovery.max_record_retries > 0
+            and (
+                node.kind is not NodeKind.MAP
+                or node.recovery.retry_timing is RetryTiming.DEFERRED
+            )
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "local recovery currently supports inline Map record retry only; "
+                f"nodes={unsupported}"
+            )
         context: dict[IRPortRef, PortBatch] = {}
         for port in graph.inputs:
             if port.name not in inputs:
@@ -78,21 +93,42 @@ class MultigrainExecutor:
         node: IRNode,
         inputs: tuple[PortBatch, ...],
     ) -> tuple[PortBatch, ...]:
+        result = self._execute_node_result(node, inputs)
+        if result.deferred:
+            raise NotImplementedError(
+                "deferred node results require the streaming coordinator"
+            )
+        return result.outputs
+
+    def _execute_node_result(
+        self,
+        node: IRNode,
+        inputs: tuple[PortBatch, ...],
+        *,
+        force_inline: bool = False,
+    ) -> NodeExecution:
         if node.kind is NodeKind.PROJECT:
-            return _as_output_tuple(inputs)
+            return NodeExecution(_as_output_tuple(inputs))
         if node.kind in (NodeKind.REBATCH, NodeKind.MATERIALIZE):
             if len(inputs) != 1:
                 raise ValueError(f"{node.kind.value} expects exactly one input")
-            return _as_output_tuple(inputs[0])
+            return NodeExecution(_as_output_tuple(inputs[0]))
         if node.kind is NodeKind.FILTER and node.op.cls_ref.endswith("SelectFilter"):
-            return self._execute_select_filter(node, inputs)
+            return NodeExecution(self._execute_select_filter(node, inputs))
 
         wrapper = self._wrapper_for(node)
         if node.kind is NodeKind.REDUCE:
             result = wrapper(group_by(inputs[0], *inputs[1:]))
+            deferred = ()
+        elif node.kind is NodeKind.MAP:
+            result, deferred = wrapper.run_with_recovery(
+                *inputs,
+                force_inline=force_inline,
+            )
         else:
             result = wrapper(*inputs)
-        return _as_output_tuple(result)
+            deferred = ()
+        return NodeExecution(_as_output_tuple(result), tuple(deferred))
 
     def _wrapper_for(self, node: IRNode) -> Any:
         """Build (and cache) the operator wrapper for a node.
@@ -105,6 +141,11 @@ class MultigrainExecutor:
         """
         cached = self._wrappers.get(node.name)
         if cached is not None:
+            if self._wrapper_nodes[node.name] != node:
+                raise ValueError(
+                    f"operator cache name collision for node '{node.name}'; "
+                    "use a separate executor for a different graph/node recipe"
+                )
             return cached
 
         op_cls = _load_object(node.op.cls_ref)
@@ -120,6 +161,7 @@ class MultigrainExecutor:
                 num_outputs=output_count,
                 properties=node.properties,
                 physical=node.physical,
+                recovery=node.recovery,
                 **kwargs,
             )
         elif node.kind is NodeKind.EXPAND:
@@ -132,6 +174,7 @@ class MultigrainExecutor:
                 num_outputs=output_count,
                 properties=node.properties,
                 physical=node.physical,
+                recovery=node.recovery,
                 **kwargs,
             )
         elif node.kind is NodeKind.FILTER:
@@ -141,6 +184,7 @@ class MultigrainExecutor:
                 name=node.name,
                 properties=node.properties,
                 physical=node.physical,
+                recovery=node.recovery,
                 **kwargs,
             )
         elif node.kind is NodeKind.REDUCE:
@@ -152,6 +196,7 @@ class MultigrainExecutor:
                 missing_child=node.op.provenance.get("missing_child", "fail_open"),
                 properties=node.properties,
                 physical=node.physical,
+                recovery=node.recovery,
                 **kwargs,
             )
         elif node.kind is NodeKind.RELATE:
@@ -181,12 +226,14 @@ class MultigrainExecutor:
                 num_outputs=output_count,
                 properties=node.properties,
                 physical=node.physical,
+                recovery=node.recovery,
                 **kwargs,
             )
         else:
             raise NotImplementedError(f"cannot execute node kind {node.kind.value}")
 
         self._wrappers[node.name] = wrapper
+        self._wrapper_nodes[node.name] = node
         return wrapper
 
     def warm(self, node: IRNode) -> None:

@@ -24,9 +24,18 @@ class BadRecordError(Exception):
     the runtime falls back to split-and-retry isolation.
     """
 
-    def __init__(self, message: str, *, index: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        index: int | None = None,
+        retryable: bool = False,
+    ) -> None:
         super().__init__(message)
         self.index = index
+        # Classification only; the multigrain RecoveryPolicy decides whether
+        # and when to retry. False preserves deterministic-poison semantics.
+        self.retryable = bool(retryable)
 
 
 @dataclass

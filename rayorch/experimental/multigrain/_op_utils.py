@@ -70,13 +70,17 @@ def normalize_mask(mask: Any, count: int) -> list[bool]:
     return mask
 
 
-def lineage_union(paths: Sequence[tuple[str, ...]], op_name: str) -> tuple[str, ...]:
+def lineage_union(
+    paths: Sequence[tuple[str, ...]],
+    op_name: str | None = None,
+) -> tuple[str, ...]:
     lineage: list[str] = []
     for path in paths:
         for step in path:
             if step not in lineage:
                 lineage.append(step)
-    lineage.append(op_name)
+    if op_name is not None:
+        lineage.append(op_name)
     return tuple(lineage)
 
 

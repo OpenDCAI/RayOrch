@@ -6,7 +6,9 @@
 >
 > 相关设计文档：原语与 IR 评审见 `docs/todos/11-multigrain-primitive-api-ir-review.md`；
 > 三层关系模型见 `docs/todos/12-relation-model-three-tiers.md`；重排不变性定理见
-> `docs/todos/13-reordering-invariance-theorem.md`。本文是**上手手册**，只讲怎么用。
+> `docs/todos/13-reordering-invariance-theorem.md`；真实 MinerU 图片对象驱动的图形、
+> 容灾和 LPT 集成测试与已知缺口见
+> `docs/todos/17-mineru-graph-integration-findings.md`。本文是**上手手册**，只讲怎么用。
 
 ---
 
@@ -127,21 +129,35 @@ print(out.errors)      # 隔离/连锁产生的 ErrorTrace 列表
 ## 4. Ray 执行：副本并行 + 微批重叠 + 分片规划
 
 ```python
-from rayorch.experimental.multigrain.ray_executor import (
-    MultigrainRayExecutor, lpt_shard_planner,
+from rayorch.experimental.multigrain import (
+    MultigrainRayExecutor, RunMetrics, lpt_shard_planner,
 )
 from mg_bridge.ops import page_work
 
+metrics = RunMetrics()
 ex = MultigrainRayExecutor(
     default_replicas=4,
     shard_planner=lpt_shard_planner(page_work),  # 见下：长尾均衡
-    max_retries=2,
+    metrics=metrics,
 )
 ex.warm_pools(ir)                    # 预热：每副本各加载一次模型（把 load 排除出计时）
+
+# 单批：同样走下面的统一 coordinator（max_inflight=1）
 out = ex.execute(ir, {"pdfs": pdfs})
+
+# 流式：输入可以是 generator；结果默认按输入顺序 yield，不会全部攒在内存。
+microbatches = ({"pdfs": pdf_sources(chunk)} for chunk in chunks)
+for out in ex.execute_stream(ir, microbatches, max_inflight=3):
+    consume(out)
+
 ex.shutdown()                        # 释放所有 actor 和 GPU
 ```
 
+- **统一 DAG coordinator**：`execute`、兼容接口 `execute_microbatches` 和流式
+  `execute_stream` 走同一套节点调度。节点在全部输入端口 ready 后运行；不同
+  microbatch 与独立分支可并发，支持多输出和 fan-in，不写死 MinerU 拓扑。
+- **bounded backpressure**：正在执行以及已完成但尚未被用户消费的结果都计入
+  `max_inflight`，因此页图等大对象不会无限堆在 Ray object store。
 - **持久 actor 池**：GPU/持模型算子的 actor 长期存活，模型**每副本只加载一次**，跨 chunk / microbatch / 多次 `execute` 复用。**隔离、重试都复用同一 actor，不会重载模型**（只有进程真崩溃才会被 Ray 重建 → 重载，那是基础设施故障，不是数据隔离）。
 - **`PhysicalHints(replicas=, num_gpus_per_replica=)`**：写在算子上，声明它要几个副本、每副本几张卡。
 - **`shard_planner`**：`(node, inputs, replicas) -> 每片的行下标列表`；返回 `None` 退化为连续切分。
@@ -173,14 +189,43 @@ ex.shutdown()                        # 释放所有 actor 和 GPU
 
 ## 6. 容错语义（本框架的核心卖点）
 
-### 6.1 两种故障粒度
+### 6.1 恢复阶梯与颗粒度
 
 | | 触发方式 | 行为 | 浪费 |
 |---|---|---|---|
-| **记录级隔离（ours）** | 算子 `raise BadRecordError(msg, index=i)` | 只把第 `i` 条（批内局部下标）隔离进 quarantine，其余健康行继续 | 只赔那 1 条 |
-| **分片级重试（Spark-like）** | 算子抛**普通异常** | 整个 shard 重试；超过 `max_retries` → 整个作业 abort | 白跑整片 |
+| **记录级恢复** | `BadRecordError(msg, index=i, retryable=True)` | inline 单条重试，或进入跨 microbatch 的有界 stage epoch | 最细 |
+| **确定性记录隔离** | `BadRecordError(..., retryable=False)` | 只隔离第 `i` 条，其余健康行保持密批执行 | 只赔坏记录 |
+| **分片级重试** | 算子抛普通异常 | 立即把 shard 投到健康 replica，最多 `max_shard_retries` 次 | 重算整片 |
+| **自适应定位** | shard 重试耗尽且 `degrade` | 有预算地二分失败子集；成功兄弟立即保留 | 稀疏故障时少于约 2× shard row-work |
+| **保守终止** | 定位预算耗尽 | 只 quarantine 尚未解析的最小子集，再由 `fail_closed` 连锁 | 成本有硬上限 |
 
 `index` 必须是**这次 `run` 收到的列表里的下标**（0-based），不是全局页号。框架负责把它映射回全局记录身份、写血缘、填 `ancestors`。
+
+恢复分级的被动接口已经进入 IR：
+
+```python
+self.ocr = mg.Map(
+    Ocr,
+    recovery=mg.RecoveryPolicy(
+        max_record_retries=2,
+        retry_timing="inline",          # inline | deferred
+        max_shard_retries=2,
+        on_shard_exhausted="degrade",   # abort | degrade
+        isolation=mg.IsolationBudget(
+            max_work_factor=3.0,
+            max_calls=64,
+            on_exhausted="quarantine",
+        ),
+        drain_scope="stage_global",
+    ),
+)
+```
+
+当前实现支持 Map 的 inline/deferred record retry、立即 shard retry、actor
+死亡后的单副本重建，以及有预算的自适应 shard 定位。`stage_global`
+指**有界 stage epoch**：跨当前活跃 microbatch 聚合，在达到正常 shard
+大小、stage 暂时无健康工作或输入关闭时 drain；不是等待整个数据集结束。
+尚未支持的算子种类/策略组合会明确抛 `NotImplementedError`。
 
 ```python
 from rayorch.runtime import BadRecordError
@@ -189,7 +234,11 @@ def run(self, pages: list[dict]) -> list:
     try:
         return list(self.client.batch_two_step_extract([p["img_pil"] for p in pages]))
     except PageError as e:
-        raise BadRecordError(f"ocr failed on page {e.idx}", index=e.idx) from e
+        raise BadRecordError(
+            f"ocr failed on page {e.idx}",
+            index=e.idx,
+            retryable=e.is_transient,
+        ) from e
 ```
 
 > 想要记录级隔离，算子必须能把失败**归因到具体行下标**；否则退化成分片级重试。两者都不会写坏文件，区别只是浪费多少算力。
@@ -263,7 +312,8 @@ print(dict(zip(out.display_keys, out.values)))
 print([e.action for e in out.errors])
 ```
 
-切到 Ray 只需把执行器换成 `MultigrainRayExecutor(...)` + `warm_pools` + `shutdown`，**算子和图一行都不用改**。
+切到 Ray 只需把执行器换成 `MultigrainRayExecutor(...)` +
+`execute_stream` + `shutdown`，**算子和图一行都不用改**。
 
 ---
 
@@ -285,10 +335,9 @@ import rayorch.experimental.multigrain as mg
 # 原语： mg.Map / mg.Expand / mg.Reduce / mg.Filter / mg.Select / mg.Relate
 # 组图： mg.Pipeline（子类化 + forward）
 # 数据： mg.source / mg.group_by / mg.concat / mg.rebatch / mg.PortBatch / mg.Grouped / mg.ErrorTrace
-# 执行： mg.MultigrainExecutor（本地）
-from rayorch.experimental.multigrain.ray_executor import (
-    MultigrainRayExecutor, lpt_shard_planner, FaultSpec,   # Ray 执行 + LPT + 故障注入
-)
+# 执行：mg.MultigrainExecutor（本地）/ mg.MultigrainRayExecutor（Ray）
+# 调度/观测：mg.lpt_shard_planner / mg.FaultSpec / mg.RunMetrics
+# 恢复接口：mg.RecoveryPolicy / mg.IsolationBudget / mg.RetryTiming / mg.DrainScope
 from rayorch.experimental.multigrain.graph import PhysicalHints, MissingChildPolicy
 from rayorch.runtime import BadRecordError                  # 记录级隔离信号
 ```

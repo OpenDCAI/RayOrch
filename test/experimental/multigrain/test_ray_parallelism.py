@@ -12,16 +12,36 @@ cluster (``--runslow`` + the shared ``ray_cluster`` fixture).
 from __future__ import annotations
 
 import time
+import uuid
 
 import pytest
+import ray
 
 from rayorch.experimental import multigrain as mg
 from rayorch.experimental.multigrain.graph import PhysicalHints
 from rayorch.experimental.multigrain.ray_executor import MultigrainRayExecutor
 
-from test.experimental.multigrain.dummy_ops import SLEEP, SlowDrop, SlowEmbed
+from test.experimental.multigrain.dummy_ops import (
+    SLEEP,
+    InitCountingEmbed,
+    MergeColumns,
+    SlowDrop,
+    SlowEmbed,
+)
 
 pytestmark = [pytest.mark.slow, pytest.mark.usefixtures("ray_cluster")]
+
+
+@ray.remote(num_cpus=0)
+class _InitCounter:
+    def __init__(self) -> None:
+        self.value = 0
+
+    def add(self, amount: int) -> None:
+        self.value += amount
+
+    def get(self) -> int:
+        return self.value
 
 
 # --------------------------------------------------------------------------
@@ -65,14 +85,23 @@ def test_replicas_speed_up_row_sharded_map() -> None:
     chunks = mg.source([f"c{i}" for i in range(8)], name="chunks")
 
     serial_ir = MapPipe(replicas=1).compile()
-    start = time.time()
-    serial_out = MultigrainRayExecutor().execute(serial_ir, {"chunks": chunks})
-    serial = time.time() - start
-
     parallel_ir = MapPipe(replicas=4).compile()
-    start = time.time()
-    parallel_out = MultigrainRayExecutor().execute(parallel_ir, {"chunks": chunks})
-    parallel = time.time() - start
+    serial_executor = MultigrainRayExecutor()
+    parallel_executor = MultigrainRayExecutor()
+    # Compare steady-state execution, not one-time actor/process construction.
+    serial_executor.warm_pools(serial_ir)
+    parallel_executor.warm_pools(parallel_ir)
+    try:
+        start = time.time()
+        serial_out = serial_executor.execute(serial_ir, {"chunks": chunks})
+        serial = time.time() - start
+
+        start = time.time()
+        parallel_out = parallel_executor.execute(parallel_ir, {"chunks": chunks})
+        parallel = time.time() - start
+    finally:
+        serial_executor.shutdown()
+        parallel_executor.shutdown()
 
     assert parallel_out.values == serial_out.values
     # 8 rows * 0.2s: serial ~1.6s, 4-way ~0.4s. Allow generous Ray overhead.
@@ -109,5 +138,113 @@ def test_microbatch_overlap_speeds_up_throughput() -> None:
     overlap_time = time.time() - start
 
     assert [r.values for r in serial] == [r.values for r in overlapped]
-    # each microbatch ~0.8s; 4 serial ~3.2s, overlapped ~0.8s.
-    assert overlap_time < serial_time * 0.6
+    # Node-level scheduling pays one Ray task launch per stage (rather than one
+    # task per whole graph), but bounded microbatches must still overlap
+    # materially. Model-holding stages use persistent actors (covered below).
+    assert overlap_time < serial_time * 0.8
+
+
+class CountingPipe(mg.Pipeline):
+    def __init__(self, counter_name: str) -> None:
+        super().__init__()
+        self.embed = mg.Map(
+            InitCountingEmbed,
+            counter_name,
+            physical=PhysicalHints(replicas=2),
+        )
+
+    def forward(self, chunks):
+        return self.embed(chunks)
+
+
+def test_stream_reuses_persistent_actor_pool_across_microbatches() -> None:
+    counter_name = f"mg-init-{uuid.uuid4().hex}"
+    counter = _InitCounter.options(name=counter_name).remote()
+    executor = MultigrainRayExecutor()
+    try:
+        ir = CountingPipe(counter_name).compile()
+        inputs = (
+            {"chunks": mg.source([f"m{m}-{i}" for i in range(4)], name="chunks")}
+            for m in range(5)
+        )
+
+        outputs = list(executor.execute_stream(ir, inputs, max_inflight=3))
+
+        assert len(outputs) == 5
+        assert [out.values[0] for out in outputs] == [
+            f"counted:m{m}-0" for m in range(5)
+        ]
+        # Exactly one constructor call per persistent replica, not per microbatch.
+        assert ray.get(counter.get.remote()) == 2
+    finally:
+        executor.shutdown()
+        ray.kill(counter)
+
+
+class BranchPipe(mg.Pipeline):
+    def __init__(self) -> None:
+        super().__init__()
+        self.left = mg.Map(SlowEmbed, name="left")
+        self.right = mg.Map(SlowEmbed, name="right")
+        self.merge = mg.Map(MergeColumns)
+
+    def forward(self, chunks):
+        return self.merge(self.left(chunks), self.right(chunks))
+
+
+def test_stream_coordinator_handles_branch_fan_in() -> None:
+    ir = BranchPipe().compile()
+    inputs = [
+        {"chunks": mg.source([f"m{m}-0", f"m{m}-1"], name="chunks")}
+        for m in range(3)
+    ]
+    executor = MultigrainRayExecutor()
+    try:
+        outputs = list(executor.execute_stream(ir, inputs, max_inflight=2))
+    finally:
+        executor.shutdown()
+
+    assert [out.values for out in outputs] == [
+        [
+            f"emb:m{m}-0|emb:m{m}-0",
+            f"emb:m{m}-1|emb:m{m}-1",
+        ]
+        for m in range(3)
+    ]
+
+
+class SameNameMapPipe(mg.Pipeline):
+    def __init__(self) -> None:
+        super().__init__()
+        self.op = mg.Map(
+            SlowEmbed,
+            name="shared-name",
+            physical=PhysicalHints(replicas=2),
+        )
+
+    def forward(self, chunks):
+        return self.op(chunks)
+
+
+class SameNameFilterPipe(mg.Pipeline):
+    def __init__(self) -> None:
+        super().__init__()
+        self.op = mg.Filter(
+            SlowDrop,
+            name="shared-name",
+            physical=PhysicalHints(replicas=2),
+        )
+
+    def forward(self, chunks):
+        return self.op(chunks)
+
+
+def test_executor_rejects_cross_graph_actor_pool_name_collision() -> None:
+    executor = MultigrainRayExecutor()
+    rows = mg.source(["a", "b"], name="chunks")
+    try:
+        executor.execute(SameNameMapPipe().compile(), {"chunks": rows})
+        with pytest.raises(ValueError, match="actor pool name collision"):
+            executor.execute(SameNameFilterPipe().compile(), {"chunks": rows})
+    finally:
+        executor.shutdown()

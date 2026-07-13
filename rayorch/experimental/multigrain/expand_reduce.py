@@ -18,6 +18,7 @@ from .graph import (
     OperatorProperties,
     OperatorRecipe,
     PhysicalHints,
+    RecoveryPolicy,
     SymbolicPort,
     ensure_symbolic_ports,
 )
@@ -36,6 +37,7 @@ class Expand:
         num_outputs: int = 1,
         properties: OperatorProperties | None = None,
         physical: PhysicalHints | None = None,
+        recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ) -> None:
         self.name = op_name(op_cls, name)
@@ -44,6 +46,7 @@ class Expand:
         self.num_outputs = max(1, int(num_outputs))
         self.properties = properties or OperatorProperties()
         self.physical = physical or PhysicalHints(prefer_rebatch=True)
+        self.recovery = recovery or RecoveryPolicy()
         self.op_recipe = OperatorRecipe(
             cls_ref=op_ref(op_cls),
             args=tuple(args),
@@ -77,6 +80,7 @@ class Expand:
                 op=self.op_recipe,
                 properties=self.properties,
                 physical=self.physical,
+                recovery=self.recovery,
             )
         aligned = _align_by_identity(ports)
         parent_port = aligned[self.parent]
@@ -177,6 +181,7 @@ class Reduce:
         missing_child: "MissingChildPolicy | str" = MissingChildPolicy.FAIL_OPEN,
         properties: OperatorProperties | None = None,
         physical: PhysicalHints | None = None,
+        recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ):
         self.name = op_name(op_cls, name)
@@ -189,6 +194,7 @@ class Reduce:
         self.missing = MissingChildPolicy(missing_child)
         self.properties = properties or OperatorProperties()
         self.physical = physical or PhysicalHints()
+        self.recovery = recovery or RecoveryPolicy()
         self.op_recipe = OperatorRecipe(
             cls_ref=op_ref(op_cls),
             args=tuple(args),
@@ -223,6 +229,7 @@ class Reduce:
                 op=self.op_recipe,
                 properties=self.properties,
                 physical=self.physical,
+                recovery=self.recovery,
             )
         grouped_values: List[List[List[Any]]] = [
             self._groups_for(anchor, descendant)
@@ -332,7 +339,9 @@ class Reduce:
 
     @staticmethod
     def _groups_for(anchor: PortBatch, descendant: PortBatch) -> List[List[Any]]:
-        grouped: List[List[tuple[int, Any]]] = [[] for _ in anchor.values]
+        grouped: List[List[tuple[tuple[Any, ...], Any]]] = [
+            [] for _ in anchor.values
+        ]
         anchor_index = {
             record_id: index for index, record_id in enumerate(anchor.record_ids)
         }
@@ -342,8 +351,28 @@ class Reduce:
                 continue
             if parent_id not in anchor_index:
                 continue
-            ordinal = descendant.ordinals[row_index].get(anchor.name, row_index)
-            grouped[anchor_index[parent_id]].append((ordinal, value))
+            ordinal_items = list(descendant.ordinals[row_index].items())
+            anchor_position = next(
+                (
+                    index
+                    for index, (grain, _) in enumerate(ordinal_items)
+                    if grain == anchor.name
+                ),
+                None,
+            )
+            if anchor_position is None:
+                ordinal_path: tuple[Any, ...] = (row_index,)
+            else:
+                # Nested Expand contributes one ordinal per level.  Sorting only
+                # by the anchor's first child index restores page order but leaves
+                # blocks within a page dependent on physical shard completion.
+                ordinal_path = tuple(
+                    ordinal for _, ordinal in ordinal_items[anchor_position:]
+                )
+            # A relation can legally emit multiple records at the same hierarchy
+            # position.  Its content-addressed id is a deterministic final tie.
+            order_key = (*ordinal_path, descendant.record_ids[row_index])
+            grouped[anchor_index[parent_id]].append((order_key, value))
         return [
             [value for _, value in sorted(items, key=lambda item: item[0])]
             for items in grouped

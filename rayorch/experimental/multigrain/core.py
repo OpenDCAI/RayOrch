@@ -58,6 +58,17 @@ class ParentRef:
         }
 
 
+@dataclass(frozen=True)
+class DeferredRecord:
+    """One attributable record retained for a later stage-epoch retry."""
+
+    token: str
+    inputs: tuple["PortBatch", ...]
+    failed_op: str
+    error: str
+    target_rows: int
+
+
 @dataclass
 class PortBatch:
     """One logical port with one record set and one grain."""
@@ -193,6 +204,14 @@ class PortBatch:
                     }
                 )
         return matches
+
+
+@dataclass(frozen=True)
+class NodeExecution:
+    """Internal node result plus records waiting for a deferred retry."""
+
+    outputs: tuple[PortBatch, ...]
+    deferred: tuple[DeferredRecord, ...] = ()
 
 
 def source(

@@ -31,9 +31,9 @@ Data/Trident at scale). See the "Related Work & Venue Strategy" section below.
 
 | Milestone | Topic | Status | Blocks acceptance? |
 |---|---|---|---|
-| M0 | Prototype: relation IR + passive IR + primitives + passes + Ray exec | done | prerequisite |
+| M0 | Prototype: relation IR + passive IR + primitives + passes + unified public Ray stream executor | done (generic DAG coordinator; persistent pools; bounded inflight; MinerU benchmark uses public API only) | prerequisite |
 | M1 | Formalization: relation algebra + reordering-invariance theorem | **done** | yes (else "just engineering") |
-| M2 | Real workload + real baselines + multi-node scale | **in progress** (E1 real 368-PDF: 1.57× vs measured 892s baseline, output-equivalent; competitor baselines + multi-node TODO) | **yes (make-or-break)** |
+| M2 | Real workload + real baselines + multi-node scale | **in progress** (E1 public-engine 368-PDF: 1.72× vs measured 892s baseline, output-equivalent; competitor baselines + multi-node TODO) | **yes (make-or-break)** |
 | M3 | Fault-tolerance & overhead: row-level recovery vs full recompute; lineage cost | **in progress** (E3 done: record-level COMPLETE + 0 redundant re-OCR vs shard-level ABORT + 1.5× waste on real pipeline; lineage-overhead E4 TODO) | yes |
 | M4 | New systems mechanism: kill residual bubbles (#4 stage barrier, #5 reduce skew) | not started | yes (differentiator) |
 | M5 | Ablations + sensitivity + artifact + writing | not started | yes (polish) |
@@ -70,6 +70,10 @@ Goal: prove the mechanism on a real pipeline against real systems at real scale.
 This is what makes or breaks a systems submission.
 
 Deliverables:
+- [x] Slow real-artifact graph suite (real MinerU images, deterministic UDFs):
+      nested Expand, diamond, true M:N, multi-root, Ray/LPT equivalence and
+      measured CPU proxy bubble reduction. Findings:
+      [`17-mineru-graph-integration-findings.md`](17-mineru-graph-integration-findings.md).
 - [ ] Pick 1–2 real end-to-end workloads with genuine long-tail 1:N/M:N and GPU
       stages, e.g. real MinerU PDF→Markdown parse; and/or a multimodal prep
       pipeline (doc chunk→embed, image caption, video frame→caption). Real data.
@@ -90,14 +94,32 @@ the design doc now; it is cheap and de-risks the rest.
 
 Goal: demonstrate the "lineage → recovery" payoff and prove lineage is cheap.
 
+Design spec for the recovery tier taxonomy (retry gradient: inline/deferred,
+record/shard, degrade vs abort, stage-global drain): see
+[`15-recovery-tiers-and-retry-scheduling.md`](15-recovery-tiers-and-retry-scheduling.md).
+Batch-scoped UUID identity, arena lifetime, and low-rank/hash-consed lineage:
+[`16-batch-arena-and-compact-lineage.md`](16-batch-arena-and-compact-lineage.md).
+
 Deliverables:
-- [ ] Fault-injection harness: kill records / tasks / a node mid-run.
+- [x] Fault-injection harness: kill records / tasks / a node mid-run; includes
+      bounded real-image integration coverage for inline/deferred retry,
+      adaptive isolation, dense failure, fail-closed cascade, and actor death.
 - [ ] Measure recovery cost & correctness: only affected records recomputed vs
       full recompute (Ray Data / Spark comparison where possible).
+- [x] RecoveryPolicy + nested IsolationBudget passive IR/user interface;
+      unsupported node-kind combinations rejected explicitly.
+- [x] Recovery tiers for Map/shardable MVP (doc 15): inline/deferred record
+      retry, immediate healthy-replica shard retry, bounded adaptive
+      localization, actor replacement, and bounded stage-epoch drain. Remaining:
+      wrapper-specific attributable units for Filter/Expand/Reduce/Relate.
 - [ ] Overhead study: cost of record-level lineage tracking in steady state
       (must be small, e.g. < a few %); memory footprint of lineage; effect of
       `MaterializePolicy` boundaries.
-- [ ] Tie back to M1 corollary: recovery localization is reorder-invariant.
+- [ ] Compact-lineage substrate (doc 16): coordinator UUID/BatchArena → shared
+      1:1 path table → columnar 1:N → Reduce/M:N compact relations → arena
+      lifecycle/release.
+- [ ] Tie back to M1 corollary: recovery localization is reorder-invariant
+      (deferred retry is a legal reordering — no new proof needed).
 
 Dependencies: M2 (needs the real pipeline to inject into).
 
@@ -200,3 +222,6 @@ acceptance odds. Track in M2.
 - `12-relation-model-three-tiers.md` — relation model (Expand/Reduce | on= | adapter).
 - `13-reordering-invariance-theorem.md` — M1 formalization + proofs.
 - `14-m2-experiment-design.md` — M2 workloads, baselines, metrics, prototype gaps.
+- `15-recovery-tiers-and-retry-scheduling.md` — recovery ladder and retry timing.
+- `16-batch-arena-and-compact-lineage.md` — batch identity and compact lineage plan.
+- `17-mineru-graph-integration-findings.md` — real-image graph/recovery/LPT coverage ledger.

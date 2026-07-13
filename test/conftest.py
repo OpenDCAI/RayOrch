@@ -29,6 +29,14 @@ def pytest_collection_modifyitems(
 @pytest.fixture(scope="session")
 def ray_cluster():
     """Share one local Ray cluster across opted-in integration tests."""
-    ray.init(ignore_reinit_error=True, num_cpus=16, include_dashboard=False)
+    # ``address="local"`` prevents an ambient RAY_ADDRESS / remembered cluster
+    # from turning this local fixture into a remote connection, where Ray
+    # rejects the requested num_cpus.
+    ray.init(
+        address="local",
+        ignore_reinit_error=True,
+        num_cpus=16,
+        include_dashboard=False,
+    )
     yield
     ray.shutdown()

@@ -23,6 +23,7 @@ from .graph import (
     OperatorProperties,
     OperatorRecipe,
     PhysicalHints,
+    RecoveryPolicy,
     SymbolicPort,
     ensure_symbolic_ports,
 )
@@ -66,6 +67,7 @@ class Relate:
         num_outputs: int = 1,
         properties: OperatorProperties | None = None,
         physical: PhysicalHints | None = None,
+        recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ) -> None:
         self.name = op_name(op_cls, name)
@@ -79,6 +81,7 @@ class Relate:
         self.num_outputs = max(1, int(num_outputs))
         self.properties = properties or OperatorProperties()
         self.physical = physical or PhysicalHints()
+        self.recovery = recovery or RecoveryPolicy()
         provenance: dict[str, Any] = {}
         if self.on is not None:
             provenance["on"] = {
@@ -120,6 +123,7 @@ class Relate:
                 op=self.op_recipe,
                 properties=self.properties,
                 physical=self.physical,
+                recovery=self.recovery,
                 relation_roles=self.roles,
             )
         if self.on is not None:
@@ -170,14 +174,20 @@ class Relate:
 
         output_index = 0
         seen_keys: set[Any] = set()
-        for base_index, base_value in enumerate(role_to_port[first_role].values):
+        for base_value in role_to_port[first_role].values:
             key = _extract_key(base_value, self.on[first_role])
             if key in seen_keys:
                 continue
             seen_keys.add(key)
             if any(key not in key_to_indices[role] for role in other_roles):
                 continue  # inner join: skip keys missing on any side
-            combos = [[(first_role, base_index)]]
+            # A key may occur more than once in *every* role.  Seed the product
+            # with every first-role row as well; using only the first occurrence
+            # silently degraded a true M:N join into 1:N for duplicate keys.
+            combos = [
+                [(first_role, base_index)]
+                for base_index in key_to_indices[first_role][key]
+            ]
             for role in other_roles:
                 combos = [
                     combo + [(role, idx)]

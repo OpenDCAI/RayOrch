@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from rayorch.experimental import multigrain as mg
 from rayorch.experimental.multigrain.passes import InsertRebatchAfterExpandPass
 
@@ -48,6 +50,43 @@ def test_local_executor_runs_compiled_expand_map_reduce_ir() -> None:
     assert markdown.record_ids == pdfs.record_ids
 
 
+class _Left:
+    def run(self, values):
+        return [f"left:{value}" for value in values]
+
+
+class _Right:
+    def run(self, values):
+        return [f"right:{value}" for value in values]
+
+
+class _Merge:
+    def run(self, left, right):
+        return [f"{a}|{b}" for a, b in zip(left, right)]
+
+
+class DiamondPipe(mg.Pipeline):
+    def __init__(self) -> None:
+        super().__init__()
+        self.left = mg.Map(_Left, name="left")
+        self.right = mg.Map(_Right, name="right")
+        self.merge = mg.Map(_Merge, name="merge")
+
+    def forward(self, rows):
+        return self.merge(self.left(rows), self.right(rows))
+
+
+def test_same_grain_diamond_map_merges_lineage_from_every_branch() -> None:
+    rows = mg.source(["x"], name="rows")
+    output = mg.MultigrainExecutor().execute(
+        DiamondPipe().compile(),
+        {"rows": rows},
+    )
+
+    assert output.values == ["left:x|right:x"]
+    assert output.lineage == [("left", "right", "merge")]
+
+
 def test_local_executor_runs_rebatch_transformed_ir() -> None:
     graph = ExecMineruPipe().compile()
     transformed = InsertRebatchAfterExpandPass().run(graph).graph
@@ -75,6 +114,33 @@ def test_local_executor_runs_compiled_filter_ir() -> None:
 
     assert kept.values == ["good-0", "good-2"]
     assert kept.record_ids == [pages.record_ids[0], pages.record_ids[2]]
+
+
+class SameNameMapPipe(mg.Pipeline):
+    def __init__(self) -> None:
+        super().__init__()
+        self.op = mg.Map(Layout, name="shared-name")
+
+    def forward(self, pages):
+        return self.op(pages)
+
+
+class SameNameFilterPipe(mg.Pipeline):
+    def __init__(self) -> None:
+        super().__init__()
+        self.op = mg.Filter(KeepPages, name="shared-name")
+
+    def forward(self, pages):
+        return self.op(pages)
+
+
+def test_local_executor_rejects_cross_graph_wrapper_name_collision() -> None:
+    executor = mg.MultigrainExecutor()
+    pages = mg.source(["good-0"], name="pages")
+    executor.execute(SameNameMapPipe().compile(), {"pages": pages})
+
+    with pytest.raises(ValueError, match="operator cache name collision"):
+        executor.execute(SameNameFilterPipe().compile(), {"pages": pages})
 
 
 class ExecSelectPipe(mg.Pipeline):

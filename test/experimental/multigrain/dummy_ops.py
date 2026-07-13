@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import time
 
+from rayorch.runtime import BadRecordError
+
 SLEEP = 0.2
 
 
@@ -27,3 +29,60 @@ class SlowDrop:
         for _ in chunks:
             time.sleep(SLEEP)
         return ["x" not in chunk for chunk in chunks]
+
+
+class InitCountingEmbed:
+    """Map op whose constructor reports actor-local initialization once."""
+
+    def __init__(self, counter_name: str) -> None:
+        import ray
+
+        self._counter = ray.get_actor(counter_name)
+        ray.get(self._counter.add.remote(1))
+
+    def run(self, chunks: list[str]) -> list[str]:
+        return [f"counted:{chunk}" for chunk in chunks]
+
+
+class MergeColumns:
+    """Map op used to exercise a two-branch DAG fan-in."""
+
+    def run(self, left: list[str], right: list[str]) -> list[str]:
+        return [f"{a}|{b}" for a, b in zip(left, right)]
+
+
+class OpaquePoisonMap:
+    """Fail an invocation without identifying the poison row."""
+
+    def __init__(self, poison: str = "bad") -> None:
+        self.poison = poison
+
+    def run(self, rows: list[str]) -> list[str]:
+        if self.poison in rows:
+            raise RuntimeError(f"opaque poison: {self.poison}")
+        return [f"ok:{row}" for row in rows]
+
+
+class AlwaysOpaqueFail:
+    def run(self, rows: list[str]) -> list[str]:
+        raise RuntimeError(f"systemic opaque failure for {len(rows)} rows")
+
+
+class RetryableOnceMap:
+    def __init__(self) -> None:
+        self.seen: set[str] = set()
+
+    def run(self, rows: list[str]) -> list[str]:
+        for index, row in enumerate(rows):
+            if row.startswith("flaky") and row not in self.seen:
+                self.seen.add(row)
+                raise BadRecordError("temporary", index=index, retryable=True)
+        return [f"ok:{row}" for row in rows]
+
+
+class AlwaysRetryableBadMap:
+    def run(self, rows: list[str]) -> list[str]:
+        for index, row in enumerate(rows):
+            if row.startswith("bad"):
+                raise BadRecordError("still temporary", index=index, retryable=True)
+        return [f"ok:{row}" for row in rows]

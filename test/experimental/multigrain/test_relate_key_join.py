@@ -110,6 +110,35 @@ def test_key_join_inner_joins_and_attaches_cross_branch_lineage() -> None:
     ]
 
 
+def test_key_join_is_truly_many_to_many_when_both_roles_repeat_a_key() -> None:
+    pages = mg.source(
+        [
+            {"page_id": "shared", "page": 0},
+            {"page_id": "shared", "page": 1},
+        ],
+        name="pages",
+    )
+    figs = mg.source(
+        [
+            {"page_id": "shared", "fig_id": "f0"},
+            {"page_id": "shared", "fig_id": "f1"},
+        ],
+        name="figs",
+    )
+
+    linked = mg.Relate(
+        LinkFig,
+        on={"page": "page_id", "fig": "page_id"},
+    )(pages, figs)
+
+    assert len(linked) == 4
+    assert {
+        (value["page_id"], value["fig"])
+        for value in linked.values
+    } == {("shared", "f0"), ("shared", "f1")}
+    assert len(set(linked.record_ids)) == 4
+
+
 def test_key_join_then_reduce_regroups_by_ancestor_only_one_branch_had() -> None:
     pdfs = mg.source(["a.pdf", "b.pdf"], name="pdfs")
     pages = mg.Expand(PdfToPages, parent=0)(pdfs)

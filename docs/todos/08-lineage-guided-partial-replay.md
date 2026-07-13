@@ -65,6 +65,12 @@ per-stage resources, replica counts, and inflight limits.
   record identity.
 - Support low-cost impact analysis without requiring full cell lineage.
 
+The first bullet is a **required optimization, not current behavior**. The MVP
+currently stores multiple Python metadata objects per row and copies lineage /
+ancestor / ordinal structures through `take` and `with_values`. This is adequate
+for the 7k-page MinerU experiment but must be replaced with shared 1:1 paths and
+compact/columnar ancestry before claiming million-record scalability.
+
 ### Lineage-Guided Fault Isolation And Partial Replay
 
 Use lineage, operator cost, failure type, and prior failures to choose between:
@@ -84,7 +90,7 @@ and node loss without unnecessarily replaying healthy work.
 The Runtime MVP already provides:
 
 - Ray Actor replicas and resource configuration;
-- pipeline-level microbatch overlap;
+- the primitives needed for pipeline-level microbatch overlap;
 - record identity;
 - multi-parent DAG lineage;
 - bad-record quarantine;
@@ -92,6 +98,15 @@ The Runtime MVP already provides:
 - Flash-MinerU-compatible DAG topology.
 
 Current lineage is primarily used for reporting and error attribution.
+
+Important execution caveat: the public multigrain executor currently provides
+node-by-node sharding and persistent pools, but the high-performance
+render/OCR/assemble overlap used by the MinerU benchmark is orchestrated in
+`Flash-mineru/mg_bridge/run_bench.py` through private pool/shard APIs. The graph
+itself is framework-native (`MinerUReal` compiles
+`Pipeline → Expand → Map → Reduce` into passive IR); the benchmark-specific
+physical scheduler is not yet behind one public executor API. Unifying that
+scheduler is a prerequisite for a truthful stage-global deferred-replay barrier.
 
 ## Missing Research Loop
 
@@ -114,6 +129,22 @@ This requires:
 - `1:N` and `N:M` lineage through the buffered emit API;
 - persistent lineage and execution metadata;
 - adaptive isolation rather than unconditional binary splitting.
+
+## Scope Boundaries
+
+The correctness argument assumes UDF value-purity: a record's output is
+independent of internal IDs, global position, execution time, and replica.
+Consequently, the current model deliberately does not define semantics for
+globally stateful/sessionized operators, global sorting, cross-record
+deduplication, iterative/cyclic dataflow, or unsafe external side effects.
+These require explicit state/materialization/commit contracts rather than being
+silently treated as reorderable maps.
+
+`Relate` represents M:N evidence and lineage, but its current key-join execution
+is an in-process in-memory hash join with per-key Cartesian expansion. Large
+distributed M:N joins require partitioning, spill/backpressure, and distributed
+materialization; representation completeness should not be confused with
+execution scalability.
 
 ## Evaluation Requirements
 
