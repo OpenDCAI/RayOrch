@@ -49,9 +49,10 @@ class Parse(orch.Pipeline):
 用户写的只有算子逻辑。**关系代码:0 行。** page 属于哪个 pdf、第几页、失败落在
 哪一页,全自动。
 
-实现依据:`Expand._make_outputs` 自动填 `ancestors[parent.name]=parent_id` 与
+实现依据:`PortBatchBuilder.expanded`（`multigrain.primitives.output`）自动填
+`ancestors[parent.name]=parent_id` 与
 `ordinals[parent.name]=child_index`;`Reduce._groups_for` 读 `ancestors`/`ordinals`
-自动重组并按 ordinal 排序。见 `rayorch/experimental/multigrain/expand_reduce.py`。
+自动重组并按 ordinal 排序。见 `rayorch/experimental/multigrain/primitives/expand_reduce.py`。
 
 ## 第②档:真跨分支 join —— 重语义挂在 `__init__`(VERL 式)
 
@@ -95,7 +96,7 @@ SQL `JOIN ON page_id` —— 这已经是 join 的最小诚实表达,再简就�
 字段建索引做 inner equi-join(缺键的记录被丢弃),对每个匹配组合调用
 `op.run(by_role_dict)`,并把两侧血缘(ancestors / ordinals / lineage)合并进关系行。
 `on` 以纯数据存入 recipe provenance,IR 可 pickle 往返、可被 executor 复原执行。
-见 `rayorch/experimental/multigrain/relate.py` 与
+见 `rayorch/experimental/multigrain/primitives/relate.py` 与
 `test/experimental/multigrain/test_relate_key_join.py`。
 
 ## 第③档:任意非等值关系 —— by-ref adapter 逃生口(极少见)
@@ -143,9 +144,9 @@ class ParseFuzzy(orch.Pipeline):
   进 IR —— 否则 passive IR 不可序列化。
 - adapter 只说 `{role: local_index}`(局部下标),**禁止碰内部 record_id**;
   local_index → ParentRef/record_id 的翻译永远在框架侧
-  (见 `relate.py:_make_relation_batch`)。
+  (见 `primitives/relate.py:_make_relation_batch`)。
 - 运行时契约校验已就位:role 必须声明、local_index 必须在界内、长度必须对齐
-  (`relate.py`)。
+  (`primitives/relate.py`)。
 
 状态:**已实现**。新增 `relation_adapter="pkg.mod:fn"` 参数,`_resolve_adapter`
 在 execute 时 `import` 回可调用对象;dotted path 以纯字符串存入 provenance,IR

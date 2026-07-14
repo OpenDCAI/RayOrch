@@ -138,7 +138,7 @@ or fallback branch.
 - **Op-wrapper site** (shared isolation helper used by eligible wrappers):
   record-level. Only a wrapper understands the operator's logical record unit
   and can re-invoke the UDF on that subset. Handles ①/② and inline retry.
-- **Scheduler site** (`ray_executor._run_shards` / stage loop): shard-level.
+- **Scheduler site** (`multigrain.ray.executor._run_shards` / stage loop): shard-level.
   Only the driver can resubmit/split a shard and select a healthy actor. Handles
   ③–⑥ and the deferred **drain**.
 

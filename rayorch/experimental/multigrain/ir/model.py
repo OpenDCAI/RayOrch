@@ -25,6 +25,12 @@ class NodeKind(str, Enum):
     MATERIALIZE = "MATERIALIZE"
 
 
+SELECT_FILTER_RECIPE = "rayorch.experimental.multigrain.SelectFilter"
+PROJECT_RECIPE = "rayorch.experimental.multigrain.Project"
+REBATCH_RECIPE = "rayorch.experimental.multigrain.Rebatch"
+MATERIALIZE_RECIPE = "rayorch.experimental.multigrain.Materialize"
+
+
 class RelationKind(str, Enum):
     PRESERVE = "PRESERVE"
     EXPAND = "EXPAND"
@@ -541,6 +547,7 @@ class GraphTracer:
         input_specs = tuple(_port_spec_from_symbolic(port) for port in inputs)
         input_refs = tuple(port.ref for port in inputs)
         output_specs = tuple(_port_spec_from_symbolic(port) for port in outputs)
+        operator_recipe = op or OperatorRecipe(cls_ref=name)
         relations = tuple(
             RelationSpec(
                 output=port.ref,
@@ -553,6 +560,16 @@ class GraphTracer:
                     OrdinalPolicy.CHILD_INDEX
                     if node_kind is NodeKind.EXPAND
                     else OrdinalPolicy.PRESERVE
+                ),
+                missing=(
+                    MissingChildPolicy(
+                        operator_recipe.provenance.get(
+                            "missing_child",
+                            MissingChildPolicy.FAIL_OPEN.value,
+                        )
+                    )
+                    if node_kind is NodeKind.REDUCE
+                    else MissingChildPolicy.FAIL_OPEN
                 ),
             )
             for port in outputs
@@ -570,7 +587,7 @@ class GraphTracer:
                 input_specs=input_specs,
                 output_specs=output_specs,
                 contract=contract,
-                op=op or OperatorRecipe(cls_ref=name),
+                op=operator_recipe,
                 properties=properties or OperatorProperties(),
                 physical=physical or PhysicalHints(),
                 recovery=recovery or RecoveryPolicy(),
@@ -734,15 +751,19 @@ __all__ = [
     "OrdinalPolicy",
     "PayloadKind",
     "PhysicalHints",
+    "PROJECT_RECIPE",
+    "REBATCH_RECIPE",
     "RecordRecoveryAction",
     "RecoveryPolicy",
     "Pipeline",
     "RelationKind",
     "RelationSpec",
     "RetryTiming",
+    "SELECT_FILTER_RECIPE",
     "ShardExhaustedAction",
     "ShardRecoveryAction",
     "SymbolicPort",
+    "MATERIALIZE_RECIPE",
     "ensure_symbolic_ports",
 ]
 

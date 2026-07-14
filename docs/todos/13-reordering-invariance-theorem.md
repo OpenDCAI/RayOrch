@@ -12,14 +12,14 @@ hand-wavy:
 
 | formal object | code |
 |---|---|
-| record fields | `PortBatch` parallel arrays (`values`, `record_ids`, `ancestors`, `ancestor_display`, `ordinals`, `lineage`) in `core.py` |
+| record fields | `PortBatch` parallel arrays (`values`, `record_ids`, `ancestors`, `ancestor_display`, `ordinals`, `lineage`) in `multigrain.data.batch` |
 | `take` | `PortBatch.take(indices)` |
-| `concat` | `core.concat(batches)` |
-| shard/merge | `MultigrainRayExecutor._run_node` (`ray_executor.py`, lines ~133–165) |
+| `concat` | `multigrain.data.concat(batches)` |
+| shard/merge | `MultigrainRayExecutor._run_node` (`multigrain.ray.executor`, lines ~133–165) |
 | shard plan | `shard_planner(node, inputs, replicas) -> list[list[int]]`; `lpt_shard_planner`, `_contiguous_ranges` |
-| Expand lineage | `Expand._make_outputs` (`expand_reduce.py`) |
-| Reduce regroup | `Reduce._groups_for` (`expand_reduce.py`) |
-| Relate key-join | `Relate._make_key_join_batch` (`relate.py`) |
+| Expand lineage | `PortBatchBuilder.expanded` (`multigrain.primitives.output`) |
+| Reduce regroup | `Reduce._groups_for` (`multigrain.primitives.expand_reduce`) |
+| Relate key-join | `Relate._make_key_join_batch` (`multigrain.primitives.relate`) |
 
 ## 1. Data model
 
@@ -43,8 +43,9 @@ records. `B[i]` is the i-th record; `|B| = n`; `ids(B)` the sequence of ids.
 
 **Port invariant I1 (identity uniqueness).** At every port produced by the
 system, ids are pairwise distinct. (Sources emit `name:i`; `Expand` emits
-`op:parent_id:k`; `Relate` emits `op:j`; `Map`/`Filter` preserve ids. Distinctness
-is maintained by construction.)
+`op:role_1=pid_1|…|role_n=pid_n[|key=stable_key]`; `Map`/`Filter` preserve ids.
+`Relate` rejects duplicate parent evidence unless a distinct stable key is
+provided. Distinctness is maintained by construction.)
 
 **Keyed view.** Define `⟦B⟧ : ID ⇀ Record` by `⟦B⟧(id) = r` for the unique
 `r ∈ B` with that id (well-defined by I1). Two batches are **keyed-equal**,
@@ -119,14 +120,14 @@ same-id partners on the other ports, and `f_N(aligned_i)` is a batch of length
 1 (`Map`), 0 or 1 (`Filter`), or `k_i ≥ 0` (`Expand`).
 
 - **Map** `f = ` apply UDF to the aligned row, keep id/ancestors/ordinals, append
-  op to `ℓ`. Length 1. (`map_filter.py`.)
+  op to `ℓ`. Length 1. (`multigrain.primitives.map_filter`.)
 - **Filter** `f = ` `[row]` if mask true else `[]`; kept rows keep identity.
-  Length 0/1. (`map_filter.py`.)
+  Length 0/1. (`multigrain.primitives.map_filter`.)
 - **Expand** `f = ` for parent row with id `p`, emit children
   `id = op:p:k`, `a' = a ∪ {portname ↦ p}`, `o' = o ∪ {portname ↦ k}`,
   `ℓ' = ℓ⧺[op]` for `k = 0..k_p-1`. Length `k_p`. Depends only on the parent
   record’s own value (the UDF sees the parent value and returns its group).
-  (`expand_reduce.py::_make_outputs`.)
+  (`multigrain.primitives.output::PortBatchBuilder.expanded`.)
 
 Each `f_N` is a pure function of the record content only — no `i`, no cross-row
 state — which is exactly what makes reordering safe.
@@ -195,7 +196,7 @@ it too is a function of the surviving keyed set.)
 physical order, dedups by key, and for each key emits the cross-product of the
 matched rows across roles. Output identity is **content-addressed**: a relation
 row's id is `op:role_1=pid_1|role_2=pid_2|…`, i.e. a function of its matched
-parent record ids (`relate.py`), *not* of emission order. Since distinct combos
+parent record ids (`multigrain.primitives.relate`), *not* of emission order. Since distinct combos
 have distinct parent tuples, ids are unique (I1) and permutation-invariant.
 
 **Lemma 3a (key-join is `≈` under permutation).** If the role ports are permuted
@@ -210,19 +211,27 @@ matched records’ preserved fields, hence identical. Same id-set, same per-reco
 fields ⇒ `≈`. (The physical row order and the surrogate `j` no longer appear in
 identity, so they cannot break `≈`.) ∎
 
-**Lemma 3b (adapter path is `≈` up to reindexing).** For the `relation_fn` /
-`relation_adapter` escape hatch, output ids are `op:j` (emission order) and an
-adapter may emit several rows with the same parent set, so identity is not
-content-addressable in general. Under permutation the *relation content* (values,
-`ParentRef`s, merged lineage) is still identical as a multiset; only the surrogate
-ids/order differ — keyed-equal **up to reindexing**.
+**Lemma 3b (adapter path is `≈` under permutation-equivariant evidence).** For
+the `relation_fn` / `relation_adapter` escape hatch, each emitted item supplies
+`(value, {role: local_index})`, optionally followed by a deterministic
+`stable_key`. The framework immediately resolves the local indexes to parent
+record ids and constructs the content-addressed identity
+`op:role_1=pid_1|…|role_n=pid_n[|key=stable_key]`. Duplicate parent evidence
+without distinct stable keys is rejected.
 
-**Consequence.** With `on=`, Relate is fully `≈` (Theorem part 1 applies as-is).
-With the adapter escape hatch, a Relate output must be consumed by an
-order-canonicalizing operator (a `Reduce`, or any identity/ordinal-addressed
-consumer) to obtain byte-identical final results — the intended pattern
-(`link → group_by(pdf) → Reduce`). We state this as a *typing rule* rather than
-hide it:
+If, after rebasing invocation-local indexes to their records, the adapter emits
+the same set of `(value, parent tuple, stable_key)` for every permutation of its
+input rows, then the resolved `ParentRef`s, merged `(a,o,ℓ)`, values, and ids are
+identical. Therefore `Relate_adapter(P) ≈ Relate_adapter(P')`.
+
+This permutation-equivariance condition is an explicit adapter contract. An
+adapter that uses invocation-local position as business evidence, or emits a
+non-deterministic stable key, is outside the theorem just as a position-sensitive
+UDF is.
+
+**Consequence.** Both `on=` and a contract-conforming adapter make Relate fully
+`≈` (Theorem part 1 applies as-is). An order-sensitive consumer still needs
+canonicalization to obtain byte-identical sequence order:
 
 > **Reordering discipline.** A port produced downstream of a sharded node may be
 > consumed *positionally* only if it is first canonicalized (via `Reduce`, or an
@@ -265,8 +274,8 @@ physical and serial batches at each port.
   fortiori `≈`). Establishes part 2 for Reduce outputs.
 - `N_k = Relate`: run whole. By IH role ports are `≈` serial. With `on=`,
   Lemma 3a gives `Phys(out) ≈ Ser(out)` directly. With the adapter escape hatch,
-  Lemma 3b gives equality up to relation-row reindexing, which the reordering
-  discipline (below) canonicalizes at the next `Reduce`.
+  the permutation-equivariant adapter contract and Lemma 3b give
+  `Phys(out) ≈ Ser(out)` directly.
 - `N_k = Project/Rebatch/Materialize`: identity on records / pure re-blocking
   (`take`/`concat`), so `≈` is preserved by Lemma 0.
 

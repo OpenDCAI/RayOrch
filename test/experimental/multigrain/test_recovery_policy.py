@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 import rayorch.experimental.multigrain as mg
-from rayorch.experimental.multigrain.graph import (
+from rayorch.experimental.multigrain.ir import (
     RecordRecoveryAction,
     ShardRecoveryAction,
 )

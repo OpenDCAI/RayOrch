@@ -7,8 +7,8 @@ import ray
 pytest.importorskip("PIL")
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.graph import MissingChildPolicy, PhysicalHints
-from rayorch.experimental.multigrain.ray_executor import MultigrainRayExecutor
+from rayorch.experimental.multigrain.ir import MissingChildPolicy, PhysicalHints
+from rayorch.experimental.multigrain.ray import MultigrainRayExecutor
 
 from test.experimental.multigrain.mineru_integration_ops import (
     AlwaysOpaqueImageFeature,

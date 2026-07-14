@@ -3,20 +3,22 @@ from __future__ import annotations
 
 from typing import Any, List, Sequence
 
-from ._op_utils import LazyOp, op_name, op_ref, output_name
-from .core import (
+from ._utils import (
+    checked_output_lists,
+)
+from ._binding import BoundPrimitive, PrimitiveBinding
+from .output import PortBatchBuilder
+from ..data.batch import (
     ErrorTrace,
     Grouped,
     PortBatch,
     _align_by_identity,
     _as_columns,
     _call_user,
-    _normalize_output_lists,
 )
-from .graph import (
+from ..ir.model import (
     MissingChildPolicy,
     OperatorProperties,
-    OperatorRecipe,
     PhysicalHints,
     RecoveryPolicy,
     SymbolicPort,
@@ -24,7 +26,7 @@ from .graph import (
 )
 
 
-class Expand:
+class Expand(BoundPrimitive):
     """One parent record produces a child group."""
 
     def __init__(
@@ -40,27 +42,24 @@ class Expand:
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ) -> None:
-        self.name = op_name(op_cls, name)
         self.parent = parent
-        self.child_label = child_label or self.name
-        self.num_outputs = max(1, int(num_outputs))
-        self.properties = properties or OperatorProperties()
-        self.physical = physical or PhysicalHints(prefer_rebatch=True)
-        self.recovery = recovery or RecoveryPolicy()
-        self.op_recipe = OperatorRecipe(
-            cls_ref=op_ref(op_cls),
-            args=tuple(args),
-            kwargs=dict(kwargs),
+        resolved_name = name or getattr(op_cls, "__name__", type(op_cls).__name__)
+        self.child_label = child_label or resolved_name
+        self._binding = PrimitiveBinding.create(
+            op_cls,
+            tuple(args),
+            kwargs,
+            name=name,
+            num_outputs=num_outputs,
+            properties=properties,
+            physical=physical,
+            recovery=recovery,
             provenance={
                 "parent": str(parent),
                 "child_label": self.child_label,
             },
+            default_physical=PhysicalHints(prefer_rebatch=True),
         )
-        self._lazy_op = LazyOp(op_cls, tuple(args), dict(kwargs))
-
-    @property
-    def op(self) -> Any:
-        return self._lazy_op.get()
 
     def __call__(
         self,
@@ -70,6 +69,7 @@ class Expand:
             raise ValueError(f"parent input {self.parent} is out of range")
         symbolic = ensure_symbolic_ports(ports)
         if symbolic is not None:
+            self._binding.require_compilable("Expand")
             return symbolic[0].tracer.add_node(
                 name=self.name,
                 kind="EXPAND",
@@ -84,12 +84,21 @@ class Expand:
             )
         aligned = _align_by_identity(ports)
         parent_port = aligned[self.parent]
-        outputs = _normalize_output_lists(
-            _call_user(self.op, *[_as_columns(port) for port in aligned])
+        outputs = checked_output_lists(
+            _call_user(self.op, *[_as_columns(port) for port in aligned]),
+            expected=self.num_outputs,
+            primitive="Expand",
+            name=self.name,
         )
         group_outputs = [self._normalize_groups(output, len(parent_port)) for output in outputs]
         self._validate_shared_groups(group_outputs)
-        return self._make_outputs(parent_port, group_outputs)
+        outputs = PortBatchBuilder.expanded(
+            parent_port,
+            group_outputs,
+            name=self.name,
+            child_label=self.child_label,
+        )
+        return outputs[0] if len(outputs) == 1 else outputs
 
     @staticmethod
     def _normalize_groups(output: Sequence[Any], parent_count: int) -> List[List[Any]]:
@@ -119,57 +128,7 @@ class Expand:
                     "multi-output Expand requires shared group lengths in the MVP"
                 )
 
-    def _make_outputs(
-        self,
-        parent_port: PortBatch,
-        group_outputs: Sequence[Sequence[Sequence[Any]]],
-    ) -> PortBatch | tuple[PortBatch, ...]:
-        batches: List[PortBatch] = []
-        count = len(group_outputs)
-        for output_index, groups in enumerate(group_outputs):
-            values: List[Any] = []
-            record_ids: List[str] = []
-            display_keys: List[str] = []
-            ancestors: List[dict[str, str]] = []
-            ancestor_display: List[dict[str, str]] = []
-            ordinals: List[dict[str, int]] = []
-            lineage: List[tuple[str, ...]] = []
-            for parent_index, group in enumerate(groups):
-                parent_id = parent_port.record_ids[parent_index]
-                parent_key = parent_port.display_keys[parent_index]
-                for child_index, value in enumerate(group):
-                    child_id = f"{self.name}:{parent_id}:{child_index}"
-                    child_key = f"{parent_key}/{self.child_label}={child_index}"
-                    values.append(value)
-                    record_ids.append(child_id)
-                    display_keys.append(child_key)
-                    child_ancestors = dict(parent_port.ancestors[parent_index])
-                    child_ancestors[parent_port.name] = parent_id
-                    ancestors.append(child_ancestors)
-                    child_display = dict(parent_port.ancestor_display[parent_index])
-                    child_display[parent_port.name] = parent_key
-                    ancestor_display.append(child_display)
-                    child_ordinals = dict(parent_port.ordinals[parent_index])
-                    child_ordinals[parent_port.name] = child_index
-                    ordinals.append(child_ordinals)
-                    lineage.append(tuple((*parent_port.lineage[parent_index], self.name)))
-            batches.append(
-                PortBatch(
-                    name=output_name(self.name, output_index, count),
-                    values=values,
-                    record_ids=record_ids,
-                    display_keys=display_keys,
-                    ancestors=ancestors,
-                    ancestor_display=ancestor_display,
-                    ordinals=ordinals,
-                    lineage=lineage,
-                    errors=list(parent_port.errors),
-                )
-            )
-        return batches[0] if len(batches) == 1 else tuple(batches)
-
-
-class Reduce:
+class Reduce(BoundPrimitive):
     """Group descendants by an anchor port and return anchor-grain rows."""
 
     def __init__(
@@ -184,28 +143,23 @@ class Reduce:
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ):
-        self.name = op_name(op_cls, name)
-        self.num_outputs = max(1, int(num_outputs))
         # Recovery policy for a lost descendant: FAIL_OPEN assembles from whatever
         # survived (may be partial); FAIL_CLOSED suppresses the affected anchor's
         # output (the UDF is not called for it) and emits an anchor-grain error, so
         # a permanently-lost child cascades to a flagged, *not-written* result
         # instead of a silently-truncated one.
         self.missing = MissingChildPolicy(missing_child)
-        self.properties = properties or OperatorProperties()
-        self.physical = physical or PhysicalHints()
-        self.recovery = recovery or RecoveryPolicy()
-        self.op_recipe = OperatorRecipe(
-            cls_ref=op_ref(op_cls),
-            args=tuple(args),
-            kwargs=dict(kwargs),
+        self._binding = PrimitiveBinding.create(
+            op_cls,
+            tuple(args),
+            kwargs,
+            name=name,
+            num_outputs=num_outputs,
+            properties=properties,
+            physical=physical,
+            recovery=recovery,
             provenance={"missing_child": self.missing.value},
         )
-        self._lazy_op = LazyOp(op_cls, tuple(args), dict(kwargs))
-
-    @property
-    def op(self) -> Any:
-        return self._lazy_op.get()
 
     def __call__(
         self,
@@ -215,6 +169,7 @@ class Reduce:
             raise TypeError("Reduce expects orch.group_by(anchor, *descendants)")
         anchor = grouped.anchor
         if isinstance(anchor, SymbolicPort):
+            self._binding.require_compilable("Reduce")
             descendants = grouped.descendants
             if not all(isinstance(port, SymbolicPort) for port in descendants):
                 raise TypeError("cannot mix symbolic and eager grouped ports")
@@ -246,21 +201,21 @@ class Reduce:
             )
             errors = errors + cascade
         else:
-            outputs = _normalize_output_lists(
-                _call_user(self.op, anchor.values, *grouped_values)
+            outputs = checked_output_lists(
+                _call_user(self.op, anchor.values, *grouped_values),
+                expected=self.num_outputs,
+                primitive="Reduce",
+                name=self.name,
             )
 
-        result: List[PortBatch] = []
-        count = len(outputs)
-        for output_index, values in enumerate(outputs):
-            batch = anchor.with_values(
-                values,
-                name=output_name(self.name, output_index, count),
-                op_name=self.name,
-            )
-            batch.errors.extend(errors)
-            result.append(batch)
-        return result[0] if len(result) == 1 else tuple(result)
+        result = PortBatchBuilder.preserved(
+            anchor,
+            outputs,
+            name=self.name,
+            op_name=self.name,
+            errors=errors,
+        )
+        return result[0] if len(result) == 1 else result
 
     def _poisoned_anchor_ids(
         self,
@@ -295,8 +250,11 @@ class Reduce:
         ]
         clean_anchor_vals = [anchor.values[i] for i in clean_idx]
         clean_grouped = [[groups[i] for i in clean_idx] for groups in grouped_values]
-        clean_outputs = _normalize_output_lists(
-            _call_user(self.op, clean_anchor_vals, *clean_grouped)
+        clean_outputs = checked_output_lists(
+            _call_user(self.op, clean_anchor_vals, *clean_grouped),
+            expected=self.num_outputs,
+            primitive="Reduce",
+            name=self.name,
         )
         count = len(clean_outputs)
         n = len(anchor.values)

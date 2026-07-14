@@ -16,12 +16,15 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any, Callable, List, Mapping, Sequence
 
-from ._op_utils import LazyOp, lineage_union, op_name, op_ref
-from .core import ParentRef, PortBatch, _as_columns, _call_user
-from .graph import (
+from ._utils import (
+    lineage_union,
+)
+from ..data.batch import ParentRef, PortBatch, _as_columns, _call_user
+from ._binding import BoundPrimitive, PrimitiveBinding
+from .output import PortBatchBuilder, RelationOutput
+from ..ir.model import (
     NodeKind,
     OperatorProperties,
-    OperatorRecipe,
     PhysicalHints,
     RecoveryPolicy,
     SymbolicPort,
@@ -51,7 +54,7 @@ def _extract_key(value: Any, field: str | Callable[[Any], Any]) -> Any:
     return getattr(value, field)
 
 
-class Relate:
+class Relate(BoundPrimitive):
     """Arbitrary invocation-local relation primitive."""
 
     def __init__(
@@ -70,18 +73,19 @@ class Relate:
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ) -> None:
-        self.name = op_name(op_cls, name)
-        self.output_grain = output_grain or self.name
+        if num_outputs != 1:
+            raise ValueError(
+                "Relate currently supports exactly one output; "
+                "multi-output relation evidence is not defined"
+            )
+        resolved_name = name or getattr(op_cls, "__name__", type(op_cls).__name__)
+        self.output_grain = output_grain or resolved_name
         self.on = dict(on) if on else None
         if self.on and not roles:
             roles = tuple(self.on.keys())
         self.roles = tuple(roles)
         self.relation_adapter = relation_adapter
         self.relation_fn = relation_fn
-        self.num_outputs = max(1, int(num_outputs))
-        self.properties = properties or OperatorProperties()
-        self.physical = physical or PhysicalHints()
-        self.recovery = recovery or RecoveryPolicy()
         provenance: dict[str, Any] = {}
         if self.on is not None:
             provenance["on"] = {
@@ -94,17 +98,17 @@ class Relate:
             provenance["relation_fn"] = getattr(
                 relation_fn, "__name__", type(relation_fn).__name__
             )
-        self.op_recipe = OperatorRecipe(
-            cls_ref=op_ref(op_cls),
-            args=tuple(args),
-            kwargs=dict(kwargs),
+        self._binding = PrimitiveBinding.create(
+            op_cls,
+            tuple(args),
+            kwargs,
+            name=name,
+            num_outputs=1,
+            properties=properties,
+            physical=physical,
+            recovery=recovery,
             provenance=provenance,
         )
-        self._lazy_op = LazyOp(op_cls, tuple(args), dict(kwargs))
-
-    @property
-    def op(self) -> Any:
-        return self._lazy_op.get()
 
     def __call__(
         self,
@@ -112,6 +116,17 @@ class Relate:
     ) -> PortBatch | SymbolicPort | tuple[SymbolicPort, ...]:
         symbolic = ensure_symbolic_ports(ports)
         if symbolic is not None:
+            self._binding.require_compilable("Relate")
+            if self.on is not None and any(callable(field) for field in self.on.values()):
+                raise TypeError(
+                    "Relate compiled on= keys must be field names; "
+                    "use relation_adapter='pkg.mod:fn' for custom extraction"
+                )
+            if self.relation_fn is not None:
+                raise TypeError(
+                    "Relate relation_fn is eager-only; compiled graphs require "
+                    "relation_adapter='pkg.mod:fn'"
+                )
             if self.roles and len(self.roles) != len(symbolic):
                 raise ValueError("Relate roles must match the number of input ports")
             return symbolic[0].tracer.add_node(
@@ -163,14 +178,7 @@ class Relate:
         first_role = role_names[0]
         other_roles = role_names[1:]
 
-        values: List[Any] = []
-        record_ids: List[str] = []
-        display_keys: List[str] = []
-        ancestors: List[dict[str, str]] = []
-        ancestor_display: List[dict[str, str]] = []
-        ordinals: List[dict[str, int]] = []
-        lineage: List[tuple[str, ...]] = []
-        relations: List[tuple[ParentRef, ...]] = []
+        rows: List[RelationOutput] = []
 
         output_index = 0
         seen_keys: set[Any] = set()
@@ -224,30 +232,28 @@ class Relate:
                     key_parts.append(f"{role}={port.display_keys[idx]}")
                     id_parts.append(f"{role}={port.record_ids[idx]}")
 
-                values.append(value)
                 # Content-addressed identity: a relation row is identified by its
                 # matched parent tuple, not by emission order. Combos are distinct
                 # by construction, so ids are unique AND invariant to upstream
                 # reordering (see docs/todos/13-reordering-invariance-theorem.md).
-                record_ids.append(f"{self.name}:{'|'.join(id_parts)}")
-                display_keys.append("/".join(key_parts))
-                ancestors.append(merged_ancestors)
-                ancestor_display.append(merged_display)
-                ordinals.append(merged_ordinals)
-                lineage.append(lineage_union(parent_lineage, self.name))
-                relations.append(tuple(parent_refs))
+                rows.append(
+                    RelationOutput(
+                        value=value,
+                        record_id=f"{self.name}:{'|'.join(id_parts)}",
+                        display_key="/".join(key_parts),
+                        ancestors=merged_ancestors,
+                        ancestor_display=merged_display,
+                        ordinals=merged_ordinals,
+                        lineage=lineage_union(parent_lineage, self.name),
+                        parents=tuple(parent_refs),
+                    )
+                )
                 output_index += 1
 
-        return PortBatch(
+        return PortBatchBuilder.related(
+            rows,
             name=self.name,
-            values=values,
-            record_ids=record_ids,
-            display_keys=display_keys,
-            ancestors=ancestors,
-            ancestor_display=ancestor_display,
-            ordinals=ordinals,
-            lineage=lineage,
-            relations=relations,
+            errors=[error for port in ports for error in port.errors],
         )
 
     def _make_relation_batch(
@@ -260,29 +266,28 @@ class Relate:
         if not isinstance(evidence, list):
             raise TypeError("Relate relation_fn must return a list")
 
-        values: List[Any] = []
-        record_ids: List[str] = []
-        display_keys: List[str] = []
-        ancestors: List[dict[str, str]] = []
-        ancestor_display: List[dict[str, str]] = []
-        ordinals: List[dict[str, int]] = []
-        lineage: List[tuple[str, ...]] = []
-        relations: List[tuple[ParentRef, ...]] = []
+        rows: List[RelationOutput] = []
         role_to_port = dict(zip(role_names, ports))
 
+        seen_ids: set[str] = set()
         for output_index, item in enumerate(evidence):
-            if not isinstance(item, tuple) or len(item) != 2:
+            if not isinstance(item, tuple) or len(item) not in (2, 3):
                 raise TypeError(
-                    "Relate relation_fn items must be (value, {role: local_index})"
+                    "Relate relation_fn items must be "
+                    "(value, {role: local_index}) or "
+                    "(value, {role: local_index}, stable_key)"
                 )
-            value, parent_indexes = item
+            value, parent_indexes = item[:2]
+            stable_key = item[2] if len(item) == 3 else None
             if not isinstance(parent_indexes, dict):
                 raise TypeError("Relate parent refs must be a dict of role -> index")
 
             parent_refs: List[ParentRef] = []
             item_ancestors: dict[str, str] = {}
             item_display: dict[str, str] = {}
+            item_ordinals: dict[str, int] = {}
             parent_lineage: List[tuple[str, ...]] = []
+            id_parts: List[str] = []
             for role, local_index in parent_indexes.items():
                 if role not in role_to_port:
                     raise ValueError(f"Relate parent role '{role}' is not declared")
@@ -302,36 +307,49 @@ class Relate:
                         display_key=parent_port.display_keys[local_index],
                     )
                 )
-                item_ancestors[role] = parent_port.record_ids[local_index]
-                item_display[role] = parent_port.display_keys[local_index]
+                item_ancestors.update(parent_port.ancestors[local_index])
+                item_ancestors[parent_port.name] = parent_port.record_ids[local_index]
+                item_display.update(parent_port.ancestor_display[local_index])
+                item_display[parent_port.name] = parent_port.display_keys[local_index]
+                item_ordinals.update(parent_port.ordinals[local_index])
                 parent_lineage.append(parent_port.lineage[local_index])
+                id_parts.append(f"{role}={parent_port.record_ids[local_index]}")
 
-            values.append(value)
-            record_ids.append(f"{self.name}:{output_index}")
-            display_keys.append(
-                "/".join(f"{ref.role}={ref.display_key}" for ref in parent_refs)
-                or f"{self.name}:{output_index}"
+            record_id = f"{self.name}:{'|'.join(id_parts)}"
+            if stable_key is not None:
+                record_id += f"|key={stable_key}"
+            if record_id in seen_ids:
+                raise ValueError(
+                    "Relate adapter emitted duplicate parent evidence; "
+                    "provide a stable_key as the third tuple item"
+                )
+            seen_ids.add(record_id)
+            rows.append(
+                RelationOutput(
+                    value=value,
+                    record_id=record_id,
+                    display_key=(
+                        "/".join(
+                            f"{ref.role}={ref.display_key}" for ref in parent_refs
+                        )
+                        or f"{self.name}:{output_index}"
+                    ),
+                    ancestors=item_ancestors,
+                    ancestor_display=item_display,
+                    ordinals=item_ordinals,
+                    lineage=lineage_union(parent_lineage, self.name),
+                    parents=tuple(parent_refs),
+                )
             )
-            ancestors.append(item_ancestors)
-            ancestor_display.append(item_display)
-            ordinals.append({})
-            lineage.append(lineage_union(parent_lineage, self.name))
-            relations.append(tuple(parent_refs))
 
-        if isinstance(raw_values, list) and len(raw_values) != len(values):
+        if isinstance(raw_values, list) and len(raw_values) != len(rows):
             raise ValueError(
                 "Relate relation_fn output length must match raw value length"
             )
-        return PortBatch(
+        return PortBatchBuilder.related(
+            rows,
             name=self.name,
-            values=values,
-            record_ids=record_ids,
-            display_keys=display_keys,
-            ancestors=ancestors,
-            ancestor_display=ancestor_display,
-            ordinals=ordinals,
-            lineage=lineage,
-            relations=relations,
+            errors=[error for port in ports for error in port.errors],
         )
 
 

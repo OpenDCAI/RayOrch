@@ -11,8 +11,8 @@ This is the first, deliberately small, Ray *lowering* of the passive
 
 It reuses the local ``MultigrainExecutor`` node logic inside the Ray tasks, so
 the semantics stay identical to local execution; only the scheduling changes.
-This executor is intentionally not part of the narrow package ``__init__``:
-import it explicitly from ``rayorch.experimental.multigrain.ray_executor``.
+The backend is available explicitly from ``rayorch.experimental.multigrain.ray``;
+the root facade resolves its public symbols lazily for API compatibility.
 """
 from __future__ import annotations
 
@@ -23,22 +23,18 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import ray
 
-from ._coordinator import ExecutionCoordinator, GraphOutput
-from .core import DeferredRecord, ErrorTrace, NodeExecution, PortBatch, concat
-from .executor import MultigrainExecutor
-from .graph import (
+from ..data.batch import DeferredRecord, ErrorTrace, NodeExecution, PortBatch, concat
+from ..execution.coordinator import ExecutionCoordinator, GraphOutput
+from ..execution.local import MultigrainExecutor
+from ..execution.metrics import NodeMetric, RunMetrics
+from ..ir.capabilities import capabilities_for
+from ..ir.model import (
     IRNode,
     IsolationExhaustedAction,
     MultigrainIR,
     NodeKind,
     ShardRecoveryAction,
 )
-from .metrics import NodeMetric, RunMetrics
-
-# Node kinds whose rows/parents are independent and therefore safe to row-shard.
-# Reduce/Relate need cross-row context, so they run on a single task in the MVP.
-_SHARDABLE = frozenset({NodeKind.MAP, NodeKind.FILTER, NodeKind.EXPAND})
-
 
 class InjectedFault(RuntimeError):
     """Raised inside a Ray task to simulate a task/node crash (fault injection)."""
@@ -251,7 +247,7 @@ class MultigrainRayExecutor:
                     attempt=node.recovery.max_shard_retries
                 )
                 is ShardRecoveryAction.DEGRADE
-                and node.kind not in _SHARDABLE
+                and not capabilities_for(node).row_partitionable
             )
         ]
         if unsupported:
@@ -330,7 +326,7 @@ class MultigrainRayExecutor:
 
         Everything else stays on cheap stateless tasks.
         """
-        if node.kind not in _SHARDABLE:
+        if not capabilities_for(node).row_partitionable:
             return False
         if self._num_gpus_for(node) > 0.0:
             return True
@@ -668,7 +664,11 @@ class MultigrainRayExecutor:
     ) -> NodeExecution:
         relation_fn = self.relation_fns.get(node.name)
         fault = self._fault_for(node.name)
-        replicas = self._replicas_for(node) if node.kind in _SHARDABLE else 1
+        replicas = (
+            self._replicas_for(node)
+            if capabilities_for(node).row_partitionable
+            else 1
+        )
         nrows = len(inputs[0]) if inputs else 0
 
         if replicas <= 1 or nrows <= 1:

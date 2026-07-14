@@ -8,7 +8,13 @@
 > 三层关系模型见 `docs/todos/12-relation-model-three-tiers.md`；重排不变性定理见
 > `docs/todos/13-reordering-invariance-theorem.md`；真实 MinerU 图片对象驱动的图形、
 > 容灾和 LPT 集成测试与已知缺口见
-> `docs/todos/17-mineru-graph-integration-findings.md`。本文是**上手手册**，只讲怎么用。
+> `docs/todos/17-mineru-graph-integration-findings.md`；当前 primitive 内核边界见
+> `docs/todos/18-multigrain-primitive-core-convergence.md`。本文是**上手手册**，只讲怎么用。
+>
+> 面向框架开发者的完整代码脉络、字段字典、RelationSpec/Capability 推导、primitive
+> 契约和执行/recovery 说明，以
+> [`rayorch/experimental/multigrain/README.md`](../rayorch/experimental/multigrain/README.md)
+> 为唯一入口。
 
 ---
 
@@ -51,10 +57,14 @@ class RealVlmOcrPage:
 
 **硬性规则（违反会破坏并行正确性）：**
 
-1. **`__init__` 只负责建资源**（加载模型、开连接）。别在 driver 侧手动实例化——把类和构造参数交给原语即可，框架在 actor 里懒加载一次。
+1. **`__init__` 只负责建资源**（加载模型、开连接）。编译图必须把**可导入的类**
+   和构造参数交给原语；不要传已经构造好的实例。实例只允许本地 eager 调用，不能进入
+   被动 IR。框架会在 executor/actor 中懒加载一次。
 2. **`run` 是值纯函数**：输出只依赖输入值，**不得**依赖 `record_id`、全局下标、ordinal。
    （批内顺序框架会保证，你按位置处理没问题；但不能假设"我是全局第 37 条"。）这是重排不变性的前提。
 3. **`run` 返回长度必须与输入对齐**（`Map` 1:1）。`Expand` 返回"每条输入 → 一个子列表"（1:N）。
+   多输出原语必须显式写 `num_outputs=N`；实际输出数、每个输出的行数以及多输出
+   Expand 的逐父组长度都会被严格校验，不再动态猜测。
 4. **不要碰血缘 / id / 错误清单**——这些是框架的活。你连线用值，别用"飞线"（out-of-band 传路径 / 全局字典）。
 
 各原语的 `run` 签名：
@@ -76,7 +86,7 @@ class RealVlmOcrPage:
 
 ```python
 import rayorch.experimental.multigrain as mg
-from rayorch.experimental.multigrain.graph import PhysicalHints
+from rayorch.experimental.multigrain.ir import PhysicalHints
 
 class MinerUReal(mg.Pipeline):
     def __init__(self, output_dir, replicas=4, num_gpus_per_replica=1.0):
@@ -173,15 +183,27 @@ ex.shutdown()                        # 释放所有 actor 和 GPU
 按"从简单到通用"分三层，够用就用上面的：
 
 1. **Expand / Reduce**：纯父子 1:N / N:1（最常用，见上）。
-2. **`on=` 键连接**：两个端口按字段等值关联。
+2. **`on=` 键连接**：各角色按字段等值关联；重复键会产生完整笛卡尔积。
    ```python
-   self.link = mg.Relate(MyJoinOp, on="doc_id")   # 左右记录 doc_id 相等则关联
+   self.link = mg.Relate(
+       MyJoinOp,
+       on={"image": "doc_id", "caption": "doc_id"},
+   )
    ```
-3. **`relation_adapter=` 点路径适配器**：关系藏在嵌套结构里时，用点路径取出关联键。
+   编译图中的 key extractor 必须是字段名；自定义 callable 只允许 eager。
+3. **`relation_adapter=` 可导入适配器**：关系不是等值连接时，用
+   `"package.module:function"` 引用一个返回关系 evidence 的函数。
    ```python
-   self.link = mg.Relate(MyOp, relation_adapter="meta.refs.parent_id")
+   self.link = mg.Relate(
+       MyOp,
+       roles=("image", "caption"),
+       relation_adapter="my_project.relations:link_visual_refs",
+   )
    ```
-   也可给 Ray 执行器注册 `relation_fns={node_name: fn}` 做自定义关联。
+   evidence 项为 `(value, {role: local_index})`；同一父证据要产出多条时，使用
+   `(value, {role: local_index}, stable_key)`，保证 relation identity 在重排后稳定。
+   `relation_fn=` 是 eager-only；执行已有 compiled IR 时，也可给 executor 注册
+   `relation_fns={node_name: fn}`。当前 `Relate` 明确只支持一个输出端口。
 
 `Relate` 满足重排不变性：任何合法的物理分片重排，输出与串行基线**逐条等价**（证明见 doc 13）。
 
@@ -338,7 +360,7 @@ import rayorch.experimental.multigrain as mg
 # 执行：mg.MultigrainExecutor（本地）/ mg.MultigrainRayExecutor（Ray）
 # 调度/观测：mg.lpt_shard_planner / mg.FaultSpec / mg.RunMetrics
 # 恢复接口：mg.RecoveryPolicy / mg.IsolationBudget / mg.RetryTiming / mg.DrainScope
-from rayorch.experimental.multigrain.graph import PhysicalHints, MissingChildPolicy
+from rayorch.experimental.multigrain.ir import PhysicalHints, MissingChildPolicy
 from rayorch.runtime import BadRecordError                  # 记录级隔离信号
 ```
 

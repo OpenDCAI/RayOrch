@@ -493,7 +493,7 @@ InsertRebatchAfterExpandPass
 
 ## 实施清单
 
-### 1. 升级`graph.py`数据模型
+### 1. 升级 `ir/model.py` 数据模型
 
 - 添加`IRPortRef`、`IRPortSpec`、`IRNode`、`RelationSpec`、
   `CardinalityContract`,`OperatorRecipe`,`OperatorProperties`,
@@ -579,7 +579,7 @@ InsertRebatchAfterExpandPass
 ## 射线执行 MVP (`MultigrainRayExecutor`)
 
 第一个、故意的小射线降低存在于
-`rayorch/experimental/multigrain/ray_executor.py`。它重用了本地
+`rayorch/experimental/multigrain/ray/executor.py`。它重用了本地
 `MultigrainExecutor`节点逻辑 *内部* Ray 任务，因此语义保持相同
 本地执行并且仅调度更改。它验证了被动红外
 再加上`PhysicalHints`可以驱动真正的并行性：
@@ -602,7 +602,7 @@ InsertRebatchAfterExpandPass
 由`test/experimental/multigrain/test_ray_parallelism.py`覆盖（标记为
 `slow`;需要`--runslow`+`ray_cluster`灯具）。执行人不属于
 窄封装`__init__`；将其导入自
-`rayorch.experimental.multigrain.ray_executor`。
+`rayorch.experimental.multigrain.ray`。
 
 MVP 限制仍然开放：`batch_size`提示尚未消耗；`Reduce`/`Relate`
 没有被分片；没有跨节点流调度程序（微批次重叠

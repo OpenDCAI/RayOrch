@@ -3,8 +3,7 @@ from __future__ import annotations
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.graph import NodeKind, RelationKind
-from rayorch.experimental.multigrain.passes import VerifyPass
+from rayorch.experimental.multigrain.ir import NodeKind, RelationKind, VerifyPass
 
 from test.experimental.multigrain.test_pdf_mvp import PdfToImages
 
@@ -75,7 +74,14 @@ def test_select_eager_returns_filtered_inputs_and_annotations() -> None:
     assert kept_pages.values == ["good-0", "good-2"]
     assert kept_scores.values == [0.9, 0.9]
     assert kept_pages.record_ids == kept_scores.record_ids
-    assert kept_pages.lineage == [("ScoreAndKeep",), ("ScoreAndKeep",)]
+    assert kept_pages.lineage == [
+        ("ScoreAndKeep__filter",),
+        ("ScoreAndKeep__filter",),
+    ]
+    assert kept_scores.lineage == [
+        ("ScoreAndKeep__map", "ScoreAndKeep__filter"),
+        ("ScoreAndKeep__map", "ScoreAndKeep__filter"),
+    ]
 
 
 class FilterSelectPipe(mg.Pipeline):
@@ -202,6 +208,25 @@ def test_relate_eager_uses_adapter_relation_evidence() -> None:
         [("image", "image", "img-1"), ("caption", "caption", "cap-1")],
     ]
     assert pairs.trace_item(image="img-0")[0]["relations"][0]["role"] == "image"
+    assert pairs.record_ids == [
+        "MatchImagesAndCaptions:image=image:0|caption=caption:1",
+        "MatchImagesAndCaptions:image=image:1|caption=caption:0",
+    ]
+
+
+def test_relate_adapter_inherits_upstream_ancestry() -> None:
+    docs = mg.source(["d0", "d1"], name="docs")
+    images = docs.with_values(["img-0", "img-1"], name="image", op_name="images")
+    captions = mg.source(["cap-1", "cap-0"], name="caption")
+
+    pairs = mg.Relate(
+        MatchImagesAndCaptions,
+        roles=("image", "caption"),
+        relation_fn=pair_relation,
+    )(images, captions)
+
+    assert pairs.ancestors[0]["docs"] == docs.record_ids[0]
+    assert pairs.ancestor_display[0]["docs"] == docs.display_keys[0]
 
 
 def test_relate_runtime_check_rejects_out_of_range_parent_ref() -> None:

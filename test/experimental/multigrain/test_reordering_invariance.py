@@ -20,9 +20,9 @@ import random
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.core import concat
-from rayorch.experimental.multigrain.executor import MultigrainExecutor
-from rayorch.experimental.multigrain.graph import NodeKind
+from rayorch.experimental.multigrain.data import concat
+from rayorch.experimental.multigrain.execution import MultigrainExecutor
+from rayorch.experimental.multigrain.ir import NodeKind
 
 from test.experimental.multigrain.test_dummy_e2e import GovPipe
 from test.experimental.multigrain.test_relate_key_join import (

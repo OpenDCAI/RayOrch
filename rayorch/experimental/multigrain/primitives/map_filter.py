@@ -4,45 +4,44 @@ from __future__ import annotations
 from typing import Any, List, Sequence
 import uuid
 
-from rayorch.runtime import BadRecordError
+from rayorch.runtime.core import BadRecordError
 
-from ._op_utils import (
-    LazyOp,
+from ._utils import (
     as_tuple,
+    checked_output_lists,
     check_symbolic_same_grain,
-    lineage_union,
     normalize_mask,
-    op_name,
-    op_ref,
     output_name,
-    take_with_lineage,
 )
-from .core import (
+from .output import PortBatchBuilder, merge_aligned_inputs, select_filter_outputs
+from ._binding import BoundPrimitive, PrimitiveBinding
+from ..data.batch import (
     DeferredRecord,
     ErrorTrace,
     PortBatch,
     _align_by_identity,
     _as_columns,
     _call_user,
-    _normalize_output_lists,
     _parent_display,
     _source_item,
     _without_index,
 )
-from .graph import (
+from ..ir.model import (
     NodeKind,
     OperatorProperties,
     OperatorRecipe,
     PhysicalHints,
+    PROJECT_RECIPE,
     RecordRecoveryAction,
     RecoveryPolicy,
     RetryTiming,
+    SELECT_FILTER_RECIPE,
     SymbolicPort,
     ensure_symbolic_ports,
 )
 
 
-class Map:
+class Map(BoundPrimitive):
     """Record-preserving logical operator."""
 
     def __init__(
@@ -56,21 +55,16 @@ class Map:
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ):
-        self.name = op_name(op_cls, name)
-        self.num_outputs = max(1, int(num_outputs))
-        self.properties = properties or OperatorProperties()
-        self.physical = physical or PhysicalHints()
-        self.recovery = recovery or RecoveryPolicy()
-        self.op_recipe = OperatorRecipe(
-            cls_ref=op_ref(op_cls),
-            args=tuple(args),
-            kwargs=dict(kwargs),
+        self._binding = PrimitiveBinding.create(
+            op_cls,
+            tuple(args),
+            kwargs,
+            name=name,
+            num_outputs=num_outputs,
+            properties=properties,
+            physical=physical,
+            recovery=recovery,
         )
-        self._lazy_op = LazyOp(op_cls, tuple(args), dict(kwargs))
-
-    @property
-    def op(self) -> Any:
-        return self._lazy_op.get()
 
     def __call__(
         self,
@@ -78,6 +72,7 @@ class Map:
     ) -> PortBatch | SymbolicPort | tuple[PortBatch, ...] | tuple[SymbolicPort, ...]:
         symbolic = ensure_symbolic_ports(ports)
         if symbolic is not None:
+            self._binding.require_compilable("Map")
             grain = check_symbolic_same_grain(f"Map '{self.name}'", symbolic)
             return symbolic[0].tracer.add_node(
                 name=self.name,
@@ -127,69 +122,19 @@ class Map:
         *,
         errors: Sequence[ErrorTrace] = (),
     ) -> PortBatch | tuple[PortBatch, ...]:
-        result: List[PortBatch] = []
-        count = len(outputs)
-        for index, values in enumerate(outputs):
-            batch = base.with_values(
-                list(values),
-                name=output_name(self.name, index, count),
-                op_name=self.name,
-            )
-            batch.errors.extend(errors)
-            result.append(batch)
-        return result[0] if len(result) == 1 else tuple(result)
+        result = PortBatchBuilder.preserved(
+            base,
+            outputs,
+            name=self.name,
+            op_name=self.name,
+            errors=errors,
+        )
+        return result[0] if len(result) == 1 else result
 
     @staticmethod
     def _merge_lineage(ports: Sequence[PortBatch]) -> PortBatch:
         """Merge metadata from every same-identity input of a diamond fan-in."""
-        base = ports[0]
-        if len(ports) == 1:
-            return base
-
-        ancestors: List[dict[str, str]] = []
-        ancestor_display: List[dict[str, str]] = []
-        ordinals: List[dict[str, int]] = []
-        lineage: List[tuple[str, ...]] = []
-        relations = []
-        any_relations = any(port.relations for port in ports)
-        for index in range(len(base)):
-            item_ancestors: dict[str, str] = {}
-            item_display: dict[str, str] = {}
-            item_ordinals: dict[str, int] = {}
-            item_relations = []
-            for port in ports:
-                item_ancestors.update(port.ancestors[index])
-                item_display.update(port.ancestor_display[index])
-                item_ordinals.update(port.ordinals[index])
-                if port.relations:
-                    for ref in port.relations[index]:
-                        if ref not in item_relations:
-                            item_relations.append(ref)
-            ancestors.append(item_ancestors)
-            ancestor_display.append(item_display)
-            ordinals.append(item_ordinals)
-            # ``with_values`` appends this Map's own op name afterwards.
-            lineage.append(lineage_union([port.lineage[index] for port in ports]))
-            if any_relations:
-                relations.append(tuple(item_relations))
-
-        errors = []
-        for port in ports:
-            for error in port.errors:
-                if error not in errors:
-                    errors.append(error)
-        return PortBatch(
-            name=base.name,
-            values=list(base.values),
-            record_ids=list(base.record_ids),
-            display_keys=list(base.display_keys),
-            ancestors=ancestors,
-            ancestor_display=ancestor_display,
-            ordinals=ordinals,
-            lineage=lineage,
-            relations=relations,
-            errors=errors,
-        )
+        return merge_aligned_inputs(ports)
 
     def _trace_for(self, ports: Sequence[PortBatch], bad_index: int, error: str) -> ErrorTrace:
         base = ports[0]
@@ -322,13 +267,12 @@ class Map:
             return (*merged, errors, deferred)
 
     def _checked_outputs(self, raw: Any) -> tuple[List[Any], ...]:
-        outputs = _normalize_output_lists(raw)
-        if len(outputs) != self.num_outputs:
-            raise ValueError(
-                f"Map '{self.name}' expected {self.num_outputs} outputs, "
-                f"got {len(outputs)}"
-            )
-        return outputs
+        return checked_output_lists(
+            raw,
+            expected=self.num_outputs,
+            primitive="Map",
+            name=self.name,
+        )
 
     def _merge_recovered(
         self,
@@ -385,7 +329,7 @@ class Map:
         )
 
 
-class Filter:
+class Filter(BoundPrimitive):
     """Record-dropping logical operator that preserves kept identities."""
 
     def __init__(
@@ -398,20 +342,16 @@ class Filter:
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ) -> None:
-        self.name = op_name(op_cls, name)
-        self.properties = properties or OperatorProperties()
-        self.physical = physical or PhysicalHints()
-        self.recovery = recovery or RecoveryPolicy()
-        self.op_recipe = OperatorRecipe(
-            cls_ref=op_ref(op_cls),
-            args=tuple(args),
-            kwargs=dict(kwargs),
+        self._binding = PrimitiveBinding.create(
+            op_cls,
+            tuple(args),
+            kwargs,
+            name=name,
+            num_outputs=1,
+            properties=properties,
+            physical=physical,
+            recovery=recovery,
         )
-        self._lazy_op = LazyOp(op_cls, tuple(args), dict(kwargs))
-
-    @property
-    def op(self) -> Any:
-        return self._lazy_op.get()
 
     def __call__(
         self,
@@ -419,6 +359,7 @@ class Filter:
     ) -> PortBatch | SymbolicPort | tuple[PortBatch, ...] | tuple[SymbolicPort, ...]:
         symbolic = ensure_symbolic_ports(ports)
         if symbolic is not None:
+            self._binding.require_compilable("Filter")
             grain = check_symbolic_same_grain(f"Filter '{self.name}'", symbolic)
             return symbolic[0].tracer.add_node(
                 name=self.name,
@@ -438,19 +379,16 @@ class Filter:
             len(aligned[0]),
         )
         kept = [index for index, keep in enumerate(mask) if keep]
-        outputs = tuple(
-            take_with_lineage(
-                port,
-                kept,
-                name=output_name(self.name, index, len(aligned)),
-                op_name=self.name,
-            )
-            for index, port in enumerate(aligned)
+        outputs = PortBatchBuilder.filtered(
+            aligned,
+            kept,
+            name=self.name,
+            op_name=self.name,
         )
         return outputs[0] if len(outputs) == 1 else outputs
 
 
-class Select:
+class Select(BoundPrimitive):
     """High-level score/annotate-then-filter API lowered to Map + Filter + Project."""
 
     def __init__(
@@ -464,21 +402,23 @@ class Select:
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ) -> None:
-        self.name = op_name(op_cls, name)
-        self.num_annotations = max(0, int(num_annotations))
-        self.properties = properties or OperatorProperties()
-        self.physical = physical or PhysicalHints()
-        self.recovery = recovery or RecoveryPolicy()
-        self.op_recipe = OperatorRecipe(
-            cls_ref=op_ref(op_cls),
-            args=tuple(args),
-            kwargs=dict(kwargs),
+        if (
+            isinstance(num_annotations, bool)
+            or not isinstance(num_annotations, int)
+            or num_annotations < 0
+        ):
+            raise ValueError("num_annotations must be a non-negative integer")
+        self.num_annotations = num_annotations
+        self._binding = PrimitiveBinding.create(
+            op_cls,
+            tuple(args),
+            kwargs,
+            name=name,
+            num_outputs=1 + num_annotations,
+            properties=properties,
+            physical=physical,
+            recovery=recovery,
         )
-        self._lazy_op = LazyOp(op_cls, tuple(args), dict(kwargs))
-
-    @property
-    def op(self) -> Any:
-        return self._lazy_op.get()
 
     def __call__(
         self,
@@ -486,6 +426,7 @@ class Select:
     ) -> PortBatch | SymbolicPort | tuple[PortBatch, ...] | tuple[SymbolicPort, ...]:
         symbolic = ensure_symbolic_ports(ports)
         if symbolic is not None:
+            self._binding.require_compilable("Select")
             grain = check_symbolic_same_grain(f"Select '{self.name}'", symbolic)
             annotate = symbolic[0].tracer.add_node(
                 name=f"{self.name}__map",
@@ -506,7 +447,7 @@ class Select:
                 num_outputs=len(symbolic) + self.num_annotations,
                 output_grain=grain,
                 op=OperatorRecipe(
-                    cls_ref="rayorch.experimental.multigrain.SelectFilter",
+                    cls_ref=SELECT_FILTER_RECIPE,
                     provenance={"mask_input": str(len(symbolic))},
                 ),
             )
@@ -517,47 +458,35 @@ class Select:
                 inputs=filtered_ports,
                 num_outputs=len(filtered_ports),
                 output_grain=grain,
-                op=OperatorRecipe(cls_ref="rayorch.experimental.multigrain.Project"),
+                op=OperatorRecipe(cls_ref=PROJECT_RECIPE),
             )
 
         aligned = _align_by_identity(ports)
-        raw_outputs = as_tuple(_call_user(self.op, *[_as_columns(port) for port in aligned]))
-        if not raw_outputs:
-            raise ValueError("Select operator must return at least a mask")
-        mask = normalize_mask(raw_outputs[0], len(aligned[0]))
-        annotations = raw_outputs[1:]
-        if len(annotations) != self.num_annotations:
-            raise ValueError(
-                f"Select expected {self.num_annotations} annotation outputs, "
-                f"got {len(annotations)}"
-            )
-        kept = [index for index, keep in enumerate(mask) if keep]
-        output_batches: list[PortBatch] = []
-        total = len(aligned) + len(annotations)
-        for index, port in enumerate(aligned):
-            output_batches.append(
-                take_with_lineage(
-                    port,
-                    kept,
-                    name=output_name(self.name, index, total),
-                    op_name=self.name,
-                )
-            )
-        for offset, values in enumerate(annotations):
-            annotated = aligned[0].with_values(
+        raw_outputs = checked_output_lists(
+            _call_user(self.op, *[_as_columns(port) for port in aligned]),
+            expected=1 + self.num_annotations,
+            primitive="Select",
+            name=self.name,
+        )
+        annotated = tuple(
+            aligned[0].with_values(
                 values,
-                name=output_name(f"{self.name}_annotation", offset, len(annotations)),
+                name=output_name(
+                    f"{self.name}__map",
+                    index,
+                    len(raw_outputs),
+                ),
                 op_name=f"{self.name}__map",
             )
-            output_batches.append(
-                take_with_lineage(
-                    annotated,
-                    kept,
-                    name=output_name(self.name, len(aligned) + offset, total),
-                    op_name=f"{self.name}__filter",
-                )
-            )
-        return output_batches[0] if len(output_batches) == 1 else tuple(output_batches)
+            for index, values in enumerate(raw_outputs)
+        )
+        outputs = select_filter_outputs(
+            (*aligned, *annotated),
+            mask_index=len(aligned),
+            output_count=len(aligned) + self.num_annotations,
+            op_name=f"{self.name}__filter",
+        )
+        return outputs[0] if len(outputs) == 1 else outputs
 
 
 __all__ = ["Filter", "Map", "Select"]

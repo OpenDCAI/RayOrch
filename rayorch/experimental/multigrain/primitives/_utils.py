@@ -1,10 +1,11 @@
 """Shared helpers for experimental multigrain operator wrappers."""
 from __future__ import annotations
 
+from importlib import import_module
 from typing import Any, Sequence
 
-from .core import PortBatch
-from .graph import SymbolicPort
+from ..data.batch import PortBatch, _normalize_output_lists
+from ..ir.model import SymbolicPort
 
 
 def op_name(op_cls: Any, name: str | None) -> str:
@@ -16,6 +17,53 @@ def op_name(op_cls: Any, name: str | None) -> str:
 def op_ref(op_cls: Any) -> str:
     cls = op_cls if isinstance(op_cls, type) else type(op_cls)
     return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def require_compilable_factory(op_cls: Any, primitive: str) -> None:
+    """Reject live instances when a wrapper enters symbolic compilation.
+
+    Eager wrappers may intentionally use an already-created object.  Passive IR
+    cannot: it records a class recipe, not arbitrary live instance state.
+    """
+    if not isinstance(op_cls, type):
+        raise TypeError(
+            f"{primitive} compiled graphs require an importable operator class; "
+            "live operator instances are eager-only"
+        )
+    if op_cls.__module__ == "__main__" or "<locals>" in op_cls.__qualname__:
+        raise TypeError(
+            f"{primitive} compiled graphs require an importable operator class; "
+            "classes defined in __main__ or a local scope are not importable"
+        )
+    target: Any = import_module(op_cls.__module__)
+    for part in op_cls.__qualname__.split("."):
+        target = getattr(target, part, None)
+    if target is not op_cls:
+        raise TypeError(
+            f"{primitive} operator class "
+            f"{op_cls.__module__}.{op_cls.__qualname__} is not importable"
+        )
+
+
+def validate_output_count(value: Any, *, field: str = "num_outputs") -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def checked_output_lists(
+    raw: Any,
+    *,
+    expected: int,
+    primitive: str,
+    name: str,
+) -> tuple[list[Any], ...]:
+    outputs = _normalize_output_lists(raw)
+    if len(outputs) != expected:
+        raise ValueError(
+            f"{primitive} '{name}' expected {expected} outputs, got {len(outputs)}"
+        )
+    return outputs
 
 
 class LazyOp:

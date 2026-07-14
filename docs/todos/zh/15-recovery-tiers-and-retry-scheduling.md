@@ -114,7 +114,7 @@ class RecoveryPolicy:
 ### 4.3 两个机制位置（物理上不可避免，决策集中）
 
 - **Op-wrapper 位置**（符合条件 wrappers 共享的 isolation helper）：记录级。只有 wrapper 了解算子的逻辑记录单元，且能在该子集上重新调用 UDF。处理 ①/② 及 inline retry。
-- **Scheduler 位置**（`ray_executor._run_shards` / stage loop）：分片级。只有 driver 能重提交/切分 shard 并选择健康 actor。处理 ③–⑥ 和 deferred **drain**。
+- **Scheduler 位置**（`multigrain.ray.executor._run_shards` / stage loop）：分片级。只有 driver 能重提交/切分 shard 并选择健康 actor。处理 ③–⑥ 和 deferred **drain**。
 
 ### 4.4 共享 sink 是数据，而不是进程
 

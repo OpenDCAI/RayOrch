@@ -9,8 +9,8 @@ unaffected. Under FAIL_OPEN the legacy best-effort behaviour is preserved.
 from __future__ import annotations
 
 import rayorch.experimental.multigrain as mg
-from rayorch.experimental.multigrain.executor import MultigrainExecutor
-from rayorch.experimental.multigrain.graph import MissingChildPolicy
+from rayorch.experimental.multigrain.execution import MultigrainExecutor
+from rayorch.experimental.multigrain.ir import MissingChildPolicy
 
 from test.experimental.multigrain.lineage_ops import (
     AssembleDoc,

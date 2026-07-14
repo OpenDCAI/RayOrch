@@ -64,6 +64,7 @@ class MineruPipe:
             page_counts,
             parent=0,
             child_label="page",
+            num_outputs=2,
         )
         self.layout = mg.Map(Layout)
         self.ocr = mg.Map(OCR, bad_image)
@@ -117,6 +118,7 @@ def test_rebatch_preserves_identity_relation_and_child_order() -> None:
         {"short.pdf": 1, "long.pdf": 5, "mid.pdf": 2},
         parent=0,
         child_label="page",
+        num_outputs=2,
     )
     images, page_meta = expand(pdfs)
 
@@ -146,6 +148,7 @@ def test_map_rejects_cross_grain_inputs_without_group_by() -> None:
         {"a.pdf": 2},
         parent=0,
         child_label="page",
+        num_outputs=2,
     )(pdfs)
 
     with pytest.raises(ValueError, match="cannot align"):

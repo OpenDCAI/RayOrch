@@ -14,10 +14,8 @@ from __future__ import annotations
 import random
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ray_executor import (
-    _contiguous_ranges,
-    lpt_shard_planner,
-)
+from rayorch.experimental.multigrain.ray import lpt_shard_planner
+from rayorch.experimental.multigrain.ray.executor import _contiguous_ranges
 
 R = 4
 

@@ -56,7 +56,7 @@ cedar/Pecan 将被引用用于优化器/UDF 提示的定位，但不一定实际
 3. **插桩。[已完成]** `metrics.RunMetrics` / `NodeMetric` +
    `lineage_footprint`：每节点 makespan、每分片 busy -> idle-bubble fraction、血缘记录/字节开销、恢复计数器。已穿透 `MultigrainExecutor` 和 `MultigrainRayExecutor`。（真实算子落地后添加真实 GPU-util 采样。）
 4. **基线测试框架。** 在 Ray Data、Spark、朴素 Ray 上表达相同的 W1/W2；从 CEPH 共享数据集加载器；共享正确性检查器（比较健康输出）。
-5. **故障注入框架。[已完成，MVP]** `ray_executor.FaultSpec` 注入确定性任务/节点崩溃；executor 仅重试失败分片，因此 `recovery_rows` 保持血缘局部（< 全阶段）。通过 `BadRecordError` 的行级隔离已存在。由 `test_metrics_and_recovery.py` 覆盖。（通过真实 Ray actor 死亡的节点终止属于后续工作。）
+5. **故障注入框架。[已完成，MVP]** `multigrain.ray.executor.FaultSpec` 注入确定性任务/节点崩溃；executor 仅重试失败分片，因此 `recovery_rows` 保持血缘局部（< 全阶段）。通过 `BadRecordError` 的行级隔离已存在。由 `test_metrics_and_recovery.py` 覆盖。（通过真实 Ray actor 死亡的节点终止属于后续工作。）
 6. **数据摄取。** 将 CEPH 中的真实 PDF/图像流式输入到带有稳定 `display_key`s（文档 id）的源 `PortBatch`，从而使 trace 在大规模下保持可读。
 7. *(推迟到 M4)* 面向偏斜的 Reduce/Relate 分片——W1/W2 初版不需要，但若 Reduce 变为 GPU 密集则需要。
 

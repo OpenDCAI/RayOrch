@@ -17,9 +17,9 @@ from __future__ import annotations
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.graph import PhysicalHints
-from rayorch.experimental.multigrain.metrics import RunMetrics, lineage_footprint
-from rayorch.experimental.multigrain.ray_executor import (
+from rayorch.experimental.multigrain.ir import PhysicalHints
+from rayorch.experimental.multigrain.execution import RunMetrics, lineage_footprint
+from rayorch.experimental.multigrain.ray import (
     FaultSpec,
     MultigrainRayExecutor,
     lpt_shard_planner,

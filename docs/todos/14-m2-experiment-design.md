@@ -72,7 +72,7 @@ Ordered by leverage. These are the concrete "further prototype design" tasks.
    when real ops land.)
 4. **Baseline harness.** Same W1/W2 expressed on Ray Data, Spark, naive Ray; shared
    dataset loader from CEPH; shared correctness checker (compare healthy outputs).
-5. **Fault-injection harness. [DONE, MVP]** `ray_executor.FaultSpec` injects
+5. **Fault-injection harness. [DONE, MVP]** `multigrain.ray.executor.FaultSpec` injects
    deterministic task/node crashes; the executor retries only the failed shard, so
    `recovery_rows` stays lineage-local (< whole-stage). Row-level quarantine via
    `BadRecordError` already exists. Covered by

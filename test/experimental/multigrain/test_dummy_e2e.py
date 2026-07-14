@@ -19,8 +19,8 @@ import pickle
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.graph import SymbolicPort
-from rayorch.experimental.multigrain.passes import (
+from rayorch.experimental.multigrain.ir import SymbolicPort
+from rayorch.experimental.multigrain.ir import (
     InsertRebatchAfterExpandPass,
     MarkMapFilterFusionCandidatesPass,
     PlanReduceGroupsPass,

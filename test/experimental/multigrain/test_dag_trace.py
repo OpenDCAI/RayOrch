@@ -5,13 +5,13 @@ from dataclasses import replace
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.graph import (
+from rayorch.experimental.multigrain.ir import (
     MaterializePolicy,
     MaterializeReason,
     NodeKind,
     RelationKind,
 )
-from rayorch.experimental.multigrain.passes import PassManager, VerifyPass
+from rayorch.experimental.multigrain.ir import PassManager, VerifyPass
 
 from test.experimental.multigrain.test_pdf_mvp import (
     Assemble,

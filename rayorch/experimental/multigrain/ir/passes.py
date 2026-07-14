@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Protocol
 
-from .graph import (
+from .model import (
     CardinalityContract,
     IRNode,
     IRPortRef,
@@ -14,6 +14,7 @@ from .graph import (
     NodeKind,
     OperatorRecipe,
     PhysicalHints,
+    REBATCH_RECIPE,
     RelationKind,
     RelationSpec,
 )
@@ -98,32 +99,81 @@ class VerifyPass:
 
         return PassResult(graph=graph, diagnostics=tuple(diagnostics))
 
-    def _check_node_contract(self, node) -> tuple[Diagnostic, ...]:
+    def _check_node_contract(self, node: IRNode) -> tuple[Diagnostic, ...]:
         diagnostics: list[Diagnostic] = []
-        if node.kind is NodeKind.MAP:
-            if len(set(node.contract.input_grains)) > 1:
-                diagnostics.append(
-                    Diagnostic("Map requires same-grain inputs", node=node.name)
-                )
-            diagnostics.extend(
-                self._expect_relations(node, RelationKind.PRESERVE)
+        contract = node.contract
+        if contract.kind is not node.kind:
+            diagnostics.append(
+                Diagnostic("contract kind must match node kind", node=node.name)
             )
-        elif node.kind is NodeKind.FILTER:
-            if len(set(node.contract.input_grains)) > 1:
-                diagnostics.append(
-                    Diagnostic("Filter requires same-grain inputs", node=node.name)
+        if contract.input_grains != tuple(spec.grain for spec in node.input_specs):
+            diagnostics.append(
+                Diagnostic(
+                    "contract input grains must match input specs "
+                    "before same-grain validation",
+                    node=node.name,
                 )
-            if node.contract.input_grains:
-                grain = node.contract.input_grains[0]
-                if any(output != grain for output in node.contract.output_grains):
+            )
+        if contract.output_grains != tuple(spec.grain for spec in node.output_specs):
+            diagnostics.append(
+                Diagnostic(
+                    "contract output grains must match output specs",
+                    node=node.name,
+                )
+            )
+        if len(contract.relations) != len(node.output_refs):
+            diagnostics.append(
+                Diagnostic(
+                    "each output requires exactly one relation contract",
+                    node=node.name,
+                )
+            )
+        relation_outputs = tuple(relation.output for relation in contract.relations)
+        if relation_outputs != node.output_refs:
+            diagnostics.append(
+                Diagnostic(
+                    "relation outputs must match node outputs in order",
+                    node=node.name,
+                )
+            )
+        for relation in contract.relations:
+            if relation.parents != node.input_refs:
+                diagnostics.append(
+                    Diagnostic(
+                        "relation parents must match node inputs in order",
+                        node=node.name,
+                    )
+                )
+
+        families = {relation.relation for relation in contract.relations}
+        if len(families) > 1:
+            diagnostics.append(
+                Diagnostic(
+                    "a primitive node cannot mix relation families",
+                    node=node.name,
+                )
+            )
+            return tuple(diagnostics)
+        family = next(iter(families), None)
+
+        if family in (RelationKind.PRESERVE, RelationKind.FILTER):
+            if len(set(contract.input_grains)) > 1:
+                diagnostics.append(
+                    Diagnostic(
+                        "identity-aligned primitive requires same-grain inputs",
+                        node=node.name,
+                    )
+                )
+            if contract.input_grains:
+                grain = contract.input_grains[0]
+                if any(output != grain for output in contract.output_grains):
                     diagnostics.append(
                         Diagnostic(
-                            "Filter outputs must preserve kept input grain",
+                            "identity-aligned outputs must preserve input grain",
                             node=node.name,
                         )
                     )
-            diagnostics.extend(self._expect_relations(node, RelationKind.FILTER))
-        elif node.kind is NodeKind.EXPAND:
+        elif family is RelationKind.EXPAND:
             if node.parent_input is None:
                 diagnostics.append(
                     Diagnostic("Expand requires parent_input", node=node.name)
@@ -132,18 +182,17 @@ class VerifyPass:
                 diagnostics.append(
                     Diagnostic("Expand parent_input is out of range", node=node.name)
                 )
-            diagnostics.extend(self._expect_relations(node, RelationKind.EXPAND))
             parent_inputs = {
                 relation.parent_input for relation in node.contract.relations
             }
-            if len(parent_inputs) > 1:
+            if parent_inputs != {node.parent_input}:
                 diagnostics.append(
                     Diagnostic(
-                        "multi-output Expand requires one shared parent_input",
+                        "Expand relations must share node parent_input",
                         node=node.name,
                     )
                 )
-        elif node.kind is NodeKind.REDUCE:
+        elif family is RelationKind.REDUCE:
             if not node.grouped:
                 diagnostics.append(
                     Diagnostic("Reduce must consume an explicit group_by", node=node.name)
@@ -161,9 +210,17 @@ class VerifyPass:
                             node=node.name,
                         )
                     )
-            diagnostics.extend(self._expect_relations(node, RelationKind.REDUCE))
-        elif node.kind is NodeKind.RELATE:
-            diagnostics.extend(self._expect_relations(node, RelationKind.RELATE))
+            if any(
+                relation.anchor != node.input_refs[0]
+                for relation in contract.relations
+            ):
+                diagnostics.append(
+                    Diagnostic(
+                        "Reduce relation anchor must be input 0",
+                        node=node.name,
+                    )
+                )
+        elif family is RelationKind.RELATE:
             for relation in node.contract.relations:
                 if relation.roles and len(relation.roles) != len(node.input_refs):
                     diagnostics.append(
@@ -172,35 +229,6 @@ class VerifyPass:
                             node=node.name,
                         )
                     )
-        elif node.kind is NodeKind.PROJECT:
-            diagnostics.extend(
-                self._expect_relations(node, RelationKind.PRESERVE)
-            )
-        elif node.kind is NodeKind.REBATCH:
-            diagnostics.extend(
-                self._expect_relations(node, RelationKind.PRESERVE)
-            )
-        return tuple(diagnostics)
-
-    @staticmethod
-    def _expect_relations(node, expected: RelationKind) -> tuple[Diagnostic, ...]:
-        diagnostics: list[Diagnostic] = []
-        for relation in node.contract.relations:
-            if relation.relation is not expected:
-                diagnostics.append(
-                    Diagnostic(
-                        f"expected {expected.value} relation, got {relation.relation.value}",
-                        node=node.name,
-                    )
-                )
-            if relation.output not in node.output_refs:
-                diagnostics.append(
-                    Diagnostic(
-                        f"relation output {relation.output.node}.{relation.output.port} "
-                        "is not a node output",
-                        node=node.name,
-                    )
-                )
         return tuple(diagnostics)
 
 
@@ -427,7 +455,7 @@ def _make_rebatch_node(port: IRPortSpec) -> IRNode:
             relations=(relation,),
         ),
         op=OperatorRecipe(
-            cls_ref="rayorch.experimental.multigrain.Rebatch",
+            cls_ref=REBATCH_RECIPE,
             provenance={"source": f"{port.ref.node}.{port.ref.port}"},
         ),
         physical=PhysicalHints(prefer_rebatch=False),

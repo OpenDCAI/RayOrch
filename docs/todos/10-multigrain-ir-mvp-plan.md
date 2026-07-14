@@ -493,7 +493,7 @@ InsertRebatchAfterExpandPass
 
 ## Implementation Checklist
 
-### 1. Upgrade `graph.py` Data Model
+### 1. Upgrade `ir/model.py` Data Model
 
 - Add `IRPortRef`, `IRPortSpec`, `IRNode`, `RelationSpec`,
   `CardinalityContract`, `OperatorRecipe`, `OperatorProperties`,
@@ -579,7 +579,7 @@ Add tests for:
 ## Ray Execution MVP (`MultigrainRayExecutor`)
 
 A first, deliberately small Ray lowering exists in
-`rayorch/experimental/multigrain/ray_executor.py`. It reuses the local
+`rayorch/experimental/multigrain/ray/executor.py`. It reuses the local
 `MultigrainExecutor` node logic *inside* Ray tasks, so semantics stay identical
 to local execution and only scheduling changes. It validates that the passive IR
 plus `PhysicalHints` can drive real parallelism:
@@ -602,7 +602,7 @@ Measured on CPU + per-row sleep dummy ops (8 rows / 4 microbatches):
 Covered by `test/experimental/multigrain/test_ray_parallelism.py` (marked
 `slow`; needs `--runslow` + the `ray_cluster` fixture). The executor is not part
 of the narrow package `__init__`; import it from
-`rayorch.experimental.multigrain.ray_executor`.
+`rayorch.experimental.multigrain.ray`.
 
 MVP limits still open: `batch_size` hints are not yet consumed; `Reduce`/`Relate`
 are not sharded; there is no cross-node streaming scheduler (microbatches overlap

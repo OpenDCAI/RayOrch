@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain._coordinator import ExecutionCoordinator
-from rayorch.experimental.multigrain.core import (
+from rayorch.experimental.multigrain.execution.coordinator import ExecutionCoordinator
+from rayorch.experimental.multigrain.data.batch import (
     DeferredRecord,
     NodeExecution,
     concat,

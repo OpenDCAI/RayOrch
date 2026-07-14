@@ -12,8 +12,8 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Mapping
 
-from .core import DeferredRecord, ErrorTrace, NodeExecution, PortBatch, concat
-from .graph import IRNode, IRPortRef, MultigrainIR
+from ..data.batch import DeferredRecord, ErrorTrace, NodeExecution, PortBatch, concat
+from ..ir.model import IRNode, IRPortRef, MultigrainIR
 
 
 GraphOutput = PortBatch | tuple[PortBatch, ...]

@@ -40,6 +40,27 @@ Data/Trident at scale). See the "Related Work & Venue Strategy" section below.
 
 Minimal acceptable set: **M1 + M2 + M3 + (one of M4)**. M5 makes it competitive.
 
+Primitive 内核已完成声明、输出 builder、handler registry、capability 与 structural
+verifier 收敛；设计边界和重复矩阵见
+[`18-multigrain-primitive-core-convergence.md`](18-multigrain-primitive-core-convergence.md)。
+Expand mixed outputs、`mg.out.same/children` relation forest、现实 workload 覆盖和未来
+Partition/global/window/async 扩展门已记录在
+[`19-expand-mixed-output-relation-design.md`](19-expand-mixed-output-relation-design.md)；
+该设计当前为 **deferred**，不阻塞框架理解、内核收敛或 M2/M3。
+
+Deferred primitive authoring/compiler follow-ups（当前不优先）:
+- [ ] **Expand mixed-output relation override**：保留现有 Expand 默认 shared-child
+      语义，只在不可拆分的 corner case 中用 typed `mg.out.same/children` 表达
+      parent metadata、独立 child cohort、sibling alignment 和 nested fanout。
+      实现前重新审查 doc 19 的 R1–R3，禁止直接扩成万能 Transform/emit DSL。
+- [ ] **AST-based UDF output-arity inference**：在不实例化或执行 UDF 的前提下，从
+      importable `run()`/callable 源码推导 `num_outputs`。分析器返回
+      `Exact(n) / Inconsistent(arities) / Unknown(reason)`：所有 reachable returns
+      arity 一致时自动生成 IR output ports；分支不一致或存在隐式 fallthrough 时编译
+      失败；动态 call、starred tuple、source unavailable 等未知情况要求用户显式声明。
+      显式声明与可推导结果冲突时编译失败，运行时 `checked_output_lists()` 校验继续保留。
+      实现应位于 authoring/compiler introspection 层，IR 仍只保存确定的整数 arity。
+
 ---
 
 ## M1 — Formalization  ✅ done
@@ -225,3 +246,5 @@ acceptance odds. Track in M2.
 - `15-recovery-tiers-and-retry-scheduling.md` — recovery ladder and retry timing.
 - `16-batch-arena-and-compact-lineage.md` — batch identity and compact lineage plan.
 - `17-mineru-graph-integration-findings.md` — real-image graph/recovery/LPT coverage ledger.
+- `18-multigrain-primitive-core-convergence.md` — primitive core ownership and convergence.
+- `19-expand-mixed-output-relation-design.md` — deferred mixed-output API and future relation-space gates.

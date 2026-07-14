@@ -18,12 +18,9 @@ from __future__ import annotations
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.graph import PhysicalHints
-from rayorch.experimental.multigrain.ray_executor import (
-    MultigrainRayExecutor,
-    _contiguous_ranges,
-    lpt_shard_planner,
-)
+from rayorch.experimental.multigrain.ir import PhysicalHints
+from rayorch.experimental.multigrain.ray import MultigrainRayExecutor, lpt_shard_planner
+from rayorch.experimental.multigrain.ray.executor import _contiguous_ranges
 
 from test.experimental.multigrain.lineage_ops import (
     BOOM_DOC,

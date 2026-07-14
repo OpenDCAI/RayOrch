@@ -16,9 +16,8 @@ from __future__ import annotations
 import pickle
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.executor import MultigrainExecutor
-from rayorch.experimental.multigrain.graph import NodeKind, RelationKind
-from rayorch.experimental.multigrain.passes import VerifyPass
+from rayorch.experimental.multigrain.execution import MultigrainExecutor
+from rayorch.experimental.multigrain.ir import NodeKind, RelationKind, VerifyPass
 
 
 # ---------------------------------------------------------------------------

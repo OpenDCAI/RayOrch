@@ -1,5 +1,4 @@
-"""Compatibility exports for experimental multigrain operator wrappers."""
-from __future__ import annotations
+"""User-facing multigrain primitive wrappers."""
 
 from .expand_reduce import Expand, Reduce
 from .map_filter import Filter, Map, Select

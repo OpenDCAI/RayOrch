@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.passes import InsertRebatchAfterExpandPass
+from rayorch.experimental.multigrain.ir import InsertRebatchAfterExpandPass
 
 from test.experimental.multigrain.test_pdf_mvp import (
     Assemble,
@@ -157,10 +157,20 @@ def test_local_executor_runs_select_lowered_map_filter_project_ir() -> None:
     pages = mg.source(["good-0", "bad-1", "good-2"], name="pages")
 
     kept_pages, kept_scores = mg.MultigrainExecutor().execute(graph, {"pages": pages})
+    eager_pages, eager_scores = mg.Select(
+        ScoreAndKeep,
+        num_annotations=1,
+    )(pages)
 
     assert kept_pages.values == ["good-0", "good-2"]
     assert kept_pages.record_ids == [pages.record_ids[0], pages.record_ids[2]]
     assert kept_scores.values == [0.9, 0.9]
+    assert kept_pages.values == eager_pages.values
+    assert kept_pages.record_ids == eager_pages.record_ids
+    assert kept_pages.lineage == eager_pages.lineage
+    assert kept_scores.values == eager_scores.values
+    assert kept_scores.record_ids == eager_scores.record_ids
+    assert kept_scores.lineage == eager_scores.lineage
 
 
 class ExecRelatePipe(mg.Pipeline):

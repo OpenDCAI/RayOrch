@@ -6,14 +6,14 @@
 
 | 形式对象 | 代码 |
 |---|---|
-| record fields | `PortBatch` 平行数组（`values`, `record_ids`, `ancestors`, `ancestor_display`, `ordinals`, `lineage`），位于 `core.py` |
+| record fields | `PortBatch` 平行数组（`values`, `record_ids`, `ancestors`, `ancestor_display`, `ordinals`, `lineage`），位于 `multigrain.data.batch` |
 | `take` | `PortBatch.take(indices)` |
-| `concat` | `core.concat(batches)` |
-| shard/merge | `MultigrainRayExecutor._run_node`（`ray_executor.py`，约第 133–165 行） |
+| `concat` | `multigrain.data.concat(batches)` |
+| shard/merge | `MultigrainRayExecutor._run_node`（`multigrain.ray.executor`，约第 133–165 行） |
 | shard plan | `shard_planner(node, inputs, replicas) -> list[list[int]]`；`lpt_shard_planner`、`_contiguous_ranges` |
-| Expand lineage | `Expand._make_outputs`（`expand_reduce.py`） |
-| Reduce regroup | `Reduce._groups_for`（`expand_reduce.py`） |
-| Relate key-join | `Relate._make_key_join_batch`（`relate.py`） |
+| Expand lineage | `PortBatchBuilder.expanded`（`multigrain.primitives.output`） |
+| Reduce regroup | `Reduce._groups_for`（`multigrain.primitives.expand_reduce`） |
+| Relate key-join | `Relate._make_key_join_batch`（`multigrain.primitives.relate`） |
 
 ## 1. 数据模型
 
@@ -29,7 +29,7 @@
 
 **批次。** 一个*批次* `B = [r_0, …, r_{n-1}]` 是记录的有限**序列**。`B[i]` 是第 i 个记录；`|B| = n`；`ids(B)` 为 ids 序列。
 
-**端口不变量 I1（身份唯一性）。** 在系统产生的每个 port 上，ids 两两不同。（Sources 产生 `name:i`；`Expand` 产生 `op:parent_id:k`；`Relate` 产生 `op:j`；`Map`/`Filter` 保留 ids。唯一性由构造维持。）
+**端口不变量 I1（身份唯一性）。** 在系统产生的每个 port 上，ids 两两不同。（Sources 产生 `name:i`；`Expand` 产生 `op:parent_id:k`；`Relate` 产生 `op:role_1=pid_1|…|role_n=pid_n[|key=stable_key]`；`Map`/`Filter` 保留 ids。`Relate` 会拒绝没有不同 stable key 的重复 parent evidence。唯一性由构造维持。）
 
 **键控视图。** 定义 `⟦B⟧ : ID ⇀ Record`，其中 `⟦B⟧(id) = r`，`r ∈ B` 是具有该 id 的唯一记录（由 I1 良定义）。当且仅当 `⟦B⟧ = ⟦B'⟧`（作为完整记录集合相等——每个 id 相同，且每个 id 的 `(v,a,o,ℓ)` 相同）时，两个批次**键控相等**，记作 `B ≈ B'`。当 `B ≈ B'` 且 `|B| = |B'|` 时，`B` 是 `B'` 的**置换**（等价地，`B'` 重排 `B`）。
 
@@ -72,11 +72,11 @@ N(P^0,…,P^t) = concat_i  f_N( aligned_i )
 
 其中 `aligned_i` 是第 i 个 base row 与其他 ports 上同 id partners 的 identity-aligned tuple，`f_N(aligned_i)` 的批次长度为 1（`Map`）、0 或 1（`Filter`），或 `k_i ≥ 0`（`Expand`）。
 
-- **Map** `f = ` 对已对齐行应用 UDF，保留 id/ancestors/ordinals，向 `ℓ` 追加 op。长度为 1。（`map_filter.py`。）
-- **Filter** `f = ` 若 mask 为 true 则为 `[row]`，否则为 `[]`；保留行保持 identity。长度 0/1。（`map_filter.py`。）
+- **Map** `f = ` 对已对齐行应用 UDF，保留 id/ancestors/ordinals，向 `ℓ` 追加 op。长度为 1。（`multigrain.primitives.map_filter`。）
+- **Filter** `f = ` 若 mask 为 true 则为 `[row]`，否则为 `[]`；保留行保持 identity。长度 0/1。（`multigrain.primitives.map_filter`。）
 - **Expand** `f = ` 对 id 为 `p` 的 parent row，产生 children：
   `id = op:p:k`，`a' = a ∪ {portname ↦ p}`，`o' = o ∪ {portname ↦ k}`，
-  `ℓ' = ℓ⧺[op]`，其中 `k = 0..k_p-1`。长度 `k_p`。仅依赖 parent record 自身的 value（UDF 看到 parent value 并返回其 group）。（`expand_reduce.py::_make_outputs`。）
+  `ℓ' = ℓ⧺[op]`，其中 `k = 0..k_p-1`。长度 `k_p`。仅依赖 parent record 自身的 value（UDF 看到 parent value 并返回其 group）。（`multigrain.primitives.output::PortBatchBuilder.expanded`。）
 
 每个 `f_N` 都是仅关于 record content 的纯函数——没有 `i`、没有 cross-row state——这正是重排安全的原因。
 
@@ -113,15 +113,19 @@ group(A[q], D) = [ v : (id,v,a,o,ℓ) ∈ D, a(A.name) = A.record_id(q) ]
 
 ## 6. Relate
 
-**Key-join（`on=`）。** `_make_key_join_batch` 以 physical order 遍历**第一个 role 的**行，按 key dedup，并为每个 key 产生跨 roles 匹配行的 cross-product。输出 identity 是**content-addressed**：relation row 的 id 是 `op:role_1=pid_1|role_2=pid_2|…`，即其 matched parent record ids（`relate.py`）的函数，*不是* emission order 的函数。因不同 combos 有不同 parent tuples，ids 唯一（I1）且 permutation-invariant。
+**Key-join（`on=`）。** `_make_key_join_batch` 以 physical order 遍历**第一个 role 的**行，按 key dedup，并为每个 key 产生跨 roles 匹配行的 cross-product。输出 identity 是**content-addressed**：relation row 的 id 是 `op:role_1=pid_1|role_2=pid_2|…`，即其 matched parent record ids（`multigrain.primitives.relate`）的函数，*不是* emission order 的函数。因不同 combos 有不同 parent tuples，ids 唯一（I1）且 permutation-invariant。
 
 **引理 3a（key-join 在置换下为 `≈`）。** 若 role ports 是置换键控相等的（`P^r ≈ P'^r`），则 `Relate_on(P) ≈ Relate_on(P')`。
 
 *证明。* matched combos 集合由每 role 的 key index `key ↦ {matched records}` 决定，它只是 keyed content 的函数（join key 从每个 record 的 value 提取），所以无论 role-port order 如何，都会产生相同*集合*的 parent tuples。对每个 combo，value、`ParentRef`s、merged `(a,o,ℓ)` 与**content-addressed id**均由 matched records 的保留 fields 计算，故相同。相同 id-set、相同 per-record fields ⇒ `≈`。（physical row order 和 surrogate `j` 不再参与 identity，所以无法破坏 `≈`。）∎
 
-**引理 3b（adapter path 在重新索引意义下为 `≈`）。** 对 `relation_fn` / `relation_adapter` escape hatch，output ids 是 `op:j`（emission order），且 adapter 可对同一 parent set 产生多个 rows，所以通常 identity 不可 content-address。置换下，*relation content*（values、`ParentRef`s、merged lineage）作为 multiset 仍相同；只有 surrogate ids/order 不同——键控相等**直至重新索引**。
+**引理 3b（满足置换等变证据契约的 adapter path 为 `≈`）。** 对 `relation_fn` / `relation_adapter` escape hatch，每个输出项提供 `(value, {role: local_index})`，并可选提供确定性的 `stable_key`。框架立即把 invocation-local indexes 解析为 parent record ids，并构造 content-addressed identity：`op:role_1=pid_1|…|role_n=pid_n[|key=stable_key]`。没有不同 stable key 的重复 parent evidence 会被拒绝。
 
-**推论。** 使用 `on=` 时，Relate 完全满足 `≈`（定理第 1 部分可直接适用）。使用 adapter escape hatch 时，Relate output 必须被 order-canonicalizing operator（`Reduce` 或任何 identity/ordinal-addressed consumer）消费，才能获得 byte-identical final results——预期模式（`link → group_by(pdf) → Reduce`）。我们将其陈述为*类型规则*，而非隐藏它：
+若 adapter 在把 invocation-local indexes 重新绑定到对应 records 后，对输入 rows 的任意置换都产生相同的 `(value, parent tuple, stable_key)` 集合，则解析后的 `ParentRef`s、merged `(a,o,ℓ)`、values 与 ids 均相同。因此 `Relate_adapter(P) ≈ Relate_adapter(P')`。
+
+这一置换等变性是显式的 adapter 契约。把 invocation-local position 当作业务证据，或产生非确定性 stable key 的 adapter，与依赖位置的 UDF 一样，不在本定理范围内。
+
+**推论。** `on=` 与满足契约的 adapter 都使 Relate 完全满足 `≈`（定理第 1 部分可直接适用）。order-sensitive consumer 若要获得 byte-identical sequence order，仍必须先 canonicalize：
 
 > **重排纪律。** sharded node 下游产生的 port 只有在先被规范化（经 `Reduce` 或 unsharded anchor）后才可被*位置性*消费。identity/ordinal-addressed consumers 始终安全。
 
@@ -142,7 +146,7 @@ group(A[q], D) = [ v : (id,v,a,o,ℓ) ∈ D, a(A.name) = A.record_id(q) ]
 
 - `N_k` 是行独立的（Map/Filter/Expand）：由 IH，其 inputs 与 serial `≈`；`≈` 保留 aligned row multiset，节点逐行应用 `f_N`，所以 `N_k(Phys(inp))` 和 `N_k(Ser(inp))` 共享相同 per-row image multiset。sharding 仅重新分块串接（引理 1）。故 `Phys(out) = Exec_σ(N_k)(Phys(inp)) ≈ N_k(Ser(inp)) = Ser(out)`。（WF 使 positional shard 在全部 ports 上选择匹配 ids。）
 - `N_k = Reduce`：整批运行。由 IH descendants 与 serial `≈`，anchor 也与 serial `≈`。若 anchor 是 graph input 或 canonical port，其*顺序*也等于 serial（第 2 部分 / 基），所以由引理 2，`Phys(out) = Ser(out)`（有序）。在所有情形下 `Phys(out) ≈ Ser(out)`（引理 2 给出相等，因而 `≈`）。这为 Reduce outputs 建立第 2 部分。
-- `N_k = Relate`：整批运行。由 IH role ports 与 serial `≈`。使用 `on=` 时，引理 3a 直接给出 `Phys(out) ≈ Ser(out)`。使用 adapter escape hatch 时，引理 3b 给出 relation-row reindexing 下的相等，随后由重排纪律（下文）在下一个 `Reduce` 规范化。
+- `N_k = Relate`：整批运行。由 IH role ports 与 serial `≈`。使用 `on=` 时，引理 3a 直接给出 `Phys(out) ≈ Ser(out)`。使用 adapter escape hatch 时，置换等变 adapter 契约与引理 3b 直接给出 `Phys(out) ≈ Ser(out)`。
 - `N_k = Project/Rebatch/Materialize`：对 records 的 identity / pure re-blocking（`take`/`concat`），因此由引理 0 保留 `≈`。
 
 全部 node kinds 保留 `≈`；具有 canonical anchor 的 Reduce 升级为 ordered equality。∎
