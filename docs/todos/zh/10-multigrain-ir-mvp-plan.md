@@ -1,5 +1,10 @@
 # TODO：多粒度 IR MVP 实施计划
 
+> 历史方案（已被取代）。当前实现已收敛为更薄的 `ExecutionGraph`，
+> 下文所述 `ir/model.py` 与 pass 系统已删除。现行契约请从
+> [`rayorch/experimental/multigrain/README.md`](../../../rayorch/experimental/multigrain/README.md)
+> 开始阅读。
+
 状态：实验`rayorch.experimental.multigrain`的实施计划
 原型。
 

@@ -1,5 +1,10 @@
 # Multigrain Primitive Core 收敛记录
 
+> 第一轮收敛的历史记录，已由最小 relation-aware `ExecutionGraph` 重构取代。
+> 当前类名、边界和验证规则以
+> [`rayorch/experimental/multigrain/README.md`](../../rayorch/experimental/multigrain/README.md)
+> 为准。
+
 ## 结论
 
 新 `MultigrainIR` 现在是唯一演进主线。用户 API 仍是平坦的

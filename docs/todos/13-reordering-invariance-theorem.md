@@ -12,14 +12,33 @@ hand-wavy:
 
 | formal object | code |
 |---|---|
-| record fields | `PortBatch` parallel arrays (`values`, `record_ids`, `ancestors`, `ancestor_display`, `ordinals`, `lineage`) in `multigrain.data.batch` |
-| `take` | `PortBatch.take(indices)` |
-| `concat` | `multigrain.data.concat(batches)` |
-| shard/merge | `MultigrainRayExecutor._run_node` (`multigrain.ray.executor`, lines ~133–165) |
-| shard plan | `shard_planner(node, inputs, replicas) -> list[list[int]]`; `lpt_shard_planner`, `_contiguous_ranges` |
-| Expand lineage | `PortBatchBuilder.expanded` (`multigrain.primitives.output`) |
-| Reduce regroup | `Reduce._groups_for` (`multigrain.primitives.expand_reduce`) |
-| Relate key-join | `Relate._make_key_join_batch` (`multigrain.primitives.relate`) |
+| static port address | `GraphInputRef | NodeOutputRef` (`PortRef`) |
+| static output relation | `SameAs`, `SubsetOf`, `ChildrenOf`, `AggregateOf`, `RelatedFrom` |
+| graph node | `NodeSpec(operation=..., outputs=(OutputSpec(...), ...))` |
+| mandatory graph check | `verify_graph` |
+| record fields | `PortBatch` parallel arrays (`values`, `record_ids`, `ancestors`, `ancestor_display`, `ordinals`, `lineage`) |
+| `take` / `concat` | `PortBatch.take(indices)` / `multigrain.data.concat(batches)` |
+| shard-plan check | `validate_shard_plan(partitions, row_count)` |
+| Expand lineage | `PortBatchBuilder.expanded` |
+| Reduce regroup | `Reduce._groups_for` |
+| Relate key-join | `Relate._make_key_join_batch` |
+
+The passive `ExecutionGraph` supplies a static relation algebra, while the proof
+still operates on runtime `PortBatch` records. The correspondence is:
+
+- `SameAs(source)` preserves the source keyed records;
+- `SubsetOf(source)` keeps a keyed subset;
+- `ChildrenOf(parent, label)` names the child grain/display path and creates
+  children identified by parent identity plus ordinal;
+- `AggregateOf(anchor, members, incomplete)` regroups members by runtime
+  `ancestors` and canonicalizes them by `ordinals`;
+- `RelatedFrom(RoleSource(...))` derives identity from an ordered role-parent
+  tuple.
+
+`verify_graph` checks that these relations use valid refs and grains and match the
+typed operation. It does not replace the runtime evidence: Reduce and the theorem
+continue to rely on `record_ids`, `ancestors`, and `ordinals` carried by
+`PortBatch`.
 
 ## 1. Data model
 
@@ -40,12 +59,18 @@ the same argument.)
 
 **Batches.** A *batch* `B = [r_0, …, r_{n-1}]` is a finite **sequence** of
 records. `B[i]` is the i-th record; `|B| = n`; `ids(B)` the sequence of ids.
+Each runtime batch also has a grain name. Execution enforces
+`PortBatch.name == OutputSpec.grain`; therefore physical and serial batches at
+the same graph port have the same name in addition to the per-record equality
+proved below.
 
 **Port invariant I1 (identity uniqueness).** At every port produced by the
 system, ids are pairwise distinct. (Sources emit `name:i`; `Expand` emits
-`op:role_1=pid_1|…|role_n=pid_n[|key=stable_key]`; `Map`/`Filter` preserve ids.
-`Relate` rejects duplicate parent evidence unless a distinct stable key is
-provided. Distinctness is maintained by construction.)
+`op:parent_id:child_index`; `Map` preserves ids and `Filter`/`FilterByMask` keep
+a subset. `Relate` emits
+`op:role_1=pid_1|…|role_n=pid_n[|key=stable_key]` and rejects duplicate parent
+evidence unless a distinct stable key is provided. Distinctness is maintained by
+construction.)
 
 **Keyed view.** Define `⟦B⟧ : ID ⇀ Record` by `⟦B⟧(id) = r` for the unique
 `r ∈ B` with that id (well-defined by I1). Two batches are **keyed-equal**,
@@ -64,18 +89,18 @@ intact (`PortBatch.take` copies `value`, `ancestors`, `ordinals`, `lineage`
 element-wise).
 
 **concat.** `concat(B_1,…,B_m) = B_1 ⧺ … ⧺ B_m` — sequence concatenation, each
-record intact (`core.concat` extends the parallel arrays element-wise).
+record intact (`multigrain.data.concat` extends the parallel arrays element-wise).
 
 **Shard plan.** A *shard plan* for an `n`-row port is `σ = (σ_1,…,σ_m)`, a tuple
 of index lists. It is **legal** iff `{σ_1,…,σ_m}` is a **set partition** of
 `{0,…,n-1}`: the `σ_j` are pairwise disjoint and `⋃_j σ_j = {0,…,n-1}`.
 
-> `_contiguous_ranges` yields a legal plan trivially. `lpt_shard_planner` assigns
-> every index `i` to exactly one bin (`bins[target].append(i)` inside a loop over
-> all `i`), so it too yields a legal plan. Legality is the *only* property of the
-> planner the proofs use — an optimizer may reorder/rebalance arbitrarily.
+> Ray calls `validate_shard_plan` on planner output. It rejects out-of-range or
+> duplicate indexes and any plan that does not cover every row exactly once.
+> Legality is therefore checked at runtime, not merely assumed from contiguous
+> or LPT planner implementations.
 
-**Sharded node execution** (mirrors `_run_node`): for a node `N` with inputs
+**Sharded node execution** (mirrors the Ray node runner): for a node `N` with inputs
 `(P^0,…,P^t)` (port 0 is the base) and legal plan `σ` over `|P^0|`:
 
 ```
@@ -88,10 +113,10 @@ merged per output port. `Serial(N) = N(P^0,…,P^t)` is the whole-batch run
 **Well-formedness WF (co-ordered inputs).** For a *sharded* multi-input node, all
 input ports present records in the same id-order, i.e. `ids(P^0)=…=ids(P^t)`, so
 positional `take(P^r, σ_j)` selects the same id-set on every port. (Single-input
-sharded nodes satisfy WF vacuously. In the MVP only `Map`/`Filter`/`Expand` are
-sharded; `_align_by_identity` inside the node then re-pairs by id within the
-shard and *rejects* a violated WF with a readable error rather than silently
-mis-joining.)
+sharded nodes satisfy WF vacuously. The current row-partitionable operations are
+`Map`/`Filter`/`FilterByMask`/`Expand`; Ray checks exact identity order before
+planning, and `_align_by_identity` inside the primitive remains a defensive
+check rather than the first line of protection.)
 
 ## 3. Reassembly lemma
 
@@ -104,7 +129,7 @@ with `B[i]` copied intact. `concat` gathers all selected records, so the result
 contains each `B[i]` exactly once ⇒ same id-set, same per-record fields, same
 length ⇒ a permutation of `B`. ∎
 
-## 4. Row-independent operators (Map, Filter, Expand)
+## 4. Row-independent operators (Map, Filter, FilterByMask, Expand)
 
 **Definition (row-independent).** `N` is *row-independent* if there is a per-row
 function `f_N` s.t. for aligned input rows, the output is the ordered
@@ -123,14 +148,21 @@ same-id partners on the other ports, and `f_N(aligned_i)` is a batch of length
   op to `ℓ`. Length 1. (`multigrain.primitives.map_filter`.)
 - **Filter** `f = ` `[row]` if mask true else `[]`; kept rows keep identity.
   Length 0/1. (`multigrain.primitives.map_filter`.)
+- **FilterByMask** is Select's internal canonical filtering operation. The mask
+  is a same-identity Map output; it applies the same 0/1 decision to every
+  aligned source/annotation and therefore has the same row-local argument as
+  Filter. The mask port itself is consumed, not emitted.
 - **Expand** `f = ` for parent row with id `p`, emit children
   `id = op:p:k`, `a' = a ∪ {portname ↦ p}`, `o' = o ∪ {portname ↦ k}`,
   `ℓ' = ℓ⧺[op]` for `k = 0..k_p-1`. Length `k_p`. Depends only on the parent
   record’s own value (the UDF sees the parent value and returns its group).
   (`multigrain.primitives.output::PortBatchBuilder.expanded`.)
 
-Each `f_N` is a pure function of the record content only — no `i`, no cross-row
-state — which is exactly what makes reordering safe.
+This is an explicit **row-local UDF assumption**: each `f_N` is a deterministic
+function of the aligned row values only—no `i`, no batch-size dependence, no
+cross-row mutable state, and no dependence on execution order. The call boundary
+hides framework metadata, but Python cannot prove that a user object has no
+external state; programs violating this contract are outside the theorem.
 
 **Lemma 1 (sharding commutes with row-independent nodes).** For a row-independent
 `N` under WF and any legal plan `σ`:  `Exec_σ(N)(P) ≈ Serial(N)(P)`.
@@ -154,8 +186,9 @@ the same record content in both). They may differ only in the order of the block
 parent id `p` and child index `k`, both content-derived, so no collision arises
 from reordering.) ∎
 
-Lemma 1 is the crux: **for Map/Filter/Expand, a sharded/reordered run equals the
-serial run as a keyed collection — including all lineage fields.**
+Lemma 1 is the crux: **for Map/Filter/FilterByMask/Expand, a
+sharded/reordered run equals the serial run as a keyed collection — including
+all lineage fields.**
 
 ## 5. Order-canonicalizing operators (Reduce, group_by)
 
@@ -212,7 +245,7 @@ fields ⇒ `≈`. (The physical row order and the surrogate `j` no longer appear
 identity, so they cannot break `≈`.) ∎
 
 **Lemma 3b (adapter path is `≈` under permutation-equivariant evidence).** For
-the `relation_fn` / `relation_adapter` escape hatch, each emitted item supplies
+the dotted `relation_adapter` path, each emitted item supplies
 `(value, {role: local_index})`, optionally followed by a deterministic
 `stable_key`. The framework immediately resolves the local indexes to parent
 record ids and constructs the content-addressed identity
@@ -229,6 +262,10 @@ adapter that uses invocation-local position as business evidence, or emits a
 non-deterministic stable key, is outside the theorem just as a position-sensitive
 UDF is.
 
+The eager-only `relation_fn` path uses the same runtime evidence shape, so this
+lemma also describes its eager semantics. It is not a compiled graph matcher;
+compiled Relate requires `KeyJoinSpec` or dotted `RelationAdapterSpec`.
+
 **Consequence.** Both `on=` and a contract-conforming adapter make Relate fully
 `≈` (Theorem part 1 applies as-is). An order-sensitive consumer still needs
 canonicalization to obtain byte-identical sequence order:
@@ -241,9 +278,9 @@ canonicalization to obtain byte-identical sequence order:
 
 Consider a DAG `G` in topological order `N_1,…,N_K`, executed physically with an
 arbitrary assignment of a legal shard plan to each sharded node (`Map`/`Filter`/
-`Expand`), WF holding at each sharded multi-input node, and `Reduce`/`Relate` run
-whole (single task, as in the MVP). Let `Phys(port)` and `Ser(port)` be the
-physical and serial batches at each port.
+`FilterByMask`/`Expand`), WF holding at each sharded multi-input node, and
+`Reduce`/`Relate` run whole (single task, as in the MVP). Let `Phys(port)` and
+`Ser(port)` be the physical and serial batches at each port.
 
 **Theorem (Reordering Invariance).**
 
@@ -261,7 +298,8 @@ physical and serial batches at each port.
 
 *Step.* Assume `Phys(inp) ≈ Ser(inp)` for all inputs of `N_k`.
 
-- `N_k` row-independent (Map/Filter/Expand): its inputs are `≈` to serial by IH;
+- `N_k` row-independent (Map/Filter/FilterByMask/Expand): its inputs are `≈` to
+  serial by IH;
   `≈` preserves the aligned row multiset, and the node applies `f_N` per row, so
   `N_k(Phys(inp))` and `N_k(Ser(inp))` share the same per-row image multiset.
   Sharding only re-blocks the concatenation (Lemma 1). Hence
@@ -276,10 +314,7 @@ physical and serial batches at each port.
   Lemma 3a gives `Phys(out) ≈ Ser(out)` directly. With the adapter escape hatch,
   the permutation-equivariant adapter contract and Lemma 3b give
   `Phys(out) ≈ Ser(out)` directly.
-- `N_k = Project/Rebatch/Materialize`: identity on records / pure re-blocking
-  (`take`/`concat`), so `≈` is preserved by Lemma 0.
-
-All node kinds preserve `≈`; Reduce with a canonical anchor upgrades to ordered
+All covered operations preserve `≈`; Reduce with a canonical anchor upgrades to ordered
 equality. ∎
 
 **Corollary (lineage-guided recovery is reorder-stable).** The `ErrorTrace` for a
@@ -307,24 +342,21 @@ scheduler is free to optimize within the legal-plan family.
   reduce, salting for skew), Lemma 2 must be re-established under a *monoid*
   (associative, commutative-up-to-sort) reduce UDF; the ordinal sort already
   supplies the canonical order. This is exactly the M4 residual (#5 reduce skew).
-- **UDF value-purity (id/position independence).** Every UDF is a pure function of
-  its input *values* only: it never reads `record_id`, `ancestors`, `ordinals`,
-  `lineage`, `display_keys`, nor the physical row position. This is enforced at the
-  call boundary — operators pass `_as_columns(batch) = list(batch.values)` (Map/
-  Filter/Expand), `anchor.values` + framework-grouped value lists (Reduce), or
-  `{role: values}` (Relate key-join); the only index a UDF-adjacent hook ever sees
-  is the relation adapter's *invocation-local* index, which the framework
-  immediately translates to a `record_id`/`ParentRef`. This is precisely what
-  makes the per-row image `f_N(aligned_i)` in §4 depend only on record content,
-  which Lemma 1 relies on: if a UDF could observe id or position, reordering could
-  change its output and the whole theorem would fail. (It is also the design red
-  line in [`11-multigrain-primitive-api-ir-review.md`](11-multigrain-primitive-api-ir-review.md)
-  and [`12-relation-model-three-tiers.md`](12-relation-model-three-tiers.md):
-  "forbidden evidence: global record IDs".)
-- **Determinism.** The theorem assumes operator UDFs are deterministic functions
-  of their inputs (`OperatorProperties.deterministic`). Non-deterministic ops need
-  a materialization boundary (already modeled by `MaterializePolicy`) to keep
-  replay/recovery well-defined.
+- **Row-local UDF value-purity.** Map/Filter/Expand UDF output for a row is a
+  deterministic function of that aligned row's *values* only. It must not depend
+  on batch size, sibling rows, mutable cross-call state, invocation order,
+  framework IDs, or physical position. The call boundary hides `record_id`,
+  `ancestors`, `ordinals`, `lineage`, and display fields, but semantic purity is
+  a user contract. Reduce may inspect its complete, canonically ordered value
+  groups; Relate key-join receives values selected by content-derived keys.
+- **Adapter permutation-equivariance.** After invocation-local indexes are
+  rebound to their records, a relation adapter must emit the same keyed set of
+  `(value, ordered role-parent tuple, deterministic stable_key)` for every input
+  permutation. Position-sensitive adapters are outside the theorem.
+- **Determinism.** All covered UDFs and adapters are deterministic functions of
+  their allowed value/evidence inputs. The current minimal graph has no
+  materialization operation that could make a nondeterministic operator
+  replay-safe.
 - **Floating point.** Reduce over floats is only associative up to rounding; byte
   equality (part 2) assumes the reduce UDF sees children in the canonical ordinal
   order, which Lemma 2 guarantees — so there is *no* new nondeterminism from

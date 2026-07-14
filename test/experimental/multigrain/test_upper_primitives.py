@@ -3,7 +3,15 @@ from __future__ import annotations
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ir import NodeKind, RelationKind, VerifyPass
+from rayorch.experimental.multigrain.ir import (
+    FilterByMaskOp,
+    FilterOp,
+    MapOp,
+    RelatedFrom,
+    RelateOp,
+    SameAs,
+    SubsetOf,
+)
 
 from test.experimental.multigrain.test_pdf_mvp import PdfToImages
 
@@ -99,37 +107,28 @@ class FilterSelectPipe(mg.Pipeline):
 def test_filter_and_select_lower_to_canonical_ir_shape() -> None:
     graph = FilterSelectPipe().compile()
 
-    assert graph.topo_order == (
+    assert tuple(node.name for node in graph.nodes) == (
         "KeepPages",
         "ScoreAndKeep__map",
         "ScoreAndKeep__filter",
-        "ScoreAndKeep__project",
     )
-    assert graph.node("KeepPages").kind == NodeKind.FILTER
-    assert graph.node("KeepPages").contract.relations[0].relation == (
-        RelationKind.FILTER
-    )
+    assert isinstance(graph.node("KeepPages").operation, FilterOp)
+    assert isinstance(graph.node("KeepPages").outputs[0].relation, SubsetOf)
 
     select_map = graph.node("ScoreAndKeep__map")
-    assert select_map.kind == NodeKind.MAP
+    assert isinstance(select_map.operation, MapOp)
     assert len(select_map.outputs) == 2
-    assert [relation.relation for relation in select_map.contract.relations] == [
-        RelationKind.PRESERVE,
-        RelationKind.PRESERVE,
-    ]
+    assert all(isinstance(output.relation, SameAs) for output in select_map.outputs)
 
     select_filter = graph.node("ScoreAndKeep__filter")
-    assert select_filter.kind == NodeKind.FILTER
+    assert isinstance(select_filter.operation, FilterByMaskOp)
     assert len(select_filter.inputs) == 3
     assert len(select_filter.outputs) == 2
 
-    select_project = graph.node("ScoreAndKeep__project")
-    assert select_project.kind == NodeKind.PROJECT
     assert [port.node for port in graph.outputs] == [
-        "ScoreAndKeep__project",
-        "ScoreAndKeep__project",
+        "ScoreAndKeep__filter",
+        "ScoreAndKeep__filter",
     ]
-    assert VerifyPass().run(graph).ok is True
 
 
 class InvalidFilterCrossGrainPipe(mg.Pipeline):
@@ -155,6 +154,9 @@ class RelatePipe(mg.Pipeline):
             MatchImagesAndCaptions,
             roles=("image", "caption"),
             output_grain="pair",
+            relation_adapter=(
+                "test.experimental.multigrain.relate_adapters:pair_from_fields"
+            ),
         )
 
     def forward(self, images, captions):
@@ -165,12 +167,15 @@ def test_relate_records_invocation_local_mn_relation_contract() -> None:
     graph = RelatePipe().compile()
     relate = graph.node("MatchImagesAndCaptions")
 
-    assert relate.kind == NodeKind.RELATE
+    assert isinstance(relate.operation, RelateOp)
     assert relate.outputs[0].grain == "pair"
-    assert relate.contract.relations[0].relation == RelationKind.RELATE
-    assert relate.contract.relations[0].roles == ("image", "caption")
+    relation = relate.outputs[0].relation
+    assert isinstance(relation, RelatedFrom)
+    assert tuple(binding.role for binding in relation.roles) == (
+        "image",
+        "caption",
+    )
     assert [port.name for port in relate.inputs] == ["images", "captions"]
-    assert VerifyPass().run(graph).ok is True
 
 
 def test_relate_eager_is_not_faked_with_portbatch() -> None:

@@ -22,17 +22,13 @@ import pytest
 from rayorch.experimental import multigrain as mg
 from rayorch.experimental.multigrain.data import concat
 from rayorch.experimental.multigrain.execution import MultigrainExecutor
-from rayorch.experimental.multigrain.ir import NodeKind
+from rayorch.experimental.multigrain.ir import is_row_partitionable
 
 from test.experimental.multigrain.test_dummy_e2e import GovPipe
 from test.experimental.multigrain.test_relate_key_join import (
     LinkPipe,
     _fig_source,
 )
-
-# Same set as the Ray executor: only these are row-sharded.
-_SHARDABLE = frozenset({NodeKind.MAP, NodeKind.FILTER, NodeKind.EXPAND})
-
 
 def _random_legal_partition(n: int, rng: random.Random) -> list[list[int]]:
     """A random set partition of range(n): disjoint, covering, arbitrary order."""
@@ -47,20 +43,25 @@ def _random_legal_partition(n: int, rng: random.Random) -> list[list[int]]:
     return [b for b in bins if b]
 
 
-def _run(graph, inputs, rng, *, shard: bool, relation_fns=None):
+def _run(graph, inputs, rng, *, shard: bool):
     """Execute the passive IR, optionally random-sharding shardable nodes.
 
     Returns the full ``IRPortRef -> PortBatch`` context so intermediate ports can
     be compared, not just the final output.
     """
-    base = MultigrainExecutor(relation_fns=relation_fns)
+    base = MultigrainExecutor()
     context = {}
     for spec in graph.inputs:
         context[spec.ref] = inputs[spec.name]
 
     for node in graph.nodes:
-        node_inputs = tuple(context[ref] for ref in node.input_refs)
-        can_shard = shard and node.kind in _SHARDABLE and node_inputs and len(node_inputs[0]) > 1
+        node_inputs = tuple(context[ref] for ref in node.inputs)
+        can_shard = (
+            shard
+            and is_row_partitionable(node)
+            and node_inputs
+            and len(node_inputs[0]) > 1
+        )
         if can_shard:
             parts = _random_legal_partition(len(node_inputs[0]), rng)
             shard_outs = [
@@ -123,7 +124,7 @@ def test_gov_pipeline_is_reordering_invariant(seed: int) -> None:
     _assert_keyed_equal_everywhere(phys, ser)
 
     # Theorem part 2: the Reduce output (anchor = docs input) is byte-identical.
-    (out_ref,) = graph.graph_outputs
+    (out_ref,) = graph.outputs
     _assert_ordered_equal(phys[out_ref], ser[out_ref])
 
 
@@ -143,7 +144,7 @@ def test_key_join_pipeline_is_reordering_invariant(seed: int) -> None:
     # With content-addressed key-join ids, even the Relate port is ≈ (Lemma 3a).
     _assert_keyed_equal_everywhere(phys, ser)
 
-    (out_ref,) = graph.graph_outputs
+    (out_ref,) = graph.outputs
     _assert_ordered_equal(phys[out_ref], ser[out_ref])
 
 
@@ -207,5 +208,5 @@ def test_nested_expand_reduce_restores_full_ordinal_path(seed: int) -> None:
     serial = _run(graph, {"docs": docs}, rng, shard=False)
     physical = _run(graph, {"docs": docs}, rng, shard=True)
 
-    (out_ref,) = graph.graph_outputs
+    (out_ref,) = graph.outputs
     _assert_ordered_equal(physical[out_ref], serial[out_ref])

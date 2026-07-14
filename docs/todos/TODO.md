@@ -31,7 +31,7 @@ Data/Trident at scale). See the "Related Work & Venue Strategy" section below.
 
 | Milestone | Topic | Status | Blocks acceptance? |
 |---|---|---|---|
-| M0 | Prototype: relation IR + passive IR + primitives + passes + unified public Ray stream executor | done (generic DAG coordinator; persistent pools; bounded inflight; MinerU benchmark uses public API only) | prerequisite |
+| M0 | Minimal relation-aware ExecutionGraph + primitives + unified public Ray stream executor | done (typed operations/relations; mandatory verifier; generic DAG coordinator; persistent pools; bounded inflight) | prerequisite |
 | M1 | Formalization: relation algebra + reordering-invariance theorem | **done** | yes (else "just engineering") |
 | M2 | Real workload + real baselines + multi-node scale | **in progress** (E1 public-engine 368-PDF: 1.72× vs measured 892s baseline, output-equivalent; competitor baselines + multi-node TODO) | **yes (make-or-break)** |
 | M3 | Fault-tolerance & overhead: row-level recovery vs full recompute; lineage cost | **in progress** (E3 done: record-level COMPLETE + 0 redundant re-OCR vs shard-level ABORT + 1.5× waste on real pipeline; lineage-overhead E4 TODO) | yes |
@@ -40,13 +40,15 @@ Data/Trident at scale). See the "Related Work & Venue Strategy" section below.
 
 Minimal acceptable set: **M1 + M2 + M3 + (one of M4)**. M5 makes it competitive.
 
-Primitive 内核已完成声明、输出 builder、handler registry、capability 与 structural
-verifier 收敛；设计边界和重复矩阵见
+Primitive 内核现已收敛到 `ExecutionGraph`、typed operation、per-output relation、
+output builder、typed handler registry、`verify_graph` 函数和
+`is_row_partitionable` capability 查询；旧 pass 模型不再是当前实现。历史设计边界见
 [`18-multigrain-primitive-core-convergence.md`](18-multigrain-primitive-core-convergence.md)。
 Expand mixed outputs、`mg.out.same/children` relation forest、现实 workload 覆盖和未来
 Partition/global/window/async 扩展门已记录在
 [`19-expand-mixed-output-relation-design.md`](19-expand-mixed-output-relation-design.md)；
-该设计当前为 **deferred**，不阻塞框架理解、内核收敛或 M2/M3。
+identity forest 已可由 IR/verifier 表示，但 marker API 与 runtime materialization
+仍为 **deferred**，不阻塞 M2/M3。
 
 Deferred primitive authoring/compiler follow-ups（当前不优先）:
 - [ ] **Expand mixed-output relation override**：保留现有 Expand 默认 shared-child
@@ -74,8 +76,9 @@ Deliverables (all landed):
 - [x] Reordering-Invariance theorem: part 1 (keyed/lineage `≈` everywhere),
       part 2 (byte-identical ordered equality at canonical Reduce outputs);
       corollaries: lineage-guided recovery is reorder-stable, LPT is safe.
-- [x] Honest assumptions: WF co-ordered inputs, whole-batch Reduce/Relate,
-      determinism, UDF value-purity (id/position independence).
+- [x] Honest assumptions: exact-partition validation, WF co-ordered inputs,
+      whole-batch Reduce/Relate, deterministic row-local UDFs, and
+      permutation-equivariant relation adapters.
 - [x] Content-addressed relation ids (so key-join is strictly `≈`).
 - [x] Machine-checked property test over random legal shard plans
       → `test/experimental/multigrain/test_reordering_invariance.py` (25×2, green).
@@ -127,15 +130,14 @@ Deliverables:
       adaptive isolation, dense failure, fail-closed cascade, and actor death.
 - [ ] Measure recovery cost & correctness: only affected records recomputed vs
       full recompute (Ray Data / Spark comparison where possible).
-- [x] RecoveryPolicy + nested IsolationBudget passive IR/user interface;
-      unsupported node-kind combinations rejected explicitly.
+- [x] `RecoveryPolicy` + nested `IsolationBudget` on `NodeSpec`;
+      unsupported operation/policy combinations rejected explicitly.
 - [x] Recovery tiers for Map/shardable MVP (doc 15): inline/deferred record
       retry, immediate healthy-replica shard retry, bounded adaptive
       localization, actor replacement, and bounded stage-epoch drain. Remaining:
       wrapper-specific attributable units for Filter/Expand/Reduce/Relate.
 - [ ] Overhead study: cost of record-level lineage tracking in steady state
-      (must be small, e.g. < a few %); memory footprint of lineage; effect of
-      `MaterializePolicy` boundaries.
+      (must be small, e.g. < a few %); memory footprint of lineage.
 - [ ] Compact-lineage substrate (doc 16): coordinator UUID/BatchArena → shared
       1:1 path table → columnar 1:N → Reduce/M:N compact relations → arena
       lifecycle/release.
@@ -238,7 +240,7 @@ acceptance odds. Track in M2.
 ## Index of detailed docs
 
 - `09-multi-grain-port-cardinality-api.md` — API / paradigm design.
-- `10-multigrain-ir-mvp-plan.md` — IR MVP plan, passes, Ray exec, bubble taxonomy, GPU benches.
+- `10-multigrain-ir-mvp-plan.md` — historical IR MVP plan, bubble taxonomy, GPU benches.
 - `11-multigrain-primitive-api-ir-review.md` — per-primitive API/IR review.
 - `12-relation-model-three-tiers.md` — relation model (Expand/Reduce | on= | adapter).
 - `13-reordering-invariance-theorem.md` — M1 formalization + proofs.

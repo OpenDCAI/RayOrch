@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ir import InsertRebatchAfterExpandPass
 
 from test.experimental.multigrain.test_pdf_mvp import (
     Assemble,
@@ -15,7 +14,6 @@ from test.experimental.multigrain.test_upper_primitives import (
     KeepPages,
     MatchImagesAndCaptions,
     ScoreAndKeep,
-    pair_relation,
 )
 
 
@@ -87,16 +85,6 @@ def test_same_grain_diamond_map_merges_lineage_from_every_branch() -> None:
     assert output.lineage == [("left", "right", "merge")]
 
 
-def test_local_executor_runs_rebatch_transformed_ir() -> None:
-    graph = ExecMineruPipe().compile()
-    transformed = InsertRebatchAfterExpandPass().run(graph).graph
-    pdfs = mg.source(["a.pdf"], name="pdfs")
-
-    markdown = mg.MultigrainExecutor().execute(transformed, {"pdfs": pdfs})
-
-    assert markdown.values == ["a.pdf|pages=0,1|texts=2"]
-
-
 class ExecFilterPipe(mg.Pipeline):
     def __init__(self) -> None:
         super().__init__()
@@ -152,7 +140,7 @@ class ExecSelectPipe(mg.Pipeline):
         return self.select(pages)
 
 
-def test_local_executor_runs_select_lowered_map_filter_project_ir() -> None:
+def test_local_executor_runs_select_lowered_map_filter_graph() -> None:
     graph = ExecSelectPipe().compile()
     pages = mg.source(["good-0", "bad-1", "good-2"], name="pages")
 
@@ -180,6 +168,9 @@ class ExecRelatePipe(mg.Pipeline):
             MatchImagesAndCaptions,
             roles=("image", "caption"),
             output_grain="pair",
+            relation_adapter=(
+                "test.experimental.multigrain.relate_adapters:pair_from_fields"
+            ),
         )
 
     def forward(self, images, captions):
@@ -191,9 +182,9 @@ def test_local_executor_runs_compiled_relate_ir_with_relation_fn() -> None:
     images = mg.source(["img-0", "img-1"], name="image")
     captions = mg.source(["cap-1", "cap-0"], name="caption")
 
-    pairs = mg.MultigrainExecutor(
-        relation_fns={"MatchImagesAndCaptions": pair_relation}
-    ).execute(graph, {"images": images, "captions": captions})
+    pairs = mg.MultigrainExecutor().execute(
+        graph, {"images": images, "captions": captions}
+    )
 
     assert pairs.display_keys == [
         "image=img-0/caption=cap-0",

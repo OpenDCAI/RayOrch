@@ -4,8 +4,8 @@ This file is the durable version of the ad hoc "does the representation actually
 execute?" checks. It uses fresh dummy operators (independent from the PDF/mineru
 fixtures) and exercises the full path for every graph motif:
 
-    trace -> canonical/passive IR -> VerifyPass -> pickle round-trip
-          -> MultigrainExecutor (local) -> transformed IR execution
+    trace -> mandatory graph verification -> pickle round-trip
+          -> MultigrainExecutor (local)
 
 Keep it as the reference example for "what shapes the paradigm supports and how
 they run". The motifs mirror ``docs/todos/09-multi-grain-port-cardinality-api.md``
@@ -19,15 +19,7 @@ import pickle
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ir import SymbolicPort
-from rayorch.experimental.multigrain.ir import (
-    InsertRebatchAfterExpandPass,
-    MarkMapFilterFusionCandidatesPass,
-    PlanReduceGroupsPass,
-    RebatchCandidatePass,
-    RelationSummaryPass,
-    VerifyPass,
-)
+from rayorch.experimental.multigrain.tracing import TracePort
 
 
 # ---------------------------------------------------------------------------
@@ -74,14 +66,6 @@ class Match:
 
     def run(self, images: list[str], captions: list[str]) -> list[str]:
         return [f"{image}|{caption}" for image, caption in zip(images, captions)]
-
-
-def match_relation(raw_values: list[str]) -> list[tuple[str, dict[str, int]]]:
-    """Adapter: expose invocation-local parent indexes as relation evidence."""
-    return [
-        (value, {"image": index, "caption": index})
-        for index, value in enumerate(raw_values)
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +121,14 @@ class RelatePipe(mg.Pipeline):
 
     def __init__(self) -> None:
         super().__init__()
-        self.match = mg.Relate(Match, roles=("image", "caption"), output_grain="pair")
+        self.match = mg.Relate(
+            Match,
+            roles=("image", "caption"),
+            output_grain="pair",
+            relation_adapter=(
+                "test.experimental.multigrain.relate_adapters:link_by_index"
+            ),
+        )
 
     def forward(self, images, captions):
         return self.match(images, captions)
@@ -148,11 +139,11 @@ class RelatePipe(mg.Pipeline):
 # ---------------------------------------------------------------------------
 def _has_symbolic_port(ir) -> bool:
     for node in ir.nodes:
-        for spec in (*node.input_specs, *node.output_specs):
-            if isinstance(spec, SymbolicPort):
+        for spec in (*node.inputs, *node.outputs):
+            if isinstance(spec, TracePort):
                 return True
     for port in (*ir.inputs, *ir.outputs):
-        if isinstance(port, SymbolicPort):
+        if isinstance(port, TracePort):
             return True
     return False
 
@@ -169,7 +160,6 @@ MOTIF_PIPELINES = {
 def test_motif_traces_verifies_and_is_passive_picklable(name: str) -> None:
     ir = MOTIF_PIPELINES[name]().compile()
 
-    assert VerifyPass().run(ir).ok is True
     assert _has_symbolic_port(ir) is False
 
     reloaded = pickle.loads(pickle.dumps(ir))
@@ -206,23 +196,7 @@ def test_gov_pipeline_executes_from_pickled_reloaded_ir() -> None:
     assert detached.values == original.values
 
 
-def test_gov_pipeline_executes_after_rebatch_transform() -> None:
-    ir = GovPipe().compile()
-    transformed = InsertRebatchAfterExpandPass().run(ir).graph
-    docs = mg.source(["a-dropme-c", "x-y"], name="docs")
-
-    assert [node.kind.value for node in transformed.nodes] == [
-        "EXPAND",
-        "REBATCH",
-        "MAP",
-        "FILTER",
-        "REDUCE",
-    ]
-    out = mg.MultigrainExecutor().execute(transformed, {"docs": docs})
-    assert out.values == ["a-dropme-c=>[emb:a,emb:c]", "x-y=>[emb:x,emb:y]"]
-
-
-def test_select_pipeline_executes_lowered_map_filter_project() -> None:
+def test_select_pipeline_executes_lowered_map_filter() -> None:
     ir = SelectPipe().compile()
     docs = mg.source(["a-dropme-c"], name="docs")  # chunks: a, dropme, c
 
@@ -237,7 +211,7 @@ def test_relate_pipeline_executes_with_relation_adapter() -> None:
     images = mg.source(["img0", "img1"], name="image")
     captions = mg.source(["cap0", "cap1"], name="caption")
 
-    pairs = mg.MultigrainExecutor(relation_fns={"Match": match_relation}).execute(
+    pairs = mg.MultigrainExecutor().execute(
         ir, {"images": images, "captions": captions}
     )
 
@@ -248,31 +222,3 @@ def test_relate_pipeline_executes_with_relation_adapter() -> None:
     ]
     assert pairs.relations[0][0].role == "image"
     assert pairs.relations[0][1].role == "caption"
-
-
-# ---------------------------------------------------------------------------
-# Analysis passes still read the passive IR
-# ---------------------------------------------------------------------------
-def test_analysis_passes_read_gov_pipeline_ir() -> None:
-    ir = GovPipe().compile()
-
-    summary = RelationSummaryPass().run(ir).metadata
-    assert summary["relation_kinds"]["EXPAND"] == 1
-    assert summary["relation_kinds"]["REDUCE"] == 1
-
-    rebatch = RebatchCandidatePass().run(ir).metadata["rebatch_candidates"]
-    assert len(rebatch) == 1  # the single Expand output
-
-    plans = PlanReduceGroupsPass().run(ir).metadata["reduce_group_plans"]
-    assert plans[0]["anchor"] == "__input__docs"
-
-
-def test_select_lowering_marks_map_filter_fusion_candidate() -> None:
-    ir = SelectPipe().compile()
-
-    candidates = MarkMapFilterFusionCandidatesPass().run(ir).metadata[
-        "fusion_candidates"
-    ]
-
-    assert candidates
-    assert candidates[0]["filter"] == "Score__filter"

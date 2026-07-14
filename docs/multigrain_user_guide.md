@@ -11,7 +11,7 @@
 > `docs/todos/17-mineru-graph-integration-findings.md`；当前 primitive 内核边界见
 > `docs/todos/18-multigrain-primitive-core-convergence.md`。本文是**上手手册**，只讲怎么用。
 >
-> 面向框架开发者的完整代码脉络、字段字典、RelationSpec/Capability 推导、primitive
+> 面向框架开发者的完整代码脉络、`ExecutionGraph`、per-output relation、primitive
 > 契约和执行/recovery 说明，以
 > [`rayorch/experimental/multigrain/README.md`](../rayorch/experimental/multigrain/README.md)
 > 为唯一入口。
@@ -25,7 +25,9 @@
   每条记录有框架分配的 `record_id`、`display_key`、`ancestors`（祖先各粒度的 id）——**这些你都看不到、也不用管**。
 - **Op UDF（算子）**：你只写一个类，`__init__` 里加载资源（模型等），`run(...)` 里对**一批值**做纯函数变换。
   **不接收、不依赖 id / 位置 / 血缘**。
-- **Primitive（原语）**：`Map / Expand / Reduce / Filter / Select / Relate` 决定粒度怎么变（1:1 / 1:N / N:1 / M:N）。
+- **Primitive（原语）**：大原语 `Map / Filter / Expand / Reduce / Relate` 决定 invocation
+  scope；`Select` 是 lower 为 Map→FilterByMask 的 authoring macro，mask port 被消费而
+  不会成为 output。
 - 框架负责：跨副本分片并行、按血缘重组、故障隔离与恢复。
 
 一句话：**你描述"值怎么变、粒度怎么变"，框架负责"谁是谁的祖先、谁在哪块 GPU、坏了怎么办"。**
@@ -86,19 +88,22 @@ class RealVlmOcrPage:
 
 ```python
 import rayorch.experimental.multigrain as mg
-from rayorch.experimental.multigrain.ir import PhysicalHints
 
 class MinerUReal(mg.Pipeline):
     def __init__(self, output_dir, replicas=4, num_gpus_per_replica=1.0):
         super().__init__()
+        cpu_pool = mg.WorkerPoolSpec(replicas=replicas)
+        gpu_pool = mg.WorkerPoolSpec(
+            replicas=replicas,
+            gpus_per_worker=num_gpus_per_replica,
+        )
         self.to_pages = mg.Expand(
             RealPdfToPages, parent=0, child_label="page",
-            physical=PhysicalHints(replicas=replicas),          # CPU 渲染，多副本
+            workers=cpu_pool,
         )
         self.ocr = mg.Map(
             RealVlmOcrPage, model=MODEL,
-            physical=PhysicalHints(replicas=replicas,
-                                   num_gpus_per_replica=num_gpus_per_replica),  # GPU
+            workers=gpu_pool,
         )
         self.assemble = mg.Reduce(
             RealAssembleDoc, output_dir=output_dir,
@@ -110,11 +115,13 @@ class MinerUReal(mg.Pipeline):
         contents = self.ocr(pages)                           # page -> page (1:1)
         return self.assemble(mg.group_by(pdfs, contents, pages))  # page -> pdf (N:1)
 
-ir = MinerUReal(output_dir="./out").compile()   # -> MultigrainIR（被动、可序列化、可优化）
+graph = MinerUReal(output_dir="./out").compile()  # -> verified ExecutionGraph
 ```
 
 关键点：
-- **`compile()` 只建 IR，不跑模型、不占显存**（工厂模式）。IR 是被动数据结构，可打印、可校验、可过 pass。
+- **`compile()` 只建 graph，不跑模型、不占显存**。它保存
+  `OperatorFactorySpec(import_path, args, kwargs)`，并强制调用 `verify_graph()`。
+- graph 是不可变 `ExecutionGraph`；Local 和 Ray 执行前也会再次验证。
 - `Expand(parent=0)`：从第 0 个输入端口 fan-out；`child_label` 只是给子粒度起个可读名字。
 - `Reduce` 的输入是 `mg.group_by(anchor, *descendants)`：第一个是**锚粒度**（输出粒度），其余是要按血缘归并回锚的后代端口，框架会**按阅读序对齐**后分组喂给 `run`。
 
@@ -126,12 +133,13 @@ ir = MinerUReal(output_dir="./out").compile()   # -> MultigrainIR（被动、可
 from rayorch.experimental.multigrain import MultigrainExecutor, source
 
 pdfs = source(pdf_paths, name="pdfs", display_key=lambda p: Path(p).stem)
-out  = MultigrainExecutor().execute(ir, {"pdfs": pdfs})   # 单进程串行
+out  = MultigrainExecutor().execute(graph, {"pdfs": pdfs})  # 单进程串行
 print(out.values)      # 每个文档一条结果
 print(out.errors)      # 隔离/连锁产生的 ErrorTrace 列表
 ```
 
-`source(values, name=, display_key=)` 是入口端口；`name` 要和 `execute(ir, {name: ...})` 的键一致。
+`source(values, name=, display_key=)` 是入口端口；`name` 要和
+`execute(graph, {name: ...})` 的键一致。
 本地执行器语义与 Ray 执行器**逐行一致**，是写单测的首选（快、无 GPU）。
 
 ---
@@ -150,14 +158,14 @@ ex = MultigrainRayExecutor(
     shard_planner=lpt_shard_planner(page_work),  # 见下：长尾均衡
     metrics=metrics,
 )
-ex.warm_pools(ir)                    # 预热：每副本各加载一次模型（把 load 排除出计时）
+ex.warm_pools(graph)                 # 预热：每副本各加载一次模型（把 load 排除出计时）
 
 # 单批：同样走下面的统一 coordinator（max_inflight=1）
-out = ex.execute(ir, {"pdfs": pdfs})
+out = ex.execute(graph, {"pdfs": pdfs})
 
 # 流式：输入可以是 generator；结果默认按输入顺序 yield，不会全部攒在内存。
 microbatches = ({"pdfs": pdf_sources(chunk)} for chunk in chunks)
-for out in ex.execute_stream(ir, microbatches, max_inflight=3):
+for out in ex.execute_stream(graph, microbatches, max_inflight=3):
     consume(out)
 
 ex.shutdown()                        # 释放所有 actor 和 GPU
@@ -169,8 +177,9 @@ ex.shutdown()                        # 释放所有 actor 和 GPU
 - **bounded backpressure**：正在执行以及已完成但尚未被用户消费的结果都计入
   `max_inflight`，因此页图等大对象不会无限堆在 Ray object store。
 - **持久 actor 池**：GPU/持模型算子的 actor 长期存活，模型**每副本只加载一次**，跨 chunk / microbatch / 多次 `execute` 复用。**隔离、重试都复用同一 actor，不会重载模型**（只有进程真崩溃才会被 Ray 重建 → 重载，那是基础设施故障，不是数据隔离）。
-- **`PhysicalHints(replicas=, num_gpus_per_replica=)`**：写在算子上，声明它要几个副本、每副本几张卡。
+- **`WorkerPoolSpec(replicas=, gpus_per_worker=)`**：写在算子 `workers=` 上，声明副本和 GPU。
 - **`shard_planner`**：`(node, inputs, replicas) -> 每片的行下标列表`；返回 `None` 退化为连续切分。
+  planner 输出会经过 exact-partition validation：不能越界、重复或遗漏，必须恰好覆盖每行一次。
   - **contiguous（连续切分）**：按行号顺序等分——实现简单，但长尾负载会造成 GPU 空泡。
   - **`lpt_shard_planner(work_fn)`（LPT，最长优先）**：按 `work_fn(row)` 估算每行开销，贪心把最重的先分给当前最闲的副本 → 消除长尾空泡。`work_fn` 要对**非本粒度的行**鲁棒（比如上游是字符串就返回 1.0）。
 
@@ -202,8 +211,9 @@ ex.shutdown()                        # 释放所有 actor 和 GPU
    ```
    evidence 项为 `(value, {role: local_index})`；同一父证据要产出多条时，使用
    `(value, {role: local_index}, stable_key)`，保证 relation identity 在重排后稳定。
-   `relation_fn=` 是 eager-only；执行已有 compiled IR 时，也可给 executor 注册
-   `relation_fns={node_name: fn}`。当前 `Relate` 明确只支持一个输出端口。
+   `relation_fn=` 是 eager-only。compiled Relate 必须使用 `on=` 产生的 `KeyJoinSpec`
+   或 dotted `relation_adapter=` 产生的 `RelationAdapterSpec`，不能注入 live matcher。
+   当前 `Relate` 明确只支持一个输出端口。
 
 `Relate` 满足重排不变性：任何合法的物理分片重排，输出与串行基线**逐条等价**（证明见 doc 13）。
 
@@ -238,15 +248,13 @@ self.ocr = mg.Map(
             max_calls=64,
             on_exhausted="quarantine",
         ),
-        drain_scope="stage_global",
     ),
 )
 ```
 
 当前实现支持 Map 的 inline/deferred record retry、立即 shard retry、actor
-死亡后的单副本重建，以及有预算的自适应 shard 定位。`stage_global`
-指**有界 stage epoch**：跨当前活跃 microbatch 聚合，在达到正常 shard
-大小、stage 暂时无健康工作或输入关闭时 drain；不是等待整个数据集结束。
+死亡后的单副本重建，以及有预算的自适应 shard 定位。deferred records 由 streaming
+coordinator 跨当前活跃 microbatches 有界聚合和 drain。
 尚未支持的算子种类/策略组合会明确抛 `NotImplementedError`。
 
 ```python
@@ -326,10 +334,10 @@ class Doc2MD(mg.Pipeline):
         pages = self.split(docs)
         return self.asm(mg.group_by(docs, self.ocr(pages)))
 
-ir = Doc2MD().compile()
+graph = Doc2MD().compile()
 docs = source([{"name": "d1", "n": 2}, {"name": "d2", "n": 3}],
               name="docs", display_key=lambda d: d["name"])
-out = MultigrainExecutor().execute(ir, {"docs": docs})
+out = MultigrainExecutor().execute(graph, {"docs": docs})
 print(dict(zip(out.display_keys, out.values)))
 print([e.action for e in out.errors])
 ```
@@ -356,12 +364,24 @@ print([e.action for e in out.errors])
 import rayorch.experimental.multigrain as mg
 # 原语： mg.Map / mg.Expand / mg.Reduce / mg.Filter / mg.Select / mg.Relate
 # 组图： mg.Pipeline（子类化 + forward）
-# 数据： mg.source / mg.group_by / mg.concat / mg.rebatch / mg.PortBatch / mg.Grouped / mg.ErrorTrace
+# 数据： mg.source / mg.group_by / mg.concat / mg.PortBatch / mg.Grouped / mg.ErrorTrace
 # 执行：mg.MultigrainExecutor（本地）/ mg.MultigrainRayExecutor（Ray）
 # 调度/观测：mg.lpt_shard_planner / mg.FaultSpec / mg.RunMetrics
-# 恢复接口：mg.RecoveryPolicy / mg.IsolationBudget / mg.RetryTiming / mg.DrainScope
-from rayorch.experimental.multigrain.ir import PhysicalHints, MissingChildPolicy
+# 声明：mg.WorkerPoolSpec / mg.RecoveryPolicy / mg.IsolationBudget
+#       mg.RetryTiming / mg.IncompleteGroupPolicy
 from rayorch.runtime import BadRecordError                  # 记录级隔离信号
 ```
 
-IR / passes 属于研究 & 调试面，从 `graph` / `passes` 子模块取用；用户日常只碰上面这些。
+高级 IR/debug API 位于 `rayorch.experimental.multigrain.ir`：refs、typed operations、
+per-output relations、`ExecutionGraph`、`verify_graph` 和
+`is_row_partitionable` capability query。
+
+执行器会校验每个 output 的 `PortBatch.name == OutputSpec.grain`：Map/Filter 保留 source
+grain，Expand 使用 child label，Reduce 返回 anchor grain，Relate 使用 `output_grain`。
+
+## 10. Mixed-output Expand 状态
+
+当前多输出 Expand 仍要求所有 outputs 每个 parent 的 group lengths 相同，并共享 child
+identity。新的 `SameAs` / `ChildrenOf` relation IR 和 verifier 已能表示 mixed-output
+identity forest，但未来的 `mg.out.same` / `mg.out.children` marker 与 Local/Ray runtime
+materialization 尚未实现。不要在用户代码中调用这些 future APIs。

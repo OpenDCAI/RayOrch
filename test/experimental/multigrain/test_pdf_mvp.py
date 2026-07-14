@@ -88,6 +88,7 @@ def test_expand_map_reduce_groups_pages_back_to_documents() -> None:
         "b.pdf|pages=0,1,2|texts=3",
     ]
     assert markdown.record_ids == pdfs.record_ids
+    assert markdown.name == "document"
     assert markdown.trace_item(document="a.pdf")[0]["lineage"] == ["Assemble"]
 
 
@@ -105,7 +106,7 @@ def test_page_failure_produces_readable_trace_and_keeps_healthy_pages() -> None:
     assert trace.source_item == "a.pdf"
     assert trace.logical_item == "a.pdf/page=1"
     assert trace.failed_op == "OCR"
-    assert trace.grain == "PdfToImages"
+    assert trace.grain == "page"
     assert trace.parent == "a.pdf"
     assert trace.upstream_path == ("PdfToImages", "Layout", "OCR")
     assert trace.action == "quarantined"
@@ -121,6 +122,7 @@ def test_rebatch_preserves_identity_relation_and_child_order() -> None:
         num_outputs=2,
     )
     images, page_meta = expand(pdfs)
+    assert images.name == page_meta.name == "page"
 
     image_batches = mg.rebatch(images, batch_size=3)
     meta_batches = mg.rebatch(page_meta, batch_size=3)

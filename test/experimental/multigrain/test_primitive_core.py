@@ -2,18 +2,24 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from rayorch.experimental import multigrain as mg
 from rayorch.experimental.multigrain.ir.capabilities import (
-    RelationEvidenceFamily,
-    capabilities_for,
+    is_row_partitionable,
 )
 from rayorch.experimental.multigrain.execution.handlers import (
     DEFAULT_HANDLER_REGISTRY,
+    FilterByMaskHandler,
     MapHandler,
-    SelectFilterHandler,
 )
 from rayorch.experimental.multigrain.primitives.output import merge_aligned_inputs
-from rayorch.experimental.multigrain.ir import VerifyPass
+from rayorch.experimental.multigrain.ir import (
+    GraphInputRef,
+    GraphValidationError,
+    SameAs,
+    verify_graph,
+)
 
 from test.experimental.multigrain.test_executor import ExecSelectPipe
 from test.experimental.multigrain.test_pdf_mvp import (
@@ -40,22 +46,12 @@ class _CorePipe(mg.Pipeline):
         return self.reduce(mg.group_by(docs, mapped, metadata))
 
 
-def test_capabilities_are_derived_from_relation_contracts() -> None:
+def test_scheduling_facts_are_derived_from_verified_operations() -> None:
     graph = _CorePipe().compile()
 
-    map_caps = capabilities_for(graph.node("Layout"))
-    assert map_caps.identity_alignment is True
-    assert map_caps.row_partitionable is True
-    assert map_caps.relation_evidence is RelationEvidenceFamily.ALIGNED
-
-    expand_caps = capabilities_for(graph.node("PdfToImages"))
-    assert expand_caps.row_partitionable is True
-    assert expand_caps.relation_evidence is RelationEvidenceFamily.PARENT
-
-    reduce_caps = capabilities_for(graph.node("Assemble"))
-    assert reduce_caps.group_completion is True
-    assert reduce_caps.row_partitionable is False
-    assert reduce_caps.relation_evidence is RelationEvidenceFamily.ANCHOR
+    assert is_row_partitionable(graph.node("Layout")) is True
+    assert is_row_partitionable(graph.node("PdfToImages")) is True
+    assert is_row_partitionable(graph.node("Assemble")) is False
 
 
 def test_handler_registry_resolves_primitive_and_internal_recipes() -> None:
@@ -69,18 +65,18 @@ def test_handler_registry_resolves_primitive_and_internal_recipes() -> None:
         DEFAULT_HANDLER_REGISTRY.resolve(
             select_graph.node("ScoreAndKeep__filter")
         ),
-        SelectFilterHandler,
+        FilterByMaskHandler,
     )
 
 
 def test_structural_verifier_rejects_relation_parent_drift() -> None:
     graph = _CorePipe().compile()
     node = graph.node("Layout")
-    relation = replace(node.contract.relations[0], parents=())
-    bad_node = replace(
-        node,
-        contract=replace(node.contract, relations=(relation,)),
+    bad_output = replace(
+        node.outputs[0],
+        relation=SameAs(GraphInputRef("missing")),
     )
+    bad_node = replace(node, outputs=(bad_output,))
     bad_graph = replace(
         graph,
         nodes=tuple(
@@ -89,13 +85,8 @@ def test_structural_verifier_rejects_relation_parent_drift() -> None:
         ),
     )
 
-    result = VerifyPass().run(bad_graph)
-
-    assert result.ok is False
-    assert any(
-        "relation parents" in diagnostic.message
-        for diagnostic in result.diagnostics
-    )
+    with pytest.raises(GraphValidationError, match="unavailable"):
+        verify_graph(bad_graph)
 
 
 def test_aligned_lineage_merge_rejects_conflicting_ancestor_identity() -> None:

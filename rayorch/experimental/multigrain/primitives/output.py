@@ -124,6 +124,7 @@ class PortBatchBuilder:
         name: str,
         op_name: str,
         errors: Sequence[ErrorTrace] = (),
+        preserve_name: bool = False,
     ) -> tuple[PortBatch, ...]:
         result: list[PortBatch] = []
         count = len(outputs)
@@ -131,7 +132,7 @@ class PortBatchBuilder:
         for index, values in enumerate(outputs):
             batch = base.with_values(
                 list(values),
-                name=output_name(name, index, count),
+                name=base.name if preserve_name else output_name(name, index, count),
                 op_name=op_name,
             )
             batch.errors = list(merged_errors)
@@ -166,12 +167,12 @@ class PortBatchBuilder:
         parent: PortBatch,
         group_outputs: Sequence[Sequence[Sequence[Any]]],
         *,
-        name: str,
+        grain: str,
+        op_name: str,
         child_label: str,
     ) -> tuple[PortBatch, ...]:
         batches: list[PortBatch] = []
-        count = len(group_outputs)
-        for output_index, groups in enumerate(group_outputs):
+        for groups in group_outputs:
             values: list[Any] = []
             record_ids: list[str] = []
             display_keys: list[str] = []
@@ -184,7 +185,7 @@ class PortBatchBuilder:
                 parent_key = parent.display_keys[parent_index]
                 for child_index, value in enumerate(group):
                     values.append(value)
-                    record_ids.append(f"{name}:{parent_id}:{child_index}")
+                    record_ids.append(f"{op_name}:{parent_id}:{child_index}")
                     display_keys.append(
                         f"{parent_key}/{child_label}={child_index}"
                     )
@@ -197,10 +198,10 @@ class PortBatchBuilder:
                     child_ordinals = dict(parent.ordinals[parent_index])
                     child_ordinals[parent.name] = child_index
                     ordinals.append(child_ordinals)
-                    lineage.append((*parent.lineage[parent_index], name))
+                    lineage.append((*parent.lineage[parent_index], op_name))
             batches.append(
                 PortBatch(
-                    name=output_name(name, output_index, count),
+                    name=grain,
                     values=values,
                     record_ids=record_ids,
                     display_keys=display_keys,

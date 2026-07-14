@@ -9,8 +9,8 @@ Image = pytest.importorskip("PIL.Image")
 
 from rayorch.experimental import multigrain as mg
 from rayorch.experimental.multigrain.ir import (
-    MissingChildPolicy,
-    PhysicalHints,
+    IncompleteGroupPolicy,
+    WorkerPoolSpec,
 )
 from rayorch.experimental.multigrain.ray import MultigrainRayExecutor
 
@@ -47,7 +47,7 @@ class CompoundDiamondPipe(mg.Pipeline):
 
     def __init__(self, replicas: int = 1, sleep_scale: float = 0.0) -> None:
         super().__init__()
-        hints = PhysicalHints(replicas=replicas)
+        hints = WorkerPoolSpec(replicas=replicas)
         self.to_pages = mg.Expand(DocsToPages, parent=0, child_label="page")
         self.to_blocks = mg.Expand(
             PagesToBlocks,
@@ -59,14 +59,14 @@ class CompoundDiamondPipe(mg.Pipeline):
             ImageFeature,
             sleep_scale,
             name="image_feature",
-            physical=hints,
+            workers=hints,
         )
-        self.layout = mg.Map(LayoutFeature, name="layout_feature", physical=hints)
+        self.layout = mg.Map(LayoutFeature, name="layout_feature", workers=hints)
         self.merge = mg.Map(MergeFeatures, name="merge_features")
         self.assemble = mg.Reduce(
             AssembleDoc,
             name="assemble_doc",
-            missing_child=MissingChildPolicy.FAIL_CLOSED,
+            missing_child=IncompleteGroupPolicy.FAIL_CLOSED,
         )
 
     def forward(self, docs):

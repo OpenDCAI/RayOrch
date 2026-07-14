@@ -9,7 +9,7 @@ from rayorch.runtime.core import BadRecordError
 from ._utils import (
     as_tuple,
     checked_output_lists,
-    check_symbolic_same_grain,
+    require_same_trace_grain,
     normalize_mask,
     output_name,
 )
@@ -26,19 +26,15 @@ from ..data.batch import (
     _source_item,
     _without_index,
 )
-from ..ir.model import (
-    NodeKind,
-    OperatorProperties,
-    OperatorRecipe,
-    PhysicalHints,
-    PROJECT_RECIPE,
+from ..ir.operations import FilterByMaskOp, FilterOp, MapOp
+from ..ir.policy import (
     RecordRecoveryAction,
     RecoveryPolicy,
     RetryTiming,
-    SELECT_FILTER_RECIPE,
-    SymbolicPort,
-    ensure_symbolic_ports,
+    WorkerPoolSpec,
 )
+from ..ir.relations import SameAs, SubsetOf
+from ..tracing import TracePort, ensure_trace_ports
 
 
 class Map(BoundPrimitive):
@@ -50,8 +46,7 @@ class Map(BoundPrimitive):
         *args: Any,
         name: str | None = None,
         num_outputs: int = 1,
-        properties: OperatorProperties | None = None,
-        physical: PhysicalHints | None = None,
+        workers: WorkerPoolSpec | None = None,
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ):
@@ -61,29 +56,26 @@ class Map(BoundPrimitive):
             kwargs,
             name=name,
             num_outputs=num_outputs,
-            properties=properties,
-            physical=physical,
+            workers=workers,
             recovery=recovery,
         )
 
     def __call__(
         self,
-        *ports: PortBatch | SymbolicPort,
-    ) -> PortBatch | SymbolicPort | tuple[PortBatch, ...] | tuple[SymbolicPort, ...]:
-        symbolic = ensure_symbolic_ports(ports)
+        *ports: PortBatch | TracePort,
+    ) -> PortBatch | TracePort | tuple[PortBatch, ...] | tuple[TracePort, ...]:
+        symbolic = ensure_trace_ports(ports)
         if symbolic is not None:
             self._binding.require_compilable("Map")
-            grain = check_symbolic_same_grain(f"Map '{self.name}'", symbolic)
+            grain = require_same_trace_grain(f"Map '{self.name}'", symbolic)
             return symbolic[0].tracer.add_node(
                 name=self.name,
-                kind=NodeKind.MAP,
                 inputs=symbolic,
-                num_outputs=self.num_outputs,
-                output_grain=grain,
-                op=self.op_recipe,
-                properties=self.properties,
-                physical=self.physical,
+                operation=MapOp(self.factory_spec),
+                output_grains=(grain,) * self.num_outputs,
+                relations=(SameAs(symbolic[0].ref),) * self.num_outputs,
                 recovery=self.recovery,
+                workers=self.workers,
             )
         aligned = _align_by_identity(ports)
         result, deferred = self.run_with_recovery(*aligned)
@@ -128,6 +120,7 @@ class Map(BoundPrimitive):
             name=self.name,
             op_name=self.name,
             errors=errors,
+            preserve_name=True,
         )
         return result[0] if len(result) == 1 else result
 
@@ -337,8 +330,7 @@ class Filter(BoundPrimitive):
         op_cls: Any,
         *args: Any,
         name: str | None = None,
-        properties: OperatorProperties | None = None,
-        physical: PhysicalHints | None = None,
+        workers: WorkerPoolSpec | None = None,
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ) -> None:
@@ -348,29 +340,26 @@ class Filter(BoundPrimitive):
             kwargs,
             name=name,
             num_outputs=1,
-            properties=properties,
-            physical=physical,
+            workers=workers,
             recovery=recovery,
         )
 
     def __call__(
         self,
-        *ports: PortBatch | SymbolicPort,
-    ) -> PortBatch | SymbolicPort | tuple[PortBatch, ...] | tuple[SymbolicPort, ...]:
-        symbolic = ensure_symbolic_ports(ports)
+        *ports: PortBatch | TracePort,
+    ) -> PortBatch | TracePort | tuple[PortBatch, ...] | tuple[TracePort, ...]:
+        symbolic = ensure_trace_ports(ports)
         if symbolic is not None:
             self._binding.require_compilable("Filter")
-            grain = check_symbolic_same_grain(f"Filter '{self.name}'", symbolic)
+            grain = require_same_trace_grain(f"Filter '{self.name}'", symbolic)
             return symbolic[0].tracer.add_node(
                 name=self.name,
-                kind=NodeKind.FILTER,
                 inputs=symbolic,
-                num_outputs=len(symbolic),
-                output_grain=grain,
-                op=self.op_recipe,
-                properties=self.properties,
-                physical=self.physical,
+                operation=FilterOp(self.factory_spec),
+                output_grains=(grain,) * len(symbolic),
+                relations=tuple(SubsetOf(port.ref) for port in symbolic),
                 recovery=self.recovery,
+                workers=self.workers,
             )
 
         aligned = _align_by_identity(ports)
@@ -384,6 +373,7 @@ class Filter(BoundPrimitive):
             kept,
             name=self.name,
             op_name=self.name,
+            preserve_names=True,
         )
         return outputs[0] if len(outputs) == 1 else outputs
 
@@ -397,8 +387,7 @@ class Select(BoundPrimitive):
         *args: Any,
         name: str | None = None,
         num_annotations: int = 1,
-        properties: OperatorProperties | None = None,
-        physical: PhysicalHints | None = None,
+        workers: WorkerPoolSpec | None = None,
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ) -> None:
@@ -415,51 +404,40 @@ class Select(BoundPrimitive):
             kwargs,
             name=name,
             num_outputs=1 + num_annotations,
-            properties=properties,
-            physical=physical,
+            workers=workers,
             recovery=recovery,
         )
 
     def __call__(
         self,
-        *ports: PortBatch | SymbolicPort,
-    ) -> PortBatch | SymbolicPort | tuple[PortBatch, ...] | tuple[SymbolicPort, ...]:
-        symbolic = ensure_symbolic_ports(ports)
+        *ports: PortBatch | TracePort,
+    ) -> PortBatch | TracePort | tuple[PortBatch, ...] | tuple[TracePort, ...]:
+        symbolic = ensure_trace_ports(ports)
         if symbolic is not None:
             self._binding.require_compilable("Select")
-            grain = check_symbolic_same_grain(f"Select '{self.name}'", symbolic)
+            grain = require_same_trace_grain(f"Select '{self.name}'", symbolic)
             annotate = symbolic[0].tracer.add_node(
                 name=f"{self.name}__map",
-                kind=NodeKind.MAP,
                 inputs=symbolic,
-                num_outputs=1 + self.num_annotations,
-                output_grain=grain,
-                op=self.op_recipe,
-                properties=self.properties,
-                physical=self.physical,
+                operation=MapOp(self.factory_spec),
+                output_grains=(grain,) * (1 + self.num_annotations),
+                relations=(SameAs(symbolic[0].ref),)
+                * (1 + self.num_annotations),
                 recovery=self.recovery,
+                workers=self.workers,
             )
             annotate_ports = as_tuple(annotate)
+            filtered_sources = (*symbolic, *annotate_ports[1:])
             filtered = symbolic[0].tracer.add_node(
                 name=f"{self.name}__filter",
-                kind=NodeKind.FILTER,
                 inputs=(*symbolic, *annotate_ports),
-                num_outputs=len(symbolic) + self.num_annotations,
-                output_grain=grain,
-                op=OperatorRecipe(
-                    cls_ref=SELECT_FILTER_RECIPE,
-                    provenance={"mask_input": str(len(symbolic))},
+                operation=FilterByMaskOp(mask_input=len(symbolic)),
+                output_grains=(grain,) * len(filtered_sources),
+                relations=tuple(
+                    SubsetOf(port.ref) for port in filtered_sources
                 ),
             )
-            filtered_ports = as_tuple(filtered)
-            return symbolic[0].tracer.add_node(
-                name=f"{self.name}__project",
-                kind=NodeKind.PROJECT,
-                inputs=filtered_ports,
-                num_outputs=len(filtered_ports),
-                output_grain=grain,
-                op=OperatorRecipe(cls_ref=PROJECT_RECIPE),
-            )
+            return filtered
 
         aligned = _align_by_identity(ports)
         raw_outputs = checked_output_lists(

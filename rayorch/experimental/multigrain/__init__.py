@@ -11,15 +11,16 @@ from typing import Any
 from .data import ErrorTrace, Grouped, PortBatch, concat, group_by, rebatch, source
 from .execution import MultigrainExecutor, NodeMetric, RunMetrics
 from .ir import (
-    DrainScope,
+    IncompleteGroupPolicy,
     IsolationBudget,
     IsolationExhaustedAction,
-    Pipeline,
     RecoveryPolicy,
     RetryTiming,
     ShardExhaustedAction,
+    WorkerPoolSpec,
 )
 from .primitives import Expand, Filter, Map, Reduce, Relate, Select
+from .tracing import Pipeline
 
 _RAY_EXPORTS = frozenset(
     {"FaultSpec", "MultigrainRayExecutor", "lpt_shard_planner"}
@@ -37,11 +38,11 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "ErrorTrace",
-    "DrainScope",
     "Expand",
     "Filter",
     "FaultSpec",
     "Grouped",
+    "IncompleteGroupPolicy",
     "IsolationBudget",
     "IsolationExhaustedAction",
     "Map",
@@ -57,6 +58,7 @@ __all__ = [
     "RetryTiming",
     "Select",
     "ShardExhaustedAction",
+    "WorkerPoolSpec",
     "concat",
     "group_by",
     "lpt_shard_planner",

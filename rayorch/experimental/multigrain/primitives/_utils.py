@@ -5,7 +5,7 @@ from importlib import import_module
 from typing import Any, Sequence
 
 from ..data.batch import PortBatch, _normalize_output_lists
-from ..ir.model import SymbolicPort
+from ..tracing import TracePort
 
 
 def op_name(op_cls: Any, name: str | None) -> str:
@@ -14,7 +14,7 @@ def op_name(op_cls: Any, name: str | None) -> str:
     return getattr(op_cls, "__name__", type(op_cls).__name__)
 
 
-def op_ref(op_cls: Any) -> str:
+def factory_import_path(op_cls: Any) -> str:
     cls = op_cls if isinstance(op_cls, type) else type(op_cls)
     return f"{cls.__module__}.{cls.__qualname__}"
 
@@ -99,7 +99,7 @@ def as_tuple(value: Any) -> tuple[Any, ...]:
     return value if isinstance(value, tuple) else (value,)
 
 
-def check_symbolic_same_grain(name: str, ports: Sequence[SymbolicPort]) -> str:
+def require_same_trace_grain(name: str, ports: Sequence[TracePort]) -> str:
     grain = ports[0].grain
     if any(port.grain != grain for port in ports[1:]):
         raise ValueError(

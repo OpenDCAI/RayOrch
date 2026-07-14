@@ -17,7 +17,11 @@ import pickle
 
 from rayorch.experimental import multigrain as mg
 from rayorch.experimental.multigrain.execution import MultigrainExecutor
-from rayorch.experimental.multigrain.ir import NodeKind, RelationKind, VerifyPass
+from rayorch.experimental.multigrain.ir import (
+    KeyJoinSpec,
+    RelatedFrom,
+    RelateOp,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -176,12 +180,15 @@ def test_key_join_pipeline_compiles_verifies_and_carries_on_in_ir() -> None:
     ir = LinkPipe().compile()
 
     relate = ir.node("LinkFig")
-    assert relate.kind == NodeKind.RELATE
-    assert relate.contract.relations[0].relation == RelationKind.RELATE
-    assert relate.contract.relations[0].roles == ("page", "fig")
-    # `on` is pure data in the recipe provenance -> passive, serializable IR.
-    assert relate.op.provenance["on"] == {"page": "page_id", "fig": "page_id"}
-    assert VerifyPass().run(ir).ok is True
+    assert isinstance(relate.operation, RelateOp)
+    relation = relate.outputs[0].relation
+    assert isinstance(relation, RelatedFrom)
+    assert tuple(binding.role for binding in relation.roles) == ("page", "fig")
+    assert isinstance(relate.operation.matcher, KeyJoinSpec)
+    assert dict(relate.operation.matcher.fields) == {
+        "page": "page_id",
+        "fig": "page_id",
+    }
 
 
 def test_key_join_pipeline_executes_from_pickled_ir() -> None:
@@ -216,12 +223,12 @@ def test_relate_adapter_by_ref_resolves_dotted_path() -> None:
     assert [ref.role for ref in pairs.relations[0]] == ["image", "caption"]
 
 
-def test_relate_adapter_provenance_stores_dotted_path_not_object() -> None:
+def test_relate_adapter_is_stored_as_typed_dotted_path() -> None:
     relate = mg.Relate(
         Match,
         roles=("image", "caption"),
         relation_adapter="test.experimental.multigrain.relate_adapters:link_by_index",
     )
-    assert relate.op_recipe.provenance["relation_adapter"] == (
+    assert relate.relation_adapter == (
         "test.experimental.multigrain.relate_adapters:link_by_index"
     )

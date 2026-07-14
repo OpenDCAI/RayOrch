@@ -22,14 +22,14 @@ from ._utils import (
 from ..data.batch import ParentRef, PortBatch, _as_columns, _call_user
 from ._binding import BoundPrimitive, PrimitiveBinding
 from .output import PortBatchBuilder, RelationOutput
-from ..ir.model import (
-    NodeKind,
-    OperatorProperties,
-    PhysicalHints,
-    RecoveryPolicy,
-    SymbolicPort,
-    ensure_symbolic_ports,
+from ..ir.operations import (
+    KeyJoinSpec,
+    RelateOp,
+    RelationAdapterSpec,
 )
+from ..ir.policy import RecoveryPolicy, WorkerPoolSpec
+from ..ir.relations import RelatedFrom, RoleSource
+from ..tracing import TracePort, ensure_trace_ports
 
 
 def _resolve_adapter(ref: str) -> Callable[[Any], Any]:
@@ -68,8 +68,7 @@ class Relate(BoundPrimitive):
         relation_adapter: str | None = None,
         relation_fn: Any | None = None,
         num_outputs: int = 1,
-        properties: OperatorProperties | None = None,
-        physical: PhysicalHints | None = None,
+        workers: WorkerPoolSpec | None = None,
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ) -> None:
@@ -86,35 +85,21 @@ class Relate(BoundPrimitive):
         self.roles = tuple(roles)
         self.relation_adapter = relation_adapter
         self.relation_fn = relation_fn
-        provenance: dict[str, Any] = {}
-        if self.on is not None:
-            provenance["on"] = {
-                role: (getattr(field, "__name__", "<callable>") if callable(field) else field)
-                for role, field in self.on.items()
-            }
-        if relation_adapter is not None:
-            provenance["relation_adapter"] = relation_adapter
-        if relation_fn is not None:
-            provenance["relation_fn"] = getattr(
-                relation_fn, "__name__", type(relation_fn).__name__
-            )
         self._binding = PrimitiveBinding.create(
             op_cls,
             tuple(args),
             kwargs,
             name=name,
             num_outputs=1,
-            properties=properties,
-            physical=physical,
+            workers=workers,
             recovery=recovery,
-            provenance=provenance,
         )
 
     def __call__(
         self,
-        *ports: PortBatch | SymbolicPort,
-    ) -> PortBatch | SymbolicPort | tuple[SymbolicPort, ...]:
-        symbolic = ensure_symbolic_ports(ports)
+        *ports: PortBatch | TracePort,
+    ) -> PortBatch | TracePort | tuple[TracePort, ...]:
+        symbolic = ensure_trace_ports(ports)
         if symbolic is not None:
             self._binding.require_compilable("Relate")
             if self.on is not None and any(callable(field) for field in self.on.values()):
@@ -129,17 +114,33 @@ class Relate(BoundPrimitive):
                 )
             if self.roles and len(self.roles) != len(symbolic):
                 raise ValueError("Relate roles must match the number of input ports")
+            role_names = self.roles or tuple(port.name for port in symbolic)
+            if self.on is not None:
+                matcher = KeyJoinSpec(
+                    tuple((role, str(self.on[role])) for role in role_names)
+                )
+            elif self.relation_adapter is not None:
+                matcher = RelationAdapterSpec(self.relation_adapter)
+            else:
+                raise TypeError(
+                    "Relate compiled graphs require on= field names or "
+                    "relation_adapter='pkg.mod:fn'"
+                )
             return symbolic[0].tracer.add_node(
                 name=self.name,
-                kind=NodeKind.RELATE,
                 inputs=symbolic,
-                num_outputs=self.num_outputs,
-                output_grain=self.output_grain,
-                op=self.op_recipe,
-                properties=self.properties,
-                physical=self.physical,
+                operation=RelateOp(self.factory_spec, matcher),
+                output_grains=(self.output_grain,),
+                relations=(
+                    RelatedFrom(
+                        tuple(
+                            RoleSource(role, port.ref)
+                            for role, port in zip(role_names, symbolic)
+                        )
+                    ),
+                ),
                 recovery=self.recovery,
-                relation_roles=self.roles,
+                workers=self.workers,
             )
         if self.on is not None:
             if len(self.roles) != len(ports):
@@ -252,7 +253,7 @@ class Relate(BoundPrimitive):
 
         return PortBatchBuilder.related(
             rows,
-            name=self.name,
+            name=self.output_grain,
             errors=[error for port in ports for error in port.errors],
         )
 
@@ -348,7 +349,7 @@ class Relate(BoundPrimitive):
             )
         return PortBatchBuilder.related(
             rows,
-            name=self.name,
+            name=self.output_grain,
             errors=[error for port in ports for error in port.errors],
         )
 

@@ -38,7 +38,6 @@ def test_recovery_policy_decisions_are_scope_local() -> None:
         retry_timing="inline",
         max_shard_retries=3,
         on_shard_exhausted="degrade",
-        drain_scope="stage_global",
     )
 
     assert policy.decide_record(
@@ -60,18 +59,10 @@ def test_recovery_policy_round_trips_through_passive_ir() -> None:
 
     assert graph.nodes[0].recovery == policy
     encoded = graph.to_dict()["nodes"][0]["recovery"]
-    assert encoded == {
-        "max_record_retries": 1,
-        "retry_timing": "inline",
-        "max_shard_retries": 2,
-        "on_shard_exhausted": "abort",
-        "isolation": {
-            "max_work_factor": 3.0,
-            "max_calls": 64,
-            "on_exhausted": "quarantine",
-        },
-        "drain_scope": "stage_global",
-    }
+    assert encoded["type"] == "RecoveryPolicy"
+    assert encoded["max_record_retries"] == 1
+    assert encoded["retry_timing"] == "inline"
+    assert encoded["isolation"]["type"] == "IsolationBudget"
 
 
 def test_unimplemented_policy_is_rejected_instead_of_silently_ignored() -> None:

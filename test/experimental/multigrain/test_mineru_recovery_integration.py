@@ -7,7 +7,10 @@ import ray
 pytest.importorskip("PIL")
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ir import MissingChildPolicy, PhysicalHints
+from rayorch.experimental.multigrain.ir import (
+    IncompleteGroupPolicy,
+    WorkerPoolSpec,
+)
 from rayorch.experimental.multigrain.ray import MultigrainRayExecutor
 
 from test.experimental.multigrain.mineru_integration_ops import (
@@ -62,13 +65,13 @@ class RecoveryImagePipe(mg.Pipeline):
             op_cls,
             *op_args,
             name="recover_image",
-            physical=PhysicalHints(replicas=replicas),
+            workers=WorkerPoolSpec(replicas=replicas),
             recovery=policy,
         )
         self.assemble = mg.Reduce(
             AssembleDoc,
             name="assemble_recovery",
-            missing_child=MissingChildPolicy.FAIL_CLOSED,
+        missing_child=IncompleteGroupPolicy.FAIL_CLOSED,
         )
 
     def forward(self, docs):

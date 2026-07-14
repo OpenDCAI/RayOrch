@@ -6,14 +6,25 @@
 
 | 形式对象 | 代码 |
 |---|---|
+| 静态 port address | `GraphInputRef | NodeOutputRef`（`PortRef`） |
+| 静态逐输出关系 | `SameAs`、`SubsetOf`、`ChildrenOf`、`AggregateOf`、`RelatedFrom` |
+| 被动执行图 | `ExecutionGraph` / `NodeSpec` / `OutputSpec` |
+| 强制结构验证 | `verify_graph` |
 | record fields | `PortBatch` 平行数组（`values`, `record_ids`, `ancestors`, `ancestor_display`, `ordinals`, `lineage`），位于 `multigrain.data.batch` |
 | `take` | `PortBatch.take(indices)` |
 | `concat` | `multigrain.data.concat(batches)` |
 | shard/merge | `MultigrainRayExecutor._run_node`（`multigrain.ray.executor`，约第 133–165 行） |
-| shard plan | `shard_planner(node, inputs, replicas) -> list[list[int]]`；`lpt_shard_planner`、`_contiguous_ranges` |
+| shard plan 验证 | `validate_shard_plan(partitions, row_count)` |
 | Expand lineage | `PortBatchBuilder.expanded`（`multigrain.primitives.output`） |
 | Reduce regroup | `Reduce._groups_for`（`multigrain.primitives.expand_reduce`） |
 | Relate key-join | `Relate._make_key_join_batch`（`multigrain.primitives.relate`） |
+
+`ExecutionGraph` 的静态关系代数与运行时证据一一对应：
+`SameAs` 保留 identity，`SubsetOf` 保留 keyed subset，
+`ChildrenOf(parent, label)` 以 parent identity 与 ordinal 派生 child identity，
+`AggregateOf` 通过 `ancestors/ordinals` regroup，`RelatedFrom` 以有序 role-parent
+tuple 派生 M:N identity。`verify_graph` 检查 ref、grain 和 typed operation 配对；
+证明本身仍建立在 `PortBatch` 的 `record_ids/ancestors/ordinals` 上。
 
 ## 1. 数据模型
 
@@ -27,7 +38,9 @@
 
 （`display_keys` / `ancestor_display` 是相同数据的展示投影，且由 `take`/`concat` 原样承载，因此在证明中省略；它们遵循相同论证。）
 
-**批次。** 一个*批次* `B = [r_0, …, r_{n-1}]` 是记录的有限**序列**。`B[i]` 是第 i 个记录；`|B| = n`；`ids(B)` 为 ids 序列。
+**批次。** 一个*批次* `B = [r_0, …, r_{n-1}]` 是记录的有限**序列**。`B[i]` 是第 i 个记录；`|B| = n`；`ids(B)` 为 ids 序列。executor 还强制
+`PortBatch.name == OutputSpec.grain`，因此同一 graph port 的串行与物理执行也具有
+相同 grain。
 
 **端口不变量 I1（身份唯一性）。** 在系统产生的每个 port 上，ids 两两不同。（Sources 产生 `name:i`；`Expand` 产生 `op:parent_id:k`；`Relate` 产生 `op:role_1=pid_1|…|role_n=pid_n[|key=stable_key]`；`Map`/`Filter` 保留 ids。`Relate` 会拒绝没有不同 stable key 的重复 parent evidence。唯一性由构造维持。）
 
@@ -44,7 +57,9 @@
 
 **分片计划。** 一个 n 行 port 的*分片计划*为 indices lists 的元组 `σ = (σ_1,…,σ_m)`。仅当 `{σ_1,…,σ_m}` 是 `{0,…,n-1}` 的**集合分割**时它才**合法**：`σ_j` 两两不交，且 `⋃_j σ_j = {0,…,n-1}`。
 
-> `_contiguous_ranges` 显然产生合法计划。`lpt_shard_planner` 将每个 index `i` 恰好分配给一个 bin（遍历全部 `i` 的循环内的 `bins[target].append(i)`），故也产生合法计划。合法性是证明使用的 planner 的*唯一*性质——优化器可任意重排/再平衡。
+> Ray 对 planner 输出强制调用 `validate_shard_plan`，拒绝越界、重复或遗漏 index。
+> 因此合法性是运行时检查，而不只是 contiguous/LPT 实现约定；它也是证明使用的
+> planner 的唯一性质。
 
 **分片节点执行**（镜像 `_run_node`）：对输入为 `(P^0,…,P^t)`（port 0 是 base）的节点 `N`，以及 `|P^0|` 上的合法计划 `σ`：
 
@@ -54,7 +69,7 @@ Exec_σ(N)(P^0,…,P^t) = concat_j ( N( take(P^0,σ_j), …, take(P^t,σ_j) ) )
 
 按每个 output port 合并。`Serial(N) = N(P^0,…,P^t)` 是整批运行（`m = 1`，`σ_1 = [0..n-1]`）。
 
-**良构性 WF（共序输入）。** 对一个*分片的*多输入节点，所有输入 ports 以相同 id-order 呈现记录，即 `ids(P^0)=…=ids(P^t)`，故位置 `take(P^r, σ_j)` 在每个 port 上选择同一 id-set。（单输入分片节点平凡满足 WF。MVP 中仅 `Map`/`Filter`/`Expand` 被分片；节点内的 `_align_by_identity` 随后在 shard 内按 id 重新配对，若 WF 被违反则以可读错误*拒绝*，而不是悄然错误 join。）
+**良构性 WF（共序输入）。** 对一个*分片的*多输入节点，所有输入 ports 以相同 id-order 呈现记录，即 `ids(P^0)=…=ids(P^t)`，故位置 `take(P^r, σ_j)` 在每个 port 上选择同一 id-set。（单输入分片节点平凡满足 WF。当前 `Map`/`Filter`/`FilterByMask`/`Expand` 可被分片；Ray 在 planner 前直接检查 identity 顺序，节点内 `_align_by_identity` 再执行防御性校验。）
 
 ## 3. 重组引理
 
@@ -62,7 +77,7 @@ Exec_σ(N)(P^0,…,P^t) = concat_j ( N( take(P^0,σ_j), …, take(P^t,σ_j) ) )
 
 *证明。* 由合法性，每个 index `i ∈ {0..n-1}` 恰好出现于一个 `σ_j`，且在该列表中恰好一次，因此它被恰好一个 `take(B,σ_j)` 选择一次，且 `B[i]` 被完整复制。`concat` 聚集所有选中记录，故结果恰好包含每个 `B[i]` 一次 ⇒ 相同 id-set、相同 per-record fields、相同长度 ⇒ 为 `B` 的置换。∎
 
-## 4. 行独立算子（Map、Filter、Expand）
+## 4. 行独立算子（Map、Filter、FilterByMask、Expand）
 
 **定义（行独立）。** 若存在 per-row function `f_N`，使得对于已对齐输入行，输出是 per-row images 的有序串接，且 `f_N` 仅依赖 record content、不依赖该行位置或其他行，则 `N` 是*行独立的*：
 
@@ -74,11 +89,15 @@ N(P^0,…,P^t) = concat_i  f_N( aligned_i )
 
 - **Map** `f = ` 对已对齐行应用 UDF，保留 id/ancestors/ordinals，向 `ℓ` 追加 op。长度为 1。（`multigrain.primitives.map_filter`。）
 - **Filter** `f = ` 若 mask 为 true 则为 `[row]`，否则为 `[]`；保留行保持 identity。长度 0/1。（`multigrain.primitives.map_filter`。）
+- **FilterByMask** 是 Select lowering 的内部操作：对原 inputs 与 annotations 应用同一
+  row-local 0/1 决策，并消费而不输出 mask port。
 - **Expand** `f = ` 对 id 为 `p` 的 parent row，产生 children：
   `id = op:p:k`，`a' = a ∪ {portname ↦ p}`，`o' = o ∪ {portname ↦ k}`，
   `ℓ' = ℓ⧺[op]`，其中 `k = 0..k_p-1`。长度 `k_p`。仅依赖 parent record 自身的 value（UDF 看到 parent value 并返回其 group）。（`multigrain.primitives.output::PortBatchBuilder.expanded`。）
 
-每个 `f_N` 都是仅关于 record content 的纯函数——没有 `i`、没有 cross-row state——这正是重排安全的原因。
+每个 `f_N` 都必须是 aligned row values 的确定性纯函数——没有 `i`、batch-size
+依赖、cross-row mutable state 或执行顺序依赖。Python 无法静态证明该契约；违反者
+不在定理覆盖范围内。
 
 **引理 1（分片与行独立节点可交换）。** 对 WF 下的行独立 `N` 和任意合法计划 `σ`：`Exec_σ(N)(P) ≈ Serial(N)(P)`。
 

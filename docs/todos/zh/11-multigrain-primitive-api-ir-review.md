@@ -1,5 +1,9 @@
 # Multigrain 原始 API 和 IR 审查
 
+> 历史评审。工作负载分析仍可参考，但旧 IR 类名不再是当前 API。已实现的
+> `ExecutionGraph` 与 relation algebra 请见
+> [`rayorch/experimental/multigrain/README.md`](../../../rayorch/experimental/multigrain/README.md)。
+
 本文回顾了来自
 原始水平。关键问题不在于系统是否可以追踪 DAG。
 关键问题是每个面向用户的原语是否都有一个清晰的语义

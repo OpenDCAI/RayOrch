@@ -1,14 +1,8 @@
 # Overview：从用户程序到运行时
 
-## 1. 问题是什么
+## 1. 问题
 
-普通 batch pipeline 通常默认所有 stage 都处理“同一批行”：
-
-```text
-input row i → stage A row i → stage B row i
-```
-
-文档解析、视频处理和多模态数据准备并不满足这个假设：
+普通 batch pipeline 常假设每个 stage 都处理同一批行。对象流水线会改变粒度：
 
 ```text
 document 1:N page 1:N block
@@ -16,325 +10,166 @@ image M:N caption
 page N:1 document
 ```
 
-一旦粒度改变，运行时不仅要传值，还必须回答：
-
-1. 当前记录属于哪个逻辑粒度？
-2. page 是由哪个 document 产生的？
-3. 物理重排后 page 的原始顺序是什么？
-4. diamond fan-in 时应合并哪些 lineage？
-5. 某一 page 永久失败后，哪个 document 应被抑制？
-6. 哪些节点可以按行分片，哪些必须等待完整 group？
-
-Multigrain 的核心选择是：关系由 primitive 声明，identity 和 lineage 由框架维护，
-UDF 只处理业务值。
+运行时必须在物理重排后仍知道记录身份、祖先、逻辑顺序和故障归属。Multigrain 的核心
+选择是：primitive 声明值变换和 output relation，框架维护 identity/lineage，UDF
+只处理业务值。
 
 ## 2. 用户心智模型
 
-用户只需要理解四个概念：
-
-- **Grain**：记录的逻辑粒度，如 `document`、`page`、`block`；
+- **Grain**：记录的逻辑粒度，如 document、page；
 - **Port**：一组同 grain 的记录；
-- **Primitive**：值和粒度如何变化；
-- **Pipeline**：primitive 之间如何连接。
+- **Primitive**：一次 UDF invocation 及其 output relation；
+- **Pipeline**：primitive 连接成的 DAG。
 
-框架内部补充：
+框架内部还维护 record identity、ancestor、ordinal、lineage 和 recovery policy。
 
-- **Record identity**：不会暴露给 UDF 的稳定逻辑身份；
-- **Relation evidence**：parent、anchor 或 role parent 关系；
-- **Ordinal**：物理重排后恢复逻辑顺序的层级位置；
-- **Lineage**：记录经过的操作路径和祖先集合；
-- **Recovery policy**：失败如何重试、隔离或向下游传播。
-
-## 3. 五层架构
+## 3. 架构
 
 ```mermaid
 flowchart TD
-    User["用户 UDF 与 Pipeline"] --> Primitive["Primitive wrappers"]
-    Primitive --> Trace["GraphTracer"]
-    Trace --> PassiveIR["Passive MultigrainIR"]
-    PassiveIR --> Handler["PrimitiveHandlerRegistry"]
+    User["UDF + Pipeline"] --> Primitive["Primitive wrappers"]
+    Primitive --> Trace["tracing.py: GraphTracer"]
+    Trace --> Graph["Passive ExecutionGraph"]
+    Graph --> Verify["verify_graph"]
+    Verify --> Handler["OperationHandlerRegistry"]
     Handler --> Local["MultigrainExecutor"]
-    Local --> RayBackend["MultigrainRayExecutor"]
-
-    Batch["PortBatch data model"] --> Primitive
+    Handler --> Ray["MultigrainRayExecutor"]
+    Batch["PortBatch"] --> Primitive
     Batch --> Local
-    Contract["RelationSpec 与 Capability"] --> Handler
-    Contract --> RayBackend
+    Batch --> Ray
 ```
 
 ### 3.1 Data
 
-`data/batch.py` 保存运行时记录。它独立于 Ray，也不理解具体 primitive。最重要的类型是：
+`PortBatch` 把 `values` 与 `record_ids / ancestors / ordinals / lineage / relations`
+保存为严格对齐的列。`Grouped` 只声明 Reduce 的 anchor 和 descendants；真实 regroup
+发生在 Reduce runtime。`ErrorTrace` 与 `DeferredRecord` 支持故障归因和恢复。
 
-- `PortBatch`：一个逻辑 port 上同 grain 的一批记录；把业务 `values` 与
-  `record_ids / ancestors / ordinals / lineage` 等框架 metadata 保存为严格等长的平行列，
-  使物理重排不影响逻辑身份。
-- `ParentRef`：一条 M:N relation output 对某个输入 parent 的显式引用；通过
-  `role + port + record_id + display_key` 表达多父关系，避免把动态 relation 塞进单一
-  ancestor 链。
-- `ErrorTrace`：一个失败逻辑项的结构化 provenance；记录失败 grain、operator、祖先和
-  处置动作，使错误可以随 `PortBatch` 传播，并让下游 Reduce 精确定位受影响的 anchor。
-- `DeferredRecord`：暂缓重试的一条可归因记录；保存稳定 token、原始 singleton inputs
-  和失败信息，让 coordinator 能跨 microbatch 聚合后再执行 stage-global retry。
-- `NodeExecution`：handler 执行一次 node 的统一返回信封；同时携带正常
-  `outputs` 和待后续 drain 的 `deferred`，避免 executor 使用异常或旁路队列表达部分成功。
-- `Grouped`：`group_by(anchor, *descendants)` 产生的轻量声明对象；只描述 Reduce 的
-  anchor 与 descendant ports，不立即搬运或分组数据，真正 regroup 由 Reduce 根据
-  ancestry 完成。
+### 3.2 Tracing
 
-### 3.2 IR
+tracing 位于 `rayorch/experimental/multigrain/tracing.py`：
 
-`ir/model.py` 保存编译后的逻辑图：
+- `TracePort` 只存在于 `Pipeline.forward()` 的 symbolic tracing；
+- `GraphTracer` 收集 typed `NodeSpec`；
+- `Pipeline.compile()` 构造 `ExecutionGraph` 并立即调用 `verify_graph()`。
 
-- port 引用与 grain：用 `IRPortRef / IRPortSpec` 表达边的来源、输出序号和逻辑粒度，
-  让 graph connection 与 runtime object 解耦；
-- node 输入输出：`IRNode` 只保存 passive port specs，由 executor 在运行时用 ref 查找
-  对应的 `PortBatch`；
-- cardinality/relation contract：`CardinalityContract / RelationSpec` 描述 1:1、1:N、
-  N:1、M:N 语义，是 verifier 和 capability 推导的唯一事实来源；
-- operator reconstruction recipe：`OperatorRecipe` 保存 importable class path 与构造参数，
-  让 operator 能在 local process 或 Ray actor 内按需重建；
-- operator properties、physical hints、recovery policy：分别描述逻辑安全属性、物理执行
-  偏好和失败处置策略，三者都是声明而不是 live runtime state。
+trace-time token 和 live tracer 不进入最终图。
 
-IR 不保存：
+### 3.3 Passive ExecutionGraph
 
-- live operator instance：避免 compile 时加载模型或持有不可序列化资源；
-- `GraphTracer`：它只服务 symbolic tracing，结束后由 passive refs 替代；
-- handler：handler 是 execution strategy，可按执行环境选择，不属于逻辑图；
-- actor handle：actor 是某次 Ray execution 的临时物理资源；
-- runtime `PortBatch`：具体 values 与 lineage context 只存在于一次执行；
-- optimizer 推导缓存：Capability 等结论可由 IR 重算，避免形成第二份事实来源。
-
-### 3.3 Primitives
-
-`primitives/` 提供六种用户原语：
+`ir/` 按职责拆分：
 
 ```text
-Map      same grain, 1:1
-Filter   same grain, 0:1
-Select   annotate + filter
-Expand   parent grain → child grain, 1:N
-Reduce   descendant grain → anchor grain, N:1
-Relate   multiple roles → relation grain, M:N
+refs.py          GraphInputRef, NodeOutputRef, PortRef
+relations.py     SameAs, SubsetOf, ChildrenOf, AggregateOf, RelatedFrom
+operations.py    typed operation calls and OperatorFactorySpec
+graph.py         GraphInputSpec, OutputSpec, NodeSpec, ExecutionGraph
+policy.py        WorkerPoolSpec, RecoveryPolicy
+verify.py        verify_graph, validate_shard_plan
+capabilities.py  is_row_partitionable
 ```
 
-Primitive wrapper 同时支持 symbolic 和 eager 调用，因此它既是用户 DSL，也是唯一的
-primitive 语义实现。
+`OutputSpec(ref, grain, relation)` 是关系语义的直接事实来源。`NodeSpec` 包含 inputs、
+outputs、typed operation、worker pool 和 recovery policy。图中不保存 live operator、
+handler、actor、runtime `PortBatch` 或 optimizer state。
 
-### 3.4 Execution
+### 3.4 Operations and relations
 
-`execution/` 负责：
+Operation 与 output relation 是正交但受 verifier 约束的 typed sum：
 
-- 用 handler 把 passive recipe 还原成 wrapper：registry 将 IR node 解析为对应执行策略，
-  handler 再用 `OperatorRecipe` 重建 primitive；
-- 缓存每个 node 的 runtime/operator instance：一个 executor replica 内只构造一次 UDF，
-  同时校验同名 node 没有被另一份 recipe 错误复用；
-- 按拓扑执行：维护 `IRPortRef → PortBatch` context，只有 inputs ready 的 node 才能运行；
-- 调度多个 microbatch：coordinator 允许独立 branch 和不同 microbatch overlap，并通过
-  `max_inflight` 实现背压；
-- 收集 metrics：统一记录 rows、wall time、shard busy time、retry 和 lineage footprint，
-  不把观测逻辑写入 primitive。
+| Operation | 允许的 output relation |
+|---|---|
+| `MapOp` | `SameAs` |
+| `FilterOp` | `SubsetOf` |
+| `ExpandOp` | `ChildrenOf`；IR 也预留 `SameAs` mixed output |
+| `ReduceOp` | `AggregateOf` |
+| `RelateOp` | `RelatedFrom` |
+| `FilterByMaskOp` | `SubsetOf` |
 
-### 3.5 Ray backend
+`OperatorFactorySpec(import_path, args, kwargs)` 让 Local process 或 Ray actor 延迟构造
+operator。资源只由 `WorkerPoolSpec(replicas, gpus_per_worker)` 表达。
 
-`ray/` 只负责物理执行：
+### 3.5 Execution
 
-- row sharding：仅对 `row_partitionable` relation family 拆分 records，并保证 aligned
-  input ports 使用相同 row indexes；
-- contiguous/LPT shard planning：前者连续等分，后者按预计工作量做 longest-processing-
-  time 贪心均衡，二者只改变物理顺序；
-- persistent actor pools：对 GPU/model stage 或多 CPU replicas 长期复用 operator，
-  避免每个 shard 重复 import 和加载模型；
-- GPU placement：由 `PhysicalHints.num_gpus_per_replica` 转换为 Ray actor resource request；
-- bounded in-flight microbatches：复用通用 coordinator，在 object store 侧限制运行中和
-  已完成未消费 payload；
-- shard retry、actor replacement 和 adaptive isolation：区分数据失败与 actor 失败，
-  在预算内重试或二分定位坏记录，并只替换真正死亡的 replica。
+`OperationHandlerRegistry` 按 `type(node.operation)` 选择 handler，不依赖 enum kind 或
+class-name suffix。handler 从 `OperatorFactorySpec` 重建 wrapper，并复用 primitives 中
+唯一的 runtime semantics。
 
-它不重新实现 Map、Expand、Reduce 或 Relate 语义。
+Local 和 Ray 执行前都再次 `verify_graph()`。Local 按 graph node 顺序维护
+`PortRef → PortBatch` context，并校验每个 output `PortBatch.name ==
+OutputSpec.grain`。Map/Filter 保留 source grain，Expand 使用 `ChildrenOf.label`，
+Reduce 返回 anchor grain，Relate 使用 `output_grain`。Ray 在此语义之上加入 exact row
+sharding、persistent actor pool、microbatch coordinator 和 recovery。
 
-## 4. 两条执行路径
+## 4. Primitive core
 
-### 4.1 Eager
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Wrapper as PrimitiveWrapper
-    participant UDF
-    participant Builder as PortBatchBuilder
-
-    User->>Wrapper: wrapper(PortBatch)
-    Wrapper->>Wrapper: align/group/derive evidence
-    Wrapper->>UDF: run(value columns)
-    UDF-->>Wrapper: raw lists
-    Wrapper->>Wrapper: validate arity and shape
-    Wrapper->>Builder: values + explicit relation evidence
-    Builder-->>User: PortBatch outputs
-```
-
-适合单元测试和交互式开发。已构造的 operator instance 只允许走 eager 路径。
-
-### 4.2 Compiled
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Tracer as GraphTracer
-    participant IR as MultigrainIR
-    participant Registry as HandlerRegistry
-    participant Executor
-
-    User->>Tracer: Pipeline.compile()
-    Tracer->>User: SymbolicPort inputs
-    User->>Tracer: forward(SymbolicPort)
-    Tracer-->>IR: IRNode + RelationSpec + OperatorRecipe
-    Executor->>Registry: resolve(node)
-    Registry->>Registry: prepare wrapper from recipe
-    Executor->>Registry: execute(runtime, PortBatch inputs)
-    Registry-->>Executor: NodeExecution
-```
-
-compiled 路径仍调用相同 wrapper，因此 eager/compiled 不应有两套 shape、identity 或
-lineage 规则。
-
-## 5. 关键设计模式
-
-### 5.1 Symbolic tracing + passive IR
-
-`SymbolicPort` 类似 PyTorch FX Proxy：只存在于 `forward()` tracing 期间。
-`IRPortSpec` 才进入最终图。这样 IR 可序列化、可检查、与执行引擎无关。
-
-### 5.2 Composition over inheritance
-
-所有 primitive 继承薄的 `BoundPrimitive`，并组合 `PrimitiveBinding`：
-
-```mermaid
-classDiagram
-    class BoundPrimitive {
-        +name
-        +num_outputs
-        +op_recipe
-        +physical
-        +recovery
-    }
-    class PrimitiveBinding {
-        +op_cls
-        +recipe
-        +lazy_op
-    }
-    class Expand
-    class Reduce
-    class Relate
-
-    BoundPrimitive o-- PrimitiveBinding
-    BoundPrimitive <|-- Expand
-    BoundPrimitive <|-- Reduce
-    BoundPrimitive <|-- Relate
-```
-
-薄基类只复用声明样板，不抽象 parent、anchor、role 等不同关系语义。
-
-### 5.3 Builder
-
-`PortBatchBuilder` 集中维护平行 metadata 列的完整性，但调用方必须明确选择：
-
-- `preserved`：Map/Reduce 等输出保持某个 base port 的 identity，只替换 values 并追加
-  lineage；
-- `filtered`：按同一 mask 对 values 和全部 metadata 列同步取子集，避免列错位；
-- `expanded`：为每个 child 生成 parent-addressed ID、ancestor 与 child ordinal；
-- `related`：根据显式 `RelationOutput` 组装多父 `ParentRef`、合并 ancestry 和稳定 identity。
-
-Builder 不猜测 relation family。
-
-### 5.4 Strategy + Registry
-
-`PrimitiveHandlerRegistry` 根据 node kind 或 internal recipe 选择 handler。Handler：
-
-- `prepare()`：从 recipe 构造并缓存 wrapper；
-- `execute()`：适配 grouped input、record recovery 或 internal node。
-
-Handler 不拥有 actor、shard 或 stage lifecycle。
-
-### 5.5 Derived Capability
-
-Capability 是根据 `RelationSpec` 计算的执行视图，不是 IR 的第二份声明。这样避免：
+五个大 primitive 决定 invocation scope：
 
 ```text
-relation = REDUCE
-row_partitionable = true
+Map      aligned row-local 1:1
+Filter   aligned row-local 0:1
+Expand   parent-local 1:N
+Reduce   group-complete N:1
+Relate   cross-role M:N
 ```
 
-这样的矛盾状态。
+`Select` 不是第六种 core relation。它是 authoring macro：
 
-## 6. Operator factory 生命周期
+```mermaid
+flowchart LR
+    Inputs --> MapOp["MapOp: mask + annotations"]
+    Inputs --> FilterOp["FilterByMaskOp"]
+    MapOp --> FilterOp
+    FilterOp --> Outputs["filtered inputs + annotations"]
+```
 
-用户声明：
+`FilterByMaskOp` 使用 mask input 做过滤，但排除 mask port 本身，不把它暴露给用户。
+
+## 5. Capability
+
+Capability 不作为可变字段写入 graph。当前只有：
 
 ```python
-self.ocr = mg.Map(OcrPage, model="model/path")
+is_row_partitionable(node)
 ```
 
-保存的是：
+当前 Map、Filter、FilterByMask、Expand 可按 input rows 分片。Reduce 仍必须 whole-batch
+观察 `AggregateOf` groups，Relate 需要 cross-role context；这些是 operation semantics，
+不是另一个持久化或派生 capability。
 
-```python
-OperatorRecipe(
-    cls_ref="package.OcrPage",
-    args=(),
-    kwargs={"model": "model/path"},
-)
-```
+所有自定义 shard plan 都经过 `validate_shard_plan(partitions, row_count)`，必须无越界、
+无重复、无遗漏地覆盖每一行一次。
 
-而不是 `OcrPage()` 实例。执行时：
+## 6. 两条调用路径
 
-1. handler 加载 importable class；
-2. 构造 wrapper；
-3. `LazyOp` 首次访问时执行 `OcrPage(...)`；
-4. local executor 按 node 缓存 wrapper；
-5. Ray actor 中每个 replica 缓存自己的 wrapper/model。
+### Eager
 
-因此 compile 不占 GPU，persistent actor 也不会为每个 shard 重载模型。
+wrapper 接收 `PortBatch`，对齐/分组后调用 UDF，校验 shape，再由 output builder 维护
+metadata。适合 primitive 单测。
 
-## 7. 一个端到端记录的变化
+### Compiled
 
-假设输入：
+wrapper 接收 `TracePort`，记录 typed operation 和 per-output relation。executor 解析
+`NodeSpec` 后仍调用同一个 wrapper/runtime semantics，因此 eager、Local 和 Ray 不应
+各自维护 identity 或 lineage 规则。
 
-```text
-document record_id = documents:0
-display_key = a.pdf
-```
+## 7. Mixed-output identity forest
 
-Expand 第 2 个 page 后：
+新 IR/verifier 已能表达 node-local forest：一个 Expand output 可 `ChildrenOf` input 或
+更早 output，也可 `SameAs` input/更早 output；source 必须可用、grain 必须匹配、禁止
+self/forward source。
 
-```text
-record_id = SplitPages:documents:0:2
-display_key = a.pdf/page=2
-ancestors = {documents: documents:0}
-ordinals = {documents: 2}
-lineage = [SplitPages]
-```
+这只是**可表示、可验证**，不是已完成的用户功能。未来 `mg.out.same` /
+`mg.out.children` marker 和 runtime materializer 仍 deferred。当前 Expand wrapper/
+handler 只执行 shared-child cohort：所有 outputs 使用同一个 `ChildrenOf`，逐 parent
+group lengths 相同。
 
-Map OCR 后 identity 不变，只追加：
+## 8. 不变量
 
-```text
-lineage = [SplitPages, OcrPage]
-```
-
-Reduce 读取 `ancestors[documents]` regroup，并按从 `documents` 开始的完整 ordinal path
-排序，最终返回 document grain。
-
-## 8. 扩展框架时的判断顺序
-
-增加功能前依次回答：
-
-1. 这是新的用户逻辑关系，还是已有关系的新执行方式？
-2. 如果是逻辑关系，现有 `RelationKind` 是否能准确表达？
-3. output identity、ancestor、ordinal、relation evidence 如何定义？
-4. 该关系能否按 row partition？是否需要 group completion？
-5. verifier 能否在执行前拒绝不完整 contract？
-6. eager 与 compiled 是否调用同一个 authoritative implementation？
-7. Ray 是否只改变调度，而没有重写语义？
-
-如果只是在 Ray 中增加新调度，不应新增 primitive；如果 relation semantics 不同，也不应
-强行塞入现有 `PortBatchBuilder` 策略。
+1. UDF 只依赖 values，不观察内部 id 或物理位置；
+2. relation adapter 在重排下必须置换等变；
+3. physical shard/reorder 不改变 logical identity；
+4. aligned inputs 使用相同 partition；
+5. Reduce 执行前必须有完整 group；
+6. unsupported relation/runtime 组合显式失败；
+7. Ray 只改变物理调度，不重写 primitive semantics。

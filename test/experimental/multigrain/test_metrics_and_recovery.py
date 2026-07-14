@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ir import PhysicalHints
+from rayorch.experimental.multigrain.ir import WorkerPoolSpec
 from rayorch.experimental.multigrain.execution import RunMetrics, lineage_footprint
 from rayorch.experimental.multigrain.ray import (
     FaultSpec,
@@ -55,7 +55,9 @@ def _pipe(replicas: int) -> mg.Pipeline:
         def __init__(self) -> None:
             super().__init__()
             self.split = mg.Expand(MakeRows, parent=0, child_label="row")
-            self.embed = mg.Map(SleepMap, physical=PhysicalHints(replicas=replicas))
+            self.embed = mg.Map(
+                SleepMap, workers=WorkerPoolSpec(replicas=replicas)
+            )
             self.assemble = mg.Reduce(Assemble)
 
         def forward(self, docs):

@@ -57,6 +57,19 @@ def test_compiled_relate_rejects_callable_join_key() -> None:
         Pipe().compile()
 
 
+def test_compiled_relate_requires_passive_relation_evidence() -> None:
+    class Pipe(mg.Pipeline):
+        def __init__(self):
+            super().__init__()
+            self.relate = mg.Relate(_Identity, roles=("left", "right"))
+
+        def forward(self, left, right):
+            return self.relate(left, right)
+
+    with pytest.raises(TypeError, match="require on="):
+        Pipe().compile()
+
+
 def test_expand_validates_declared_output_arity() -> None:
     rows = mg.source(["a"], name="rows")
     with pytest.raises(ValueError, match="expected 2 outputs"):

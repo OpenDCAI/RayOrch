@@ -8,7 +8,7 @@ import pytest
 pytest.importorskip("PIL")
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ir import PhysicalHints
+from rayorch.experimental.multigrain.ir import WorkerPoolSpec
 from rayorch.experimental.multigrain.ray import (
     MultigrainRayExecutor,
     lpt_shard_planner,
@@ -75,7 +75,7 @@ class CompoundedFanoutPipe(mg.Pipeline):
             PowerLawImageFeature,
             sleep_scale,
             name="power_vision",
-            physical=PhysicalHints(replicas=REPLICAS),
+            workers=WorkerPoolSpec(replicas=REPLICAS),
         )
         self.assemble = mg.Reduce(AssembleDoc, name="assemble_power")
 

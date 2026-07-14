@@ -18,7 +18,7 @@ from __future__ import annotations
 import pytest
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ir import PhysicalHints
+from rayorch.experimental.multigrain.ir import WorkerPoolSpec
 from rayorch.experimental.multigrain.ray import MultigrainRayExecutor, lpt_shard_planner
 from rayorch.experimental.multigrain.ray.executor import _contiguous_ranges
 
@@ -60,7 +60,7 @@ class Pipe(mg.Pipeline):
     def __init__(self, embed_cls, replicas: int) -> None:
         super().__init__()
         self.split = mg.Expand(SplitPages, parent=0, child_label="page")
-        self.embed = mg.Map(embed_cls, physical=PhysicalHints(replicas=replicas))
+        self.embed = mg.Map(embed_cls, workers=WorkerPoolSpec(replicas=replicas))
         self.assemble = mg.Reduce(AssembleDoc)
 
     def forward(self, docs):

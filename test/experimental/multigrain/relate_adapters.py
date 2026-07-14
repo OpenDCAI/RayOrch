@@ -15,3 +15,18 @@ def link_by_index(raw_values: List[Any]) -> List[Tuple[Any, dict[str, int]]]:
         (value, {"image": index, "caption": index})
         for index, value in enumerate(raw_values)
     ]
+
+
+def pair_from_fields(raw_values: List[Any]) -> List[Tuple[Any, dict[str, int]]]:
+    """Use explicit invocation-local indexes emitted in each output value."""
+
+    return [
+        (
+            value,
+            {
+                "image": int(value["image_idx"]),
+                "caption": int(value["caption_idx"]),
+            },
+        )
+        for value in raw_values
+    ]

@@ -1,5 +1,10 @@
 # Multigrain Primitive API and IR Review
 
+> Historical review. Its workload analysis remains useful, but old IR class
+> names are not current API. See
+> [`rayorch/experimental/multigrain/README.md`](../../rayorch/experimental/multigrain/README.md)
+> for the implemented `ExecutionGraph` and relation algebra.
+
 This note reviews the experimental multigrain programming model from the
 primitive level. The key question is not whether the system can trace a DAG.
 The key question is whether each user-facing primitive has one clear semantic

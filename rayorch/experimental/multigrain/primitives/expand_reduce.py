@@ -16,14 +16,10 @@ from ..data.batch import (
     _as_columns,
     _call_user,
 )
-from ..ir.model import (
-    MissingChildPolicy,
-    OperatorProperties,
-    PhysicalHints,
-    RecoveryPolicy,
-    SymbolicPort,
-    ensure_symbolic_ports,
-)
+from ..ir.operations import ExpandOp, ReduceOp
+from ..ir.policy import RecoveryPolicy, WorkerPoolSpec
+from ..ir.relations import AggregateOf, ChildrenOf, IncompleteGroupPolicy
+from ..tracing import TracePort, ensure_trace_ports
 
 
 class Expand(BoundPrimitive):
@@ -37,8 +33,7 @@ class Expand(BoundPrimitive):
         child_label: str | None = None,
         name: str | None = None,
         num_outputs: int = 1,
-        properties: OperatorProperties | None = None,
-        physical: PhysicalHints | None = None,
+        workers: WorkerPoolSpec | None = None,
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ) -> None:
@@ -51,36 +46,30 @@ class Expand(BoundPrimitive):
             kwargs,
             name=name,
             num_outputs=num_outputs,
-            properties=properties,
-            physical=physical,
+            workers=workers,
             recovery=recovery,
-            provenance={
-                "parent": str(parent),
-                "child_label": self.child_label,
-            },
-            default_physical=PhysicalHints(prefer_rebatch=True),
         )
 
     def __call__(
         self,
-        *ports: PortBatch | SymbolicPort,
-    ) -> PortBatch | SymbolicPort | tuple[PortBatch, ...] | tuple[SymbolicPort, ...]:
+        *ports: PortBatch | TracePort,
+    ) -> PortBatch | TracePort | tuple[PortBatch, ...] | tuple[TracePort, ...]:
         if self.parent < 0 or self.parent >= len(ports):
             raise ValueError(f"parent input {self.parent} is out of range")
-        symbolic = ensure_symbolic_ports(ports)
+        symbolic = ensure_trace_ports(ports)
         if symbolic is not None:
             self._binding.require_compilable("Expand")
             return symbolic[0].tracer.add_node(
                 name=self.name,
-                kind="EXPAND",
                 inputs=symbolic,
-                num_outputs=self.num_outputs,
-                output_grain=self.name,
-                parent_input=self.parent,
-                op=self.op_recipe,
-                properties=self.properties,
-                physical=self.physical,
+                operation=ExpandOp(self.factory_spec),
+                output_grains=(self.child_label,) * self.num_outputs,
+                relations=(
+                    ChildrenOf(symbolic[self.parent].ref, self.child_label),
+                )
+                * self.num_outputs,
                 recovery=self.recovery,
+                workers=self.workers,
             )
         aligned = _align_by_identity(ports)
         parent_port = aligned[self.parent]
@@ -95,7 +84,8 @@ class Expand(BoundPrimitive):
         outputs = PortBatchBuilder.expanded(
             parent_port,
             group_outputs,
-            name=self.name,
+            grain=self.child_label,
+            op_name=self.name,
             child_label=self.child_label,
         )
         return outputs[0] if len(outputs) == 1 else outputs
@@ -137,9 +127,8 @@ class Reduce(BoundPrimitive):
         *args: Any,
         name: str | None = None,
         num_outputs: int = 1,
-        missing_child: "MissingChildPolicy | str" = MissingChildPolicy.FAIL_OPEN,
-        properties: OperatorProperties | None = None,
-        physical: PhysicalHints | None = None,
+        missing_child: "IncompleteGroupPolicy | str" = IncompleteGroupPolicy.FAIL_OPEN,
+        workers: WorkerPoolSpec | None = None,
         recovery: RecoveryPolicy | None = None,
         **kwargs: Any,
     ):
@@ -148,43 +137,44 @@ class Reduce(BoundPrimitive):
         # output (the UDF is not called for it) and emits an anchor-grain error, so
         # a permanently-lost child cascades to a flagged, *not-written* result
         # instead of a silently-truncated one.
-        self.missing = MissingChildPolicy(missing_child)
+        self.missing = IncompleteGroupPolicy(missing_child)
         self._binding = PrimitiveBinding.create(
             op_cls,
             tuple(args),
             kwargs,
             name=name,
             num_outputs=num_outputs,
-            properties=properties,
-            physical=physical,
+            workers=workers,
             recovery=recovery,
-            provenance={"missing_child": self.missing.value},
         )
 
     def __call__(
         self,
         grouped: Grouped,
-    ) -> PortBatch | SymbolicPort | tuple[PortBatch, ...] | tuple[SymbolicPort, ...]:
+    ) -> PortBatch | TracePort | tuple[PortBatch, ...] | tuple[TracePort, ...]:
         if not isinstance(grouped, Grouped):
             raise TypeError("Reduce expects orch.group_by(anchor, *descendants)")
         anchor = grouped.anchor
-        if isinstance(anchor, SymbolicPort):
+        if isinstance(anchor, TracePort):
             self._binding.require_compilable("Reduce")
             descendants = grouped.descendants
-            if not all(isinstance(port, SymbolicPort) for port in descendants):
+            if not all(isinstance(port, TracePort) for port in descendants):
                 raise TypeError("cannot mix symbolic and eager grouped ports")
             return anchor.tracer.add_node(
                 name=self.name,
-                kind="REDUCE",
                 inputs=(anchor, *descendants),
-                num_outputs=self.num_outputs,
-                output_grain=anchor.grain,
-                parent_input=0,
-                grouped=True,
-                op=self.op_recipe,
-                properties=self.properties,
-                physical=self.physical,
+                operation=ReduceOp(self.factory_spec),
+                output_grains=(anchor.grain,) * self.num_outputs,
+                relations=(
+                    AggregateOf(
+                        anchor=anchor.ref,
+                        members=tuple(port.ref for port in descendants),
+                        incomplete=self.missing,
+                    ),
+                )
+                * self.num_outputs,
                 recovery=self.recovery,
+                workers=self.workers,
             )
         grouped_values: List[List[List[Any]]] = [
             self._groups_for(anchor, descendant)
@@ -214,6 +204,7 @@ class Reduce(BoundPrimitive):
             name=self.name,
             op_name=self.name,
             errors=errors,
+            preserve_name=True,
         )
         return result[0] if len(result) == 1 else result
 
@@ -223,7 +214,7 @@ class Reduce(BoundPrimitive):
         errors: Sequence[ErrorTrace],
     ) -> set[str]:
         """Anchor record ids that have a lost descendant (only under FAIL_CLOSED)."""
-        if self.missing is not MissingChildPolicy.FAIL_CLOSED:
+        if self.missing is not IncompleteGroupPolicy.FAIL_CLOSED:
             return set()
         anchor_ids = set(anchor.record_ids)
         poisoned: set[str] = set()
@@ -319,7 +310,7 @@ class Reduce(BoundPrimitive):
                 None,
             )
             if anchor_position is None:
-                ordinal_path: tuple[Any, ...] = (row_index,)
+                ordinal_path: tuple[Any, ...] = ()
             else:
                 # Nested Expand contributes one ordinal per level.  Sorting only
                 # by the anchor's first child index restores page order but leaves

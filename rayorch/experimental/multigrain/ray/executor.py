@@ -1,10 +1,10 @@
 """Ray-backed executor for the experimental multigrain IR.
 
-This is the first, deliberately small, Ray *lowering* of the passive
-``MultigrainIR``. It proves two things the local ``MultigrainExecutor`` cannot:
+This is the Ray execution backend for the passive ``ExecutionGraph``. It proves
+two things the local ``MultigrainExecutor`` cannot:
 
 1. **Intra-node replica parallelism** -- row-independent nodes (``Map`` /
-   ``Filter`` / ``Expand``) are row-sharded across ``PhysicalHints.replicas`` Ray
+   ``Filter`` / ``Expand``) are row-sharded across ``WorkerPoolSpec.replicas`` Ray
    tasks and merged back while preserving record identity and lineage.
 2. **Pipeline microbatch overlap** -- a generic driver-side DAG coordinator
    advances bounded microbatches through persistent per-node actor pools.
@@ -27,14 +27,14 @@ from ..data.batch import DeferredRecord, ErrorTrace, NodeExecution, PortBatch, c
 from ..execution.coordinator import ExecutionCoordinator, GraphOutput
 from ..execution.local import MultigrainExecutor
 from ..execution.metrics import NodeMetric, RunMetrics
-from ..ir.capabilities import capabilities_for
-from ..ir.model import (
-    IRNode,
+from ..ir.capabilities import is_row_partitionable
+from ..ir.graph import ExecutionGraph, NodeSpec
+from ..ir.operations import MapOp, operation_name
+from ..ir.policy import (
     IsolationExhaustedAction,
-    MultigrainIR,
-    NodeKind,
     ShardRecoveryAction,
 )
+from ..ir.verify import validate_shard_plan, verify_graph
 
 class InjectedFault(RuntimeError):
     """Raised inside a Ray task to simulate a task/node crash (fault injection)."""
@@ -75,9 +75,8 @@ class FaultSpec:
 
 @ray.remote
 def _run_node_remote(
-    node: IRNode,
+    node: NodeSpec,
     inputs: Sequence[PortBatch],
-    relation_fn: Callable[[Any], Any] | None,
     fail: bool = False,
     force_inline: bool = False,
 ) -> tuple[NodeExecution, float]:
@@ -89,8 +88,7 @@ def _run_node_remote(
     """
     if fail:
         raise InjectedFault(f"injected fault in node '{node.name}'")
-    relation_fns = {node.name: relation_fn} if relation_fn is not None else None
-    executor = MultigrainExecutor(relation_fns=relation_fns)
+    executor = MultigrainExecutor()
     start = time.perf_counter()
     result = executor._execute_node_result(
         node,
@@ -107,19 +105,17 @@ class _StageActor:
     Mirrors :class:`rayorch.ray_module.RunnerActor`: the operator is instantiated
     exactly once at actor construction (its ``__init__`` loads the model), then
     reused across every shard and every microbatch/chunk routed to this actor.
-    The op class + init args come from the node's ``OperatorRecipe``, so the user
-    only writes ``__init__`` + ``run`` and declares ``PhysicalHints`` -- no driver
+    The op class + init args come from ``OperatorFactorySpec``, so the user only
+    writes ``__init__`` + ``run`` and declares ``WorkerPoolSpec`` -- no driver
     ever instantiates the model.
     """
 
     def __init__(
         self,
-        node: IRNode,
-        relation_fn: Callable[[Any], Any] | None = None,
+        node: NodeSpec,
     ) -> None:
-        relation_fns = {node.name: relation_fn} if relation_fn is not None else None
         self._node = node
-        self._exec = MultigrainExecutor(relation_fns=relation_fns)
+        self._exec = MultigrainExecutor()
         self._exec.warm(node)  # pay model-load cost now, not on the first shard
 
     def run_shard(
@@ -157,22 +153,20 @@ def _contiguous_ranges(total: int, parts: int) -> list[range]:
 
 
 class MultigrainRayExecutor:
-    """Execute a ``MultigrainIR`` on Ray with replica and microbatch parallelism."""
+    """Execute an ``ExecutionGraph`` with replica and microbatch parallelism."""
 
     def __init__(
         self,
         *,
-        relation_fns: Mapping[str, Callable[[Any], Any]] | None = None,
         default_replicas: int = 1,
         shard_planner: Callable[
-            [IRNode, Sequence[PortBatch], int], Sequence[Sequence[int]] | None
+            [NodeSpec, Sequence[PortBatch], int], Sequence[Sequence[int]] | None
         ]
         | None = None,
         metrics: RunMetrics | None = None,
         faults: Sequence[FaultSpec] | None = None,
         max_retries: int | None = None,
     ) -> None:
-        self.relation_fns = dict(relation_fns or {})
         self.default_replicas = max(1, int(default_replicas))
         # Optional policy: given (node, inputs, replicas) -> per-shard row-index
         # lists. Returning None falls back to contiguous ranges. This is where
@@ -190,7 +184,8 @@ class MultigrainRayExecutor:
         # lazily on first use and reused across every execute()/microbatch/chunk
         # so the model loads once per replica for the whole run.
         self._pools: dict[str, list[Any]] = {}
-        self._pool_nodes: dict[str, IRNode] = {}
+        self._pool_nodes: dict[str, NodeSpec] = {}
+        self._pool_cursor: dict[str, int] = {}
         self._pool_lock = threading.Lock()
 
     def _fault_for(self, node_name: str) -> FaultSpec | None:
@@ -202,7 +197,7 @@ class MultigrainRayExecutor:
     # -- single-graph execution with intra-node replica parallelism ----------
     def execute(
         self,
-        graph: MultigrainIR,
+        graph: ExecutionGraph,
         inputs: Mapping[str, PortBatch],
     ) -> PortBatch | tuple[PortBatch, ...]:
         """Execute one input through the same coordinator used for streams."""
@@ -218,7 +213,7 @@ class MultigrainRayExecutor:
 
     def execute_stream(
         self,
-        graph: MultigrainIR,
+        graph: ExecutionGraph,
         microbatch_inputs: Iterable[Mapping[str, PortBatch]],
         *,
         max_inflight: int = 1,
@@ -228,31 +223,32 @@ class MultigrainRayExecutor:
 
         The coordinator schedules nodes when all their input ports are ready, so
         independent branches and different microbatches can overlap.  It never
-        inspects workload-specific node names or kinds; sharding, retries, actor
+        inspects workload-specific node names or operation types; sharding, retries, actor
         placement, metrics, and operator semantics stay in ``_run_node``.
 
         Results preserve input order by default.  Completed-but-unconsumed
         results count against ``max_inflight``, providing end-to-end backpressure
         and bounding payloads retained in Ray's object store.
         """
+        verify_graph(graph)
         unsupported = [
             node.name
             for node in graph.nodes
             if (
                 node.recovery.max_record_retries > 0
-                and node.kind is not NodeKind.MAP
+                and not isinstance(node.operation, MapOp)
             )
             or (
                 node.recovery.decide_shard(
                     attempt=node.recovery.max_shard_retries
                 )
                 is ShardRecoveryAction.DEGRADE
-                and not capabilities_for(node).row_partitionable
+                and not is_row_partitionable(node)
             )
         ]
         if unsupported:
             raise NotImplementedError(
-                "unsupported recovery policy/node-kind combination; "
+                "unsupported recovery policy/operation combination; "
                 f"nodes={unsupported}"
             )
         self.warm_pools(graph)
@@ -267,7 +263,7 @@ class MultigrainRayExecutor:
 
     def _drain_node(
         self,
-        node: IRNode,
+        node: NodeSpec,
         items: tuple[DeferredRecord, ...],
     ) -> NodeExecution:
         """Repack deferred singleton rows and force their record retry inline."""
@@ -309,14 +305,14 @@ class MultigrainRayExecutor:
             errors=[],
         )
 
-    def _replicas_for(self, node: IRNode) -> int:
-        hint = node.physical.replicas if node.physical else 1
+    def _replicas_for(self, node: NodeSpec) -> int:
+        hint = node.workers.replicas
         return max(self.default_replicas, int(hint or 1))
 
-    def _num_gpus_for(self, node: IRNode) -> float:
-        return float(node.physical.num_gpus_per_replica if node.physical else 0.0)
+    def _num_gpus_for(self, node: NodeSpec) -> float:
+        return float(node.workers.gpus_per_worker)
 
-    def _use_pool(self, node: IRNode) -> bool:
+    def _use_pool(self, node: NodeSpec) -> bool:
         """Run on a persistent actor pool when it pays off.
 
         * GPU / model-holding stages: always (never reload the model).
@@ -326,13 +322,12 @@ class MultigrainRayExecutor:
 
         Everything else stays on cheap stateless tasks.
         """
-        if not capabilities_for(node).row_partitionable:
-            return False
-        if self._num_gpus_for(node) > 0.0:
-            return True
-        return self._replicas_for(node) > 1
+        return (
+            self._num_gpus_for(node) > 0.0
+            or self._replicas_for(node) > 1
+        )
 
-    def _pool_for(self, node: IRNode, replicas: int) -> list[Any]:
+    def _pool_for(self, node: NodeSpec, replicas: int) -> list[Any]:
         # execute_stream may discover independent ready branches concurrently.
         # Serialize pool construction so a node never gets duplicate actor sets.
         with self._pool_lock:
@@ -341,7 +336,7 @@ class MultigrainRayExecutor:
                 if self._pool_nodes[node.name] != node or len(pool) != replicas:
                     raise ValueError(
                         f"actor pool name collision for node '{node.name}'; "
-                        "use a separate executor for a different graph/node recipe"
+                        "use a separate executor for a different graph/node factory"
                     )
                 return pool
             pool = [self._new_actor(node) for _ in range(replicas)]
@@ -351,17 +346,22 @@ class MultigrainRayExecutor:
             self._pool_nodes[node.name] = node
             return pool
 
-    def _new_actor(self, node: IRNode) -> Any:
+    def _new_actor(self, node: NodeSpec) -> Any:
         num_gpus = self._num_gpus_for(node)
-        relation_fn = self.relation_fns.get(node.name)
         actor_cls = (
             _StageActor.options(num_gpus=num_gpus) if num_gpus else _StageActor
         )
-        return actor_cls.remote(node, relation_fn)
+        return actor_cls.remote(node)
+
+    def _claim_pool_slot(self, node_name: str, size: int) -> int:
+        with self._pool_lock:
+            slot = self._pool_cursor.get(node_name, 0) % size
+            self._pool_cursor[node_name] = slot + 1
+            return slot
 
     def _replace_actor(
         self,
-        node: IRNode,
+        node: NodeSpec,
         replica: int,
         failed_actor: Any,
     ) -> None:
@@ -383,7 +383,7 @@ class MultigrainRayExecutor:
             ray.get(replacement.ping.remote())
             pool[replica] = replacement
 
-    def warm_pools(self, graph: MultigrainIR) -> None:
+    def warm_pools(self, graph: ExecutionGraph) -> None:
         """Pre-create persistent actor pools (loading their models) before timing.
 
         Lets a benchmark exclude one-time model-load cost from wall time, matching
@@ -400,12 +400,12 @@ class MultigrainRayExecutor:
                 ray.kill(actor)
         self._pools.clear()
         self._pool_nodes.clear()
+        self._pool_cursor.clear()
 
     def _submit(
         self,
-        node: IRNode,
+        node: NodeSpec,
         inputs: tuple[PortBatch, ...],
-        relation_fn: Callable[[Any], Any] | None,
         fail: bool = False,
         force_inline: bool = False,
     ) -> Any:
@@ -413,11 +413,11 @@ class MultigrainRayExecutor:
         remote = (
             _run_node_remote.options(num_gpus=num_gpus) if num_gpus else _run_node_remote
         )
-        return remote.remote(node, inputs, relation_fn, fail, force_inline)
+        return remote.remote(node, inputs, fail, force_inline)
 
     def _run_shards(
         self,
-        node: IRNode,
+        node: NodeSpec,
         shard_inputs: list[tuple[PortBatch, ...]],
         submit_shard: Callable[
             [int, tuple[PortBatch, ...], int],
@@ -507,7 +507,7 @@ class MultigrainRayExecutor:
 
     def _localize_shard(
         self,
-        node: IRNode,
+        node: NodeSpec,
         shard_index: int,
         inputs: tuple[PortBatch, ...],
         submit_shard: Callable[
@@ -600,7 +600,7 @@ class MultigrainRayExecutor:
 
     def _quarantine_outputs(
         self,
-        node: IRNode,
+        node: NodeSpec,
         inputs: tuple[PortBatch, ...],
         error: BaseException,
     ) -> NodeExecution:
@@ -625,7 +625,7 @@ class MultigrainRayExecutor:
         return NodeExecution(
             tuple(
                 PortBatch(
-                    name=spec.name or spec.ref.port,
+                    name=spec.grain,
                     values=[],
                     record_ids=[],
                     display_keys=[],
@@ -635,19 +635,21 @@ class MultigrainRayExecutor:
                     lineage=[],
                     errors=list(traces),
                 )
-                for spec in node.output_specs
+                for spec in node.outputs
             )
         )
 
     @staticmethod
     def _merge_leaf_outputs(
-        node: IRNode,
+        node: NodeSpec,
         leaves: Sequence[tuple[tuple[int, ...], NodeExecution]],
     ) -> NodeExecution:
         merged: list[PortBatch] = []
-        for output_index, spec in enumerate(node.output_specs):
+        for output_index, spec in enumerate(node.outputs):
             parts = [result.outputs[output_index] for _, result in leaves]
-            merged.append(concat(parts, name=parts[0].name if parts else spec.name))
+            merged.append(
+                concat(parts, name=parts[0].name if parts else spec.grain)
+            )
         deferred = tuple(
             item
             for _, result in leaves
@@ -657,16 +659,15 @@ class MultigrainRayExecutor:
 
     def _run_node(
         self,
-        node: IRNode,
+        node: NodeSpec,
         inputs: tuple[PortBatch, ...],
         *,
         force_inline: bool = False,
     ) -> NodeExecution:
-        relation_fn = self.relation_fns.get(node.name)
         fault = self._fault_for(node.name)
         replicas = (
             self._replicas_for(node)
-            if capabilities_for(node).row_partitionable
+            if is_row_partitionable(node)
             else 1
         )
         nrows = len(inputs[0]) if inputs else 0
@@ -674,20 +675,27 @@ class MultigrainRayExecutor:
         if replicas <= 1 or nrows <= 1:
             # Even the single-shard path uses the persistent pool for GPU stages
             # so the model is not reloaded per call.
+            runtime_replicas = 1
             if self._use_pool(node):
-                pool = self._pool_for(node, replicas=1)
+                pool = self._pool_for(
+                    node,
+                    replicas=self._replicas_for(node),
+                )
+                runtime_replicas = len(pool)
+                start_slot = self._claim_pool_slot(node.name, len(pool))
                 def submit(s, shard, attempt):
                     fail = (
                         fault.should_fail(node.name, s, attempt)
                         if fault
                         else False
                     )
-                    actor = pool[0]
+                    replica = (start_slot + attempt) % len(pool)
+                    actor = pool[replica]
                     return actor.run_shard.remote(
                         shard,
                         fail,
                         force_inline,
-                    ), 0, actor
+                    ), replica, actor
             else:
                 def submit(s, shard, attempt):
                     fail = (
@@ -698,7 +706,6 @@ class MultigrainRayExecutor:
                     return self._submit(
                         node,
                         shard,
-                        relation_fn,
                         fail,
                         force_inline,
                     ), None, None
@@ -711,18 +718,29 @@ class MultigrainRayExecutor:
                 inputs,
                 result.outputs,
                 shard_busy,
-                1,
+                runtime_replicas,
                 retries,
                 rec_rows,
             )
             return result
 
         partitions: Sequence[Sequence[int]] | None = None
+        if len(inputs) > 1:
+            base_ids = inputs[0].record_ids
+            if any(port.record_ids != base_ids for port in inputs[1:]):
+                raise ValueError(
+                    f"row-partitioned node '{node.name}' requires identity-aligned "
+                    "inputs in the same order"
+                )
         if self.shard_planner is not None:
             partitions = self.shard_planner(node, inputs, replicas)
         if partitions is None:
             partitions = [list(rng) for rng in _contiguous_ranges(nrows, replicas)]
-        partitions = [list(idx) for idx in partitions if len(idx) > 0]
+        partitions = [
+            list(indices)
+            for indices in validate_shard_plan(partitions, nrows)
+            if indices
+        ]
 
         shard_inputs = [
             tuple(port.take(idx) for port in inputs) for idx in partitions
@@ -752,7 +770,6 @@ class MultigrainRayExecutor:
                 return self._submit(
                     node,
                     shard,
-                    relation_fn,
                     fail,
                     force_inline,
                 ), None, None
@@ -761,7 +778,7 @@ class MultigrainRayExecutor:
         )
 
         merged: list[PortBatch] = []
-        for output_index in range(len(node.output_refs)):
+        for output_index in range(len(node.outputs)):
             parts = [result.outputs[output_index] for result in shard_outputs]
             merged.append(concat(parts, name=parts[0].name))
         deferred = tuple(
@@ -776,7 +793,7 @@ class MultigrainRayExecutor:
 
     def _record(
         self,
-        node: IRNode,
+        node: NodeSpec,
         inputs: tuple[PortBatch, ...],
         outputs: Sequence[PortBatch],
         shard_busy: list[float],
@@ -789,7 +806,7 @@ class MultigrainRayExecutor:
         self.metrics.record(
             NodeMetric(
                 name=node.name,
-                kind=node.kind.value,
+                kind=operation_name(node.operation),
                 replicas=replicas,
                 rows_in=len(inputs[0]) if inputs else 0,
                 rows_out=len(outputs[0]) if outputs else 0,
@@ -803,7 +820,7 @@ class MultigrainRayExecutor:
     # -- multi-microbatch execution with bounded overlap ---------------------
     def execute_microbatches(
         self,
-        graph: MultigrainIR,
+        graph: ExecutionGraph,
         microbatch_inputs: Sequence[Mapping[str, PortBatch]],
         *,
         max_inflight: int = 1,
@@ -821,7 +838,7 @@ class MultigrainRayExecutor:
 
 def lpt_shard_planner(
     weight_of: Callable[[Any], float],
-) -> Callable[[IRNode, Sequence[PortBatch], int], list[list[int]]]:
+) -> Callable[[NodeSpec, Sequence[PortBatch], int], list[list[int]]]:
     """Work-aware shard planner (Longest-Processing-Time greedy bin packing).
 
     Given a per-row weight (e.g. a page's content length), it balances *total
@@ -831,7 +848,7 @@ def lpt_shard_planner(
     order via ordinals, so reordering rows across shards is safe.
     """
 
-    def plan(node: IRNode, inputs: Sequence[PortBatch], replicas: int) -> list[list[int]]:
+    def plan(node: NodeSpec, inputs: Sequence[PortBatch], replicas: int) -> list[list[int]]:
         base = inputs[0]
         weights = [float(weight_of(value)) for value in base.values]
         order = sorted(range(len(weights)), key=lambda i: -weights[i])

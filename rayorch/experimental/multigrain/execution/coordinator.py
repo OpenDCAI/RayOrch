@@ -13,19 +13,20 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Mapping
 
 from ..data.batch import DeferredRecord, ErrorTrace, NodeExecution, PortBatch, concat
-from ..ir.model import IRNode, IRPortRef, MultigrainIR
+from ..ir.graph import ExecutionGraph, NodeSpec
+from ..ir.refs import PortRef
 
 
 GraphOutput = PortBatch | tuple[PortBatch, ...]
-RunNode = Callable[[IRNode, tuple[PortBatch, ...]], NodeExecution]
-DrainNode = Callable[[IRNode, tuple[DeferredRecord, ...]], NodeExecution]
+RunNode = Callable[[NodeSpec, tuple[PortBatch, ...]], NodeExecution]
+DrainNode = Callable[[NodeSpec, tuple[DeferredRecord, ...]], NodeExecution]
 
 
 @dataclass
 class _MicrobatchState:
     index: int
-    context: dict[IRPortRef, PortBatch]
-    pending: dict[str, IRNode]
+    context: dict[PortRef, PortBatch]
+    pending: dict[str, NodeSpec]
     running: set[str] = field(default_factory=set)
 
     @property
@@ -36,7 +37,7 @@ class _MicrobatchState:
 @dataclass
 class _DeferredCompletion:
     state: _MicrobatchState
-    node: IRNode
+    node: NodeSpec
     inputs: tuple[PortBatch, ...]
     result: NodeExecution
 
@@ -52,7 +53,7 @@ class ExecutionCoordinator:
 
     def __init__(
         self,
-        graph: MultigrainIR,
+        graph: ExecutionGraph,
         run_node: RunNode,
         *,
         max_inflight: int,
@@ -73,7 +74,7 @@ class ExecutionCoordinator:
         active: dict[int, _MicrobatchState] = {}
         futures: dict[
             Future[NodeExecution],
-            tuple[int, IRNode, tuple[PortBatch, ...]],
+            tuple[int, NodeSpec, tuple[PortBatch, ...]],
         ] = {}
         deferred_by_node: dict[str, list[_DeferredCompletion]] = {}
         ready: dict[int, GraphOutput] = {}
@@ -89,9 +90,9 @@ class ExecutionCoordinator:
 
             def schedule_ready(state: _MicrobatchState) -> None:
                 for name, node in list(state.pending.items()):
-                    if not all(ref in state.context for ref in node.input_refs):
+                    if not all(ref in state.context for ref in node.inputs):
                         continue
-                    inputs = tuple(state.context[ref] for ref in node.input_refs)
+                    inputs = tuple(state.context[ref] for ref in node.inputs)
                     del state.pending[name]
                     state.running.add(name)
                     future = threads.submit(self.run_node, node, inputs)
@@ -100,12 +101,12 @@ class ExecutionCoordinator:
             def finish_if_done(state: _MicrobatchState) -> None:
                 if not state.done:
                     return
-                missing = [ref for ref in self.graph.graph_outputs if ref not in state.context]
+                missing = [ref for ref in self.graph.outputs if ref not in state.context]
                 if missing:
                     raise RuntimeError(
                         f"microbatch {state.index} finished without graph outputs {missing}"
                     )
-                outputs = tuple(state.context[ref] for ref in self.graph.graph_outputs)
+                outputs = tuple(state.context[ref] for ref in self.graph.outputs)
                 ready[state.index] = outputs[0] if len(outputs) == 1 else outputs
                 if not self.ordered:
                     completion_order.append(state.index)
@@ -125,7 +126,7 @@ class ExecutionCoordinator:
                     except StopIteration:
                         source_exhausted = True
                         break
-                    context: dict[IRPortRef, PortBatch] = {}
+                    context: dict[PortRef, PortBatch] = {}
                     for spec in self.graph.inputs:
                         if spec.name not in inputs:
                             raise KeyError(

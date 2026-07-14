@@ -6,12 +6,15 @@ import pytest
 
 from rayorch.experimental import multigrain as mg
 from rayorch.experimental.multigrain.ir import (
-    MaterializePolicy,
-    MaterializeReason,
-    NodeKind,
-    RelationKind,
+    AggregateOf,
+    ChildrenOf,
+    ExpandOp,
+    GraphValidationError,
+    MapOp,
+    NodeOutputRef,
+    SameAs,
+    verify_graph,
 )
-from rayorch.experimental.multigrain.ir import PassManager, VerifyPass
 
 from test.experimental.multigrain.test_pdf_mvp import (
     Assemble,
@@ -42,132 +45,87 @@ class TraceMineruPipe(mg.Pipeline):
         return self.assemble(mg.group_by(pdfs, texts, page_meta))
 
 
-def test_compile_traces_multigrain_pdf_dag_contracts() -> None:
+def test_compile_traces_minimal_relation_execution_graph() -> None:
     graph = TraceMineruPipe().compile()
 
-    assert graph.topo_order == (
+    assert tuple(node.name for node in graph.nodes) == (
         "PdfToImages",
         "Layout",
         "OCR",
         "Assemble",
     )
 
-    pdf_to_images = graph.node("PdfToImages")
-    assert pdf_to_images.kind == "EXPAND"
-    assert pdf_to_images.parent_input == 0
-    assert [port.name for port in pdf_to_images.outputs] == [
-        "PdfToImages",
-        "PdfToImages_1",
+    expand = graph.node("PdfToImages")
+    assert isinstance(expand.operation, ExpandOp)
+    assert [output.name for output in expand.outputs] == ["out", "out_1"]
+    assert [output.grain for output in expand.outputs] == [
+        "page",
+        "page",
     ]
-    assert [port.grain for port in pdf_to_images.outputs] == [
-        "PdfToImages",
-        "PdfToImages",
-    ]
+    assert all(isinstance(output.relation, ChildrenOf) for output in expand.outputs)
+    assert all(
+        output.relation.parent == graph.inputs[0].ref
+        for output in expand.outputs
+        if isinstance(output.relation, ChildrenOf)
+    )
 
     layout = graph.node("Layout")
-    assert layout.kind == "MAP"
-    assert [port.node for port in layout.inputs] == ["PdfToImages"]
-    assert layout.outputs[0].grain == "PdfToImages"
+    assert isinstance(layout.operation, MapOp)
+    assert layout.inputs == (expand.outputs[0].ref,)
+    assert isinstance(layout.outputs[0].relation, SameAs)
 
     ocr = graph.node("OCR")
-    assert ocr.kind == "MAP"
-    assert [port.node for port in ocr.inputs] == ["PdfToImages", "Layout"]
-    assert ocr.outputs[0].grain == "PdfToImages"
-
-    assemble = graph.node("Assemble")
-    assert assemble.kind == "REDUCE"
-    assert assemble.grouped is True
-    assert assemble.parent_input == 0
-    assert [port.node for port in assemble.inputs] == [
-        "__input__pdfs",
-        "OCR",
-        "PdfToImages",
-    ]
-    assert assemble.outputs[0].grain == "pdfs"
-    assert [port.node for port in graph.outputs] == ["Assemble"]
-
-
-def test_ir_records_relation_contracts_and_derived_graph_indexes() -> None:
-    graph = TraceMineruPipe().compile()
-
-    expand = graph.node("PdfToImages")
-    assert expand.contract.kind == NodeKind.EXPAND
-    assert [relation.relation for relation in expand.contract.relations] == [
-        RelationKind.EXPAND,
-        RelationKind.EXPAND,
-    ]
-    assert [relation.parent_input for relation in expand.contract.relations] == [0, 0]
-    assert [spec.ref.port for spec in expand.output_specs] == ["out", "out_1"]
-    assert [spec.grain for spec in expand.output_specs] == [
-        "PdfToImages",
-        "PdfToImages",
-    ]
-    assert expand.physical.prefer_rebatch is True
+    assert isinstance(ocr.operation, MapOp)
+    assert ocr.inputs == (expand.outputs[0].ref, layout.outputs[0].ref)
+    assert ocr.outputs[0].grain == "page"
 
     reduce = graph.node("Assemble")
-    assert reduce.contract.kind == NodeKind.REDUCE
-    assert reduce.contract.relations[0].relation == RelationKind.REDUCE
-    assert reduce.contract.relations[0].anchor.node == "__input__pdfs"
-    assert reduce.output_specs[0].grain == "pdfs"
+    relation = reduce.outputs[0].relation
+    assert isinstance(relation, AggregateOf)
+    assert relation.anchor == graph.inputs[0].ref
+    assert relation.members == (ocr.outputs[0].ref, expand.outputs[1].ref)
+    assert reduce.outputs[0].grain == "pdfs"
+    assert graph.outputs == (reduce.outputs[0].ref,)
 
-    assert graph.deps == {
+
+def test_graph_indexes_are_derived_from_port_refs() -> None:
+    graph = TraceMineruPipe().compile()
+
+    assert graph.dependencies == {
         "PdfToImages": (),
         "Layout": ("PdfToImages",),
         "OCR": ("PdfToImages", "Layout"),
         "Assemble": ("OCR", "PdfToImages"),
     }
     assert graph.consumers["PdfToImages"] == ("Layout", "OCR", "Assemble")
-    assert graph.graph_outputs[0].node == "Assemble"
 
 
-def test_ir_is_displayable_and_serializable_without_live_tracer_state() -> None:
+def test_graph_is_displayable_serializable_and_has_no_trace_state() -> None:
     graph = TraceMineruPipe().compile()
-    graph = graph.with_materialization(
-        graph.outputs[0],
-        policy=MaterializePolicy.ON_FAILURE,
-        reason=MaterializeReason.TRACE,
-        storage={"kind": "local"},
-    )
 
     payload = graph.to_dict()
     assert payload["name"] == "TraceMineruPipe"
-    assert payload["nodes"][0]["op"]["cls_ref"].endswith("PdfToImages")
-    assert payload["nodes"][0]["contract"]["relations"][0]["relation"] == "EXPAND"
-    assert payload["materialization"][0]["policy"] == "on_failure"
-    assert payload["materialization"][0]["reason"] == "trace"
     assert "tracer" not in str(payload)
 
     description = graph.describe()
-    assert "MultigrainIR(TraceMineruPipe)" in description
+    assert "ExecutionGraph(TraceMineruPipe)" in description
     assert "[EXPAND] PdfToImages" in description
     assert "[REDUCE] Assemble" in description
-
-    mermaid = graph.to_mermaid()
-    assert "flowchart TD" in mermaid
-    assert "PdfToImages -->|out| Layout" in mermaid
-    assert "Assemble --> __sink__" in mermaid
+    assert "flowchart TD" in graph.to_mermaid()
 
 
-def test_verify_pass_accepts_valid_ir_and_flags_contract_corner_cases() -> None:
+def test_mandatory_verifier_rejects_relation_grain_drift() -> None:
     graph = TraceMineruPipe().compile()
-    manager = PassManager((VerifyPass(),))
-
-    assert manager.run(graph).ok is True
-
     ocr = graph.node("OCR")
-    bad_ocr = replace(
-        ocr,
-        contract=replace(ocr.contract, input_grains=("pdfs", "PdfToImages")),
-    )
+    bad_output = replace(ocr.outputs[0], grain="pdfs")
+    bad_node = replace(ocr, outputs=(bad_output,))
     bad_graph = replace(
         graph,
-        nodes=tuple(bad_ocr if node.name == "OCR" else node for node in graph.nodes),
+        nodes=tuple(bad_node if node.name == "OCR" else node for node in graph.nodes),
     )
 
-    result = manager.run(bad_graph)
-    assert result.ok is False
-    assert result.diagnostics[0].node == "OCR"
-    assert "same-grain" in result.diagnostics[0].message
+    with pytest.raises(GraphValidationError, match="keep source grain"):
+        verify_graph(bad_graph)
 
 
 class FanoutPipe(mg.Pipeline):
@@ -185,13 +143,11 @@ class FanoutPipe(mg.Pipeline):
 
 def test_compile_traces_fanout_and_same_grain_fanin() -> None:
     graph = FanoutPipe().compile()
-
-    assert graph.topo_order == ("left", "right", "merge")
-    assert [port.node for port in graph.node("left").inputs] == ["__input__pages"]
-    assert [port.node for port in graph.node("right").inputs] == ["__input__pages"]
-    assert [port.node for port in graph.node("merge").inputs] == ["left", "right"]
-    assert graph.node("merge").kind == "MAP"
-    assert graph.node("merge").outputs[0].grain == "pages"
+    assert tuple(node.name for node in graph.nodes) == ("left", "right", "merge")
+    assert graph.node("merge").inputs == (
+        NodeOutputRef("left"),
+        NodeOutputRef("right"),
+    )
 
 
 class ExpandWithSideInputPipe(mg.Pipeline):
@@ -209,28 +165,17 @@ class ExpandWithSideInputPipe(mg.Pipeline):
         return self.expand(settings, documents)
 
 
-def test_expand_can_use_non_first_parent_input() -> None:
+def test_expand_relation_names_non_first_parent_directly() -> None:
     graph = ExpandWithSideInputPipe().compile()
-    expand = graph.node("expand_docs")
-
-    assert [port.node for port in expand.inputs] == [
-        "__input__settings",
-        "__input__documents",
-    ]
-    assert expand.parent_input == 1
-    assert expand.contract.relations[0].parent_input == 1
-    assert VerifyPass().run(graph).ok is True
+    relation = graph.node("expand_docs").outputs[0].relation
+    assert isinstance(relation, ChildrenOf)
+    assert relation.parent == graph.inputs[1].ref
 
 
 class InvalidCrossGrainPipe(mg.Pipeline):
     def __init__(self) -> None:
         super().__init__()
-        self.expand = mg.Expand(
-            PdfToImages,
-            {"a.pdf": 2},
-            parent=0,
-            child_label="page",
-        )
+        self.expand = mg.Expand(PdfToImages, {"a.pdf": 2}, child_label="page")
         self.bad = mg.Map(Layout, name="bad")
 
     def forward(self, documents):
@@ -252,7 +197,7 @@ class UngroupedReducePipe(mg.Pipeline):
         return self.reduce(documents)
 
 
-def test_reduce_requires_explicit_group_by_for_user_friendly_api() -> None:
+def test_reduce_requires_explicit_group_by() -> None:
     with pytest.raises(TypeError, match="group_by"):
         UngroupedReducePipe().compile()
 
@@ -263,13 +208,10 @@ class ReusedNamePipe(mg.Pipeline):
         self.step = mg.Map(Layout, name="step")
 
     def forward(self, pages):
-        first = self.step(pages)
-        return self.step(first)
+        return self.step(self.step(pages))
 
 
 def test_compile_assigns_unique_node_names_for_reused_wrapper() -> None:
     graph = ReusedNamePipe().compile()
-
-    assert graph.topo_order == ("step", "step_1")
-    assert [port.node for port in graph.node("step_1").inputs] == ["step"]
-
+    assert tuple(node.name for node in graph.nodes) == ("step", "step_1")
+    assert graph.node("step_1").inputs == (NodeOutputRef("step"),)

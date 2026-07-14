@@ -2,7 +2,7 @@
 
 Guards the production concern: when a page is permanently quarantined, the
 document it belonged to must not be assembled into a silently-truncated output.
-Under ``MissingChildPolicy.FAIL_CLOSED`` the Reduce suppresses that document (its
+Under ``IncompleteGroupPolicy.FAIL_CLOSED`` the Reduce suppresses that document (its
 UDF is never called) and emits an anchor-grain error; other documents are
 unaffected. Under FAIL_OPEN the legacy best-effort behaviour is preserved.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import rayorch.experimental.multigrain as mg
 from rayorch.experimental.multigrain.execution import MultigrainExecutor
-from rayorch.experimental.multigrain.ir import MissingChildPolicy
+from rayorch.experimental.multigrain.ir import IncompleteGroupPolicy
 
 from test.experimental.multigrain.lineage_ops import (
     AssembleDoc,
@@ -22,7 +22,7 @@ from test.experimental.multigrain.lineage_ops import (
 
 
 class DocPipe(mg.Pipeline):
-    def __init__(self, missing: MissingChildPolicy) -> None:
+    def __init__(self, missing: IncompleteGroupPolicy) -> None:
         super().__init__()
         self.split = mg.Expand(SplitPages, parent=0, child_label="page")
         self.embed = mg.Map(EmbedPage)
@@ -47,7 +47,7 @@ def _docs():
 
 
 def test_fail_closed_suppresses_only_the_affected_document():
-    ir = DocPipe(MissingChildPolicy.FAIL_CLOSED).compile()
+    ir = DocPipe(IncompleteGroupPolicy.FAIL_CLOSED).compile()
     out = MultigrainExecutor().execute(ir, {"docs": _docs()})
 
     by_doc = dict(zip(out.display_keys, out.values))
@@ -68,7 +68,7 @@ def test_fail_closed_suppresses_only_the_affected_document():
 
 
 def test_fail_open_still_assembles_from_survivors():
-    ir = DocPipe(MissingChildPolicy.FAIL_OPEN).compile()
+    ir = DocPipe(IncompleteGroupPolicy.FAIL_OPEN).compile()
     out = MultigrainExecutor().execute(ir, {"docs": _docs()})
 
     by_doc = dict(zip(out.display_keys, out.values))

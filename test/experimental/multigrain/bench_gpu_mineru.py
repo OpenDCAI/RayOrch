@@ -21,7 +21,7 @@ import time
 import ray
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ir import PhysicalHints
+from rayorch.experimental.multigrain.ir import WorkerPoolSpec
 from rayorch.experimental.multigrain.ray import (
     MultigrainRayExecutor,
     _contiguous_ranges,
@@ -65,7 +65,7 @@ class MineruGpuPipe(mg.Pipeline):
         self.to_pages = mg.Expand(PdfToPages, parent=0, child_label="page")
         self.ocr = mg.Map(
             OcrGpu,
-            physical=PhysicalHints(replicas=replicas, num_gpus_per_replica=gpus),
+            workers=WorkerPoolSpec(replicas=replicas, gpus_per_worker=gpus),
         )
         self.assemble = mg.Reduce(AssemblePages)
 

@@ -18,7 +18,7 @@ import pytest
 import ray
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ir import PhysicalHints
+from rayorch.experimental.multigrain.ir import WorkerPoolSpec
 from rayorch.experimental.multigrain.ray import MultigrainRayExecutor
 
 from test.experimental.multigrain.dummy_ops import (
@@ -50,8 +50,12 @@ class _InitCounter:
 class MapFilterPipe(mg.Pipeline):
     def __init__(self, replicas: int = 1) -> None:
         super().__init__()
-        self.embed = mg.Map(SlowEmbed, physical=PhysicalHints(replicas=replicas))
-        self.keep = mg.Filter(SlowDrop, physical=PhysicalHints(replicas=replicas))
+        self.embed = mg.Map(
+            SlowEmbed, workers=WorkerPoolSpec(replicas=replicas)
+        )
+        self.keep = mg.Filter(
+            SlowDrop, workers=WorkerPoolSpec(replicas=replicas)
+        )
 
     def forward(self, chunks):
         return self.keep(self.embed(chunks))
@@ -75,10 +79,44 @@ def test_ray_executor_matches_local_executor() -> None:
 class MapPipe(mg.Pipeline):
     def __init__(self, replicas: int) -> None:
         super().__init__()
-        self.embed = mg.Map(SlowEmbed, physical=PhysicalHints(replicas=replicas))
+        self.embed = mg.Map(
+            SlowEmbed, workers=WorkerPoolSpec(replicas=replicas)
+        )
 
     def forward(self, chunks):
         return self.embed(chunks)
+
+
+class WholeBatchReduce:
+    def run(self, rows):
+        return list(rows)
+
+
+class WholeBatchPipe(mg.Pipeline):
+    def __init__(self, replicas: int) -> None:
+        super().__init__()
+        self.reduce = mg.Reduce(
+            WholeBatchReduce,
+            workers=WorkerPoolSpec(replicas=replicas),
+        )
+
+    def forward(self, rows):
+        return self.reduce(mg.group_by(rows))
+
+
+def test_whole_batch_replicas_create_round_robin_actor_pool() -> None:
+    graph = WholeBatchPipe(replicas=2).compile()
+    node = graph.nodes[0]
+    executor = MultigrainRayExecutor()
+
+    executor.warm_pools(graph)
+    try:
+        assert len(executor._pools[node.name]) == 2
+        pool = executor._pools[node.name]
+        assert executor._claim_pool_slot(node.name, len(pool)) == 0
+        assert executor._claim_pool_slot(node.name, len(pool)) == 1
+    finally:
+        executor.shutdown()
 
 
 def test_replicas_speed_up_row_sharded_map() -> None:
@@ -150,7 +188,7 @@ class CountingPipe(mg.Pipeline):
         self.embed = mg.Map(
             InitCountingEmbed,
             counter_name,
-            physical=PhysicalHints(replicas=2),
+            workers=WorkerPoolSpec(replicas=2),
         )
 
     def forward(self, chunks):
@@ -219,7 +257,7 @@ class SameNameMapPipe(mg.Pipeline):
         self.op = mg.Map(
             SlowEmbed,
             name="shared-name",
-            physical=PhysicalHints(replicas=2),
+            workers=WorkerPoolSpec(replicas=2),
         )
 
     def forward(self, chunks):
@@ -232,7 +270,7 @@ class SameNameFilterPipe(mg.Pipeline):
         self.op = mg.Filter(
             SlowDrop,
             name="shared-name",
-            physical=PhysicalHints(replicas=2),
+            workers=WorkerPoolSpec(replicas=2),
         )
 
     def forward(self, chunks):

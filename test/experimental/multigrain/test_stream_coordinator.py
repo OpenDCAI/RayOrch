@@ -80,7 +80,7 @@ def _run_epoch_case(values, *, max_inflight: int) -> list[int]:
     def run_node(node, inputs):
         delay, label, target = inputs[0].values[0]
         time.sleep(delay)
-        output_name = node.output_specs[0].name or node.name
+        output_name = node.outputs[0].name
         empty = inputs[0].take([], name=output_name)
         item = DeferredRecord(
             token=f"token-{label}",
@@ -93,7 +93,7 @@ def _run_epoch_case(values, *, max_inflight: int) -> list[int]:
 
     def drain_node(node, items):
         drain_sizes.append(len(items))
-        output_name = node.output_specs[0].name or node.name
+        output_name = node.outputs[0].name
         parts = []
         for item in items:
             label = item.inputs[0].values[0][1]

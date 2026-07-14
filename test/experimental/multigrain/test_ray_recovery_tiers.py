@@ -4,7 +4,7 @@ import pytest
 import ray
 
 from rayorch.experimental import multigrain as mg
-from rayorch.experimental.multigrain.ir import PhysicalHints
+from rayorch.experimental.multigrain.ir import WorkerPoolSpec
 from rayorch.experimental.multigrain.ray import MultigrainRayExecutor
 
 from test.experimental.multigrain.dummy_ops import (
@@ -31,7 +31,7 @@ class RecoveryMapPipe(mg.Pipeline):
             *op_args,
             name="recover-map",
             recovery=policy,
-            physical=PhysicalHints(replicas=replicas),
+            workers=WorkerPoolSpec(replicas=replicas),
         )
 
     def forward(self, rows):

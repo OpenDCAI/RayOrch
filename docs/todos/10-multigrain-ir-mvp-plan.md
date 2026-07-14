@@ -1,5 +1,10 @@
 # TODO: Multigrain IR MVP Implementation Plan
 
+> Historical plan (superseded). The implemented graph is now the thinner
+> `ExecutionGraph`; `ir/model.py` and the pass system below were removed. Use
+> [`rayorch/experimental/multigrain/README.md`](../../rayorch/experimental/multigrain/README.md)
+> for the current contract.
+
 Status: implementation plan for the experimental `rayorch.experimental.multigrain`
 prototype.
 
