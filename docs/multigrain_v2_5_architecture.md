@@ -349,6 +349,10 @@ node kind 和 compiled output contract 解释“为什么为空”；不需要�
 `FilteredOutcome/EmptyOutcome` 类层次。后文为简洁使用 `Success(0)` 表示“所有声明 output
 ports 都成功产生 0 项”，实际 ABI 始终是 `emissions_by_port`。
 
+表示层允许任一 port 为空；首版 primitive validator 仍执行 §8.6 的对称 cardinality 合同。
+因此表示能力不等于允许 Map/Reduce/Relate 的 ports 具有不同 cardinality，也不允许 Expand
+各 ports 使用不同 N。
+
 ### 4.2 Item 不再重复保存 parents
 
 一个 item 的 direct parents 由以下路径唯一决定：
@@ -393,15 +397,52 @@ child EntityId，后续 member、filtered 或 failed receipt 都能 O(1) 找回 
 
 Map/Reduce 会改变 value 却复用 entity identity，因此不得称为 content-address。
 
-V2.5 使用 run-scoped、provenance-derived opaque IDs。概念上：
+V2.5 使用 run-scoped、provenance-derived opaque IDs。Phase 0 冻结以下最小、stdlib-only
+identity protocol，不把它扩展成通用序列化框架：
 
 ```text
-source entity = H(run_salt, source_port, position)
+digest = BLAKE2b-128
+personalization = ASCII "RayOrchMGV2.5"
+payload = canonical_encode((domain, *parts))
+```
+
+`run_salt` 必须是恰好 16 bytes。所有 length/count 使用 unsigned 64-bit big-endian。
+canonical grammar：
+
+```text
+None       = "n"
+bool       = "b" + 00|01
+int        = "i" + sign:u8 + magnitude_len:u64be + minimal_unsigned_be
+bytes      = "y" + len:u64be + payload
+str        = "s" + utf8_len:u64be + utf8
+tuple      = "t" + count:u64be + encoded elements
+PortId     = "p" + encode(node) + encode(slot)
+EntityId   = "e" + raw16
+ItemRef    = "r" + encode(port) + encode(entity)
+RoleItems  = "o" + encode(role) + encode(items_tuple)
+GrainId    = "g" + raw16
+```
+
+整数 sign `0` 表示零或正数，`1` 表示负数；zero 固定为 sign `0`、magnitude length `0`、空
+magnitude。bool 在 int 之前判定，因此 `True` 与 `1` 编码不同。Identity 输入在调用 hash 前由
+各 derivation function 构造成 tuple；encoder 明确拒绝 list/dict/set/float，不做隐式
+normalization，不提供 decoder、type registry 或版本协商。不得使用 `pickle`、Python
+`hash()`、`repr()`、dict iteration order 或旧 MGCV1 production codec。
+
+role bindings 固定为 compiled role order 下的 `tuple[RoleItems, ...]`；不按 role 名排序。
+`RoleItems.items` 也是 tuple，Reduce members 按 ordinal 排列。golden vectors 同时约束
+canonical bytes、source/entity/grain IDs 和 oracle/production parity；在 golden 通过前不声称
+两份实现必然生成相同 bytes。
+
+概念公式：
+
+```text
+source entity = H("source-entity", run_salt, source_port, position)
 map entity    = primary entity
 filter entity = target entity
-expand entity = H(run_salt, node, parent entity, ordinal)
+expand entity = H("expand-entity", run_salt, node, parent entity, ordinal)
 reduce entity = anchor entity
-relate entity = H(run_salt, node, ordered(role, parent ItemRef))
+relate entity = H("relate-entity", run_salt, node, ordered(role, parent ItemRef))
 ```
 
 `ItemRef=(PortId, EntityId)` 才是唯一 occurrence：
@@ -414,9 +455,12 @@ relate entity = H(run_salt, node, ordered(role, parent ItemRef))
 Grain identity 概念上：
 
 ```text
-Map/Filter/Expand = H(run_salt, node, ordered role bindings)
-Reduce            = H(run_salt, node, anchor ItemRef)
-Relate            = H(run_salt, node, canonical role-parent tuple)
+synthetic Source = H("source-grain", run_salt, source_port, position)
+Map              = H("map-grain", run_salt, node, ordered role bindings)
+Filter           = H("filter-grain", run_salt, node, ordered role bindings)
+Expand           = H("expand-grain", run_salt, node, ordered role bindings)
+Reduce           = H("reduce-grain", run_salt, node, anchor ItemRef)
+Relate           = H("relate-grain", run_salt, node, canonical role-parent tuple)
 ```
 
 约束：
@@ -521,6 +565,7 @@ Reduce 的 `anchor` 必须显式存在，不能靠“直接上游是否为 Expan
 
 ```python
 class Primitive(enum.Enum):
+    SOURCE = "source"  # compiled internal kind；不是用户原语
     MAP = "map"
     FILTER = "filter"
     EXPAND = "expand"
@@ -540,8 +585,8 @@ class NodeSpec:
     kind: Primitive
     inputs: tuple[InputBinding, ...]
     output_ports: tuple[PortId, ...]
-    udf_recipe: "UdfRecipe"
-    execution: "ExecutionOptions"
+    udf_recipe: "UdfRecipe | None"
+    execution: "ExecutionOptions | None"
     reduce_anchor: PortId | None = None
     reduce_members: PortId | None = None
     relate_keys: tuple["KeyProjection", ...] = ()
@@ -562,6 +607,8 @@ plan_relate
 - node/port/role 唯一；
 - port slot 与 output arity 一致；
 - graph 拓扑有序；
+- internal Source node 无 inputs、恰好一个 output port，且无 UDF/execution recipe；
+- 非 Source node 必须有 UDF/execution recipe；
 - UDF constructor recipe 可序列化并已 snapshot；
 - Map/Filter/Expand 的 primary/target/parent role 明确；
 - Reduce 明确 anchor 和 members；
@@ -582,13 +629,29 @@ plan_relate
 ```text
 inputs: ()
 success: source port 上恰好一个 emission
-entity: H(run_salt, source_port, source_position)
+entity: H("source-entity", run_salt, source_port, source_position)
+grain:  H("source-grain", run_salt, source_port, source_position)
+node:   source_port.node
 ```
 
 因此“每个 emitted item 恰有一个 producer”没有 root-item 例外。Source grain identity 在读取
 value 前即可由 input group 与 position 确定；source decode/admission failure 记录为该 grain 的
 `Failed`，其 `output_slots` 仍保存预期 source `ItemRef`，但不产生 emission/value。输入枚举
 完成且所有 source grains terminal 后，source port 才 sealed。
+
+Source 是 runtime 内部 synthetic grain，不是第六个用户原语。compiled `Primitive` 包含
+internal `SOURCE` kind，使任意 `source_port.node` 都能统一解析到一个 Source `NodeSpec`；
+公开用户类仍只有 Map/Filter/Expand/Reduce/Relate。每个 Source node 恰好一个 output port，
+Source `GrainRecord.node` 使用该 NodeSpec id，不增加全局 `-1` magic constant，也不把 node
+再次混入已冻结的 source hash 公式。
+
+`source_position` 是一次 Executor run 内、每个 source port 独立的单调 logical ordinal：
+
+- 每次 run 创建新的 16-byte `run_salt`，各 source-port counter 从 0 开始；
+- 同一 run 的后续 microbatch arena 继续 counter，不能按 arena 重置；
+- ordinal 在 record 分配给 arena 前冻结；
+- rebatching、retry、actor assignment 与 completion order 不改变它；
+- 新 run 因 run_salt 不同，可以重新从 position 0 开始。
 
 ### 8.1 Map
 
@@ -633,6 +696,16 @@ UDF batch ABI 在语义上等价于：
 ```python
 list[Parent] -> list[list[Child]]
 ```
+
+多 output ports 的用户返回固定为 port-major tuple：
+
+```python
+tuple[list[list[PortValue]], ...]  # [P][G][N_g]
+```
+
+单 output 保留直接 `list[list[Child]]`，wrapper 规范化为长度 1 的 outer tuple。Phase 3
+validator 对所有 shape/cardinality contract violation 统一 abort arena；它们是 UDF ABI
+错误，不伪装成 record-level `Failed`。显式坏记录仍通过 `BadRecordError(index)` 表达。
 
 对 grain `g` 返回 N 个 children 时：
 
@@ -684,7 +757,7 @@ Reduce output 复用 anchor entity。
 首版只支持以下可静态验证的 path grammar：
 
 ```text
-anchor
+anchor（必须是 origin Expand 的精确 input port）
 → exactly one Expand
 → zero or more entity-preserving Map/Filter nodes
 → members port
@@ -693,6 +766,9 @@ anchor
 
 其中：
 
+- 不接受仅 entity 相同的 aligned branch 作为 anchor；
+- compiler 从 members 沿 primary/target path 唯一追溯到 Expand，并验证其 parent input
+  `PortId == reduce_anchor`；
 - 不允许 nested Expand、Relate 或第二个 cardinality-increasing node；
 - Map 的 primary 必须沿该 child entity；
 - Map 的 secondary/Filter control 若存在，必须按同一 child entity 1:1 对齐；
@@ -716,6 +792,11 @@ Reduce 只有 `fail_closed`，但 member failure 不等于立刻 semantic seal�
   但仍等待其余 ordinal terminal；全部 N 个 obligations settled 后，按 ordinal canonicalize
   inputs 与 causes，再创建 SEALED(Suppressed) grain；
 - 尚有 child obligation 未 terminal：保持 open，不允许 partial Reduce。
+
+已知 N 的 Suppressed Reduce inputs 按 ordinal 包含 present 和 failed/suppressed 的最终
+members-port expected coordinates，dropped 不进入 members；direct causes 只取最终 members
+receipt GrainId 并按 ordinal 排列。origin Expand 在 N 未知时失败则不虚构 children，Reduce
+固定为 anchor-only binding，direct cause 指向 origin Expand GrainId。
 
 ### 8.5 Relate
 
@@ -750,6 +831,10 @@ Relate 使用 strict、type-sensitive canonical key；Python hash/equality 不�
 
 不得虚构 key，也不得把该失败解释成正常 unmatched。
 
+Phase 1 保留 `Relate/keyed/Primitive.RELATE/NodeSpec.relate_keys/plan_relate`、relation identity、
+role-general DTO 与 `JoinIndex` 位置；production `plan_relate` 明确 feature-gate，完整 planner
+留到 Phase 5。Phase 0 reference 只覆盖 bounded int-key 1:1、M:N、unmatched/sealing。
+
 ### 8.6 首版 output cardinality 合同
 
 - Map：每个声明 output port 恰好 1 项；
@@ -782,7 +867,8 @@ class FiberBarrier:
     expected: int | None
     present: dict[int, ItemRef]
     dropped: set[int]
-    failed: dict[int, GrainId]
+    # ordinal -> (最终 members-port expected ItemRef, terminal receipt GrainId)
+    failed: dict[int, tuple[ItemRef, GrainId]]
     blocked_by: set[GrainId]
 ```
 
@@ -813,7 +899,7 @@ settled count == expected 且 failed 为空
 - origin Expand grain Failed/Suppressed 时，把其 GrainId 放入 `blocked_by`；即使 cardinality 未知，
   该 anchor fiber 也会立即 suppressed，不会永久 open 或误判 empty；
 - member-path grain Failed/Suppressed 时，通过其 input lineage 找到 `(anchor, ordinal)`，把失败
-  GrainId 记入 `failed[ordinal]`；
+  的 expected coordinate 与 GrainId 记入 `failed[ordinal]`；
 - `failed[ordinal]` 只记录 compiled members port 上的唯一 terminal receipt。若 failure 发生在
   更早节点，planner 沿剩余 path 确定性创建不执行 UDF 的 suppressed receipts，最终 member-port
   GrainId 通过 direct-cause chain 指回原始失败；同一 ordinal 第二个不同 terminal receipt 是
@@ -1297,6 +1383,27 @@ Ray hidden task retry/restart 必须关闭或纳入同一个 token fencing；首
 
 只有 planner 能证明 producer domain 已闭合，port 才能 sealed。
 
+Phase 1 planner 返回四种 occurrence action：
+
+```text
+wait | ensure executable | ensure suppressed | normal absence
+```
+
+contract/invariant violation 直接抛 planner error，Phase 2 转成 arena abort，不增加第五种 outcome。
+`ensure` 是按 GrainId 的幂等 set-if-absent：相同 semantic template 在 READY/IN_FLIGHT/SEALED
+任一 phase 都不重复插入；semantic fields 或 executable/suppressed 分类冲突则 abort。
+
+multi-role 固定优先级：
+
+1. driving occurrence normal absence 时直接传播 absence，不再等待其他 roles；
+2. driving logical occurrence 存在时等待全部 required roles settled；
+3. 任一非-driving required role sealed 后正常缺失是 contract violation；
+4. 否则按 compiled role order 收集全部 Failed/Suppressed receipt GrainId 并 suppress；
+5. 全部 present 才 ensure executable。
+
+Filter false 是 normal terminal；后续缺 driving value 的 Map/Filter 不执行，absence 沿 compiled
+entity-preserving path 传播到 members port。任何增量 cursor 都只能是可重建 derived cache。
+
 absence 的解释依赖 seal：
 
 ```text
@@ -1478,8 +1585,15 @@ max_fanout_per_grain
 max_relation_cardinality
 ```
 
-达到 arena/pending 上限后暂停 source admission 并 drain；单 grain fan-out 或 relation product
-超过上限则明确失败。首版不引入 byte-credit、RSS controller、spill 或复杂 watermark 状态机。
+达到 arena/pending 上限后暂停 source admission 并 drain。hard structural limits 统一是
+run-control arena abort，不产生 Grain `Failed`：
+
+- `max_fanout_per_grain`：单个 Expand grain 的共享 N；
+- `max_relation_cardinality`：单个 Relate node、单个 arena 的累计 tuple grains；
+- `max_grains_per_arena`：arena GrainTable 的全部 rows。
+
+任何会越界的 insertion/CommitDelta 必须在 mutation/publication 前原子拒绝。首版不引入
+byte-credit、RSS controller、spill 或复杂 watermark 状态机。
 若 benchmark 证明仅按 grain count 不足，再增加 byte-aware admission。
 
 必须测量：
@@ -1780,6 +1894,8 @@ test/experimental/multigrain_v2_5/
 - Logical Grain 独立解释器；
 - 五原语 golden cases；
 - zero-output/failed-before-output/empty fiber；
+- compiled Source kind 与 run-global per-source-port position；
+- canonical encoding/identity golden vectors；
 - schedule/retry property generator；
 - production/reference 双向 import guard。
 
@@ -1788,13 +1904,15 @@ test/experimental/multigrain_v2_5/
 - PortId/EntityId/ItemRef/GrainId；
 - GrainRecord/Outcome/Emission；
 - Producer/Consumer/Port/Value indexes；
-- 五个 primitive planners；
+- 四个 executable core planners（Map/Filter/Expand/Reduce）与 `plan_relate` contract/stub；
 - ExpandOriginIndex 与 fiber barrier；
 - compile validation。
 
-不接 Ray，先通过 unary `Expand→Map/Filter→Reduce` 的 Packing Confluence fixtures。
+不接 Ray，先通过 synthetic Source、unary `Expand→Map/Filter→Reduce` 的 reference parity
+与 planner idempotence fixtures。
 aligned secondary/control 语义保留在 §8.4，但在 unary exit gate 通过后实现；不为首个
-document workload 阻塞 semantic core。
+document workload 阻塞 semantic core。packing/retry/stale-result confluence 属于 Phase 2，
+Phase 1 不在没有 executor 时宣称已验证。
 
 ### Phase 2：single-process executor
 
