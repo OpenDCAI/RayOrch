@@ -71,9 +71,10 @@
 
 ## 4. 抽象：一个策略、两个位置、一个 sink
 
-### 4.1 `RecoveryPolicy`（声明式，镜像 `PhysicalHints`）
+### 4.1 `RecoveryPolicy`（声明式 node policy）
 
-位于 `IRNode.recovery`，如同已有的 `physical`/`properties`（dataclass field，经由 `add_node` 传递；executor 持有默认值，node 可覆盖——与 `default_replicas` vs `physical.replicas` 相同模式）。可序列化、被动、无行为。
+位于 `NodeSpec.recovery`，是 retry 的唯一真值。它从 primitive 写入 passive graph，
+executor 不再覆盖；可序列化、被动。
 
 ```python
 @dataclass(frozen=True)
@@ -181,7 +182,7 @@ recovery-tiers branch 现在有一条初始公共路径：
 
 ## 7. 接口优先、增量计划（遵循 D4）
 
-- **接口（完成）：** 带全部字段的 `RecoveryPolicy` 位于 `IRNode`（镜像 `physical`）；每个 user primitive 接受 `recovery=`；它经被动 IR 序列化，并在 executor wrapper reconstruction 后存续。`BadRecordError(..., retryable=)` 及 scope-local `decide_record` / `decide_shard` 已落地。非默认行为会抛出清晰的 `NotImplementedError`；默认值复现今日语义。
+- **接口（完成）：** `RecoveryPolicy` 直接位于 `NodeSpec`；每个 user primitive 接受 `recovery=`；它经被动 `ExecutionGraph` 序列化，并在 executor wrapper reconstruction 后存续。`BadRecordError(..., retryable=)` 及 scope-local `decide_record` / `decide_shard` 已落地。非默认行为会抛出清晰的 `NotImplementedError`；默认值复现今日语义。
 - **Phase 1（为 Map/shardable nodes 完成）：** inline Map record retry + budgeted adaptive shard localization、actor rotation/replacement、sparse 和 dense poison accounting。Expand/Filter/Reduce/Relate 的 attributable units 在各自 wrapper-specific contracts 落地前被明确拒绝。
 - **Phase 1.5（执行统一；初始实现完成）：** 公共 `execute_stream` + generic DAG coordinator + persistent-pool reuse 已落地；`run_bench.py` 不再使用 private scheduling APIs。剩余 gate：重新运行 368 PDFs，保持实测约 585 s performance/backpressure。
 - **Phase 2（Map 完成）：** node-owned recovery buffer + readiness dependency + re-placement/repacked recovery batch。target rows、stage quiescence 和 input close 均已测试。deferred inputs 合并时使用 invocation-unique temporary tokens，随后在 downstream execution 前恢复原 identity；不存在 collector actor 或 workload-specific path。

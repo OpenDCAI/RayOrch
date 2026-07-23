@@ -47,14 +47,46 @@ cedar/Pecan 将被引用用于优化器/UDF 提示的定位，但不一定实际
   （复用 `10-...md` 中的 LPT/Graham 分析）。
 - **大规模重排安全性**：在真实运行中实证确认 M1 定理（跨分片计划字节一致的结果），而不只是在单元规模上确认。
 
+### 3a. 匿名内部证据 schema
+
+内部证据需要证明 external validity，但不能导出 payload、路径、用户名、原始 record
+ID、display key、模型输入或 error text。每次运行记录两层：
+
+```text
+RunEnvelope
+  experiment_id        随机且可公开的 id
+  workload_family      document_parse | multimodal_caption | ...
+  engine_revision      git revision / artifact version
+  cluster_shape        nodes、accelerators、CPU、memory class
+  configuration        planner/recovery/replica policy 名称
+  dataset_bucket       粗粒度公开 size/fanout bucket，不记录源路径
+  started_at_bucket    day 或 week，不记录用户/请求时间戳
+
+NodeMetric
+  name, kind, replicas
+  rows_in, rows_out, fanout_ratio
+  shard_rows_in[], shard_rows_out[], shard_busy_s[]
+  stage_makespan_s, idle_bubble_frac
+  retries, recovery_rows
+  relation_entries_out, lineage_bytes_out
+```
+
+`NodeMetric.to_dict()` 是引擎原生匿名 stage trace。数组按 shard index 对齐，只包含计数和
+时长。独立 GPU sampler 可以增加 stage 级 utilization percentiles，但不能附加原始对象
+identity。论文发布 distribution 和聚合 case；每个内部 case study 都需要一个公开
+workload 复现相同定性趋势。
+
 ## 4. M2 运行前需要补齐的原型缺口
 
 按杠杆作用排序。这些是具体的“进一步原型设计”任务。
 
 1. **多节点执行。** 当前 `MultigrainRayExecutor` 进行节点内副本分片 + 全图 microbatch 重叠。需要：跨节点放置、节点间数据移动（Ray object store / plasma）、感知节点数的 `shard_planner`。（阻塞“规模”指标。）
 2. **真实算子包装器。** 将实际模型包装为 multigrain UDF：真实布局/OCR（或 MinerU 组件）及 vLLM VLM 描述器，同时保持 UDF 纯净（value-in/value-out，不含 ids —— 保留 M1 假设）。提供 `num_gpus_per_replica`、`gpu_heavy` 属性。
-3. **插桩。[已完成]** `metrics.RunMetrics` / `NodeMetric` +
-   `lineage_footprint`：每节点 makespan、每分片 busy -> idle-bubble fraction、血缘记录/字节开销、恢复计数器。已穿透 `MultigrainExecutor` 和 `MultigrainRayExecutor`。（真实算子落地后添加真实 GPU-util 采样。）
+3. **插桩。[部分完成]** `metrics.RunMetrics` / `NodeMetric` +
+   `lineage_footprint`：每节点 makespan、每分片 busy、匿名 shard input/output
+   cardinality、fanout ratio、relation/lineage footprint 与恢复计数器。已穿透
+   `MultigrainExecutor` 和 `MultigrainRayExecutor`。RunEnvelope persistence 与真实
+   GPU-util sampling 在内部采集边界确定后补充。
 4. **基线测试框架。** 在 Ray Data、Spark、朴素 Ray 上表达相同的 W1/W2；从 CEPH 共享数据集加载器；共享正确性检查器（比较健康输出）。
 5. **故障注入框架。[已完成，MVP]** `multigrain.ray.executor.FaultSpec` 注入确定性任务/节点崩溃；executor 仅重试失败分片，因此 `recovery_rows` 保持血缘局部（< 全阶段）。通过 `BadRecordError` 的行级隔离已存在。由 `test_metrics_and_recovery.py` 覆盖。（通过真实 Ray actor 死亡的节点终止属于后续工作。）
 6. **数据摄取。** 将 CEPH 中的真实 PDF/图像流式输入到带有稳定 `display_key`s（文档 id）的源 `PortBatch`，从而使 trace 在大规模下保持可读。
@@ -119,7 +151,9 @@ cedar/Pecan 将被引用用于优化器/UDF 提示的定位，但不一定实际
 
 相对于 Ray Data / Trident / Spark 的核心优势是**恢复粒度**。E3 在*真实* MinerU 流水线上用*相同* vLLM OCR 算子和*相同*确定性 poison page 测量它——唯一变量是框架如何恢复。测量发生在昂贵 GPU 工作所在的 OCR（contents）粒度，因此论述不会与 assembler 对有缺口文档的行为纠缠。
 
-**设置。** 48 PDFs → 992 pages，`MinerU2.5-2509-1.2B`，4×H20，4 个持久 GPU actors，`max_retries=2`。Poison = 一页（`2410.19313v1_copy_2#p1`），它在 OCR 中确定性失败（poison pill / 非瞬态数据故障）。
+**设置。** 48 PDFs → 992 pages，`MinerU2.5-2509-1.2B`，4×H20，4 个持久 GPU
+actors，node 使用 `RecoveryPolicy(max_shard_retries=2)`。Poison = 一页
+（`2410.19313v1_copy_2#p1`），它在 OCR 中确定性失败（poison pill / 非瞬态数据故障）。
 - **记录级（我们的方案）：** 算子抛出 `BadRecordError(index=i)`；`Map` 隔离第 *i* 行（quarantine + lineage trace），并将分片健康行**作为一个批次**重新运行（向 `_run_with_bad_index` 添加的快路径；没有逐行串行化）。
 - **分片级（Spark / Ray Data 粒度）：** 算子在 OCR 后抛出；`Map` 不捕获它，因此 `_run_shards` 重试**整个分区**。故障是确定性的 → 重试耗尽 → 作业中止（分区级行为）。
 

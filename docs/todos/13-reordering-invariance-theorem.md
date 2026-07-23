@@ -3,9 +3,10 @@
 This note turns the empirical fact behind
 `test/experimental/multigrain/test_lineage_under_parallelism.py` into a formal
 statement with proofs: **any legal shard plan (including work-aware LPT
-rebalancing) produces the same result and the same lineage as the serial
-baseline.** This is the correctness backbone that lets us reorder rows for
-performance (bubble elimination) without changing semantics.
+rebalancing) preserves keyed results and lineage; Ray canonical merge, or a
+Reduce with an ordered-identical anchor, additionally restores serial visible
+order.** This is the correctness backbone that lets us reorder rows for
+performance (bubble elimination) without changing logical semantics.
 
 Everything below is grounded in the actual data model so the formalism is not
 hand-wavy:
@@ -16,80 +17,173 @@ hand-wavy:
 | static output relation | `SameAs`, `SubsetOf`, `ChildrenOf`, `AggregateOf`, `RelatedFrom` |
 | graph node | `NodeSpec(operation=..., outputs=(OutputSpec(...), ...))` |
 | mandatory graph check | `verify_graph` |
-| record fields | `PortBatch` parallel arrays (`values`, `record_ids`, `ancestors`, `ancestor_display`, `ordinals`, `lineage`) |
+| identity namespace | immutable `IdentityDomain` |
+| record fields | `PortBatch` parallel arrays (`values`, `record_ids`, `ancestors`, `ancestor_display`, `ordinals`, `lineage`, `relations`) |
 | `take` / `concat` | `PortBatch.take(indices)` / `multigrain.data.concat(batches)` |
 | shard-plan check | `validate_shard_plan(partitions, row_count)` |
 | Expand lineage | `PortBatchBuilder.expanded` |
 | Reduce regroup | `Reduce._groups_for` |
 | Relate key-join | `Relate._make_key_join_batch` |
 
-The passive `ExecutionGraph` supplies a static relation algebra, while the proof
-still operates on runtime `PortBatch` records. The correspondence is:
+The passive `ExecutionGraph` supplies a static typed relation vocabulary, while
+the proof operates on runtime `PortBatch` records. The correspondence is:
 
-- `SameAs(source)` preserves the source keyed records;
-- `SubsetOf(source)` keeps a keyed subset;
-- `ChildrenOf(parent, label)` names the child grain/display path and creates
-  children identified by parent identity plus ordinal;
-- `AggregateOf(anchor, members, incomplete)` regroups members by runtime
-  `ancestors` and canonicalizes them by `ordinals`;
-- `RelatedFrom(RoleSource(...))` derives identity from an ordered role-parent
-  tuple.
+- `SameAs(source)` preserves the source keyed records and identity domain;
+- `SubsetOf(source)` keeps a keyed subset of the same domain;
+- `ChildrenOf(parent)` creates a fresh child domain whose ids are parent
+  identity plus ordinal; `OutputSpec.grain` is only the type label;
+- `AggregateOf(anchor, incomplete)` returns to the anchor domain after grouping
+  descendants by a declared parent function (`ByAncestor` or `ByRole`);
+- `RelatedFrom(roles)` creates a fresh relation domain whose identity is the
+  ordered role-parent evidence tuple.
 
 `verify_graph` checks that these relations use valid refs and grains and match the
 typed operation. It does not replace the runtime evidence: Reduce and the theorem
-continue to rely on `record_ids`, `ancestors`, and `ordinals` carried by
-`PortBatch`.
+continue to rely on `record_ids`, `ancestors`, `ordinals`, and role edges `e`
+carried by `PortBatch`.
+
+## 0. Fragment claim and non-goals
+
+This note formalizes a **multi-grain identity algebra fragment**, not classical
+Codd relational algebra.
+
+**Supported fragment.** Finite DAGs over closed microbatches whose cardinality
+changes are drawn from:
+
+```text
+1:1   SameAs          (Map)
+0:1   SubsetOf        (Filter / FilterByMask)
+1:N   ChildrenOf      (Expand)
+N:1   AggregateOf     (Reduce via ByAncestor or ByRole)
+M:N   RelatedFrom     (Relate)
+```
+
+**Motif coverage, not a completeness theorem.** The five relations name the
+currently executable local motifs. Their composition is restricted by the
+well-formedness rules: in particular `ByRole` consumes direct `RelatedFrom`
+evidence, while `ChildrenOf` starts a child cohort with no inherited role edges.
+The independent [Formal Core note](20-relation-basis-adequacy.md)
+defines the supported authoring fragment and its lowering claim. The theorem below is
+only about execution reordering of an already verified graph.
+
+**Explicit non-goals.** The fragment does **not** claim:
+
+- classical RA completeness (union, set difference, arbitrary θ-join);
+- general graph queries (path, transitive closure, recursive CTE);
+- cross-microbatch Global/Window state or watermark completeness;
+- transitive role-path navigation such as `Relate → Expand → ByRole`;
+- invocation-local Expand mixed-output forests (`mg.out.same/children`), which
+  remain a deferred composition extension of the same vocabulary.
 
 ## 1. Data model
 
-**Records.** A *record* is a tuple `r = (id, v, a, o, ℓ)`:
+**Domains.** Let `Domain` be the set of immutable identity namespaces
+(`IdentityDomain`). A batch lives in one current domain `D ∈ Domain`. Grain and
+current port are *labels*; they are not keys of ancestry.
 
-- `id ∈ ID` — a globally unique identity string (`record_id`);
+**Records.** A *record* is a tuple `r = (id, v, a, o, ℓ, e)` on batch identity
+domain `D`. Its logical key is `key_D(r) = (D,id)`:
+
+- `id ∈ ID_D` — an identity string unique within the live port/admission scope
+  of `D` (`record_id`), not a process-global identifier;
 - `v` — the payload value;
-- `a : Name ⇀ ID` — the *ancestor map* (`ancestors[i]`), partial map from a
-  producer port name to the ancestor record id on that port;
-- `o : Name ⇀ ℕ` — the *ordinal map* (`ordinals[i]`), child index under an
+- `a : Domain ⇀ ID` — the *ancestor map* (`ancestors[i]`), a **partial function**
+  keyed by `IdentityDomain`, never by grain or current port name;
+- `o : Domain ⇀ ℕ` — the *ordinal map* (`ordinals[i]`), child index under an
   ancestor;
 - `ℓ ∈ Name*` — the *lineage path* (`lineage[i]`), the sequence of operators the
-  record passed through.
+  record passed through;
+- `e ⊆ Role × Domain × ID` — direct role-parent evidence (`relations[i]`).
+  Relate copies only shared, unambiguous ancestors into `a`; conflicting
+  same-domain parents remain losslessly represented in `e`.
+
+**Invariant I0 (functional ancestry).** For every record, `a` is a partial
+function: each domain maps to at most one ancestor id. Therefore `a` always
+describes a forest. Multi-parent structure that would violate functionality is
+stored only in `e`, never overwritten into `a`.
 
 (`display_keys` / `ancestor_display` are display projections of the same data and
 carried verbatim by `take`/`concat`, so we omit them from the proofs; they follow
 the same argument.)
 
 **Batches.** A *batch* `B = [r_0, …, r_{n-1}]` is a finite **sequence** of
-records. `B[i]` is the i-th record; `|B| = n`; `ids(B)` the sequence of ids.
-Each runtime batch also has a grain name. Execution enforces
+records on one domain `D`. `B[i]` is the i-th record; `|B| = n`; `ids(B)` the
+sequence of ids. Each runtime batch also has a grain name. Execution enforces
 `PortBatch.name == OutputSpec.grain`; therefore physical and serial batches at
 the same graph port have the same name in addition to the per-record equality
 proved below.
 
-**Port invariant I1 (identity uniqueness).** At every port produced by the
-system, ids are pairwise distinct. (Sources emit `name:i`; `Expand` emits
+**Port invariant I1 (identity uniqueness).** Within every live `PortBatch`,
+record keys `(D,id)` are pairwise distinct. Since one batch has one `D`, runtime
+checks pairwise-distinct ids. Sources emit `name:i`; a later admission may reuse
+the same strings, so no cross-microbatch uniqueness is claimed. `Expand` emits
 `op:parent_id:child_index`; `Map` preserves ids and `Filter`/`FilterByMask` keep
 a subset. `Relate` emits
-`op:role_1=pid_1|…|role_n=pid_n[|key=stable_key]` and rejects duplicate parent
-evidence unless a distinct stable key is provided. Distinctness is maintained by
-construction.)
+the stable hash of the canonical ordered tuple
+`((role_1, domain_1, pid_1), …, stable_key)` and rejects duplicate parent
+evidence unless a distinct stable key is provided. `PortBatch.__post_init__`
+rejects duplicate IDs at every runtime boundary. Relation-hash uniqueness relies
+on the explicit collision-resistance assumption in §8.)
 
-**Keyed view.** Define `⟦B⟧ : ID ⇀ Record` by `⟦B⟧(id) = r` for the unique
-`r ∈ B` with that id (well-defined by I1). Two batches are **keyed-equal**,
-written `B ≈ B'`, iff `⟦B⟧ = ⟦B'⟧` (equal as sets of full records — same ids,
-and identical `(v,a,o,ℓ)` per id). `B` is a **permutation** of `B'` iff `B ≈ B'`
-and `|B| = |B'|` (equivalently, `B'` reorders `B`).
+**Keyed view.** Define `⟦B⟧ : (Domain × ID) ⇀ Record` by
+`⟦B⟧(D,id) = r` for the unique `r ∈ B` with that key (well-defined by I1).
+Two batches are **keyed-equal**,
+written `B ≈ B'`, iff `⟦B⟧ = ⟦B'⟧` as sets of full records: same ids and
+identical `(v, a, o, ℓ, e)` per id. `B` is a **permutation** of `B'` iff
+`B ≈ B'` and `|B| = |B'|`.
 
-`≈` ignores physical order but is strict on every per-record field, so proving
-`≈` at a port already proves *lineage equality* at that port.
+`≈` ignores physical order but is strict on every per-record field — including
+role edges `e` — so proving `≈` at a port already proves *lineage and relation
+equality* at that port.
+
+### 1.1 Domain homomorphism (IR → runtime)
+
+Static ports are addressed by `PortRef`. Runtime batches carry `IdentityDomain`.
+The homomorphism `δ` is induced by output relations:
+
+| output relation | runtime domain |
+|---|---|
+| graph input | fresh or named domain chosen at `source(...)` admission |
+| `SameAs(s)` / `SubsetOf(s)` | inherit `δ(s)` |
+| `ChildrenOf(p)` | fresh domain derived from `(op, δ(p))` |
+| `AggregateOf(anchor, ·)` | return to `δ(anchor)` |
+| `RelatedFrom(roles)` | fresh domain derived from `(op, δ(role ports)…)` |
+
+Aligned multi-input Map/Filter further require all inputs to share one domain
+(`δ(p_i)` equal) before identity alignment. Grain equality alone is insufficient.
+
+### 1.2 Parent functions for Reduce
+
+A Reduce descendant selector declares a deterministic parent function
+
+```text
+π : DescendantRecord → AnchorId
+```
+
+Currently supported:
+
+```text
+ByAncestor     π(r) = a(r)(δ(anchor))
+ByRole(ρ)      π(r) = the unique id s.t. (ρ, δ(anchor), id) ∈ e(r)
+```
+
+Both require the image of `π` to land inside the current closed anchor
+microbatch; otherwise execution raises a closure violation. Ambiguous
+multi-parent ancestry without `ByRole` is rejected (no silent overwrite).
+`ByRole` is deliberately direct: `ChildrenOf` does not copy its parent's role
+edges, so role paths through Expand and general graph traversal are outside this
+fragment.
 
 ## 2. Physical execution model
 
 **take.** For an index list `σ = [σ_1,…,σ_k]` of distinct indices into `B`,
 `take(B, σ) = [B[σ_1], …, B[σ_k]]` — a subsequence with each record copied
-intact (`PortBatch.take` copies `value`, `ancestors`, `ordinals`, `lineage`
-element-wise).
+intact (`PortBatch.take` copies `value`, `ancestors`, `ordinals`, `lineage`,
+and `relations`/`e` element-wise).
 
 **concat.** `concat(B_1,…,B_m) = B_1 ⧺ … ⧺ B_m` — sequence concatenation, each
-record intact (`multigrain.data.concat` extends the parallel arrays element-wise).
+record intact (`multigrain.data.concat` extends the parallel arrays element-wise
+and deduplicates inherited `ErrorTrace`s).
 
 **Shard plan.** A *shard plan* for an `n`-row port is `σ = (σ_1,…,σ_m)`, a tuple
 of index lists. It is **legal** iff `{σ_1,…,σ_m}` is a **set partition** of
@@ -104,10 +198,13 @@ of index lists. It is **legal** iff `{σ_1,…,σ_m}` is a **set partition** of
 `(P^0,…,P^t)` (port 0 is the base) and legal plan `σ` over `|P^0|`:
 
 ```
-Exec_σ(N)(P^0,…,P^t) = concat_j ( N( take(P^0,σ_j), …, take(P^t,σ_j) ) )
+RawExec_σ(N)(P^0,…,P^t) = concat_j ( N( take(P^0,σ_j), …, take(P^t,σ_j) ) )
+Exec_σ(N)(P) = Canon_N,P(RawExec_σ(N)(P))
 ```
 
-merged per output port. `Serial(N) = N(P^0,…,P^t)` is the whole-batch run
+merged per output port. `Canon` sorts `SameAs`/`SubsetOf` by source logical
+position and `ChildrenOf` by `(parent logical position, child ordinal,
+record_id)`. `Serial(N) = N(P^0,…,P^t)` is the whole-batch run
 (`m = 1`, `σ_1 = [0..n-1]`).
 
 **Well-formedness WF (co-ordered inputs).** For a *sharded* multi-input node, all
@@ -144,16 +241,19 @@ where `aligned_i` is the identity-aligned tuple of the i-th base row with its
 same-id partners on the other ports, and `f_N(aligned_i)` is a batch of length
 1 (`Map`), 0 or 1 (`Filter`), or `k_i ≥ 0` (`Expand`).
 
-- **Map** `f = ` apply UDF to the aligned row, keep id/ancestors/ordinals, append
-  op to `ℓ`. Length 1. (`multigrain.primitives.map_filter`.)
-- **Filter** `f = ` `[row]` if mask true else `[]`; kept rows keep identity.
-  Length 0/1. (`multigrain.primitives.map_filter`.)
+- **Map** `f = ` apply UDF to the aligned row, keep `id/a/o/e` (merging
+  ancestry and role evidence across aligned inputs), append op to `ℓ`.
+  Length 1. (`multigrain.primitives.map_filter`.)
+- **Filter** `f = ` `[row]` if mask true else `[]`; kept rows keep
+  `id/a/o/ℓ/e`. Length 0/1. (`multigrain.primitives.map_filter`.)
 - **FilterByMask** is Select's internal canonical filtering operation. The mask
   is a same-identity Map output; it applies the same 0/1 decision to every
   aligned source/annotation and therefore has the same row-local argument as
   Filter. The mask port itself is consumed, not emitted.
-- **Expand** `f = ` for parent row with id `p`, emit children
-  `id = op:p:k`, `a' = a ∪ {portname ↦ p}`, `o' = o ∪ {portname ↦ k}`,
+- **Expand** `f = ` for parent row with id `p` on domain `D_p`, emit children on
+  a fresh domain with
+  `id = op:p:k`, `a' = a ∪ {D_p ↦ p}`,
+  `o' = o ∪ {D_p ↦ k}`, `e' = ∅`,
   `ℓ' = ℓ⧺[op]` for `k = 0..k_p-1`. Length `k_p`. Depends only on the parent
   record’s own value (the UDF sees the parent value and returns its group).
   (`multigrain.primitives.output::PortBatchBuilder.expanded`.)
@@ -165,7 +265,8 @@ hides framework metadata, but Python cannot prove that a user object has no
 external state; programs violating this contract are outside the theorem.
 
 **Lemma 1 (sharding commutes with row-independent nodes).** For a row-independent
-`N` under WF and any legal plan `σ`:  `Exec_σ(N)(P) ≈ Serial(N)(P)`.
+`N` under WF and any legal plan `σ`: `RawExec_σ(N)(P) ≈ Serial(N)(P)` and,
+after canonical merge, `Exec_σ(N)(P) = Serial(N)(P)` as an ordered sequence.
 
 *Proof.* By Lemma 0, `concat_j take(P^0,σ_j)` is a permutation of `P^0`; under WF
 the same index sets select the same ids on every input port, so shard `j`
@@ -173,51 +274,65 @@ contains exactly the aligned rows `{aligned_i : i ∈ σ_j}`. Since `N` applies 
 independently per aligned row,
 
 ```
-N(take(P,σ_j)) = concat_{i∈σ_j} f_N(aligned_i)        (order within σ_j)
-Exec_σ(N)(P)  = concat_j concat_{i∈σ_j} f_N(aligned_i)
-Serial(N)(P)  = concat_{i=0..n-1} f_N(aligned_i)
+N(take(P,σ_j))   = concat_{i∈σ_j} f_N(aligned_i)
+RawExec_σ(N)(P)  = concat_j concat_{i∈σ_j} f_N(aligned_i)
+Serial(N)(P)     = concat_{i=0..n-1} f_N(aligned_i)
 ```
 
-Both are concatenations of the **same multiset** `{ f_N(aligned_i) : i }`, each
+The raw and serial forms concatenate the **same multiset**
+`{ f_N(aligned_i) : i }`, each
 `f_N(aligned_i)` identical in both runs (it depends only on `aligned_i`, which is
 the same record content in both). They may differ only in the order of the blocks
-⇒ same id-set, same per-record `(v,a,o,ℓ)` per id ⇒ `Exec_σ(N)(P) ≈ Serial(N)(P)`.
+⇒ same id-set, same per-record `(v,a,o,ℓ,e)` per id ⇒
+`RawExec_σ(N)(P) ≈ Serial(N)(P)`.
 (Ids stay distinct: Map/Filter preserve input ids, Expand ids are keyed by the
 parent id `p` and child index `k`, both content-derived, so no collision arises
-from reordering.) ∎
+from reordering.) Finally `Canon` orders preserved rows by serial source
+position and expanded rows by parent position plus child ordinal, exactly the
+order in `Serial`; hence ordered equality. ∎
 
 Lemma 1 is the crux: **for Map/Filter/FilterByMask/Expand, a
 sharded/reordered run equals the serial run as a keyed collection — including
-all lineage fields.**
+all lineage fields and role edges.**
 
 ## 5. Order-canonicalizing operators (Reduce, group_by)
 
 `Reduce(anchor A, descendants D_1..D_s)` computes, per anchor row and per
-descendant (`_groups_for`):
+descendant, using the declared parent function `π` (§1.2):
 
 ```
-group(A[q], D) = [ v : (id,v,a,o,ℓ) ∈ D, a(A.name) = A.record_id(q) ]
-                 sorted ascending by o(A.name)
+group_π(A[q], D) =
+  [ v : r=(id,v,a,o,ℓ,e) ∈ D, π(r) = A.record_id(q) ]
+  sorted by the domain-qualified ordinal path, then record_id
+```
+
+where
+
+```
+ByAncestor     π(r) = a(r)(A.domain)
+ByRole(ρ)      π(r) = unique id with (ρ, A.domain, id) ∈ e(r)
 ```
 
 then returns one output row per anchor row `q`, in **anchor order**, applying the
-reduce UDF to the (anchor value, groups). Crucially it addresses descendants by
-`a(A.name)` (identity) and orders them by `o(A.name)` (ordinal) — **never by
-physical position**.
+reduce UDF to the (anchor value, groups). Both selectors require the selected
+parent to be present in the closed anchor microbatch and order by
+domain-qualified ordinals — **never by physical position**.
 
 **Lemma 2 (Reduce is invariant to descendant permutation).** If `D ≈ D'` (keyed
-equal; hence a permutation) and the anchor `A` is identical, then
-`Reduce(A, D) = Reduce(A, D')` **as ordered sequences** (not merely `≈`).
+equal; hence a permutation), the anchor `A` is identical, and the same selector
+`π` is used, then `Reduce_π(A, D) = Reduce_π(A, D')` **as ordered sequences**
+(not merely `≈`).
 
-*Proof.* `group(A[q],D)` is defined by a filter on `a(·)` plus a sort on `o(·)`.
-Both the membership predicate and the sort key are per-record functions of fields
-that are preserved under `≈` (same set of records with same `a,o,v`). A set-filter
-followed by a total sort on a stable key yields a sequence determined solely by
-the *set* of qualifying records and their keys — independent of input order.
-Hence `group(A[q],D)=group(A[q],D')` for every `q`. Ties: child ordinals under one
-anchor are distinct (`Expand` assigns `k=0,1,…`), so the sort is total and
-tie-free. The output is one row per `q` in anchor order (same `A`), so the whole
-output sequences are equal. ∎
+*Proof.* Membership in `group_π(A[q],·)` is decided by `π(r)`, a per-record
+function of either `a` (`ByAncestor`) or `e` (`ByRole`). The sort key is a
+per-record function of `o` (and `id` as tie-break). Both are preserved under
+`≈`, which now includes `(v,a,o,ℓ,e)`. A set-filter followed by a total sort on
+a stable key yields a sequence determined solely by the *set* of qualifying
+records and their keys — independent of input order. Hence
+`group_π(A[q],D)=group_π(A[q],D')` for every `q`. Ties: child ordinals under one
+anchor are distinct for Expand-derived descendants (`k=0,1,…`); Relate-derived
+descendants use `record_id` as a total tie-break. The output is one row per `q`
+in anchor order (same `A`), so the whole output sequences are equal. ∎
 
 (If descendants come from a `Filter`, some children are absent; `group` simply
 omits them. The missing-child policy is applied identically in both runs because
@@ -228,9 +343,11 @@ it too is a function of the surviving keyed set.)
 **Key-join (`on=`).** `_make_key_join_batch` iterates the **first role's** rows in
 physical order, dedups by key, and for each key emits the cross-product of the
 matched rows across roles. Output identity is **content-addressed**: a relation
-row's id is `op:role_1=pid_1|role_2=pid_2|…`, i.e. a function of its matched
-parent record ids (`multigrain.primitives.relate`), *not* of emission order. Since distinct combos
-have distinct parent tuples, ids are unique (I1) and permutation-invariant.
+row's id is a stable hash of the canonical tuple
+`((role_1, domain_1, pid_1), (role_2, domain_2, pid_2), …)`, i.e. a function of
+its matched parent evidence (`multigrain.primitives.relate`), *not* of emission order. Since distinct combos
+have distinct parent tuples, ids are permutation-invariant; treating their
+SHA-256 digests as distinct uses the collision-resistance assumption in §8.
 
 **Lemma 3a (key-join is `≈` under permutation).** If the role ports are permuted
 keyed-equal (`P^r ≈ P'^r`), then `Relate_on(P) ≈ Relate_on(P')`.
@@ -239,23 +356,25 @@ keyed-equal (`P^r ≈ P'^r`), then `Relate_on(P) ≈ Relate_on(P')`.
 `key ↦ {matched records}`, a function of the keyed content only (the join key is
 extracted from each record’s value), so the same *set* of parent tuples is
 produced regardless of role-port order. For each combo the value, `ParentRef`s,
-merged `(a,o,ℓ)`, and the **content-addressed id** are all computed from the
-matched records’ preserved fields, hence identical. Same id-set, same per-record
-fields ⇒ `≈`. (The physical row order and the surrogate `j` no longer appear in
+role edges `e`, unambiguous shared `(a,o)`, merged `ℓ`, and the
+**content-addressed id** are all computed from the matched records’ preserved
+fields, hence identical. Same id-set, same per-record fields ⇒ `≈`. (The physical row order and the surrogate `j` no longer appear in
 identity, so they cannot break `≈`.) ∎
 
 **Lemma 3b (adapter path is `≈` under permutation-equivariant evidence).** For
 the dotted `relation_adapter` path, each emitted item supplies
 `(value, {role: local_index})`, optionally followed by a deterministic
-`stable_key`. The framework immediately resolves the local indexes to parent
-record ids and constructs the content-addressed identity
-`op:role_1=pid_1|…|role_n=pid_n[|key=stable_key]`. Duplicate parent evidence
+`stable_key`. The role mapping must contain **exactly** the declared roles.
+The framework resolves indexes in declared role order—not mapping insertion
+order—to typed `(role, domain, parent id)` evidence and constructs the stable
+hash identity from that tuple plus optional `stable_key`. Duplicate parent evidence
 without distinct stable keys is rejected.
 
 If, after rebasing invocation-local indexes to their records, the adapter emits
 the same set of `(value, parent tuple, stable_key)` for every permutation of its
-input rows, then the resolved `ParentRef`s, merged `(a,o,ℓ)`, values, and ids are
-identical. Therefore `Relate_adapter(P) ≈ Relate_adapter(P')`.
+input rows, then the resolved `ParentRef`s / role edges `e`, unambiguous shared
+`(a,o)`, merged `ℓ`, values, and ids are identical. Therefore
+`Relate_adapter(P) ≈ Relate_adapter(P')`.
 
 This permutation-equivariance condition is an explicit adapter contract. An
 adapter that uses invocation-local position as business evidence, or emits a
@@ -267,78 +386,83 @@ lemma also describes its eager semantics. It is not a compiled graph matcher;
 compiled Relate requires `KeyJoinSpec` or dotted `RelationAdapterSpec`.
 
 **Consequence.** Both `on=` and a contract-conforming adapter make Relate fully
-`≈` (Theorem part 1 applies as-is). An order-sensitive consumer still needs
-canonicalization to obtain byte-identical sequence order:
-
-> **Reordering discipline.** A port produced downstream of a sharded node may be
-> consumed *positionally* only if it is first canonicalized (via `Reduce`, or an
-> unsharded anchor). Identity/ordinal-addressed consumers are always safe.
+`≈` under role-port permutation. Relate is **not** itself an order-canonicalizer:
+if its role inputs are only keyed-equal but physically reordered, emission order
+may change. Ordered equality at a Relate port requires already-ordered role
+inputs (as provided by upstream `Canon` in the Ray model).
 
 ## 7. Main theorem
 
-Consider a DAG `G` in topological order `N_1,…,N_K`, executed physically with an
-arbitrary assignment of a legal shard plan to each sharded node (`Map`/`Filter`/
-`FilterByMask`/`Expand`), WF holding at each sharded multi-input node, and
-`Reduce`/`Relate` run whole (single task, as in the MVP). Let `Phys(port)` and
-`Ser(port)` be the physical and serial batches at each port.
+Consider a DAG `G` in topological order `N_1,…,N_K`, with a legal shard plan on
+each row-partitionable node (`Map`/`Filter`/`FilterByMask`/`Expand`), WF at each
+sharded multi-input node, and `Reduce`/`Relate` run whole-batch. Write
+
+```text
+RawPhys(p)  = result after take/concat sharding without Canon
+Phys(p)     = Ray model: Canon applied after every sharded row-independent node
+Ser(p)      = serial whole-batch execution
+```
 
 **Theorem (Reordering Invariance).**
 
-1. **(Keyed/lineage equality everywhere)** For every port `p` in `G`,
-   `Phys(p) ≈ Ser(p)`. In particular every record’s ancestors, ordinals, and
-   lineage are identical to the serial run, independent of which shard processed
-   it.
-2. **(Ordered equality at canonical outputs)** For every port that is the output
-   of a `Reduce` whose anchor is a graph input or another canonical port,
-   `Phys(p) = Ser(p)` as ordered sequences (byte-identical).
+1. **(Keyed / lineage equality everywhere)** For every port `p`,
+   `RawPhys(p) ≈ Ser(p)`. Every record’s `(v,a,o,ℓ,e)` matches the serial run
+   as a keyed collection, independent of the legal shard plan.
+2. **(Ordered equality after Canon / at Reduce)**
+   - For every row-independent port under the Ray model,
+     `Phys(p) = Ser(p)` as ordered sequences (Lemma 1).
+   - For every `Reduce` output with fixed selector `π` **and an
+     ordered-identical anchor** (`A_phys = A_ser` as sequences),
+     `RawPhys(p) = Phys(p) = Ser(p)` even if descendants are only `≈`
+     (Lemma 2). If the anchor itself is merely `≈` and physically permuted,
+     Reduce still gives keyed equality, but emits in the permuted anchor order.
+   - For a `Relate` port, ordered equality holds when role inputs are already
+     ordered-equal; in general Relate only guarantees part 1 (`≈`).
 
 *Proof.* Induction on topological position.
 
-*Base.* Graph inputs are supplied identically ⇒ `Phys = Ser` (hence `≈`).
+*Base.* Graph inputs are supplied identically ⇒ equality (hence `≈`).
 
-*Step.* Assume `Phys(inp) ≈ Ser(inp)` for all inputs of `N_k`.
+*Step (part 1).* Assume inputs are `≈` serial.
 
-- `N_k` row-independent (Map/Filter/FilterByMask/Expand): its inputs are `≈` to
-  serial by IH;
-  `≈` preserves the aligned row multiset, and the node applies `f_N` per row, so
-  `N_k(Phys(inp))` and `N_k(Ser(inp))` share the same per-row image multiset.
-  Sharding only re-blocks the concatenation (Lemma 1). Hence
-  `Phys(out) = Exec_σ(N_k)(Phys(inp)) ≈ N_k(Ser(inp)) = Ser(out)`. (WF lets the
-  positional shard select matching ids on all ports.)
-- `N_k = Reduce`: run whole. By IH descendants are `≈` serial and the anchor is
-  `≈` serial. If the anchor is a graph input or a canonical port, its *order*
-  equals serial too (part 2 / base), so by Lemma 2 `Phys(out) = Ser(out)`
-  (ordered). In all cases `Phys(out) ≈ Ser(out)` (Lemma 2 gives equality, a
-  fortiori `≈`). Establishes part 2 for Reduce outputs.
-- `N_k = Relate`: run whole. By IH role ports are `≈` serial. With `on=`,
-  Lemma 3a gives `Phys(out) ≈ Ser(out)` directly. With the adapter escape hatch,
-  the permutation-equivariant adapter contract and Lemma 3b give
-  `Phys(out) ≈ Ser(out)` directly.
-All covered operations preserve `≈`; Reduce with a canonical anchor upgrades to ordered
-equality. ∎
+- Row-independent `N_k`: Lemma 1 gives `RawExec_σ ≈ Serial`.
+- `Reduce`: Lemma 2 with descendant `≈` gives keyed-equal outputs; with an
+  ordered-identical anchor it also gives ordered equality. MVP pipelines use
+  graph-input anchors (or Canon'd SameAs ports), which satisfy the stronger
+  premise.
+- `Relate`: Lemmas 3a/3b give `≈` from keyed-equal role ports.
 
-**Corollary (lineage-guided recovery is reorder-stable).** The `ErrorTrace` for a
-failed record is a pure function of that record’s `(a, ancestor_display, ℓ)` and
-the failing op (`map_filter.py::_run_with_bad_index`). By Theorem part 1 these
-fields are identical to the serial run regardless of the shard the record landed
-in. Hence quarantine localization and the healthy-set are invariant under any
-legal shard plan. This is precisely what
-`test_lineage_under_parallelism.py::test_quarantine_localizes_same_page_under_reordered_parallelism`
-observes; the theorem generalizes it to *all* legal plans.
+*Step (part 2).* Under the Ray model every sharded row-independent node applies
+`Canon`, so Lemma 1 upgrades those ports to ordered equality. Reduce upgrades by
+Lemma 2 when the anchor is ordered-identical (true for graph-input anchors, and
+for SameAs anchors that passed Canon). Relate upgrades only when IH gives
+ordered role inputs. ∎
 
-**Corollary (LPT is safe).** `lpt_shard_planner` returns a legal plan (Section 2),
-so by the Theorem work-aware rebalancing changes only makespan, never results or
-lineage. Performance (bubble elimination) and correctness are thus decoupled: the
-scheduler is free to optimize within the legal-plan family.
+**Corollary (lineage-guided recovery is reorder-stable).** Under deterministic
+failure classification and error rendering, an `ErrorTrace` is a function of
+the record key, ancestry and display projections, lineage, selected parent,
+failing operation, recovery action, and error text. These inputs are stable
+under the theorem's keyed execution (display metadata is copied verbatim), so
+quarantine localization and the resulting trace are reorder-stable. Observed by
+`test_lineage_under_parallelism.py::test_quarantine_localizes_same_page_under_reordered_parallelism`.
+
+**Corollary (LPT is safe for correctness).** `lpt_shard_planner` returns a legal
+plan, so by part 1 it cannot change keyed results, lineage, or role edges; by
+part 2 (Ray Canon) it also cannot change user-visible `list[obj]` order at
+Map/Filter/Expand/Reduce ports. This does **not** claim lineage chooses the
+plan; LPT may use an external `weight_of(value)`.
 
 ## 8. Assumptions, scope, and honest limits
 
 - **WF (co-ordered inputs)** is required for *sharded multi-input* nodes. It holds
-  in the MVP pipelines and is *checked* (not assumed) by `_align_by_identity`,
+  in the MVP pipelines and is checked by identity-domain equality plus
+  `_align_by_identity`,
   which raises on violation instead of mis-joining. Lifting WF (shard by a
   by-id partition instead of positional `take`) is future work and would make the
   theorem unconditional for multi-input sharded nodes.
-- **Reduce/Relate are whole-batch** in the MVP. When they are sharded (two-phase
+- **Reduce/Relate are whole-batch within `CLOSED_MICROBATCH`** in the MVP.
+  Every selected ancestry/role parent must be present in that microbatch;
+  cross-microbatch Global/Window state is outside this theorem. When they are sharded (two-phase
   reduce, salting for skew), Lemma 2 must be re-established under a *monoid*
   (associative, commutative-up-to-sort) reduce UDF; the ordinal sort already
   supplies the canonical order. This is exactly the M4 residual (#5 reduce skew).
@@ -353,25 +477,38 @@ scheduler is free to optimize within the legal-plan family.
   rebound to their records, a relation adapter must emit the same keyed set of
   `(value, ordered role-parent tuple, deterministic stable_key)` for every input
   permutation. Position-sensitive adapters are outside the theorem.
+- **Content-addressed identity.** Relation IDs use SHA-256 over canonical role
+  evidence. The proof assumes collision resistance over the finite records in
+  one execution; the runtime detects any duplicate IDs that nevertheless appear
+  in one output batch.
 - **Determinism.** All covered UDFs and adapters are deterministic functions of
   their allowed value/evidence inputs. The current minimal graph has no
   materialization operation that could make a nondeterministic operator
   replay-safe.
 - **Floating point.** Reduce over floats is only associative up to rounding; byte
-  equality (part 2) assumes the reduce UDF sees children in the canonical ordinal
+  equality assumes the reduce UDF sees children in the canonical ordinal
   order, which Lemma 2 guarantees — so there is *no* new nondeterminism from
   sharding.
+- **Fragment boundary.** This theorem proves reordering invariance, not language
+  completeness. Classical RA operators, graph recursion, cross-batch
+  Global/Window, mixed-output Expand, and transitive role paths are outside its
+  executable fragment. The separate Formal Core note states the restricted
+  authoring and compilation-soundness claim.
 
 ## 9. Machine-checked evidence
 
-The hypotheses (row-independence, legal-plan partitioning, WF) and the two
-conclusions are exercised by
-`test/experimental/multigrain/test_reordering_invariance.py`: it runs each motif
-under **randomly generated legal shard plans** (including full shuffles and
-adversarial singleton/one-big splits) and asserts
+What is actually checked today:
 
-- keyed-equality (`≈`, incl. all lineage fields) at every intermediate port, and
-- byte-identical ordered equality at the final `Reduce` output,
+| claim | evidence |
+|---|---|
+| part 1 `≈` everywhere under random legal plans | `test_reordering_invariance.py` (local take→concat **without** Canon; compares `(v,a,o,ℓ,e)`) |
+| Reduce ordered equality | same file, final Reduce port |
+| part 2 ordered equality after Canon on Map/Filter | Ray `test_reordered_shards_canonize_exposed_intermediate_outputs` |
+| part 2 ordered equality after Canon on Expand | Ray `test_reordered_shards_canonize_expand_output` |
+| full deterministic ErrorTrace equality | Ray `test_quarantine_localizes_same_page_under_reordered_parallelism` |
+| ByRole / closure / domain motifs | Semantic Hardening + relate key-join suites |
 
-against the serial baseline — a property-based check that the theorem’s
-guarantees hold for the actual implementation, with no GPU and no Ray cluster.
+Honest gap: the local property harness proves part 1 strongly; part 2’s
+“ordered everywhere under Canon” is proved for the Ray `Exec=Canon(RawExec)`
+model and spot-checked, but not yet property-tested on every intermediate port
+in the local harness (which deliberately omits Canon to isolate `≈`).

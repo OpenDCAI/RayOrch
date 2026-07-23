@@ -32,13 +32,14 @@ Data/Trident at scale). See the "Related Work & Venue Strategy" section below.
 | Milestone | Topic | Status | Blocks acceptance? |
 |---|---|---|---|
 | M0 | Minimal relation-aware ExecutionGraph + primitives + unified public Ray stream executor | done (typed operations/relations; mandatory verifier; generic DAG coordinator; persistent pools; bounded inflight) | prerequisite |
-| M1 | Formalization: relation algebra + reordering-invariance theorem | **done** | yes (else "just engineering") |
+| M1a | Reordering Invariance for verified executable graphs | **done** | yes (else "just engineering") |
+| M1b | Formal Core Semantics + conditional Compilation Soundness for `F_direct` | **done** | yes (bounds the supported language) |
 | M2 | Real workload + real baselines + multi-node scale | **in progress** (E1 public-engine 368-PDF: 1.72× vs measured 892s baseline, output-equivalent; competitor baselines + multi-node TODO) | **yes (make-or-break)** |
 | M3 | Fault-tolerance & overhead: row-level recovery vs full recompute; lineage cost | **in progress** (E3 done: record-level COMPLETE + 0 redundant re-OCR vs shard-level ABORT + 1.5× waste on real pipeline; lineage-overhead E4 TODO) | yes |
 | M4 | New systems mechanism: kill residual bubbles (#4 stage barrier, #5 reduce skew) | not started | yes (differentiator) |
 | M5 | Ablations + sensitivity + artifact + writing | not started | yes (polish) |
 
-Minimal acceptable set: **M1 + M2 + M3 + (one of M4)**. M5 makes it competitive.
+Minimal acceptable set: **M1a + M1b + M2 + M3 + (one of M4)**. M5 makes it competitive.
 
 Primitive 内核现已收敛到 `ExecutionGraph`、typed operation、per-output relation、
 output builder、typed handler registry、`verify_graph` 函数和
@@ -47,8 +48,8 @@ output builder、typed handler registry、`verify_graph` 函数和
 Expand mixed outputs、`mg.out.same/children` relation forest、现实 workload 覆盖和未来
 Partition/global/window/async 扩展门已记录在
 [`19-expand-mixed-output-relation-design.md`](19-expand-mixed-output-relation-design.md)；
-identity forest 已可由 IR/verifier 表示，但 marker API 与 runtime materialization
-仍为 **deferred**，不阻塞 M2/M3。
+typed relation vocabulary 已预留必要词汇，但 marker API、forest verifier 与 runtime
+materialization 仍作为一个整体 **deferred**，不阻塞 M2/M3。
 
 Deferred primitive authoring/compiler follow-ups（当前不优先）:
 - [ ] **Expand mixed-output relation override**：保留现有 Expand 默认 shared-child
@@ -65,26 +66,56 @@ Deferred primitive authoring/compiler follow-ups（当前不优先）:
 
 ---
 
-## M1 — Formalization  ✅ done
+## M1a — Reordering Invariance  ✅ done
 
 Goal: promote the empirical "reordering doesn't corrupt results/lineage" into a
 theorem, so the work reads as research, not plumbing.
 
 Deliverables (all landed):
-- [x] Relation-algebra + physical-execution semantics grounded in code
+- [x] Typed relation contracts + physical-execution semantics grounded in code
       → `13-reordering-invariance-theorem.md`.
-- [x] Reordering-Invariance theorem: part 1 (keyed/lineage `≈` everywhere),
-      part 2 (byte-identical ordered equality at canonical Reduce outputs);
-      corollaries: lineage-guided recovery is reorder-stable, LPT is safe.
+- [x] Reordering-Invariance theorem (honest strength): part 1 keyed `≈` of
+      full records `(id,v,a,o,ℓ,e)` under any legal plan; part 2 ordered
+      equality after Ray Canon / at Reduce (Relate ordered only if inputs
+      already ordered). Corollaries: recovery reorder-stable; LPT safe for
+      correctness (not “lineage chooses the plan”).
+- [x] Formal hygiene after Semantic Hardening: `≈` includes role edges `e`;
+      Domain homomorphism IR→runtime; Reduce parent functions
+      `ByAncestor`/`ByRole`; explicit non-goals.
 - [x] Honest assumptions: exact-partition validation, WF co-ordered inputs,
-      whole-batch Reduce/Relate, deterministic row-local UDFs, and
+      closed-microbatch Reduce/Relate, deterministic row-local UDFs, and
       permutation-equivariant relation adapters.
-- [x] Content-addressed relation ids (so key-join is strictly `≈`).
+- [x] Content-addressed relation ids (stable hash of role/domain/parent tuple).
 - [x] Machine-checked property test over random legal shard plans
-      → `test/experimental/multigrain/test_reordering_invariance.py` (25×2, green).
+      → `test/experimental/multigrain/test_reordering_invariance.py` (+ hardening suite).
 
 Follow-ups (optional, do lazily): re-prove Lemma 2 under a sharded two-phase
 Reduce (needed by M4 #5); lift WF via by-id shard partitioning.
+
+---
+
+## M1b — Formal Core Semantics  ✅ done
+
+Goal: define the exact executable authoring fragment and its conditional
+compilation-soundness contract, without claiming language completeness,
+classical relational completeness, or arbitrary composition.
+
+Deliverables (all landed):
+- [x] Independent semantic fragment `F_direct`, operation-specific local
+      representation lemmas and formal-core coverage proposition
+      → `20-relation-basis-adequacy.md`.
+- [x] Conditional authoring-to-`ExecutionGraph` Compilation Soundness,
+      including `Map = SameAs(input 0)` and
+      `Select = Map + FilterByMask`.
+- [x] Explicit separation of structural verifier checks, backend/runtime checks
+      and user/data proof obligations.
+- [x] Explicit boundaries: closed microbatch, direct role evidence,
+      permutation-equivariant adapters, no mixed-output Expand, role paths,
+      Global/Window, recursion or stateful effects.
+- [x] English normative note plus synchronized Chinese translation.
+- [x] Executable evidence for legal random partitions, nested Expand,
+      Select diamonds, key-based adapters, Canon order and invalid-fragment
+      counterexamples.
 
 ---
 
@@ -138,6 +169,11 @@ Deliverables:
       wrapper-specific attributable units for Filter/Expand/Reduce/Relate.
 - [ ] Overhead study: cost of record-level lineage tracking in steady state
       (must be small, e.g. < a few %); memory footprint of lineage.
+- [ ] Canonical shard-merge overhead: separately measure CPU sort/index cost,
+      temporary metadata memory and payload-copy/object-store pressure for
+      contiguous vs LPT plans. Use the result to decide whether runtime needs an
+      internal physical-view/zero-copy permutation; do not weaken logical
+      `list[obj]` ordered equality.
 - [ ] Compact-lineage substrate (doc 16): coordinator UUID/BatchArena → shared
       1:1 path table → columnar 1:N → Reduce/M:N compact relations → arena
       lifecycle/release.
@@ -250,3 +286,4 @@ acceptance odds. Track in M2.
 - `17-mineru-graph-integration-findings.md` — real-image graph/recovery/LPT coverage ledger.
 - `18-multigrain-primitive-core-convergence.md` — primitive core ownership and convergence.
 - `19-expand-mixed-output-relation-design.md` — deferred mixed-output API and future relation-space gates.
+- `20-relation-basis-adequacy.md` — M1b semantic fragment, adequacy and compilation-soundness proofs.

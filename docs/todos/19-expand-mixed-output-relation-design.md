@@ -1,6 +1,6 @@
 # Expand 混合输出与 identity forest
 
-状态：**IR/verifier 表达已落地；authoring marker 与 runtime materialization deferred**。
+状态：**relation vocabulary 已预留；marker、forest verifier 与 runtime 整体 deferred**。
 
 本文记录未来 `mg.out.same` / `mg.out.children` 的边界。当前代码不能使用这些 marker；
 现有多输出 Expand 仍是 shared-child cohort。
@@ -15,7 +15,7 @@ pages, page_metadata = mg.Expand(ParsePages, num_outputs=2)(documents)
 
 两个 outputs 当前都：
 
-- 使用同一个 `ChildrenOf(document, label)`；
+- 使用同一个 `ChildrenOf(document)`；
 - 每个 document 的 group length 相同；
 - 共享 child identity、ancestry 和 ordinal；
 - 只是同一批 child records 的不同 value columns。
@@ -33,25 +33,19 @@ blocks            children(page)
 把它们强制视为一个 cohort 会产生错误 identity；无条件拆 UDF 又可能重复 decode/model
 工作。
 
-## 2. 已实现的静态基础
+## 2. 已实现的类型基础
 
-minimal relation-aware `ExecutionGraph` 已能表示 per-output identity：
+relation algebra 已分别定义必要的 per-output identity 类型：
 
 ```python
 OutputSpec(..., relation=SameAs(source))
-OutputSpec(..., relation=ChildrenOf(parent, label))
+OutputSpec(..., relation=ChildrenOf(parent))
 ```
 
-`verify_graph()` 允许 Expand outputs 使用 `SameAs` 或 `ChildrenOf`，并验证：
-
-- source 是 node input 或同 node 的更早 output；
-- `SameAs` output grain 等于 source grain；
-- `ChildrenOf.label` 非空；
-- source 已可用，禁止 self/forward source；
-- graph refs、producer 和 topology 合法。
-
-因此 node-local identity forest 的**静态表示和结构验证已实现**。这不等于用户 marker 或
-runtime output materialization 已实现。
+但当前类型名为 `ExecutionGraph`，`verify_graph()` 因而只接受 runtime 真正可执行的
+shared-`ChildrenOf` Expand。`ExpandOp + SameAs`、不同 parent 或不同 child grain 都在
+验证期拒绝，不产生“验证通过、执行失败”的半成品 graph。未来实现 marker 时，source
+顺序、grain、无环 forest 与 runtime materialization 必须一起落地。
 
 ## 3. Future API
 
@@ -63,8 +57,8 @@ mg.out.children(groups, of=source, grain=..., key=None)
 ```
 
 - `same` lower 为 `SameAs(source_ref)`；
-- `children` lower 为 `ChildrenOf(source_ref, label)`；`label` 命名 child
-  grain/display path，identity 由 source identity 与 ordinal 派生；
+- `children` lower 为 `ChildrenOf(source_ref)`；marker 的 `grain=` 写入
+  `OutputSpec.grain`，identity 由 source identity 与 ordinal 派生；
 - 未标注 output 保持默认 shared-child Expand 行为。
 
 它们只描述 output identity source，不引入万能 Transform/emit DSL。
@@ -176,8 +170,8 @@ return pages, blocks, scores
 - eager, Local and Ray share one implementation；
 - no expansion of record-level recovery scope。
 
-Current `ExpandHandler` intentionally rejects mixed output relations with
-`NotImplementedError`; it only accepts one shared `ChildrenOf` relation.
+Current `verify_graph` and `ExpandHandler` both accept only one shared
+`ChildrenOf` relation.
 
 ## 8. Reordering obligations
 
@@ -206,4 +200,5 @@ indivisible heterogeneous return bundle. Until then:
 - use normal shared-child multi-output Expand when group shapes match；
 - split operations when outputs have different invocation requirements；
 - use Filter, Reduce or Relate for their own relation families；
-- describe mixed forests as representable by IR/verifier but runtime-deferred。
+- describe mixed forests as a fully deferred feature, not a currently valid
+  `ExecutionGraph`。

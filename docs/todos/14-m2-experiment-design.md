@@ -53,6 +53,38 @@ cedar/Pecan are cited for optimizer/UDF-hint positioning, not necessarily run.
 - **Reorder-safety at scale**: empirically confirm M1 theorem on the real run
   (byte-identical results across shard plans), not just unit scale.
 
+### 3a. Anonymous internal evidence schema
+
+Internal evidence must establish external validity without exporting payloads,
+paths, user names, raw record IDs, display keys, model inputs, or error text.
+Every run records two layers:
+
+```text
+RunEnvelope
+  experiment_id        random publication-safe id
+  workload_family      document_parse | multimodal_caption | ...
+  engine_revision      git revision / artifact version
+  cluster_shape        nodes, accelerators, CPU, memory class
+  configuration        planner/recovery/replica policy names
+  dataset_bucket       coarse public size/fanout bucket, never a source path
+  started_at_bucket    day or week, not user/request timestamp
+
+NodeMetric
+  name, kind, replicas
+  rows_in, rows_out, fanout_ratio
+  shard_rows_in[], shard_rows_out[], shard_busy_s[]
+  stage_makespan_s, idle_bubble_frac
+  retries, recovery_rows
+  relation_entries_out, lineage_bytes_out
+```
+
+`NodeMetric.to_dict()` is the engine-native anonymous stage trace. Arrays are
+aligned by shard index and contain counts/durations only. A separate GPU sampler
+may add per-stage aggregate utilization percentiles, but must not attach raw
+object identifiers. Publication uses distributions and aggregate cases; any
+internal case study must have a public workload reproducing the same qualitative
+trend.
+
 ## 4. Prototype gaps to close before M2 can run
 
 Ordered by leverage. These are the concrete "further prototype design" tasks.
@@ -65,11 +97,12 @@ Ordered by leverage. These are the concrete "further prototype design" tasks.
    layout/OCR (or MinerU components) and a vLLM VLM captioner, staying UDF-pure
    (value-in/value-out, no ids — preserves the M1 assumption). Provide
    `num_gpus_per_replica`, `gpu_heavy` properties.
-3. **Instrumentation. [DONE]** `metrics.RunMetrics` / `NodeMetric` +
+3. **Instrumentation. [PARTIAL]** `metrics.RunMetrics` / `NodeMetric` +
    `lineage_footprint`: per-node makespan, per-shard busy -> idle-bubble fraction,
-   lineage records/bytes overhead, recovery counters. Threaded through both
-   `MultigrainExecutor` and `MultigrainRayExecutor`. (Add real GPU-util sampling
-   when real ops land.)
+   anonymous per-shard input/output cardinality, fanout ratio, relation/lineage
+   footprint and recovery counters. Threaded through both `MultigrainExecutor`
+   and `MultigrainRayExecutor`. RunEnvelope persistence and real GPU-util sampling
+   remain to be added when the internal collection boundary is chosen.
 4. **Baseline harness.** Same W1/W2 expressed on Ray Data, Spark, naive Ray; shared
    dataset loader from CEPH; shared correctness checker (compare healthy outputs).
 5. **Fault-injection harness. [DONE, MVP]** `multigrain.ray.executor.FaultSpec` injects
@@ -192,7 +225,8 @@ poison page — the only variable is how the framework recovers. Measured at the
 with the assembler's behaviour on a holed doc.
 
 **Setup.** 48 PDFs → 992 pages, `MinerU2.5-2509-1.2B`, 4×H20, 4 persistent GPU
-actors, `max_retries=2`. Poison = one page (`2410.19313v1_copy_2#p1`) that
+actors, node `RecoveryPolicy(max_shard_retries=2)`. Poison = one page
+(`2410.19313v1_copy_2#p1`) that
 deterministically fails in OCR (a poison pill / non-transient data fault).
 - **record-level (ours):** the op raises `BadRecordError(index=i)`; `Map` isolates
   row *i* (quarantine + lineage trace) and re-runs the shard's healthy rows **as one

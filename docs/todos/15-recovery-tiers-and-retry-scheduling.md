@@ -84,12 +84,11 @@ here so the design is complete and the interface can grow without churn.
 
 ## 4. The abstraction: one policy, two sites, one sink
 
-### 4.1 `RecoveryPolicy` (declarative, mirrors `PhysicalHints`)
+### 4.1 `RecoveryPolicy` (declarative node policy)
 
-Lives on `IRNode.recovery` exactly like `physical`/`properties` already do
-(dataclass field, threaded through `add_node`; executor holds a default, node may
-override — same pattern as `default_replicas` vs `physical.replicas`). Serializable,
-passive, no behavior.
+Lives on `NodeSpec.recovery` as the sole retry authority. It is threaded from the
+primitive into the passive graph; the executor does not override it. Serializable
+and passive.
 
 ```python
 @dataclass(frozen=True)
@@ -274,9 +273,9 @@ insufficient.
 
 ## 7. Interface-first, incremental plan (per D4)
 
-- **Interface (done):** `RecoveryPolicy` with all fields lives on `IRNode`
-  (mirrors `physical`); every user primitive accepts `recovery=`; it serializes
-  through passive IR and survives executor wrapper reconstruction.
+- **Interface (done):** `RecoveryPolicy` lives directly on `NodeSpec`; every
+  user primitive accepts `recovery=`; it serializes through the passive
+  `ExecutionGraph` and survives executor wrapper reconstruction.
   `BadRecordError(..., retryable=)` and scope-local `decide_record` /
   `decide_shard` are landed. Non-default behavior raises a clear
   `NotImplementedError`; defaults reproduce today's semantics.
