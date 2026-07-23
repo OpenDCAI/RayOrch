@@ -60,6 +60,7 @@ class ExecutionOptions:
     replicas: int = 1
     batch_size: int = 1
     max_batch_wait_ms: float = 2.0
+    batch_scope: str = "elastic"
     error_policy: str = "raise"
     max_retries: int = 0
     options: tuple[tuple[str, Any], ...] = ()
@@ -69,6 +70,8 @@ class ExecutionOptions:
             raise ValueError("replicas and batch_size must be positive")
         if self.max_batch_wait_ms < 0:
             raise ValueError("max_batch_wait_ms must be non-negative")
+        if self.batch_scope not in {"elastic", "parent_bound"}:
+            raise ValueError("batch_scope must be 'elastic' or 'parent_bound'")
         if self.error_policy not in {"raise", "isolate"}:
             raise ValueError("error_policy must be 'raise' or 'isolate'")
         if self.max_retries < 0:

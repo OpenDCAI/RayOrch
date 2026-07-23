@@ -1793,6 +1793,12 @@ Multigrain cost-aware rebatching
 
 所有测量必须包括最终 Reduce output，不能只测 Expand 后 child throughput。
 
+实现内保留 `batch_scope="parent_bound"` 作为 benchmark-only ablation：它复用相同
+CompiledGraph、RayWorker、ObjectRef transport、UDF 和 batch_size，只限制 Map/Filter ready
+grains 不跨 origin anchor 混合；默认和用户主路径仍是 `batch_scope="elastic"`。每个 RPC 记录
+bounded `DispatchTimeline`（node/actor/grain count/flush reason/submit-worker-commit timestamps），
+RunResult 只携带 detached timeline 与 parent completion percentiles，不引用 arena。
+
 ### 20.4 RQ2：fault containment
 
 比较：

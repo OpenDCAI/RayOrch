@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Mapping
 
@@ -48,6 +48,7 @@ from .graph import (
     plan_reduce,
     plan_relate_bounded,
 )
+from .metrics import DispatchTimeline, percentile
 from .worker import (
     BatchManifest,
     DispatchEntry,
@@ -145,6 +146,7 @@ class RayPending:
     actor_index: int
     manifest_ref: Any
     output_refs: tuple[Any, ...]
+    submitted_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +155,7 @@ class RunResult:
     failures: tuple[FailureSnapshot, ...] = ()
     sources: tuple[SourceSnapshot, ...] = ()
     metrics: Mapping[str, float] = field(default_factory=dict)
+    timeline: tuple[DispatchTimeline, ...] = ()
 
     def get(self) -> tuple[Any, ...]:
         """Resolve final Ray BlockSlices; local values pass through unchanged."""
@@ -238,6 +241,8 @@ class Arena:
             list[tuple[tuple[GrainId, ...], IsolationContext]],
         ] = {}
         self._sources: list[SourceSnapshot] = []
+        self._source_admitted_at: dict[GrainId, float] = {}
+        self._grain_completed_at: dict[GrainId, float] = {}
         self._dispatch_count = 0
         self._dispatched_grains = 0
         self._tail_or_isolation_dispatches = 0
@@ -275,6 +280,8 @@ class Arena:
         self._tail_wait_started_at.clear()
         self._forced.clear()
         self._sources.clear()
+        self._source_admitted_at.clear()
+        self._grain_completed_at.clear()
         self.state = ArenaState.RECLAIMED
 
     def _check_record_indexes(self, record: GrainRecord) -> None:
@@ -312,6 +319,11 @@ class Arena:
                 self.producers.register(record)
                 self.consumers.register(record)
                 records.append(record)
+                if record.phase is GrainPhase.SEALED:
+                    self._grain_completed_at.setdefault(
+                        record.id,
+                        self._clock(),
+                    )
                 if (
                     decision.action is PlanAction.ENSURE_EXECUTABLE
                     and record.phase is GrainPhase.READY
@@ -349,6 +361,9 @@ class Arena:
                     inserted.outcome,
                 )
             )
+            now = self._clock()
+            self._source_admitted_at[inserted.id] = now
+            self._grain_completed_at[inserted.id] = now
         except Exception as error:
             self._abort(f"source admission failed: {error}")
 
@@ -385,6 +400,9 @@ class Arena:
                         inserted.outcome,
                     )
                 )
+                now = self._clock()
+                self._source_admitted_at[inserted.id] = now
+                self._grain_completed_at[inserted.id] = now
         except Exception as error:
             self._abort(f"source batch admission failed: {error}")
 
@@ -423,6 +441,31 @@ class Arena:
     ) -> None:
         self._forced.setdefault(node, []).append((grains, context))
 
+    def _normal_batch_candidates(
+        self,
+        node: Any,
+        queue: list[GrainId],
+    ) -> tuple[GrainId, ...]:
+        if node.execution.batch_scope == "elastic":
+            return tuple(queue)
+        groups: dict[Any, list[GrainId]] = {}
+        order: list[Any] = []
+        for grain_id in queue:
+            record = self.grains.get(grain_id)
+            if record is None or not record.inputs or not record.inputs[0].items:
+                continue
+            driving = record.inputs[0].items[0]
+            origin = self.expand_origins.get(driving.entity)
+            group = origin.anchor if origin is not None else driving.entity
+            if group not in groups:
+                groups[group] = []
+                order.append(group)
+            groups[group].append(grain_id)
+        for group in order:
+            if len(groups[group]) >= node.execution.batch_size:
+                return tuple(groups[group])
+        return tuple(groups[order[0]]) if order else ()
+
     def reserve_dispatch(
         self,
         node_id: int,
@@ -458,7 +501,9 @@ class Arena:
             ready_set = self._ready_set.setdefault(node_id, set())
             if not queue:
                 return None
-            if len(queue) >= node.execution.batch_size:
+            candidates = self._normal_batch_candidates(node, queue)
+            candidate_set = set(candidates)
+            if len(candidates) >= node.execution.batch_size:
                 flush_reason = "full"
             elif admission_closed:
                 flush_reason = "port_sealed"
@@ -473,12 +518,19 @@ class Arena:
                 if wait_seconds > 0 and now - wait_started < wait_seconds:
                     return None
                 flush_reason = "timeout"
-            while queue and len(selected) < node.execution.batch_size:
-                grain_id = queue.pop(0)
+            remaining: list[GrainId] = []
+            for grain_id in queue:
+                if (
+                    grain_id not in candidate_set
+                    or len(selected) >= node.execution.batch_size
+                ):
+                    remaining.append(grain_id)
+                    continue
                 ready_set.discard(grain_id)
                 record = self.grains.get(grain_id)
                 if record is not None and record.phase is GrainPhase.READY:
                     selected.append(record)
+            queue[:] = remaining
             if not queue:
                 self._tail_wait_started_at[node_id] = None
             elif len(queue) >= node.execution.batch_size:
@@ -555,7 +607,8 @@ class Arena:
             return None
         node = self.graph.node(node_id)
         assert node.execution is not None
-        if len(queue) >= node.execution.batch_size:
+        candidates = self._normal_batch_candidates(node, list(queue))
+        if len(candidates) >= node.execution.batch_size:
             return 0.0
         now = self._clock() if now is None else now
         started = self._tail_wait_started_at.get(node_id)
@@ -832,6 +885,7 @@ class Arena:
                 )
                 self.ports.register(outcome)
                 record.seal(outcome, token=token)
+                self._grain_completed_at[record.id] = self._clock()
             for entity, origin in delta.origins:
                 self.expand_origins.add(entity, origin)
             self._next_block += len(delta.blocks)
@@ -902,6 +956,7 @@ class Arena:
                         ),
                         token=entry.token,
                     )
+                    self._grain_completed_at[record.id] = self._clock()
                 else:
                     record.release_for_reexecution(entry.token)
                     self.enqueue_ready(record)
@@ -928,6 +983,7 @@ class Arena:
                 ),
                 token=plan.entries[0].token,
             )
+            self._grain_completed_at[record.id] = self._clock()
         else:
             grain_ids: list[GrainId] = []
             for record, entry in zip(records, plan.entries):
@@ -971,6 +1027,21 @@ class Arena:
         return self._deliver(tuple(self.resolve(item) for item in outputs))
 
     def metrics_snapshot(self) -> dict[str, float]:
+        parent_latencies = []
+        for record in self.grains.values():
+            if self.graph.node(record.node).kind is not Primitive.REDUCE:
+                continue
+            completed = self._grain_completed_at.get(record.id)
+            if completed is None:
+                continue
+            anchor_roles = [
+                role for role in record.inputs if role.role == "anchor"
+            ]
+            if len(anchor_roles) != 1 or len(anchor_roles[0].items) != 1:
+                continue
+            admitted = self._source_time_for_item(anchor_roles[0].items[0])
+            if admitted is not None:
+                parent_latencies.append(completed - admitted)
         metrics = {
             "grains_per_rpc": (
                 self._dispatched_grains / self._dispatch_count
@@ -992,6 +1063,10 @@ class Arena:
             "ready_queue_high_watermark": float(
                 self._ready_queue_high_watermark
             ),
+            "parent_completion_count": float(len(parent_latencies)),
+            "parent_completion_p50_s": percentile(parent_latencies, 0.50),
+            "parent_completion_p95_s": percentile(parent_latencies, 0.95),
+            "parent_completion_p99_s": percentile(parent_latencies, 0.99),
         }
         metrics.update(
             {
@@ -1000,6 +1075,33 @@ class Arena:
             }
         )
         return metrics
+
+    def _source_time_for_item(
+        self,
+        item: ItemRef,
+        seen: set[GrainId] | None = None,
+    ) -> float | None:
+        producer = self.producers.get(item)
+        if producer is None:
+            return None
+        admitted = self._source_admitted_at.get(producer)
+        if admitted is not None:
+            return admitted
+        seen = set() if seen is None else seen
+        if producer in seen:
+            return None
+        seen.add(producer)
+        record = self.grains.get(producer)
+        if record is None:
+            return None
+        times = [
+            time_value
+            for role in record.inputs
+            for parent in role.items
+            for time_value in (self._source_time_for_item(parent, seen),)
+            if time_value is not None
+        ]
+        return min(times) if times else None
 
     def _deliver(self, values: tuple[Any, ...]) -> RunResult:
         self._require_running()
@@ -1592,7 +1694,8 @@ class Executor:
                 transport,
             )
             driver.admit_sources(tuple(sources))
-            return driver.run()
+            result = driver.run()
+            return replace(result, timeline=transport.timeline())
         finally:
             transport.shutdown()
 
@@ -1623,6 +1726,7 @@ class RayTransport:
         self._pending_by_actor: dict[tuple[int, int], int] = {}
         self._round_robin: dict[int, int] = {}
         self._pending: dict[Any, RayPending] = {}
+        self._timeline: list[DispatchTimeline] = []
 
         for node in graph.nodes:
             if node.kind is Primitive.SOURCE:
@@ -1717,6 +1821,7 @@ class RayTransport:
             actor_index=actor_index,
             manifest_ref=refs_tuple[0],
             output_refs=refs_tuple[1:],
+            submitted_at=time.monotonic(),
         )
         self._pending[pending.manifest_ref] = pending
         self._pending_by_actor[(plan.node, actor_index)] += 1
@@ -1736,6 +1841,8 @@ class RayTransport:
             return None
         manifest_ref = ready[0]
         pending = self._pending.pop(manifest_ref)
+        manifest_received_at = time.monotonic()
+        flush_reason = pending.arena.dispatch_flush_reason(pending.plan)
         self._pending_by_actor[
             (pending.node, pending.actor_index)
         ] -= 1
@@ -1743,15 +1850,39 @@ class RayTransport:
             manifest = ray.get(manifest_ref)
         except Exception:
             self._replace_actor(pending.node, pending.actor_index)
-            return pending.arena.handle_infrastructure_failure(pending.plan)
+            result = pending.arena.handle_infrastructure_failure(pending.plan)
+            self._record_timeline(
+                pending,
+                manifest_received_at,
+                None,
+                "infrastructure_failure",
+                flush_reason,
+            )
+            return result
         if isinstance(manifest, BatchManifest):
-            return pending.arena.commit_external_manifest(
+            result = pending.arena.commit_external_manifest(
                 pending.plan,
                 manifest,
                 pending.output_refs,
             )
+            self._record_timeline(
+                pending,
+                manifest_received_at,
+                manifest,
+                result.value,
+                flush_reason,
+            )
+            return result
         if isinstance(manifest, DispatchErrorReport):
-            return pending.arena.handle_error(pending.plan, manifest)
+            result = pending.arena.handle_error(pending.plan, manifest)
+            self._record_timeline(
+                pending,
+                manifest_received_at,
+                None,
+                manifest.kind,
+                flush_reason,
+            )
+            return result
         pending.arena._abort("worker returned an unknown manifest type")
         raise AssertionError("unreachable")
 
@@ -1768,6 +1899,42 @@ class RayTransport:
 
         return tuple(
             ray.get([actor.stats.remote() for actor in self._actors[node]])
+        )
+
+    def timeline(self) -> tuple[DispatchTimeline, ...]:
+        return tuple(self._timeline)
+
+    def _record_timeline(
+        self,
+        pending: RayPending,
+        manifest_received_at: float,
+        manifest: BatchManifest | None,
+        status: str,
+        flush_reason: str,
+    ) -> None:
+        self._timeline.append(
+            DispatchTimeline(
+                arena=pending.arena.id,
+                node=pending.node,
+                dispatch=pending.plan.id,
+                actor_index=pending.actor_index,
+                grains=len(pending.plan.entries),
+                flush_reason=flush_reason,
+                submitted_at=pending.submitted_at,
+                manifest_received_at=manifest_received_at,
+                committed_at=time.monotonic(),
+                worker_started_at=(
+                    manifest.worker_started_at
+                    if manifest is not None
+                    else None
+                ),
+                worker_finished_at=(
+                    manifest.worker_finished_at
+                    if manifest is not None
+                    else None
+                ),
+                status=status,
+            )
         )
 
     def shutdown(self) -> None:

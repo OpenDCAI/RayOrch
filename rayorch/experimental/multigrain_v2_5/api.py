@@ -197,6 +197,7 @@ class _TraceContext:
             max_batch_wait_ms=float(
                 options.pop("max_batch_wait_ms", 2.0)
             ),
+            batch_scope=str(options.pop("batch_scope", "elastic")),
             error_policy=str(options.pop("error_policy", "raise")),
             max_retries=int(options.pop("max_retries", 0)),
             options=tuple(options.items()),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,6 +47,8 @@ class BatchManifest:
     dispatch: int
     acks: tuple[GrainAck, ...]
     column_lengths: tuple[int, ...]
+    worker_started_at: float | None = None
+    worker_finished_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +75,9 @@ NormalizedBatchOutput = tuple[
 def build_batch_manifest(
     plan: DispatchPlan,
     outputs_by_port: NormalizedBatchOutput,
+    *,
+    worker_started_at: float | None = None,
+    worker_finished_at: float | None = None,
 ) -> tuple[BatchManifest, tuple[tuple[Any, ...], ...]]:
     """Flatten normalized ``[port][grain][row]`` outputs into coarse blocks."""
 
@@ -103,6 +109,8 @@ def build_batch_manifest(
             for index, entry in enumerate(plan.entries)
         ),
         column_lengths=tuple(len(column) for column in columns),
+        worker_started_at=worker_started_at,
+        worker_finished_at=worker_finished_at,
     )
     return manifest, tuple(columns)
 
@@ -231,6 +239,7 @@ def get_ray_worker_class():
         ):
             self.calls += 1
             try:
+                worker_started_at = time.monotonic()
                 kind = Primitive(kind_value)
                 role_columns = _role_columns(
                     plan,
@@ -280,7 +289,12 @@ def get_ray_worker_class():
                         raise WorkerContractError(
                             f"{kind.value} cannot execute on RayWorker"
                         )
-                manifest, columns = build_batch_manifest(plan, outputs)
+                manifest, columns = build_batch_manifest(
+                    plan,
+                    outputs,
+                    worker_started_at=worker_started_at,
+                    worker_finished_at=time.monotonic(),
+                )
                 return (manifest, *columns)
             except BadRecordError as error:
                 bad_token = (
