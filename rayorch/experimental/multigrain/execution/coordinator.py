@@ -10,16 +10,24 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Callable, Iterable, Iterator, Mapping
 
 from ..data.batch import DeferredRecord, ErrorTrace, NodeExecution, PortBatch, concat
 from ..ir.graph import ExecutionGraph, NodeSpec
 from ..ir.refs import PortRef
+from ..primitives.output import merge_aligned_inputs
 
 
 GraphOutput = PortBatch | tuple[PortBatch, ...]
 RunNode = Callable[[NodeSpec, tuple[PortBatch, ...]], NodeExecution]
 DrainNode = Callable[[NodeSpec, tuple[DeferredRecord, ...]], NodeExecution]
+
+
+class StreamScope(str, Enum):
+    """Relation-completeness scope supported by the streaming MVP."""
+
+    CLOSED_MICROBATCH = "closed_microbatch"
 
 
 @dataclass
@@ -59,12 +67,14 @@ class ExecutionCoordinator:
         max_inflight: int,
         ordered: bool,
         drain_node: DrainNode | None = None,
+        scope: StreamScope = StreamScope.CLOSED_MICROBATCH,
     ) -> None:
         self.graph = graph
         self.run_node = run_node
         self.max_inflight = max(1, int(max_inflight))
         self.ordered = bool(ordered)
         self.drain_node = drain_node
+        self.scope = StreamScope(scope)
 
     def run(
         self,
@@ -132,7 +142,14 @@ class ExecutionCoordinator:
                             raise KeyError(
                                 f"microbatch {index} missing input port '{spec.name}'"
                             )
-                        context[spec.ref] = inputs[spec.name]
+                        batch = inputs[spec.name]
+                        if batch.grain != spec.grain:
+                            raise ValueError(
+                                f"microbatch {index} input '{spec.name}' has "
+                                f"runtime grain '{batch.grain}', expected "
+                                f"'{spec.grain}'"
+                            )
+                        context[spec.ref] = batch
                     state = _MicrobatchState(
                         index=index,
                         context=context,
@@ -157,7 +174,9 @@ class ExecutionCoordinator:
             def terminal_trace(item: DeferredRecord) -> ErrorTrace:
                 base = item.inputs[0]
                 ancestors = dict(base.ancestors[0])
-                ancestors[base.name] = base.record_ids[0]
+                if base.identity_domain is None:
+                    raise ValueError("deferred input has no identity domain")
+                ancestors[base.identity_domain] = base.record_ids[0]
                 return ErrorTrace(
                     source_item=base.display_keys[0],
                     logical_item=base.display_keys[0],
@@ -191,7 +210,7 @@ class ExecutionCoordinator:
                         if recovered_index is None:
                             terminal.append(terminal_trace(item))
                             continue
-                        piece = item.inputs[0].with_values(
+                        piece = merge_aligned_inputs(item.inputs).with_values(
                             [recovery_output.values[recovered_index]],
                             name=healthy.name,
                             op_name=completion.node.name,
@@ -308,4 +327,4 @@ class ExecutionCoordinator:
                 drain_ready(force=source_exhausted)
 
 
-__all__ = ["ExecutionCoordinator", "GraphOutput"]
+__all__ = ["ExecutionCoordinator", "GraphOutput", "StreamScope"]

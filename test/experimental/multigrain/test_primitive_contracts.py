@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from rayorch.experimental import multigrain as mg
+from rayorch.experimental.multigrain.ir import GraphValidationError
 
 
 class _Identity:
@@ -67,6 +68,63 @@ def test_compiled_relate_requires_passive_relation_evidence() -> None:
             return self.relate(left, right)
 
     with pytest.raises(TypeError, match="require on="):
+        Pipe().compile()
+
+
+def _compile_relate_with_adapter(adapter: str) -> None:
+    class Pipe(mg.Pipeline):
+        def __init__(self):
+            super().__init__()
+            self.relate = mg.Relate(
+                _Identity,
+                roles=("left", "right"),
+                relation_adapter=adapter,
+            )
+
+        def forward(self, left, right):
+            return self.relate(left, right)
+
+    Pipe().compile()
+
+
+@pytest.mark.parametrize(
+    ("adapter", "cause_type"),
+    [
+        ("missing_multigrain_adapter:join", ModuleNotFoundError),
+        (
+            "test.experimental.multigrain.relate_adapters:NON_CALLABLE_ADAPTER",
+            TypeError,
+        ),
+        ("test.experimental.multigrain.relate_adapters", ValueError),
+    ],
+)
+def test_compiled_relate_resolves_adapter_during_verification(
+    adapter, cause_type
+) -> None:
+    with pytest.raises(
+        GraphValidationError, match="not importable and callable"
+    ) as error:
+        _compile_relate_with_adapter(adapter)
+    assert isinstance(error.value.__cause__, cause_type)
+
+
+@pytest.mark.parametrize("roles", [("same", "same"), ("left", "")])
+def test_compiled_relate_requires_unique_non_empty_roles(roles) -> None:
+    class Pipe(mg.Pipeline):
+        def __init__(self):
+            super().__init__()
+            self.relate = mg.Relate(
+                _Identity,
+                roles=roles,
+                relation_adapter=(
+                    "test.experimental.multigrain.relate_adapters:link_by_index"
+                ),
+            )
+
+        def forward(self, left, right):
+            return self.relate(left, right)
+
+    with pytest.raises(ValueError, match="unique non-empty"):
         Pipe().compile()
 
 

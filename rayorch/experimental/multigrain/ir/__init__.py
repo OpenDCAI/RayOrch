@@ -3,6 +3,8 @@
 from .capabilities import is_row_partitionable
 from .graph import ExecutionGraph, GraphInputSpec, NodeSpec, OutputSpec
 from .operations import (
+    ByAncestor,
+    ByRole,
     ExpandOp,
     FilterByMaskOp,
     FilterOp,
@@ -14,6 +16,7 @@ from .operations import (
     RelateOp,
     RelationAdapterSpec,
     operation_name,
+    resolve_relation_adapter,
 )
 from .policy import (
     IsolationBudget,
@@ -32,7 +35,6 @@ from .relations import (
     IncompleteGroupPolicy,
     OutputRelation,
     RelatedFrom,
-    RoleSource,
     SameAs,
     SubsetOf,
 )
@@ -40,6 +42,8 @@ from .verify import GraphValidationError, validate_shard_plan, verify_graph
 
 __all__ = [
     "AggregateOf",
+    "ByAncestor",
+    "ByRole",
     "ChildrenOf",
     "ExecutionGraph",
     "ExpandOp",
@@ -67,7 +71,6 @@ __all__ = [
     "RelatedFrom",
     "RelationAdapterSpec",
     "RetryTiming",
-    "RoleSource",
     "SameAs",
     "ShardExhaustedAction",
     "ShardRecoveryAction",
@@ -75,6 +78,7 @@ __all__ = [
     "WorkerPoolSpec",
     "is_row_partitionable",
     "operation_name",
+    "resolve_relation_adapter",
     "validate_shard_plan",
     "verify_graph",
 ]

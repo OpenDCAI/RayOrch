@@ -15,10 +15,14 @@ from __future__ import annotations
 
 import pickle
 
+import pytest
+
 from rayorch.experimental import multigrain as mg
 from rayorch.experimental.multigrain.execution import MultigrainExecutor
 from rayorch.experimental.multigrain.ir import (
+    ByRole,
     KeyJoinSpec,
+    ReduceOp,
     RelatedFrom,
     RelateOp,
 )
@@ -69,6 +73,56 @@ class Match:
         return [f"{image}|{caption}" for image, caption in zip(images, captions)]
 
 
+class MakeUserEdge:
+    def run(self, by_role: dict) -> dict:
+        return {
+            "left": by_role["left"]["id"],
+            "right": by_role["right"]["id"],
+        }
+
+
+class CountUserEdges:
+    def run(self, users, left_groups, right_groups):
+        return [
+            {
+                "id": user["id"],
+                "left": len(left),
+                "right": len(right),
+            }
+            for user, left, right in zip(users, left_groups, right_groups)
+        ]
+
+
+class CountOneRole:
+    def run(self, users, groups):
+        return [len(group) for group in groups]
+
+
+class SelfJoinReducePipe(mg.Pipeline):
+    def __init__(self, *, qualified: bool = True) -> None:
+        super().__init__()
+        self.qualified = qualified
+        self.link = mg.Relate(
+            MakeUserEdge,
+            roles=("left", "right"),
+            on={"left": "group", "right": "group"},
+            output_grain="user_edge",
+        )
+        self.count = mg.Reduce(CountUserEdges)
+
+    def forward(self, users):
+        edges = self.link(users, users)
+        if self.qualified:
+            return self.count(
+                mg.group_by(
+                    users,
+                    mg.via(edges, role="left"),
+                    mg.via(edges, role="right"),
+                )
+            )
+        return self.count(mg.group_by(users, edges))
+
+
 # An independent figure stream: NOT expanded from pages, but carries page_id.
 def _fig_source() -> mg.PortBatch:
     return mg.source(
@@ -103,7 +157,7 @@ def test_key_join_inner_joins_and_attaches_cross_branch_lineage() -> None:
 
     # cross-branch lineage: the joined row now knows its pdf via the page side,
     # even though the fig stream never carried pdf ancestry.
-    assert linked.ancestors[0]["pdfs"] == pdfs.record_ids[0]
+    assert linked.ancestors[0][pdfs.identity_domain] == pdfs.record_ids[0]
 
     # relation evidence carries both roles, human-readable, no internal ids leaked.
     # (page display_key is the lineage path built by Expand; fig uses its display_key.)
@@ -183,12 +237,9 @@ def test_key_join_pipeline_compiles_verifies_and_carries_on_in_ir() -> None:
     assert isinstance(relate.operation, RelateOp)
     relation = relate.outputs[0].relation
     assert isinstance(relation, RelatedFrom)
-    assert tuple(binding.role for binding in relation.roles) == ("page", "fig")
+    assert relation.roles == ("page", "fig")
     assert isinstance(relate.operation.matcher, KeyJoinSpec)
-    assert dict(relate.operation.matcher.fields) == {
-        "page": "page_id",
-        "fig": "page_id",
-    }
+    assert relate.operation.matcher.fields == ("page_id", "page_id")
 
 
 def test_key_join_pipeline_executes_from_pickled_ir() -> None:
@@ -232,3 +283,51 @@ def test_relate_adapter_is_stored_as_typed_dotted_path() -> None:
     assert relate.relation_adapter == (
         "test.experimental.multigrain.relate_adapters:link_by_index"
     )
+
+
+def test_same_domain_self_join_groups_by_explicit_roles() -> None:
+    graph = SelfJoinReducePipe().compile()
+    reduce = graph.nodes[-1]
+    assert isinstance(reduce.operation, ReduceOp)
+    assert reduce.operation.selectors == (ByRole("left"), ByRole("right"))
+
+    users = mg.source(
+        [{"id": "a", "group": 1}, {"id": "b", "group": 1}],
+        name="users",
+    )
+    output = MultigrainExecutor().execute(graph, {"users": users})
+    assert output.values == [
+        {"id": "a", "left": 2, "right": 2},
+        {"id": "b", "left": 2, "right": 2},
+    ]
+
+
+def test_same_domain_self_join_rejects_ambiguous_default_reduce() -> None:
+    graph = SelfJoinReducePipe(qualified=False).compile()
+    users = mg.source(
+        [{"id": "a", "group": 1}, {"id": "b", "group": 1}],
+        name="users",
+    )
+    with pytest.raises(ValueError, match="multiple parents"):
+        MultigrainExecutor().execute(graph, {"users": users})
+
+
+def test_role_grouping_rejects_parent_outside_closed_microbatch() -> None:
+    users = mg.source(
+        [{"id": "a", "group": 1}, {"id": "b", "group": 1}],
+        name="users",
+    )
+    edges = mg.Relate(
+        MakeUserEdge,
+        roles=("left", "right"),
+        on={"left": "group", "right": "group"},
+        output_grain="user_edge",
+    )(users, users)
+
+    with pytest.raises(ValueError, match="closed microbatch violation"):
+        mg.Reduce(CountOneRole)(
+            mg.group_by(
+                users.take([0]),
+                mg.via(edges, role="left"),
+            )
+        )

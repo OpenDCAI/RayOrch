@@ -61,6 +61,33 @@ class MapFilterPipe(mg.Pipeline):
         return self.keep(self.embed(chunks))
 
 
+class ExposedIntermediatePipe(MapFilterPipe):
+    def forward(self, chunks):
+        embedded = self.embed(chunks)
+        return embedded, self.keep(embedded)
+
+
+class ExpandRows:
+    def run(self, rows):
+        return [
+            [f"{row}/child-{index}" for index in range(count)]
+            for row, count in rows
+        ]
+
+
+class ExpandPipe(mg.Pipeline):
+    def __init__(self, replicas: int = 1) -> None:
+        super().__init__()
+        self.expand = mg.Expand(
+            ExpandRows,
+            child_label="child",
+            workers=WorkerPoolSpec(replicas=replicas),
+        )
+
+    def forward(self, rows):
+        return self.expand(rows)
+
+
 def test_ray_executor_matches_local_executor() -> None:
     ir = MapFilterPipe(replicas=4).compile()
     chunks = mg.source([f"c{i}" if i % 3 else f"x{i}" for i in range(9)], name="chunks")
@@ -70,6 +97,65 @@ def test_ray_executor_matches_local_executor() -> None:
 
     assert distributed.values == local.values
     assert distributed.record_ids == local.record_ids
+    assert distributed.lineage == local.lineage
+
+
+def test_custom_reordered_shards_restore_logical_port_order() -> None:
+    graph = MapPipe(replicas=2).compile()
+    chunks = mg.source(["c0", "c1", "c2", "c3"], name="chunks")
+
+    executor = MultigrainRayExecutor(
+        shard_planner=lambda node, inputs, replicas: [[2, 0], [3, 1]]
+    )
+    try:
+        output = executor.execute(graph, {"chunks": chunks})
+    finally:
+        executor.shutdown()
+
+    assert output.record_ids == chunks.record_ids
+    assert output.values == [f"emb:c{index}" for index in range(4)]
+
+
+def test_reordered_shards_canonize_exposed_intermediate_outputs() -> None:
+    graph = ExposedIntermediatePipe(replicas=2).compile()
+    chunks = mg.source(["c0", "x1", "c2", "c3"], name="chunks")
+    local = mg.MultigrainExecutor().execute(graph, {"chunks": chunks})
+    executor = MultigrainRayExecutor(
+        shard_planner=lambda node, inputs, replicas: [[2, 0], [3, 1]]
+    )
+    try:
+        distributed = executor.execute(graph, {"chunks": chunks})
+    finally:
+        executor.shutdown()
+
+    assert isinstance(local, tuple)
+    assert isinstance(distributed, tuple)
+    assert len(local) == len(distributed) == 2
+    for distributed_port, local_port in zip(distributed, local):
+        assert distributed_port.record_ids == local_port.record_ids
+        assert distributed_port.values == local_port.values
+        assert distributed_port.lineage == local_port.lineage
+
+
+def test_reordered_shards_canonize_expand_output() -> None:
+    graph = ExpandPipe(replicas=2).compile()
+    rows = mg.source(
+        [("r0", 2), ("r1", 1), ("r2", 3), ("r3", 2)],
+        name="rows",
+    )
+    local = mg.MultigrainExecutor().execute(graph, {"rows": rows})
+    executor = MultigrainRayExecutor(
+        shard_planner=lambda node, inputs, replicas: [[2, 0], [3, 1]]
+    )
+    try:
+        distributed = executor.execute(graph, {"rows": rows})
+    finally:
+        executor.shutdown()
+
+    assert distributed.record_ids == local.record_ids
+    assert distributed.values == local.values
+    assert distributed.ancestors == local.ancestors
+    assert distributed.ordinals == local.ordinals
     assert distributed.lineage == local.lineage
 
 

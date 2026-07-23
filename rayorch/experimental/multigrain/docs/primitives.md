@@ -94,6 +94,10 @@ Map outputs 使用 `SameAs`；FilterByMask 对原 inputs 和 annotations 产生 
 outputs，并排除 mask port 本身。如果 inputs 数为 `I`、annotations 数为 `A`，UDF
 outputs 为 `1 + A`，Select outputs 为 `I + A`。
 
+eager 和 compiled Select 共用同一个内部 Map annotation 路径，因此 multi-input
+diamond metadata 合并和 record recovery 与普通 Map 完全一致；deferred retry 仍只允许
+由 streaming coordinator drain。
+
 ## 6. Expand
 
 ```python
@@ -113,7 +117,7 @@ outer list 与 parent rows 等长，每项是 child list/tuple。每个 child：
 
 - identity 由 operation、parent ID 和 child index 派生；
 - ancestry 加入 direct parent；
-- ordinals 加入 `child_label → child index` 对应层级；
+- ordinals 加入 `parent IdentityDomain → child index` 对应层级；
 - lineage 追加 Expand。
 
 当前多输出 Expand 是 shared-child cohort：
@@ -122,18 +126,16 @@ outer list 与 parent rows 等长，每项是 child list/tuple。每个 child：
 pages, metadata = mg.Expand(Parse, num_outputs=2)(documents)
 ```
 
-所有 outputs 都声明相同 `ChildrenOf(parent, label)`，且每个 parent 在所有 outputs
-上的 child 数必须相同，因此同位置 values 共享 child identity。`label` 命名 child
-grain/display path；identity 由 parent identity 与 ordinal 派生。
+所有 outputs 都声明相同 `ChildrenOf(parent)`，且每个 parent 在所有 outputs 上的
+child 数必须相同，因此同位置 values 共享 child identity。child grain 只由
+`OutputSpec.grain` 声明；identity 由 parent identity 与 ordinal 派生。
 
 ### Mixed-output future
 
-新的 relation algebra 和 verifier 已允许 Expand output 使用 `ChildrenOf` 或 `SameAs`，
-并允许后一个 output 引用同 node 的更早 output，从而表示 identity forest。
-
-但 `mg.out.same` / `mg.out.children` marker、trace-time marker analysis 和 runtime
-materialization 都 **deferred/not implemented**。不要在当前代码中使用这些 API，也
-不要把 IR 可表示性误写成 runtime 支持。
+relation algebra 已预留 `ChildrenOf` / `SameAs` 词汇，但当前 verifier 与 runtime
+都只接受 shared-`ChildrenOf` Expand。`mg.out.same` / `mg.out.children` marker、
+forest validation 和 runtime materialization 整体 **deferred/not implemented**；
+不要在当前代码中使用这些 API。
 
 ## 7. Reduce
 
@@ -146,19 +148,43 @@ self.assemble = mg.Reduce(
 return self.assemble(mg.group_by(documents, texts, pages))
 ```
 
-`group_by(anchor, *descendants)` 是声明。graph output relation 为：
+`group_by(anchor, *descendants)` 默认按 anchor ancestry 分组。多父 relation port 必须
+用 role-qualified selector 消除同 domain 自连接歧义：
+
+```python
+return self.aggregate(
+    mg.group_by(
+        users,
+        mg.via(edges, role="left"),
+        mg.via(edges, role="right"),
+    )
+)
+```
+
+`ReduceOp.selectors` 与 descendants 一一对应，元素为 `ByAncestor()` 或
+`ByRole(role)`；graph output relation 仍只描述输出 identity：
 
 ```python
 AggregateOf(
     anchor=document_ref,
-    members=(texts_ref, pages_ref),
     incomplete=IncompleteGroupPolicy.FAIL_CLOSED,
 )
 ```
 
-runtime 根据 `ancestors[anchor.name]` regroup，并按从 anchor 层开始的完整 ordinal path
+node 的其余 inputs 自然构成 descendants。`ByAncestor` 根据
+`ancestors[anchor.identity_domain]` regroup；`ByRole` 从该行 `ParentRef` 中选择唯一
+direct role parent。parent 不在当前 anchor batch 时抛 closed-microbatch violation，
+不再静默跳过。分组后按从 anchor 层开始的完整 ordinal path
 排序，最后以 record ID 作稳定 tie-break。UDF 收到 anchor values 和每个 descendant 的
 grouped value lists，output 与 anchor 等长并复用 anchor identity。
+
+verifier 对 `ByAncestor` 检查的是 anchor 的结构可达性。若 descendant 来自
+`RelatedFrom`，selected role parents 是否真的共享同一 anchor record ID 依赖数据，
+由 runtime 在 regroup 时检查；冲突 ancestry 不会被 Relate 强行写入 functional map。
+
+`ByRole` 只读取 descendant 当前携带的直接 `RelatedFrom` evidence。`Expand` 创建 child
+cohort 时不复制父记录的 role edges，因此 `Relate → Expand → ByRole Reduce` 会在
+graph verification 阶段被拒绝；传递 role path 是明确的 future extension。
 
 `FAIL_OPEN` 使用存活 descendants；`FAIL_CLOSED` 不对 poisoned anchor 调 UDF，而是输出
 incomplete placeholder 和 `suppressed_incomplete` error。
@@ -169,12 +195,11 @@ Relate 当前单输出、whole-batch。graph output 使用：
 
 ```python
 RelatedFrom(
-    roles=(
-        RoleSource("image", images_ref),
-        RoleSource("caption", captions_ref),
-    )
+    roles=("image", "caption")
 )
 ```
+
+roles 与 node inputs 按位置对应，不重复保存 input refs。
 
 ### Key join
 
@@ -211,6 +236,8 @@ adapter 返回：
 
 adapter 必须置换等变：任意 input row permutation 经 local-index rebinding 后，应产生
 相同的 `(value, parent tuple, stable_key)` keyed set。不得把 local position 当业务证据。
+compiled graph 会在 verification 阶段解析 dotted path 并确认目标 callable，但任意
+Python adapter 的置换等变性仍是用户契约，建议用随机 permutation contract test 验证。
 
 `relation_fn` 仅允许 eager。compiled Relate 不接受 live `relation_fn` 或 executor-side
 injection；必须使用 `on=`

@@ -4,14 +4,18 @@ from __future__ import annotations
 import time
 from typing import Any, Mapping
 
-from .handlers import DEFAULT_HANDLER_REGISTRY, OperationHandlerRegistry
+from .handlers import (
+    DEFAULT_HANDLER_REGISTRY,
+    OperationHandlerRegistry,
+    expected_output_domain,
+)
 from ..data.batch import NodeExecution, PortBatch
 from ..ir.graph import ExecutionGraph, NodeSpec
 from ..ir.operations import MapOp, operation_name
 from ..ir.policy import RetryTiming
 from ..ir.refs import PortRef
 from ..ir.verify import verify_graph
-from .metrics import NodeMetric, RunMetrics
+from .metrics import NodeMetric, RunMetrics, lineage_footprint
 
 
 class MultigrainExecutor:
@@ -58,7 +62,13 @@ class MultigrainExecutor:
         for port in graph.inputs:
             if port.name not in inputs:
                 raise KeyError(f"missing input port '{port.name}'")
-            context[port.ref] = inputs[port.name]
+            batch = inputs[port.name]
+            if batch.grain != port.grain:
+                raise ValueError(
+                    f"input '{port.name}' has runtime grain '{batch.grain}', "
+                    f"expected '{port.grain}'"
+                )
+            context[port.ref] = batch
 
         for node in graph.nodes:
             node_inputs = tuple(context[ref] for ref in node.inputs)
@@ -66,6 +76,7 @@ class MultigrainExecutor:
             outputs = self._execute_node(node, node_inputs)
             elapsed = time.perf_counter() - start
             if self.metrics is not None:
+                footprint = lineage_footprint(outputs)
                 self.metrics.record(
                     NodeMetric(
                         name=node.name,
@@ -75,6 +86,10 @@ class MultigrainExecutor:
                         rows_out=len(outputs[0]) if outputs else 0,
                         wall_s=elapsed,
                         shard_busy_s=[elapsed],
+                        shard_rows_in=[len(node_inputs[0]) if node_inputs else 0],
+                        shard_rows_out=[len(outputs[0]) if outputs else 0],
+                        relation_entries_out=footprint["relation_entries"],
+                        lineage_bytes_out=footprint["approx_bytes"],
                     )
                 )
             if len(outputs) != len(node.outputs):
@@ -125,6 +140,12 @@ class MultigrainExecutor:
                 raise ValueError(
                     f"node {node.name} output '{spec.name}' produced runtime "
                     f"grain '{output.name}', expected '{spec.grain}'"
+                )
+            expected_domain = expected_output_domain(node, inputs, spec)
+            if output.identity_domain != expected_domain:
+                raise ValueError(
+                    f"node {node.name} output '{spec.name}' produced identity "
+                    f"domain {output.identity_domain}, expected {expected_domain}"
                 )
         return result
 

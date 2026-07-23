@@ -12,6 +12,8 @@ from test.experimental.multigrain.dummy_ops import (
     AlwaysOpaqueFail,
     OpaquePoisonMap,
     RetryableOnceMap,
+    RetryableOnceMerge,
+    TagSecondary,
 )
 
 pytestmark = [pytest.mark.slow, pytest.mark.usefixtures("ray_cluster")]
@@ -36,6 +38,24 @@ class RecoveryMapPipe(mg.Pipeline):
 
     def forward(self, rows):
         return self.op(rows)
+
+
+class DeferredDiamondPipe(mg.Pipeline):
+    def __init__(self) -> None:
+        super().__init__()
+        self.side = mg.Map(TagSecondary, name="side")
+        self.merge = mg.Map(
+            RetryableOnceMerge,
+            name="recover-merge",
+            recovery=mg.RecoveryPolicy(
+                max_record_retries=1,
+                retry_timing="deferred",
+            ),
+            workers=WorkerPoolSpec(replicas=2),
+        )
+
+    def forward(self, rows):
+        return self.merge(rows, self.side(rows))
 
 
 def test_sparse_opaque_poison_is_localized_without_losing_siblings() -> None:
@@ -166,3 +186,24 @@ def test_deferred_retry_exhaustion_quarantines_only_the_bad_record() -> None:
     assert output.values == ["ok:good"]
     assert [error.logical_item for error in output.errors] == ["bad-0"]
     assert output.errors[0].action == "quarantined_deferred_exhausted"
+
+
+def test_deferred_multi_input_recovery_preserves_secondary_metadata() -> None:
+    graph = DeferredDiamondPipe().compile()
+    rows = mg.source(["good", "flaky-0"], name="rows")
+    executor = MultigrainRayExecutor()
+    try:
+        output = executor.execute(graph, {"rows": rows})
+    finally:
+        executor.shutdown()
+
+    assert output.values == [
+        "ok:good|side:good",
+        "ok:flaky-0|side:flaky-0",
+    ]
+    assert output.record_ids == rows.record_ids
+    assert output.lineage == [
+        ("side", "recover-merge"),
+        ("side", "recover-merge"),
+    ]
+    assert output.errors == []

@@ -101,9 +101,9 @@ def test_framework_tracks_lineage_though_ops_are_pure() -> None:
     # full ancestry (doc AND page) and its position within each level.
     anc = blocks.ancestors[0]
     ords = blocks.ordinals[0]
-    assert "docs" in anc  # doc ancestor
-    assert any(key != "docs" for key in anc)  # page ancestor too
-    assert "docs" in ords  # page-index ordinal under the doc
+    assert docs.identity_domain in anc  # doc ancestor
+    assert pages.identity_domain in anc  # page ancestor too
+    assert docs.identity_domain in ords  # page-index ordinal under the doc
     # human-readable trace path built entirely by the framework
     assert blocks.display_keys[0].startswith("paper0/page=0/block=0")
 

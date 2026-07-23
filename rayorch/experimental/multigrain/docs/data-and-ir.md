@@ -14,6 +14,7 @@ PortBatch(
     ancestor_display=...,
     ordinals=...,
     lineage=...,
+    identity_domain=...,
     relations=...,
     errors=...,
 )
@@ -26,15 +27,22 @@ PortBatch(
 |---|---|
 | `values[i]` | UDF 可见的业务值 |
 | `record_ids[i]` | 重排不改变的框架 identity |
+| `identity_domain` | identity 所属的不可变命名空间；与 current port/grain 分离 |
 | `display_keys[i]` | 仅用于 trace/debug 的可读名称 |
-| `ancestors[i]` | ancestor port/grain 到 record ID，用于 Reduce 和故障归因 |
+| `ancestors[i]` | `IdentityDomain → record ID`，用于无歧义 Reduce 和故障归因 |
 | `ancestor_display[i]` | ancestry 的可读投影 |
-| `ordinals[i]` | 每层 child index，用于恢复逻辑顺序 |
+| `ordinals[i]` | `IdentityDomain → child index`，用于恢复逻辑顺序 |
 | `lineage[i]` | operator 路径；fan-in 时稳定 union |
 | `relations[i]` | M:N output 的 `ParentRef` tuple |
 | `errors` | batch 携带的 `ErrorTrace` |
 
-UDF 不接收这些 metadata。`record_id` 是正确性 identity，`display_key` 不能用于 join。
+`PortBatch.values` 对用户仍表现为同 grain 的 `list[obj]`。current port 是执行图地址，
+grain 是业务类型标签，`IdentityDomain` 才是 ancestry/对齐的 key：同 grain 的独立 roots
+可使用不同 domain，同一 root 派生的 Map/Filter branches 则共享 domain。UDF 不接收这些
+metadata。正确性 record key 是 `(IdentityDomain, record_id)`；`record_id` 只要求在
+一个 live `PortBatch`/closed-microbatch admission scope 内唯一，不承诺跨批全局唯一。
+`display_key` 不能用于 join。`ErrorTrace.to_dict()` 将 ancestry 编码为带
+domain `token`、`label` 和 `record_id` 的条目，不会合并同 label 的独立 domains。
 
 ## 2. Trace-time token
 
@@ -56,9 +64,9 @@ index 混在一个类型中。
 ```python
 SameAs(source)
 SubsetOf(source)
-ChildrenOf(parent, label)
-AggregateOf(anchor, members, incomplete)
-RelatedFrom(roles=(RoleSource(role, source), ...))
+ChildrenOf(parent)
+AggregateOf(anchor, incomplete)
+RelatedFrom(roles=("left", "right"))
 ```
 
 ### `SameAs`
@@ -73,8 +81,8 @@ mixed-output forest 中的 aligned metadata。
 
 ### `ChildrenOf`
 
-输出为一个直接 parent 创建 children。`label` 命名 child grain 和 display path，不能为空；
-child identity 由 parent identity 与 ordinal 派生，而不是由 label 本身充当 key。默认
+输出为一个直接 parent 创建 children。child grain 由相邻的 `OutputSpec.grain` 唯一声明；
+child identity 由 parent identity 与 ordinal 派生，而不是由 grain 本身充当 key。默认
 多输出 Expand 的 outputs 使用相同的 `ChildrenOf` 并共享 child identity。
 
 ### `AggregateOf`
@@ -82,18 +90,19 @@ child identity 由 parent identity 与 ordinal 派生，而不是由 label 本�
 ```python
 AggregateOf(
     anchor=anchor_ref,
-    members=(descendant_ref, ...),
     incomplete=IncompleteGroupPolicy.FAIL_OPEN,
 )
 ```
 
-Reduce 的 input 0 必须是 anchor，其余 inputs 必须按顺序等于 members；output grain 必须
+Reduce 的 input 0 必须是 anchor，其余 inputs 自然构成 descendants；output grain 必须
 等于 anchor grain。`FAIL_CLOSED` 会抑制丢失 descendant 的 anchor。
 
 ### `RelatedFrom`
 
-`RoleSource` 把唯一、非空 role 名绑定到 node input。role sources 必须按 node input 顺序
-完整覆盖。runtime `ParentRef` 保存每条实际 output 的 role-parent evidence。
+`RelatedFrom.roles` 按 node input 顺序赋予唯一、非空 role 名。runtime `ParentRef`
+保存每条实际 output 的 role-parent evidence；relation 不重复保存 input refs。
+verifier 能静态追踪各 role 的 ancestry 路径，但只有 selected parents 对某 domain
+拥有相同 record ID 时，runtime 才把它保留为 functional ancestry。
 
 ## 4. Typed operations
 
@@ -103,7 +112,7 @@ graph 不保存通用 kind enum。`NodeSpec.operation` 是以下 typed operation
 MapOp(factory)
 FilterOp(factory)
 ExpandOp(factory)
-ReduceOp(factory)
+ReduceOp(factory, selectors=(ByAncestor() | ByRole(role), ...))
 RelateOp(factory, matcher)
 FilterByMaskOp(mask_input)
 ```
@@ -121,9 +130,12 @@ OperatorFactorySpec(
 )
 ```
 
+`verify_graph()` 会实际解析 `import_path` 并确认目标是 class，同时检查 `args/kwargs`
+可 pickle；这保证手工构造或反序列化的被动图不会把 factory 错误推迟到 worker 启动时。
 compiled graph 不保存 live instance。compiled `RelateOp.matcher` 必须是由 `on=`
 产生的 `KeyJoinSpec`，或由 dotted `relation_adapter=` 产生的
-`RelationAdapterSpec`。`relation_fn` 仍是 eager-only，不能注入 compiled executor。
+`RelationAdapterSpec`；verifier 同样会解析 adapter 并检查 callable。
+`relation_fn` 仍是 eager-only，不能注入 compiled executor。
 
 ## 5. Graph dataclasses
 
@@ -133,7 +145,7 @@ GraphInputSpec(ref=GraphInputRef(...), grain="documents")
 OutputSpec(
     ref=NodeOutputRef("SplitPages", "out"),
     grain="page",
-    relation=ChildrenOf(GraphInputRef("documents"), label="page"),
+    relation=ChildrenOf(GraphInputRef("documents")),
 )
 
 NodeSpec(
@@ -165,8 +177,12 @@ executor 对每个 node output 强制：
 PortBatch.name == OutputSpec.grain
 ```
 
-Map/Filter 保留 source grain；Expand 的 output grain 是 `ChildrenOf.label`；Reduce 回到
-anchor grain；Relate 使用声明的 `output_grain`。这让静态 grain 不只是展示 metadata，
+graph admission 同样强制 `inputs[name].grain == GraphInputSpec.grain`；aligned
+Map/Filter/Select 还必须共享同一 `IdentityDomain`，不能只因为 record ID 字符串相同就被
+视为同一 records。
+
+Map/Filter 保留 source grain；Expand 的 child grain 直接来自 `OutputSpec.grain`；
+Reduce 回到 anchor grain；Relate 使用声明的 `output_grain`。这让静态 grain 不只是展示 metadata，
 也成为 runtime boundary check。
 
 ## 6. Worker 与 recovery policy
@@ -205,18 +221,23 @@ RecoveryPolicy(
 - graph input 与 node/output 名唯一；
 - refs 已由 graph input 或前序 node 产生；
 - graph outputs 存在；
+- operator factory path 合法，constructor args/kwargs 可 pickle；
 - operation 与 output relation 类型匹配；
 - `SameAs` / `SubsetOf` grain 与 source 相同；
-- `ChildrenOf.label` 非空且等于 output grain；
+- `ChildrenOf.parent` 是可用 input 或更早 output，child grain 只在 `OutputSpec` 声明；
 - Map outputs 精确 `SameAs(input 0)`，Filter/FilterByMask outputs 精确覆盖其数据 inputs；
-- Reduce anchor/members 精确匹配 inputs；
-- Related roles 唯一并按序覆盖 inputs；
+- Reduce input 0 精确匹配 anchor，其余 inputs 必须在静态 relation ancestry 中确为该
+  anchor 的 descendants；多输出 Reduce 共用同一 incomplete policy；
+- Related roles 唯一、非空且数量匹配 inputs；
 - Select mask index 合法；
-- node-local output relation 只能引用 invocation input 或更早 output，禁止 self/forward
-  source。
+- relation source 必须是 invocation input 或已支持的 earlier output，禁止 self/forward
+  source；当前 Expand 进一步限制为 shared `ChildrenOf`。
 
-因此 mixed-output identity forest 已可由 IR 表示并由 verifier 检查拓扑和 grain，但
-runtime marker/materialization 仍未实现。
+因此 `verify_graph()` 保证 graph 在当前 runtime 中结构可解释，但不单独证明所有
+data-dependent 语义前提。identity alignment、closed parent batch、RelatedFrom 后
+shared-parent ID consistency、output domain/grain 和 backend recovery support 由执行器
+检查；UDF 纯度与 adapter 置换等变性是用户 contract。mixed-output identity forest
+作为一个整体 deferred，不会提前放宽 verifier。
 
 ## 8. Derived capability
 
@@ -253,6 +274,6 @@ capability 查询。
 当前图中没有 pass manager、optimizer-inserted operation、graph-level rebatch 或
 materialize node。`data.rebatch()` 仅对一个 `PortBatch` 做数据级重组。
 
-未来 `mg.out.same` / `mg.out.children` 只用于 Expand mixed outputs。IR/verifier 已能表达
-identity forest；authoring markers、restricted analysis 和 Local/Ray output materializer
-仍 deferred。
+未来 `mg.out.same` / `mg.out.children` 只用于 Expand mixed outputs。relation types 已
+预留必要词汇；authoring markers、forest verifier 和 Local/Ray output materializer
+一并 deferred。

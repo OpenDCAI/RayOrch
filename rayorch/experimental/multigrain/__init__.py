@@ -8,8 +8,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from .data import ErrorTrace, Grouped, PortBatch, concat, group_by, rebatch, source
-from .execution import MultigrainExecutor, NodeMetric, RunMetrics
+from .data import (
+    ErrorTrace,
+    Grouped,
+    IdentityDomain,
+    PortBatch,
+    concat,
+    group_by,
+    rebatch,
+    source,
+    via,
+)
+from .execution import MultigrainExecutor, NodeMetric, RunMetrics, StreamScope
 from .ir import (
     IncompleteGroupPolicy,
     IsolationBudget,
@@ -42,6 +52,7 @@ __all__ = [
     "Filter",
     "FaultSpec",
     "Grouped",
+    "IdentityDomain",
     "IncompleteGroupPolicy",
     "IsolationBudget",
     "IsolationExhaustedAction",
@@ -58,10 +69,12 @@ __all__ = [
     "RetryTiming",
     "Select",
     "ShardExhaustedAction",
+    "StreamScope",
     "WorkerPoolSpec",
     "concat",
     "group_by",
     "lpt_shard_planner",
     "rebatch",
     "source",
+    "via",
 ]

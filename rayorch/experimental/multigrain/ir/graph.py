@@ -109,6 +109,12 @@ class ExecutionGraph:
             lines.append(
                 f'    {node_id}["{node.name}<br/>{operation_name(node.operation)}"]'
             )
+            for output in node.outputs:
+                output_id = _mermaid_id(output.ref)
+                lines.append(
+                    f'    {output_id}["{output.name}:{output.grain}"]'
+                )
+                lines.append(f"    {node_id} --> {output_id}")
             for ref in node.inputs:
                 lines.append(f"    {_mermaid_id(ref)} --> {node_id}")
         lines.append("    graph_sink([out])")
@@ -129,7 +135,11 @@ def _mermaid_id(ref: PortRef) -> str:
         return "input_" + "".join(
             ch if ch.isalnum() else "_" for ch in ref.name
         )
-    return _mermaid_node(ref.node)
+    return (
+        _mermaid_node(ref.node)
+        + "_out_"
+        + "".join(ch if ch.isalnum() else "_" for ch in ref.output)
+    )
 
 
 def _jsonify(value: Any) -> Any:

@@ -83,7 +83,7 @@ def test_compile_traces_minimal_relation_execution_graph() -> None:
     relation = reduce.outputs[0].relation
     assert isinstance(relation, AggregateOf)
     assert relation.anchor == graph.inputs[0].ref
-    assert relation.members == (ocr.outputs[0].ref, expand.outputs[1].ref)
+    assert reduce.inputs[1:] == (ocr.outputs[0].ref, expand.outputs[1].ref)
     assert reduce.outputs[0].grain == "pdfs"
     assert graph.outputs == (reduce.outputs[0].ref,)
 

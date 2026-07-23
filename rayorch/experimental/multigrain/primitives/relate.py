@@ -13,37 +13,30 @@ Three ways to declare an M:N relation, from cheapest to most flexible:
 """
 from __future__ import annotations
 
-from importlib import import_module
+import hashlib
 from typing import Any, Callable, List, Mapping, Sequence
 
 from ._utils import (
     lineage_union,
 )
-from ..data.batch import ParentRef, PortBatch, _as_columns, _call_user
+from ..data.batch import (
+    IdentityDomain,
+    ParentRef,
+    PortBatch,
+    _as_columns,
+    _call_user,
+)
 from ._binding import BoundPrimitive, PrimitiveBinding
 from .output import PortBatchBuilder, RelationOutput
 from ..ir.operations import (
     KeyJoinSpec,
     RelateOp,
     RelationAdapterSpec,
+    resolve_relation_adapter,
 )
 from ..ir.policy import RecoveryPolicy, WorkerPoolSpec
-from ..ir.relations import RelatedFrom, RoleSource
+from ..ir.relations import RelatedFrom
 from ..tracing import TracePort, ensure_trace_ports
-
-
-def _resolve_adapter(ref: str) -> Callable[[Any], Any]:
-    """Resolve a ``pkg.mod:fn`` dotted path into a callable."""
-    if ":" not in ref:
-        raise ValueError(
-            f"relation_adapter '{ref}' must be a 'pkg.mod:fn' dotted path"
-        )
-    module_path, _, attr = ref.partition(":")
-    module = import_module(module_path)
-    fn = getattr(module, attr)
-    if not callable(fn):
-        raise TypeError(f"relation_adapter '{ref}' is not callable")
-    return fn
 
 
 def _extract_key(value: Any, field: str | Callable[[Any], Any]) -> Any:
@@ -52,6 +45,66 @@ def _extract_key(value: Any, field: str | Callable[[Any], Any]) -> Any:
     if isinstance(value, Mapping):
         return value[field]
     return getattr(value, field)
+
+
+def _relation_record_id(
+    name: str,
+    parents: Sequence[ParentRef],
+    stable_key: Any = None,
+) -> str:
+    evidence = tuple(
+        (parent.role, parent.identity_domain.token, parent.record_id)
+        for parent in parents
+    )
+    digest = hashlib.sha256(repr((evidence, stable_key)).encode("utf-8")).hexdigest()
+    return f"{name}:{digest}"
+
+
+def _merge_relation_metadata(
+    selected: Sequence[tuple[str, PortBatch, int]],
+) -> tuple[
+    dict[IdentityDomain, str],
+    dict[str, str],
+    dict[IdentityDomain, int],
+    list[tuple[str, ...]],
+]:
+    """Keep only ancestry facts that agree across all role parents."""
+    identity_values: dict[IdentityDomain, set[str]] = {}
+    display_values: dict[str, set[str]] = {}
+    ordinal_values: dict[IdentityDomain, set[int]] = {}
+    lineages: list[tuple[str, ...]] = []
+    for _, port, index in selected:
+        if port.identity_domain is None:
+            raise ValueError("Relate input has no identity domain")
+        facts = dict(port.ancestors[index])
+        facts[port.identity_domain] = port.record_ids[index]
+        for domain, record_id in facts.items():
+            identity_values.setdefault(domain, set()).add(record_id)
+        displays = dict(port.ancestor_display[index])
+        displays[port.name] = port.display_keys[index]
+        for label, display in displays.items():
+            display_values.setdefault(label, set()).add(display)
+        for domain, ordinal in port.ordinals[index].items():
+            ordinal_values.setdefault(domain, set()).add(ordinal)
+        lineages.append(port.lineage[index])
+    return (
+        {
+            domain: next(iter(values))
+            for domain, values in identity_values.items()
+            if len(values) == 1
+        },
+        {
+            label: next(iter(values))
+            for label, values in display_values.items()
+            if len(values) == 1
+        },
+        {
+            domain: next(iter(values))
+            for domain, values in ordinal_values.items()
+            if len(values) == 1
+        },
+        lineages,
+    )
 
 
 class Relate(BoundPrimitive):
@@ -83,6 +136,13 @@ class Relate(BoundPrimitive):
         if self.on and not roles:
             roles = tuple(self.on.keys())
         self.roles = tuple(roles)
+        if self.roles and (
+            any(not role for role in self.roles)
+            or len(set(self.roles)) != len(self.roles)
+        ):
+            raise ValueError("Relate roles must be unique non-empty names")
+        if self.on is not None and set(self.on) != set(self.roles):
+            raise ValueError("Relate `on` keys must match declared roles")
         self.relation_adapter = relation_adapter
         self.relation_fn = relation_fn
         self._binding = PrimitiveBinding.create(
@@ -117,7 +177,7 @@ class Relate(BoundPrimitive):
             role_names = self.roles or tuple(port.name for port in symbolic)
             if self.on is not None:
                 matcher = KeyJoinSpec(
-                    tuple((role, str(self.on[role])) for role in role_names)
+                    tuple(str(self.on[role]) for role in role_names)
                 )
             elif self.relation_adapter is not None:
                 matcher = RelationAdapterSpec(self.relation_adapter)
@@ -132,12 +192,7 @@ class Relate(BoundPrimitive):
                 operation=RelateOp(self.factory_spec, matcher),
                 output_grains=(self.output_grain,),
                 relations=(
-                    RelatedFrom(
-                        tuple(
-                            RoleSource(role, port.ref)
-                            for role, port in zip(role_names, symbolic)
-                        )
-                    ),
+                    RelatedFrom(role_names),
                 ),
                 recovery=self.recovery,
                 workers=self.workers,
@@ -148,7 +203,9 @@ class Relate(BoundPrimitive):
             return self._make_key_join_batch(ports)
         relation_fn = self.relation_fn
         if relation_fn is None and self.relation_adapter is not None:
-            relation_fn = _resolve_adapter(self.relation_adapter)
+            relation_fn = resolve_relation_adapter(
+                RelationAdapterSpec(self.relation_adapter)
+            )
         if relation_fn is None:
             raise NotImplementedError(
                 "Relate eager execution needs on=, relation_adapter, or relation_fn"
@@ -207,31 +264,30 @@ class Relate(BoundPrimitive):
                 by_role = {role: role_to_port[role].values[idx] for role, idx in combo}
                 value = _call_user(self.op, by_role) if self.op is not None else by_role
 
-                merged_ancestors: dict[str, str] = {}
-                merged_display: dict[str, str] = {}
-                merged_ordinals: dict[str, int] = {}
                 parent_refs: List[ParentRef] = []
-                parent_lineage: List[tuple[str, ...]] = []
                 key_parts: List[str] = []
-                id_parts: List[str] = []
+                selected: list[tuple[str, PortBatch, int]] = []
                 for role, idx in combo:
                     port = role_to_port[role]
-                    merged_ancestors.update(port.ancestors[idx])
-                    merged_ancestors[port.name] = port.record_ids[idx]
-                    merged_display.update(port.ancestor_display[idx])
-                    merged_display[port.name] = port.display_keys[idx]
-                    merged_ordinals.update(port.ordinals[idx])
+                    if port.identity_domain is None:
+                        raise ValueError("Relate input has no identity domain")
+                    selected.append((role, port, idx))
                     parent_refs.append(
                         ParentRef(
                             role=role,
                             port=port.name,
                             record_id=port.record_ids[idx],
                             display_key=port.display_keys[idx],
+                            identity_domain=port.identity_domain,
                         )
                     )
-                    parent_lineage.append(port.lineage[idx])
                     key_parts.append(f"{role}={port.display_keys[idx]}")
-                    id_parts.append(f"{role}={port.record_ids[idx]}")
+                (
+                    merged_ancestors,
+                    merged_display,
+                    merged_ordinals,
+                    parent_lineage,
+                ) = _merge_relation_metadata(selected)
 
                 # Content-addressed identity: a relation row is identified by its
                 # matched parent tuple, not by emission order. Combos are distinct
@@ -240,7 +296,7 @@ class Relate(BoundPrimitive):
                 rows.append(
                     RelationOutput(
                         value=value,
-                        record_id=f"{self.name}:{'|'.join(id_parts)}",
+                        record_id=_relation_record_id(self.name, parent_refs),
                         display_key="/".join(key_parts),
                         ancestors=merged_ancestors,
                         ancestor_display=merged_display,
@@ -254,6 +310,15 @@ class Relate(BoundPrimitive):
         return PortBatchBuilder.related(
             rows,
             name=self.output_grain,
+            identity_domain=IdentityDomain.derived(
+                "related",
+                self.name,
+                *(
+                    port.identity_domain
+                    for port in ports
+                    if port.identity_domain is not None
+                ),
+            ),
             errors=[error for port in ports for error in port.errors],
         )
 
@@ -282,19 +347,23 @@ class Relate(BoundPrimitive):
             stable_key = item[2] if len(item) == 3 else None
             if not isinstance(parent_indexes, dict):
                 raise TypeError("Relate parent refs must be a dict of role -> index")
+            if set(parent_indexes) != set(role_names):
+                missing = sorted(set(role_names) - set(parent_indexes))
+                extra = sorted(set(parent_indexes) - set(role_names))
+                raise ValueError(
+                    "Relate parent refs must provide exactly the declared roles; "
+                    f"missing={missing}, extra={extra}"
+                )
 
             parent_refs: List[ParentRef] = []
-            item_ancestors: dict[str, str] = {}
-            item_display: dict[str, str] = {}
-            item_ordinals: dict[str, int] = {}
-            parent_lineage: List[tuple[str, ...]] = []
-            id_parts: List[str] = []
-            for role, local_index in parent_indexes.items():
-                if role not in role_to_port:
-                    raise ValueError(f"Relate parent role '{role}' is not declared")
+            selected: list[tuple[str, PortBatch, int]] = []
+            for role in role_names:
+                local_index = parent_indexes[role]
                 if not isinstance(local_index, int):
                     raise TypeError("Relate parent indexes must be integers")
                 parent_port = role_to_port[role]
+                if parent_port.identity_domain is None:
+                    raise ValueError("Relate input has no identity domain")
                 if local_index < 0 or local_index >= len(parent_port):
                     raise IndexError(
                         f"Relate parent index {local_index} for role '{role}' "
@@ -306,19 +375,17 @@ class Relate(BoundPrimitive):
                         port=parent_port.name,
                         record_id=parent_port.record_ids[local_index],
                         display_key=parent_port.display_keys[local_index],
+                        identity_domain=parent_port.identity_domain,
                     )
                 )
-                item_ancestors.update(parent_port.ancestors[local_index])
-                item_ancestors[parent_port.name] = parent_port.record_ids[local_index]
-                item_display.update(parent_port.ancestor_display[local_index])
-                item_display[parent_port.name] = parent_port.display_keys[local_index]
-                item_ordinals.update(parent_port.ordinals[local_index])
-                parent_lineage.append(parent_port.lineage[local_index])
-                id_parts.append(f"{role}={parent_port.record_ids[local_index]}")
-
-            record_id = f"{self.name}:{'|'.join(id_parts)}"
-            if stable_key is not None:
-                record_id += f"|key={stable_key}"
+                selected.append((role, parent_port, local_index))
+            (
+                item_ancestors,
+                item_display,
+                item_ordinals,
+                parent_lineage,
+            ) = _merge_relation_metadata(selected)
+            record_id = _relation_record_id(self.name, parent_refs, stable_key)
             if record_id in seen_ids:
                 raise ValueError(
                     "Relate adapter emitted duplicate parent evidence; "
@@ -350,6 +417,15 @@ class Relate(BoundPrimitive):
         return PortBatchBuilder.related(
             rows,
             name=self.output_grain,
+            identity_domain=IdentityDomain.derived(
+                "related",
+                self.name,
+                *(
+                    port.identity_domain
+                    for port in ports
+                    if port.identity_domain is not None
+                ),
+            ),
             errors=[error for port in ports for error in port.errors],
         )
 

@@ -16,7 +16,7 @@ from ..data.batch import (
     _as_columns,
     _call_user,
 )
-from ..ir.operations import ExpandOp, ReduceOp
+from ..ir.operations import ByAncestor, ByRole, ExpandOp, ReduceOp
 from ..ir.policy import RecoveryPolicy, WorkerPoolSpec
 from ..ir.relations import AggregateOf, ChildrenOf, IncompleteGroupPolicy
 from ..tracing import TracePort, ensure_trace_ports
@@ -65,7 +65,7 @@ class Expand(BoundPrimitive):
                 operation=ExpandOp(self.factory_spec),
                 output_grains=(self.child_label,) * self.num_outputs,
                 relations=(
-                    ChildrenOf(symbolic[self.parent].ref, self.child_label),
+                    ChildrenOf(symbolic[self.parent].ref),
                 )
                 * self.num_outputs,
                 recovery=self.recovery,
@@ -160,15 +160,21 @@ class Reduce(BoundPrimitive):
             descendants = grouped.descendants
             if not all(isinstance(port, TracePort) for port in descendants):
                 raise TypeError("cannot mix symbolic and eager grouped ports")
+            roles = grouped.roles or (None,) * len(descendants)
             return anchor.tracer.add_node(
                 name=self.name,
                 inputs=(anchor, *descendants),
-                operation=ReduceOp(self.factory_spec),
+                operation=ReduceOp(
+                    self.factory_spec,
+                    tuple(
+                        ByRole(role) if role is not None else ByAncestor()
+                        for role in roles
+                    ),
+                ),
                 output_grains=(anchor.grain,) * self.num_outputs,
                 relations=(
                     AggregateOf(
                         anchor=anchor.ref,
-                        members=tuple(port.ref for port in descendants),
                         incomplete=self.missing,
                     ),
                 )
@@ -176,9 +182,10 @@ class Reduce(BoundPrimitive):
                 recovery=self.recovery,
                 workers=self.workers,
             )
+        roles = grouped.roles or (None,) * len(grouped.descendants)
         grouped_values: List[List[List[Any]]] = [
-            self._groups_for(anchor, descendant)
-            for descendant in grouped.descendants
+            self._groups_for(anchor, descendant, role=role)
+            for descendant, role in zip(grouped.descendants, roles)
         ]
         errors = list(anchor.errors)
         for descendant in grouped.descendants:
@@ -219,7 +226,7 @@ class Reduce(BoundPrimitive):
         anchor_ids = set(anchor.record_ids)
         poisoned: set[str] = set()
         for err in errors:
-            aid = err.ancestors.get(anchor.name)
+            aid = err.ancestors.get(anchor.identity_domain)
             if aid in anchor_ids:
                 poisoned.add(aid)
         return poisoned
@@ -261,7 +268,7 @@ class Reduce(BoundPrimitive):
             lost = [
                 err.logical_item
                 for err in errors
-                if err.ancestors.get(anchor.name) == rid
+                if err.ancestors.get(anchor.identity_domain) == rid
             ]
             placeholder = {
                 "status": "incomplete",
@@ -281,13 +288,20 @@ class Reduce(BoundPrimitive):
                     parent=None,
                     action="suppressed_incomplete",
                     error=f"{len(lost)} descendant record(s) lost: {lost}",
-                    ancestors={anchor.name: rid},
+                    ancestors={anchor.identity_domain: rid},
                 )
             )
         return tuple(full), cascade
 
     @staticmethod
-    def _groups_for(anchor: PortBatch, descendant: PortBatch) -> List[List[Any]]:
+    def _groups_for(
+        anchor: PortBatch,
+        descendant: PortBatch,
+        *,
+        role: str | None = None,
+    ) -> List[List[Any]]:
+        if anchor.identity_domain is None:
+            raise ValueError("Reduce anchor has no identity domain")
         grouped: List[List[tuple[tuple[Any, ...], Any]]] = [
             [] for _ in anchor.values
         ]
@@ -295,17 +309,64 @@ class Reduce(BoundPrimitive):
             record_id: index for index, record_id in enumerate(anchor.record_ids)
         }
         for row_index, value in enumerate(descendant.values):
-            parent_id = descendant.ancestors[row_index].get(anchor.name)
+            if role is None:
+                parent_id = descendant.ancestors[row_index].get(
+                    anchor.identity_domain
+                )
+                if parent_id is None:
+                    conflicting = {
+                        ref.record_id
+                        for ref in (
+                            descendant.relations[row_index]
+                            if descendant.relations
+                            else ()
+                        )
+                        if ref.identity_domain == anchor.identity_domain
+                    }
+                    if len(conflicting) > 1:
+                        raise ValueError(
+                            "Reduce descendant has multiple parents in the "
+                            "anchor identity domain; use mg.via(..., role=...)"
+                        )
+                    raise ValueError(
+                        "closed microbatch violation: descendant has no "
+                        "parent in the anchor identity domain"
+                    )
+            else:
+                matches = [
+                    ref
+                    for ref in (
+                        descendant.relations[row_index]
+                        if descendant.relations
+                        else ()
+                    )
+                    if ref.role == role
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"Reduce role '{role}' requires exactly one ParentRef "
+                        f"per descendant, got {len(matches)}"
+                    )
+                parent = matches[0]
+                if parent.identity_domain != anchor.identity_domain:
+                    raise ValueError(
+                        f"Reduce role '{role}' belongs to a different "
+                        "identity domain than the anchor"
+                    )
+                parent_id = parent.record_id
             if parent_id is None:
                 continue
             if parent_id not in anchor_index:
-                continue
+                raise ValueError(
+                    "closed microbatch violation: relation parent is not "
+                    "present in the anchor batch"
+                )
             ordinal_items = list(descendant.ordinals[row_index].items())
             anchor_position = next(
                 (
                     index
                     for index, (grain, _) in enumerate(ordinal_items)
-                    if grain == anchor.name
+                    if grain == anchor.identity_domain
                 ),
                 None,
             )

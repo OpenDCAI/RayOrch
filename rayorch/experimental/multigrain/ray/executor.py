@@ -16,6 +16,7 @@ the root facade resolves its public symbols lazily for API compatibility.
 """
 from __future__ import annotations
 
+import math
 import time
 import threading
 from dataclasses import dataclass, field
@@ -24,9 +25,10 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 import ray
 
 from ..data.batch import DeferredRecord, ErrorTrace, NodeExecution, PortBatch, concat
-from ..execution.coordinator import ExecutionCoordinator, GraphOutput
+from ..execution.coordinator import ExecutionCoordinator, GraphOutput, StreamScope
+from ..execution.handlers import expected_output_domain
 from ..execution.local import MultigrainExecutor
-from ..execution.metrics import NodeMetric, RunMetrics
+from ..execution.metrics import NodeMetric, RunMetrics, lineage_footprint
 from ..ir.capabilities import is_row_partitionable
 from ..ir.graph import ExecutionGraph, NodeSpec
 from ..ir.operations import MapOp, operation_name
@@ -34,6 +36,7 @@ from ..ir.policy import (
     IsolationExhaustedAction,
     ShardRecoveryAction,
 )
+from ..ir.relations import ChildrenOf, SameAs, SubsetOf
 from ..ir.verify import validate_shard_plan, verify_graph
 
 class InjectedFault(RuntimeError):
@@ -158,16 +161,13 @@ class MultigrainRayExecutor:
     def __init__(
         self,
         *,
-        default_replicas: int = 1,
         shard_planner: Callable[
             [NodeSpec, Sequence[PortBatch], int], Sequence[Sequence[int]] | None
         ]
         | None = None,
         metrics: RunMetrics | None = None,
         faults: Sequence[FaultSpec] | None = None,
-        max_retries: int | None = None,
     ) -> None:
-        self.default_replicas = max(1, int(default_replicas))
         # Optional policy: given (node, inputs, replicas) -> per-shard row-index
         # lists. Returning None falls back to contiguous ranges. This is where
         # relation-aware / work-aware rebalancing plugs in.
@@ -175,11 +175,6 @@ class MultigrainRayExecutor:
         # Optional instrumentation + fault injection for M2 experiments.
         self.metrics = metrics
         self.faults = list(faults or [])
-        # Compatibility override for existing experiment scripts. New code
-        # declares max_shard_retries per node through RecoveryPolicy.
-        self.max_retries = (
-            None if max_retries is None else max(0, int(max_retries))
-        )
         # Persistent per-node actor pools for model-holding GPU stages. Created
         # lazily on first use and reused across every execute()/microbatch/chunk
         # so the model loads once per replica for the whole run.
@@ -218,6 +213,7 @@ class MultigrainRayExecutor:
         *,
         max_inflight: int = 1,
         ordered: bool = True,
+        scope: StreamScope = StreamScope.CLOSED_MICROBATCH,
     ) -> Iterator[GraphOutput]:
         """Execute a bounded stream through persistent pools and a generic DAG.
 
@@ -258,6 +254,7 @@ class MultigrainRayExecutor:
             max_inflight=max_inflight,
             ordered=ordered,
             drain_node=self._drain_node,
+            scope=scope,
         )
         return coordinator.run(microbatch_inputs)
 
@@ -301,13 +298,13 @@ class MultigrainRayExecutor:
             ancestor_display=[dict(source.ancestor_display[0])],
             ordinals=[dict(source.ordinals[0])],
             lineage=[tuple(source.lineage[0])],
+            identity_domain=source.identity_domain,
             relations=[tuple(source.relations[0])] if source.relations else [],
             errors=[],
         )
 
     def _replicas_for(self, node: NodeSpec) -> int:
-        hint = node.workers.replicas
-        return max(self.default_replicas, int(hint or 1))
+        return node.workers.replicas
 
     def _num_gpus_for(self, node: NodeSpec) -> float:
         return float(node.workers.gpus_per_worker)
@@ -456,20 +453,6 @@ class MultigrainRayExecutor:
                     action = node.recovery.decide_shard(
                         attempt=attempts[shard_index]
                     )
-                    if (
-                        self.max_retries is not None
-                        and attempts[shard_index] < self.max_retries
-                    ):
-                        action = ShardRecoveryAction.RETRY
-                    elif (
-                        self.max_retries is not None
-                        and attempts[shard_index] >= self.max_retries
-                    ):
-                        action = (
-                            ShardRecoveryAction.DEGRADE
-                            if node.recovery.on_shard_exhausted.value == "degrade"
-                            else ShardRecoveryAction.ABORT
-                        )
                     if action is ShardRecoveryAction.ABORT:
                         raise
                     if action is ShardRecoveryAction.DEGRADE:
@@ -608,7 +591,9 @@ class MultigrainRayExecutor:
         traces = list(base.errors)
         for index, record_id in enumerate(base.record_ids):
             ancestors = dict(base.ancestors[index])
-            ancestors[base.name] = record_id
+            if base.identity_domain is None:
+                raise ValueError("failed shard input has no identity domain")
+            ancestors[base.identity_domain] = record_id
             traces.append(
                 ErrorTrace(
                     source_item=base.display_keys[index],
@@ -633,6 +618,11 @@ class MultigrainRayExecutor:
                     ancestor_display=[],
                     ordinals=[],
                     lineage=[],
+                    identity_domain=expected_output_domain(
+                        node,
+                        inputs,
+                        spec,
+                    ),
                     errors=list(traces),
                 )
                 for spec in node.outputs
@@ -721,16 +711,25 @@ class MultigrainRayExecutor:
                 runtime_replicas,
                 retries,
                 rec_rows,
+                shard_rows_in=[nrows],
+                shard_rows_out=[
+                    len(result.outputs[0]) if result.outputs else 0
+                ],
             )
             return result
 
         partitions: Sequence[Sequence[int]] | None = None
         if len(inputs) > 1:
             base_ids = inputs[0].record_ids
-            if any(port.record_ids != base_ids for port in inputs[1:]):
+            base_domain = inputs[0].identity_domain
+            if any(
+                port.record_ids != base_ids
+                or port.identity_domain != base_domain
+                for port in inputs[1:]
+            ):
                 raise ValueError(
                     f"row-partitioned node '{node.name}' requires identity-aligned "
-                    "inputs in the same order"
+                    "inputs in the same order and identity domain"
                 )
         if self.shard_planner is not None:
             partitions = self.shard_planner(node, inputs, replicas)
@@ -780,16 +779,90 @@ class MultigrainRayExecutor:
         merged: list[PortBatch] = []
         for output_index in range(len(node.outputs)):
             parts = [result.outputs[output_index] for result in shard_outputs]
-            merged.append(concat(parts, name=parts[0].name))
+            batch = concat(parts, name=parts[0].name)
+            merged.append(
+                self._canonicalize_output(
+                    node,
+                    inputs,
+                    batch,
+                    output_index,
+                )
+            )
         deferred = tuple(
             item
             for result in shard_outputs
             for item in result.deferred
         )
         self._record(
-            node, inputs, tuple(merged), shard_busy, len(partitions), retries, rec_rows
+            node,
+            inputs,
+            tuple(merged),
+            shard_busy,
+            len(partitions),
+            retries,
+            rec_rows,
+            shard_rows_in=[len(shard[0]) if shard else 0 for shard in shard_inputs],
+            shard_rows_out=[
+                len(result.outputs[0]) if result.outputs else 0
+                for result in shard_outputs
+            ],
         )
         return NodeExecution(tuple(merged), deferred)
+
+    @staticmethod
+    def _canonicalize_output(
+        node: NodeSpec,
+        inputs: tuple[PortBatch, ...],
+        batch: PortBatch,
+        output_index: int,
+    ) -> PortBatch:
+        """Hide physical shard order behind the logical Port list order."""
+        if len(batch) <= 1:
+            return batch
+        relation = node.outputs[output_index].relation
+        if isinstance(relation, (SameAs, SubsetOf)):
+            source = inputs[node.inputs.index(relation.source)]
+            positions = {
+                record_id: index
+                for index, record_id in enumerate(source.record_ids)
+            }
+            try:
+                order = sorted(
+                    range(len(batch)),
+                    key=lambda index: positions[batch.record_ids[index]],
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    f"node '{node.name}' output contains identity outside "
+                    "its preserved source"
+                ) from exc
+            return batch.take(order)
+        if isinstance(relation, ChildrenOf):
+            parent = inputs[node.inputs.index(relation.parent)]
+            if parent.identity_domain is None:
+                raise ValueError("Expand parent has no identity domain")
+            positions = {
+                record_id: index
+                for index, record_id in enumerate(parent.record_ids)
+            }
+            try:
+                order = sorted(
+                    range(len(batch)),
+                    key=lambda index: (
+                        positions[
+                            batch.ancestors[index][parent.identity_domain]
+                        ],
+                        batch.ordinals[index][parent.identity_domain],
+                        batch.record_ids[index],
+                    ),
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    f"Expand node '{node.name}' output lacks canonical "
+                    "parent identity/ordinal"
+                ) from exc
+            return batch.take(order)
+        return batch
 
     def _record(
         self,
@@ -800,9 +873,13 @@ class MultigrainRayExecutor:
         replicas: int,
         retries: int,
         recovery_rows: int,
+        *,
+        shard_rows_in: Sequence[int],
+        shard_rows_out: Sequence[int],
     ) -> None:
         if self.metrics is None:
             return
+        footprint = lineage_footprint(outputs)
         self.metrics.record(
             NodeMetric(
                 name=node.name,
@@ -812,6 +889,10 @@ class MultigrainRayExecutor:
                 rows_out=len(outputs[0]) if outputs else 0,
                 wall_s=max(shard_busy) if shard_busy else 0.0,
                 shard_busy_s=list(shard_busy),
+                shard_rows_in=list(shard_rows_in),
+                shard_rows_out=list(shard_rows_out),
+                relation_entries_out=footprint["relation_entries"],
+                lineage_bytes_out=footprint["approx_bytes"],
                 retries=retries,
                 recovery_rows=recovery_rows,
             )
@@ -851,6 +932,8 @@ def lpt_shard_planner(
     def plan(node: NodeSpec, inputs: Sequence[PortBatch], replicas: int) -> list[list[int]]:
         base = inputs[0]
         weights = [float(weight_of(value)) for value in base.values]
+        if any(not math.isfinite(weight) or weight < 0 for weight in weights):
+            raise ValueError("LPT weights must be finite and non-negative")
         order = sorted(range(len(weights)), key=lambda i: -weights[i])
         bins: list[list[int]] = [[] for _ in range(replicas)]
         loads = [0.0] * replicas

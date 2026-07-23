@@ -7,6 +7,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Sequence
+import uuid
+
+
+@dataclass(frozen=True, order=True)
+class IdentityDomain:
+    """One logical record-identity namespace, independent of grain and port."""
+
+    token: str
+    label: str
+
+    @classmethod
+    def fresh(cls, label: str) -> "IdentityDomain":
+        return cls(uuid.uuid4().hex, label)
+
+    @classmethod
+    def named(cls, label: str) -> "IdentityDomain":
+        return cls(f"named:{label}", label)
+
+    @classmethod
+    def derived(
+        cls,
+        kind: str,
+        label: str,
+        *parents: "IdentityDomain",
+    ) -> "IdentityDomain":
+        seed = repr((kind, label, tuple(parent.token for parent in parents)))
+        return cls(uuid.uuid5(uuid.NAMESPACE_URL, seed).hex, label)
 
 
 @dataclass(frozen=True)
@@ -21,10 +48,10 @@ class ErrorTrace:
     parent: str | None
     action: str
     error: str
-    # Ancestor grain -> record id for the failed item (plus its own grain id).
+    # Ancestor identity domain -> record id for the failed item.
     # Lets a downstream Reduce map a lost descendant to the exact anchor it
     # belonged to, so failure can cascade to that anchor (fail-closed).
-    ancestors: Dict[str, str] = field(default_factory=dict)
+    ancestors: Dict[IdentityDomain, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -36,7 +63,17 @@ class ErrorTrace:
             "parent": self.parent,
             "action": self.action,
             "error": self.error,
-            "ancestors": dict(self.ancestors),
+            "ancestors": [
+                {
+                    "token": domain.token,
+                    "label": domain.label,
+                    "record_id": record_id,
+                }
+                for domain, record_id in sorted(
+                    self.ancestors.items(),
+                    key=lambda item: (item[0].token, item[0].label),
+                )
+            ],
         }
 
 
@@ -48,6 +85,7 @@ class ParentRef:
     port: str
     record_id: str
     display_key: str
+    identity_domain: IdentityDomain
 
     def to_dict(self) -> Dict[str, str]:
         return {
@@ -55,6 +93,8 @@ class ParentRef:
             "port": self.port,
             "record_id": self.record_id,
             "display_key": self.display_key,
+            "identity_domain": self.identity_domain.label,
+            "identity_domain_token": self.identity_domain.token,
         }
 
 
@@ -77,14 +117,49 @@ class PortBatch:
     values: List[Any]
     record_ids: List[str]
     display_keys: List[str]
-    ancestors: List[Dict[str, str]]
+    ancestors: List[Dict[IdentityDomain, str]]
     ancestor_display: List[Dict[str, str]]
-    ordinals: List[Dict[str, int]]
+    ordinals: List[Dict[IdentityDomain, int]]
     lineage: List[tuple[str, ...]]
+    identity_domain: IdentityDomain | None = None
     relations: List[tuple[ParentRef, ...]] = field(default_factory=list)
     errors: List[ErrorTrace] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.identity_domain is None:
+            self.identity_domain = IdentityDomain.named(self.name)
+        # Keep hand-built MVP batches usable while all framework-produced
+        # metadata uses typed domains.
+        self.ancestors = [
+            {
+                (
+                    key
+                    if isinstance(key, IdentityDomain)
+                    else (
+                        self.identity_domain
+                        if key == self.name
+                        else IdentityDomain.named(str(key))
+                    )
+                ): value
+                for key, value in item.items()
+            }
+            for item in self.ancestors
+        ]
+        self.ordinals = [
+            {
+                (
+                    key
+                    if isinstance(key, IdentityDomain)
+                    else (
+                        self.identity_domain
+                        if key == self.name
+                        else IdentityDomain.named(str(key))
+                    )
+                ): value
+                for key, value in item.items()
+            }
+            for item in self.ordinals
+        ]
         n = len(self.values)
         fields = {
             "record_ids": self.record_ids,
@@ -99,6 +174,8 @@ class PortBatch:
                 raise ValueError(
                     f"{name} length {len(value)} does not match values length {n}"
                 )
+        if len(set(self.record_ids)) != n:
+            raise ValueError("record_ids must be unique within a PortBatch")
         if self.relations and len(self.relations) != n:
             raise ValueError(
                 f"relations length {len(self.relations)} does not match values length {n}"
@@ -107,6 +184,10 @@ class PortBatch:
     def __len__(self) -> int:
         return len(self.values)
 
+    @property
+    def grain(self) -> str:
+        return self.name
+
     @classmethod
     def source(
         cls,
@@ -114,7 +195,17 @@ class PortBatch:
         *,
         name: str = "source",
         display_key: Callable[[Any], str] | None = None,
+        identity_domain: IdentityDomain | str | None = None,
     ) -> "PortBatch":
+        domain = (
+            identity_domain
+            if isinstance(identity_domain, IdentityDomain)
+            else (
+                IdentityDomain.named(identity_domain)
+                if isinstance(identity_domain, str)
+                else IdentityDomain.named(name)
+            )
+        )
         keys = [
             str(display_key(value) if display_key is not None else value)
             for value in values
@@ -127,7 +218,7 @@ class PortBatch:
             display_keys=keys,
             ancestors=[
                 {
-                    name: record_id,
+                    domain: record_id,
                 }
                 for record_id in record_ids
             ],
@@ -139,6 +230,7 @@ class PortBatch:
             ],
             ordinals=[{} for _ in values],
             lineage=[() for _ in values],
+            identity_domain=domain,
         )
 
     def take(self, indices: Sequence[int], *, name: str | None = None) -> "PortBatch":
@@ -151,6 +243,7 @@ class PortBatch:
             ancestor_display=[dict(self.ancestor_display[i]) for i in indices],
             ordinals=[dict(self.ordinals[i]) for i in indices],
             lineage=[tuple(self.lineage[i]) for i in indices],
+            identity_domain=self.identity_domain,
             relations=[
                 tuple(self.relations[i]) for i in indices
             ] if self.relations else [],
@@ -177,6 +270,7 @@ class PortBatch:
             ancestor_display=[dict(item) for item in self.ancestor_display],
             ordinals=[dict(item) for item in self.ordinals],
             lineage=[tuple((*path, op_name)) for path in self.lineage],
+            identity_domain=self.identity_domain,
             relations=[tuple(item) for item in self.relations],
             errors=list(self.errors),
         )
@@ -219,8 +313,22 @@ def source(
     *,
     name: str = "source",
     display_key: Callable[[Any], str] | None = None,
+    identity_domain: IdentityDomain | str | None = None,
 ) -> PortBatch:
-    return PortBatch.source(values, name=name, display_key=display_key)
+    return PortBatch.source(
+        values,
+        name=name,
+        display_key=display_key,
+        identity_domain=identity_domain,
+    )
+
+
+def dedupe_errors(errors: Sequence[ErrorTrace]) -> List[ErrorTrace]:
+    result: List[ErrorTrace] = []
+    for error in errors:
+        if error not in result:
+            result.append(error)
+    return result
 
 
 def concat(batches: Sequence[PortBatch], *, name: str | None = None) -> PortBatch:
@@ -228,6 +336,12 @@ def concat(batches: Sequence[PortBatch], *, name: str | None = None) -> PortBatc
     if not batches:
         return PortBatch(name or "empty", [], [], [], [], [], [], [])
     port_name = name or batches[0].name
+    domain = batches[0].identity_domain
+    if any(batch.identity_domain != domain for batch in batches[1:]):
+        raise ValueError("cannot concat batches from different identity domains")
+    source_name = batches[0].name
+    if any(batch.name != source_name for batch in batches[1:]):
+        raise ValueError("cannot concat batches from different logical ports")
     errors: List[ErrorTrace] = []
     values: List[Any] = []
     record_ids: List[str] = []
@@ -259,8 +373,9 @@ def concat(batches: Sequence[PortBatch], *, name: str | None = None) -> PortBatc
         ancestor_display=ancestor_display,
         ordinals=ordinals,
         lineage=lineage,
+        identity_domain=domain,
         relations=relations,
-        errors=errors,
+        errors=dedupe_errors(errors),
     )
 
 
@@ -307,6 +422,11 @@ def _align_by_identity(ports: Sequence[PortBatch]) -> List[PortBatch]:
     base_ids = list(base.record_ids)
     aligned = [base]
     for port in ports[1:]:
+        if port.identity_domain != base.identity_domain:
+            raise ValueError(
+                f"cannot align port '{port.name}' with '{base.name}' "
+                "across identity domains"
+            )
         if set(port.record_ids) != set(base_ids):
             raise ValueError(
                 f"cannot align port '{port.name}' with '{base.name}' by identity"
@@ -337,20 +457,54 @@ def _without_index(batch: PortBatch, bad_index: int) -> PortBatch:
 class Grouped:
     anchor: Any
     descendants: tuple[Any, ...]
+    roles: tuple[str | None, ...] = ()
+
+
+@dataclass(frozen=True)
+class Via:
+    """Select one direct relation-parent role for Reduce grouping."""
+
+    port: Any
+    role: str
+
+    def __post_init__(self) -> None:
+        if not self.role:
+            raise ValueError("via role must be non-empty")
+
+
+def via(port: Any, *, role: str) -> Via:
+    return Via(port=port, role=role)
 
 
 def group_by(anchor: Any, *descendants: Any) -> Grouped:
-    return Grouped(anchor=anchor, descendants=tuple(descendants))
+    ports: list[Any] = []
+    roles: list[str | None] = []
+    for descendant in descendants:
+        if isinstance(descendant, Via):
+            ports.append(descendant.port)
+            roles.append(descendant.role)
+        else:
+            ports.append(descendant)
+            roles.append(None)
+    return Grouped(
+        anchor=anchor,
+        descendants=tuple(ports),
+        roles=tuple(roles),
+    )
 
 
 __all__ = [
+    "IdentityDomain",
     "ErrorTrace",
     "Grouped",
+    "Via",
+    "dedupe_errors",
     "ParentRef",
     "PortBatch",
     "concat",
     "group_by",
     "rebatch",
     "source",
+    "via",
 ]
 

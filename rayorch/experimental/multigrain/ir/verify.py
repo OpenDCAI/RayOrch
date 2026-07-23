@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import pickle
 
 from .graph import ExecutionGraph, NodeSpec
 from .operations import (
+    ByAncestor,
+    ByRole,
     ExpandOp,
     FilterByMaskOp,
     FilterOp,
@@ -14,6 +17,8 @@ from .operations import (
     RelateOp,
     RelationAdapterSpec,
     operator_factory,
+    resolve_operator_factory,
+    resolve_relation_adapter,
 )
 from .refs import NodeOutputRef, PortRef, ref_label
 from .relations import (
@@ -41,6 +46,14 @@ def verify_graph(graph: ExecutionGraph) -> ExecutionGraph:
         raise GraphValidationError("graph input names and grains must not be empty")
 
     grains: dict[PortRef, str] = {spec.ref: spec.grain for spec in graph.inputs}
+    # Structural reachability only. This does not prove that a runtime record
+    # carries one functional ancestor ID for every reachable source.
+    ancestry_paths: dict[PortRef, frozenset[PortRef]] = {
+        spec.ref: frozenset({spec.ref}) for spec in graph.inputs
+    }
+    relation_roles: dict[PortRef, frozenset[str]] = {
+        spec.ref: frozenset() for spec in graph.inputs
+    }
     node_names: set[str] = set()
     for node in graph.nodes:
         if node.name in node_names:
@@ -51,7 +64,7 @@ def verify_graph(graph: ExecutionGraph) -> ExecutionGraph:
             raise GraphValidationError(
                 f"node '{node.name}' has unresolved or non-topological inputs {missing}"
             )
-        _verify_node(node, grains)
+        _verify_node(node, grains, ancestry_paths, relation_roles)
         for output in node.outputs:
             grains[output.ref] = output.grain
 
@@ -63,7 +76,12 @@ def verify_graph(graph: ExecutionGraph) -> ExecutionGraph:
     return graph
 
 
-def _verify_node(node: NodeSpec, upstream_grains: dict[PortRef, str]) -> None:
+def _verify_node(
+    node: NodeSpec,
+    upstream_grains: dict[PortRef, str],
+    upstream_ancestry_paths: dict[PortRef, frozenset[PortRef]],
+    upstream_relation_roles: dict[PortRef, frozenset[str]],
+) -> None:
     if not node.name:
         raise GraphValidationError("node name must not be empty")
     if not node.inputs:
@@ -82,10 +100,21 @@ def _verify_node(node: NodeSpec, upstream_grains: dict[PortRef, str]) -> None:
             f"node '{node.name}' output names and grains must not be empty"
         )
     factory = operator_factory(node.operation)
-    if factory is not None and not factory.import_path:
-        raise GraphValidationError(
-            f"node '{node.name}' operator factory import_path must not be empty"
-        )
+    if factory is not None:
+        try:
+            resolve_operator_factory(factory)
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            raise GraphValidationError(
+                f"node '{node.name}' operator factory "
+                f"'{factory.import_path}' is not an importable class"
+            ) from exc
+        try:
+            pickle.dumps((factory.args, factory.kwargs))
+        except Exception as exc:  # noqa: BLE001 - preserve pickle's cause
+            raise GraphValidationError(
+                f"node '{node.name}' operator constructor arguments "
+                "must be pickleable"
+            ) from exc
     input_grains = tuple(upstream_grains[ref] for ref in node.inputs)
     if isinstance(node.operation, (MapOp, FilterOp, FilterByMaskOp)):
         if len(set(input_grains)) != 1:
@@ -106,54 +135,69 @@ def _verify_node(node: NodeSpec, upstream_grains: dict[PortRef, str]) -> None:
                     f"'{node.name}.{output.name}' must keep source grain "
                     f"'{source_grain}', got '{output.grain}'"
                 )
+            if isinstance(node.operation, MapOp):
+                # Map preserves input-0 identity, but runtime aligned-input
+                # merging carries ancestry from every positional input.
+                output_ancestors = frozenset().union(
+                    *(upstream_ancestry_paths[source] for source in node.inputs)
+                )
+            else:
+                output_ancestors = upstream_ancestry_paths[relation.source]
+            output_roles = upstream_relation_roles[relation.source]
         elif isinstance(relation, ChildrenOf):
             _require_source(node, relation.parent, available_grains)
-            if not relation.label:
-                raise GraphValidationError(
-                    f"ChildrenOf output '{node.name}.{output.name}' needs label"
-                )
-            if output.grain != relation.label:
-                raise GraphValidationError(
-                    f"ChildrenOf output '{node.name}.{output.name}' grain "
-                    f"'{output.grain}' must equal child label '{relation.label}'"
-                )
+            output_ancestors = (
+                upstream_ancestry_paths[relation.parent] | {relation.parent}
+            )
+            output_roles = frozenset()
         elif isinstance(relation, AggregateOf):
             anchor_grain = _require_node_input(
                 node, relation.anchor, available_grains, "aggregate anchor"
             )
-            for member in relation.members:
-                _require_node_input(
-                    node, member, available_grains, "aggregate member"
-                )
             if output.grain != anchor_grain:
                 raise GraphValidationError(
                     f"AggregateOf output '{node.name}.{output.name}' must use "
                     f"anchor grain '{anchor_grain}'"
                 )
-            expected_members = tuple(node.inputs[1:])
-            if relation.anchor != node.inputs[0] or relation.members != expected_members:
+            if relation.anchor != node.inputs[0]:
                 raise GraphValidationError(
-                    f"Reduce node '{node.name}' must declare input 0 as anchor "
-                    "and remaining inputs as members"
+                    f"Reduce node '{node.name}' must declare input 0 as anchor"
                 )
+            for member in node.inputs[1:]:
+                if relation.anchor not in upstream_ancestry_paths[member]:
+                    raise GraphValidationError(
+                        f"Reduce node '{node.name}' input '{ref_label(member)}' "
+                        f"is not a descendant of anchor "
+                        f"'{ref_label(relation.anchor)}'"
+                    )
+            output_ancestors = upstream_ancestry_paths[relation.anchor]
+            output_roles = upstream_relation_roles[relation.anchor]
         elif isinstance(relation, RelatedFrom):
-            roles = [binding.role for binding in relation.roles]
-            if not roles or len(set(roles)) != len(roles):
+            roles = relation.roles
+            if (
+                len(roles) != len(node.inputs)
+                or any(not role for role in roles)
+                or len(set(roles)) != len(roles)
+            ):
                 raise GraphValidationError(
                     f"RelatedFrom output '{node.name}.{output.name}' needs "
-                    "unique non-empty roles"
+                    "one unique non-empty role per input"
                 )
-            sources = tuple(binding.source for binding in relation.roles)
-            if sources != node.inputs:
-                raise GraphValidationError(
-                    f"RelatedFrom output '{node.name}.{output.name}' roles "
-                    "must cover node inputs in order"
+            # RelatedFrom exposes structural ancestry paths from every role.
+            # Runtime relation construction retains a functional ancestor only
+            # when all selected parents agree on its record ID. A downstream
+            # ByAncestor therefore remains a data/runtime closure obligation;
+            # direct role parents are the only unconditional relation evidence.
+            output_ancestors = frozenset().union(
+                *(
+                    upstream_ancestry_paths[source] | {source}
+                    for source in node.inputs
                 )
-            for source in sources:
-                _require_node_input(
-                    node, source, available_grains, "relation role source"
-                )
+            )
+            output_roles = frozenset(roles)
         available_grains[output.ref] = output.grain
+        upstream_ancestry_paths[output.ref] = frozenset(output_ancestors)
+        upstream_relation_roles[output.ref] = frozenset(output_roles)
 
     operation = node.operation
     if isinstance(operation, MapOp):
@@ -195,31 +239,76 @@ def _verify_node(node: NodeSpec, upstream_grains: dict[PortRef, str]) -> None:
             raise GraphValidationError(
                 f"FilterByMask node '{node.name}' must emit every non-mask input"
             )
+    if isinstance(operation, ExpandOp):
+        first = node.outputs[0]
+        if any(
+            output.relation != first.relation or output.grain != first.grain
+            for output in node.outputs[1:]
+        ):
+            raise GraphValidationError(
+                f"Expand node '{node.name}' currently requires one shared "
+                "ChildrenOf parent and child grain across all outputs"
+            )
+    if isinstance(operation, ReduceOp):
+        selectors = operation.selectors or (ByAncestor(),) * (len(node.inputs) - 1)
+        if len(selectors) != len(node.inputs) - 1:
+            raise GraphValidationError(
+                f"Reduce node '{node.name}' needs one grouping selector "
+                "per descendant input"
+            )
+        for member, selector in zip(node.inputs[1:], selectors):
+            if isinstance(selector, ByRole):
+                if not selector.role:
+                    raise GraphValidationError(
+                        f"Reduce node '{node.name}' grouping role must be non-empty"
+                    )
+                if selector.role not in upstream_relation_roles[member]:
+                    raise GraphValidationError(
+                        f"Reduce node '{node.name}' role '{selector.role}' is "
+                        f"not available on '{ref_label(member)}'"
+                    )
+            elif not isinstance(selector, ByAncestor):
+                raise GraphValidationError(
+                    f"Reduce node '{node.name}' uses unsupported grouping selector "
+                    f"{type(selector).__name__}"
+                )
+        first_relation = node.outputs[0].relation
+        if any(
+            output.relation != first_relation for output in node.outputs[1:]
+        ):
+            raise GraphValidationError(
+                f"Reduce node '{node.name}' outputs must share one "
+                "AggregateOf policy"
+            )
     if isinstance(operation, RelateOp):
         if len(node.outputs) != 1:
             raise GraphValidationError(
                 f"Relate node '{node.name}' currently requires one output"
             )
         relation = node.outputs[0].relation
-        if isinstance(relation, RelatedFrom):
-            relation_roles = tuple(binding.role for binding in relation.roles)
-            matcher_fields = getattr(operation.matcher, "fields", ())
-            if matcher_fields and tuple(role for role, _ in matcher_fields) != relation_roles:
-                raise GraphValidationError(
-                    f"Relate node '{node.name}' matcher roles differ from output roles"
-                )
+        assert isinstance(relation, RelatedFrom)
+        relation_roles = relation.roles
         if isinstance(operation.matcher, KeyJoinSpec):
-            if not operation.matcher.fields or any(
-                not role or not field for role, field in operation.matcher.fields
+            if (
+                len(operation.matcher.fields) != len(relation_roles)
+                or any(not field for field in operation.matcher.fields)
             ):
                 raise GraphValidationError(
-                    f"Relate node '{node.name}' key join fields must not be empty"
+                    f"Relate node '{node.name}' needs one non-empty join field per role"
                 )
         elif isinstance(operation.matcher, RelationAdapterSpec):
-            if ":" not in operation.matcher.import_path:
+            try:
+                resolve_relation_adapter(operation.matcher)
+            except (ImportError, AttributeError, TypeError, ValueError) as exc:
                 raise GraphValidationError(
-                    f"Relate node '{node.name}' adapter must be a 'pkg.mod:fn' path"
-                )
+                    f"Relate node '{node.name}' adapter "
+                    f"'{operation.matcher.import_path}' is not importable and callable"
+                ) from exc
+        else:
+            raise GraphValidationError(
+                f"Relate node '{node.name}' uses unsupported matcher "
+                f"{type(operation.matcher).__name__}"
+            )
 
 
 def _verify_operation_relation(node: NodeSpec, relation: object) -> None:
@@ -229,7 +318,7 @@ def _verify_operation_relation(node: NodeSpec, relation: object) -> None:
     elif isinstance(node.operation, (FilterOp, FilterByMaskOp)):
         allowed = (SubsetOf,)
     elif isinstance(node.operation, ExpandOp):
-        allowed = (SameAs, ChildrenOf)
+        allowed = (ChildrenOf,)
     elif isinstance(node.operation, ReduceOp):
         allowed = (AggregateOf,)
     elif isinstance(node.operation, RelateOp):

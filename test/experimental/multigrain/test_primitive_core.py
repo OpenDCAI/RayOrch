@@ -13,6 +13,7 @@ from rayorch.experimental.multigrain.execution.handlers import (
     FilterByMaskHandler,
     MapHandler,
 )
+from rayorch.experimental.multigrain.data import ParentRef
 from rayorch.experimental.multigrain.primitives.output import merge_aligned_inputs
 from rayorch.experimental.multigrain.ir import (
     GraphInputRef,
@@ -92,7 +93,7 @@ def test_structural_verifier_rejects_relation_parent_drift() -> None:
 def test_aligned_lineage_merge_rejects_conflicting_ancestor_identity() -> None:
     left = mg.source(["a"], name="row")
     right = left.with_values(["b"], name="other", op_name="other")
-    right.ancestors[0]["row"] = "different-id"
+    right.ancestors[0][left.identity_domain] = "different-id"
 
     try:
         merge_aligned_inputs((left, right))
@@ -100,3 +101,76 @@ def test_aligned_lineage_merge_rejects_conflicting_ancestor_identity() -> None:
         assert "conflicting ancestor identity" in str(exc)
     else:
         raise AssertionError("conflicting lineage metadata was silently merged")
+
+
+def test_aligned_inputs_require_one_identity_domain() -> None:
+    left = mg.source(["a"], name="row", identity_domain="left")
+    right = mg.source(["b"], name="row", identity_domain="right")
+
+    with pytest.raises(ValueError, match="identity domain"):
+        merge_aligned_inputs((left, right))
+
+
+def test_concat_deduplicates_inherited_error_traces() -> None:
+    rows = mg.source(["a", "b"], name="rows")
+    error = mg.ErrorTrace(
+        source_item="a",
+        logical_item="a",
+        failed_op="bad",
+        grain="rows",
+        upstream_path=("bad",),
+        parent=None,
+        action="quarantined",
+        error="boom",
+        ancestors={rows.identity_domain: rows.record_ids[0]},
+    )
+    rows.errors.append(error)
+
+    merged = mg.concat((rows.take([0]), rows.take([1])))
+    assert merged.errors == [error]
+
+
+def test_concat_rejects_different_logical_port_names() -> None:
+    rows = mg.source(["a", "b"], name="rows")
+    left = rows.take([0])
+    right = rows.take([1])
+    right.name = "other"
+
+    with pytest.raises(ValueError, match="different logical ports"):
+        mg.concat((left, right), name="rows")
+
+
+def test_error_trace_serializes_same_label_domains_without_loss() -> None:
+    left = mg.IdentityDomain.fresh("page")
+    right = mg.IdentityDomain.fresh("page")
+    trace = mg.ErrorTrace(
+        source_item="doc",
+        logical_item="page",
+        failed_op="ocr",
+        grain="page",
+        upstream_path=("split", "ocr"),
+        parent="doc",
+        action="quarantined",
+        error="boom",
+        ancestors={left: "left:0", right: "right:0"},
+    )
+
+    encoded = trace.to_dict()["ancestors"]
+
+    assert encoded == sorted(encoded, key=lambda item: (item["token"], item["label"]))
+    assert {item["token"] for item in encoded} == {left.token, right.token}
+    assert {item["record_id"] for item in encoded} == {"left:0", "right:0"}
+
+
+def test_parent_ref_serialization_preserves_domain_token() -> None:
+    domain = mg.IdentityDomain.fresh("page")
+    encoded = ParentRef(
+        role="image",
+        port="page",
+        record_id="page:0",
+        display_key="doc/page=0",
+        identity_domain=domain,
+    ).to_dict()
+
+    assert encoded["identity_domain"] == "page"
+    assert encoded["identity_domain_token"] == domain.token

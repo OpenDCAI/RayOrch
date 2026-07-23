@@ -16,6 +16,11 @@
 operation/relation pairing、Reduce anchor/member、Relate roles 和 node-local output
 forest。
 
+这是结构验证，不是任意 Python/data semantics 的静态证明。identity alignment、
+closed parent batch、RelatedFrom shared-parent consistency、runtime output domain/grain
+和 recovery/backend capability 在执行边界检查；UDF 纯度、确定性和 adapter 置换等变
+仍是用户 contract。
+
 ## 2. Typed operation handlers
 
 ```python
@@ -57,7 +62,8 @@ Expand handler 会明确拒绝 mixed relations，并报告 IR 已预留但 runti
 3. 按 `graph.nodes` 的拓扑顺序执行；
 4. 由 registry resolve handler；
 5. prepare/cache 每 node runtime；
-6. 校验 output count 和 `PortBatch.name == OutputSpec.grain`，再按 `NodeOutputRef` 写回
+6. 校验 input/output grain、aligned identity domain、output relation domain 和 output
+   count，再按 `NodeOutputRef` 写回
    context；
 7. 按 `graph.outputs` 返回。
 
@@ -77,6 +83,10 @@ coordinator 是 driver-side DAG scheduler，负责：
 - bounded inflight/backpressure；
 - 默认 ordered delivery；
 - 聚合和 drain deferred Map records。
+
+当前唯一 scope 是 `StreamScope.CLOSED_MICROBATCH`：一个 Reduce group 或 Relate
+匹配域必须完整落在同一个 microbatch。缺失的 ancestry/role parent 会产生 closure
+violation；dataset-global join、watermark、window/state 尚不属于本 MVP。
 
 它不执行 UDF、不维护 lineage、不选择 shard indexes。logical output metadata 仍由
 primitive output builder 生成。
@@ -115,7 +125,10 @@ validate_shard_plan(partitions, row_count)
 它检查 indexes 不越界、不重复、不遗漏，确保每个 row 恰好属于一个 partition。所有
 aligned inputs 对同一 partition 使用相同 indexes。
 
-contiguous planner 连续等分；LPT 按预计 work 贪心重排。两者都只能改变物理顺序。
+contiguous planner 连续等分；LPT 按预计 work 贪心重排，并拒绝负数、NaN 或无穷
+weight。两者都只能改变物理顺序。每次 shard merge 后，Ray 会按 preserved source
+position，或 Expand 的 parent logical position + child ordinal，恢复 canonical Port
+顺序；因此用户看到的 `list[obj]` 顺序与 Local serial baseline 一致。
 
 ### Persistent pools
 
@@ -139,7 +152,9 @@ microbatches 之间 round-robin，避免所有请求挤在 actor 0。重试可�
 
 `BadRecordError(index=local_index, retryable=...)` 将失败归因到 invocation-local row。
 Map 可移除坏行、保持 healthy dense execution、singleton retry，并按原 identity order
-合并。deferred retry 由 Ray streaming coordinator 聚合后强制 inline drain。
+合并。deferred retry 由 Ray streaming coordinator 聚合后强制 inline drain；multi-input
+Map 恢复行会重新合并全部 aligned inputs 的 ancestry、lineage 和 relation evidence，
+不会只从 input 0 重建。
 
 ### Shard-level
 
@@ -155,13 +170,10 @@ anchor ancestry 跳过 poisoned anchor UDF，输出 incomplete placeholder 和
 
 ## 7. Mixed-output runtime boundary
 
-`ExecutionGraph` 可以手工表达一个 Expand node 的 `SameAs` / `ChildrenOf` identity
-forest，`verify_graph()` 也能验证 earlier-output source、grain 和无 forward/self
-reference。
-
-当前 handler/runtime 只支持所有 Expand outputs 共享同一个 `ChildrenOf` relation 和
-group shape。`mg.out.same`、`mg.out.children`、marker analysis 和 Local/Ray materializer
-仍 deferred。
+当前 `ExecutionGraph` verifier 与 handler 使用同一边界：所有 Expand outputs 必须共享
+同一个 `ChildrenOf` parent、grain 和 group shape。relation algebra 虽已包含 `SameAs`
+与 `ChildrenOf`，但 `mg.out.same`、`mg.out.children`、mixed-forest validation 和
+Local/Ray materializer 作为一个整体 deferred。
 
 ## 8. 明确不存在的 execution claims
 
@@ -176,7 +188,8 @@ FilterByMask。没有 optimizer pass 插入的 rebatch/materialize operation，�
 2. shard plan 必须 exact-cover rows；
 3. aligned ports 使用相同 partition；
 4. multi-output shared cohorts 保持 identity 对齐；
-5. shard merge 不丢 errors/relation evidence；
+5. shard merge 不丢 errors/relation evidence，且 inherited `ErrorTrace` 在 data-layer
+   `concat` 中去重；
 6. Reduce 前满足 complete-group requirement；
 7. retry 不改变 logical identity/order；
 8. unsupported relation/policy 显式失败；

@@ -42,7 +42,8 @@ flowchart TD
 ### 3.1 Data
 
 `PortBatch` 把 `values` 与 `record_ids / ancestors / ordinals / lineage / relations`
-保存为严格对齐的列。`Grouped` 只声明 Reduce 的 anchor 和 descendants；真实 regroup
+保存为严格对齐的列，并用 `IdentityDomain` 分离 identity namespace 与 grain。
+`Grouped` 声明 Reduce 的 anchor、descendants 和可选 `via(role)` selectors；真实 regroup
 发生在 Reduce runtime。`ErrorTrace` 与 `DeferredRecord` 支持故障归因和恢复。
 
 ### 3.2 Tracing
@@ -97,9 +98,10 @@ class-name suffix。handler 从 `OperatorFactorySpec` 重建 wrapper，并复用
 
 Local 和 Ray 执行前都再次 `verify_graph()`。Local 按 graph node 顺序维护
 `PortRef → PortBatch` context，并校验每个 output `PortBatch.name ==
-OutputSpec.grain`。Map/Filter 保留 source grain，Expand 使用 `ChildrenOf.label`，
+OutputSpec.grain`。Map/Filter 保留 source grain，Expand 使用 `OutputSpec.grain`，
 Reduce 返回 anchor grain，Relate 使用 `output_grain`。Ray 在此语义之上加入 exact row
-sharding、persistent actor pool、microbatch coordinator 和 recovery。
+sharding、persistent actor pool、`CLOSED_MICROBATCH` coordinator、canonical shard
+merge 和 recovery。
 
 ## 4. Primitive core
 
@@ -155,14 +157,11 @@ wrapper 接收 `TracePort`，记录 typed operation 和 per-output relation。ex
 
 ## 7. Mixed-output identity forest
 
-新 IR/verifier 已能表达 node-local forest：一个 Expand output 可 `ChildrenOf` input 或
-更早 output，也可 `SameAs` input/更早 output；source 必须可用、grain 必须匹配、禁止
-self/forward source。
-
-这只是**可表示、可验证**，不是已完成的用户功能。未来 `mg.out.same` /
-`mg.out.children` marker 和 runtime materializer 仍 deferred。当前 Expand wrapper/
-handler 只执行 shared-child cohort：所有 outputs 使用同一个 `ChildrenOf`，逐 parent
-group lengths 相同。
+relation algebra 已预留 `SameAs` / `ChildrenOf` 作为未来 node-local forest 的基本
+词汇，但 `ExecutionGraph` 的强制 verifier 当前只接受 runtime 已能执行的 shared-child
+cohort：所有 Expand outputs 使用同一个 `ChildrenOf` parent、grain 与逐-parent group
+shape。`mg.out.same` / `mg.out.children` marker、mixed forest 验证和 materializer
+整体 deferred，避免出现“验证通过但不能执行”的 graph。
 
 ## 8. 不变量
 

@@ -15,7 +15,13 @@ from ._utils import (
     output_name,
     take_with_lineage,
 )
-from ..data.batch import ErrorTrace, ParentRef, PortBatch
+from ..data.batch import (
+    ErrorTrace,
+    IdentityDomain,
+    ParentRef,
+    PortBatch,
+    dedupe_errors,
+)
 
 
 def _merge_consistent(
@@ -33,19 +39,13 @@ def _merge_consistent(
         target[key] = value
 
 
-def dedupe_errors(errors: Sequence[ErrorTrace]) -> list[ErrorTrace]:
-    result: list[ErrorTrace] = []
-    for error in errors:
-        if error not in result:
-            result.append(error)
-    return result
-
-
 def merge_aligned_inputs(ports: Sequence[PortBatch]) -> PortBatch:
     """Merge metadata for already identity-aligned same-grain inputs."""
     base = ports[0]
     if len(ports) == 1:
         return base
+    if any(port.identity_domain != base.identity_domain for port in ports[1:]):
+        raise ValueError("aligned inputs must share one identity domain")
 
     ancestors: list[dict[str, str]] = []
     ancestor_display: list[dict[str, str]] = []
@@ -94,6 +94,7 @@ def merge_aligned_inputs(ports: Sequence[PortBatch]) -> PortBatch:
         ancestor_display=ancestor_display,
         ordinals=ordinals,
         lineage=lineage,
+        identity_domain=base.identity_domain,
         relations=relations,
         errors=dedupe_errors(
             [error for port in ports for error in port.errors]
@@ -106,9 +107,9 @@ class RelationOutput:
     value: Any
     record_id: str
     display_key: str
-    ancestors: Mapping[str, str]
+    ancestors: Mapping[IdentityDomain, str]
     ancestor_display: Mapping[str, str]
-    ordinals: Mapping[str, int]
+    ordinals: Mapping[IdentityDomain, int]
     lineage: tuple[str, ...]
     parents: tuple[ParentRef, ...]
 
@@ -172,6 +173,13 @@ class PortBatchBuilder:
         child_label: str,
     ) -> tuple[PortBatch, ...]:
         batches: list[PortBatch] = []
+        if parent.identity_domain is None:
+            raise ValueError("Expand parent has no identity domain")
+        child_domain = IdentityDomain.derived(
+            "children",
+            op_name,
+            parent.identity_domain,
+        )
         for groups in group_outputs:
             values: list[Any] = []
             record_ids: list[str] = []
@@ -190,13 +198,13 @@ class PortBatchBuilder:
                         f"{parent_key}/{child_label}={child_index}"
                     )
                     child_ancestors = dict(parent.ancestors[parent_index])
-                    child_ancestors[parent.name] = parent_id
+                    child_ancestors[parent.identity_domain] = parent_id
                     ancestors.append(child_ancestors)
                     child_display = dict(parent.ancestor_display[parent_index])
                     child_display[parent.name] = parent_key
                     ancestor_display.append(child_display)
                     child_ordinals = dict(parent.ordinals[parent_index])
-                    child_ordinals[parent.name] = child_index
+                    child_ordinals[parent.identity_domain] = child_index
                     ordinals.append(child_ordinals)
                     lineage.append((*parent.lineage[parent_index], op_name))
             batches.append(
@@ -209,6 +217,7 @@ class PortBatchBuilder:
                     ancestor_display=ancestor_display,
                     ordinals=ordinals,
                     lineage=lineage,
+                    identity_domain=child_domain,
                     errors=list(parent.errors),
                 )
             )
@@ -219,6 +228,7 @@ class PortBatchBuilder:
         rows: Sequence[RelationOutput],
         *,
         name: str,
+        identity_domain: IdentityDomain,
         errors: Sequence[ErrorTrace] = (),
     ) -> PortBatch:
         return PortBatch(
@@ -230,6 +240,7 @@ class PortBatchBuilder:
             ancestor_display=[dict(row.ancestor_display) for row in rows],
             ordinals=[dict(row.ordinals) for row in rows],
             lineage=[tuple(row.lineage) for row in rows],
+            identity_domain=identity_domain,
             relations=[tuple(row.parents) for row in rows],
             errors=dedupe_errors(errors),
         )

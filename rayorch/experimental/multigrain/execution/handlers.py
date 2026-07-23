@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Protocol
 
-from ..data.batch import NodeExecution, PortBatch, group_by
-from ..ir.graph import NodeSpec
+from ..data.batch import IdentityDomain, NodeExecution, PortBatch, group_by, via
+from ..ir.graph import NodeSpec, OutputSpec
 from ..ir.operations import (
     ExpandOp,
+    ByAncestor,
+    ByRole,
     FilterByMaskOp,
     FilterOp,
     KeyJoinSpec,
@@ -15,9 +17,15 @@ from ..ir.operations import (
     RelateOp,
     RelationAdapterSpec,
     operator_factory,
+    resolve_operator_factory,
 )
-from ..ir.relations import AggregateOf, ChildrenOf, RelatedFrom
-from ..primitives._binding import load_factory_object
+from ..ir.relations import (
+    AggregateOf,
+    ChildrenOf,
+    RelatedFrom,
+    SameAs,
+    SubsetOf,
+)
 from ..primitives.expand_reduce import Expand, Reduce
 from ..primitives.map_filter import Filter, Map
 from ..primitives.output import select_filter_outputs
@@ -42,7 +50,7 @@ def _factory(node: NodeSpec) -> tuple[Any, tuple[Any, ...], dict[str, Any]]:
     if factory is None:
         raise TypeError(f"node '{node.name}' operation has no operator factory")
     return (
-        load_factory_object(factory.import_path),
+        resolve_operator_factory(factory),
         tuple(factory.args),
         dict(factory.kwargs),
     )
@@ -56,6 +64,35 @@ def _outputs(value: Any) -> tuple[PortBatch, ...]:
     ):
         return value
     raise TypeError("multigrain handler expected PortBatch outputs")
+
+
+def expected_output_domain(
+    node: NodeSpec,
+    inputs: tuple[PortBatch, ...],
+    output: OutputSpec,
+) -> IdentityDomain:
+    relation = output.relation
+    if isinstance(relation, (SameAs, SubsetOf)):
+        domain = inputs[node.inputs.index(relation.source)].identity_domain
+    elif isinstance(relation, ChildrenOf):
+        parent = inputs[node.inputs.index(relation.parent)]
+        if parent.identity_domain is None:
+            raise ValueError("Expand parent has no identity domain")
+        return IdentityDomain.derived("children", node.name, parent.identity_domain)
+    elif isinstance(relation, AggregateOf):
+        domain = inputs[node.inputs.index(relation.anchor)].identity_domain
+    elif isinstance(relation, RelatedFrom):
+        domains = tuple(
+            port.identity_domain
+            for port in inputs
+            if port.identity_domain is not None
+        )
+        return IdentityDomain.derived("related", node.name, *domains)
+    else:
+        raise TypeError(f"unsupported output relation {type(relation).__name__}")
+    if domain is None:
+        raise ValueError(f"node '{node.name}' input has no identity domain")
+    return domain
 
 
 class MapHandler:
@@ -107,7 +144,7 @@ class ExpandHandler:
             op_cls,
             *args,
             parent=node.inputs.index(first.parent),
-            child_label=first.label,
+            child_label=node.outputs[0].grain,
             name=node.name,
             num_outputs=len(node.outputs),
             workers=node.workers,
@@ -174,7 +211,17 @@ class ReduceHandler:
         *,
         force_inline: bool,
     ) -> NodeExecution:
-        return NodeExecution(_outputs(runtime(group_by(inputs[0], *inputs[1:]))))
+        operation = node.operation
+        if not isinstance(operation, ReduceOp):
+            raise TypeError("ReduceHandler requires ReduceOp")
+        selectors = operation.selectors or (ByAncestor(),) * (len(inputs) - 1)
+        descendants = tuple(
+            via(port, role=selector.role)
+            if isinstance(selector, ByRole)
+            else port
+            for port, selector in zip(inputs[1:], selectors)
+        )
+        return NodeExecution(_outputs(runtime(group_by(inputs[0], *descendants))))
 
 
 class RelateHandler:
@@ -186,11 +233,11 @@ class RelateHandler:
         relation = node.outputs[0].relation
         if not isinstance(relation, RelatedFrom):
             raise TypeError("Relate node requires RelatedFrom output")
-        roles = tuple(binding.role for binding in relation.roles)
+        roles = relation.roles
         on = None
         adapter = None
         if isinstance(operation.matcher, KeyJoinSpec):
-            on = dict(operation.matcher.fields)
+            on = dict(zip(roles, operation.matcher.fields))
         elif isinstance(operation.matcher, RelationAdapterSpec):
             adapter = operation.matcher.import_path
         return Relate(
@@ -277,4 +324,5 @@ __all__ = [
     "OperationHandlerRegistry",
     "ReduceHandler",
     "RelateHandler",
+    "expected_output_domain",
 ]

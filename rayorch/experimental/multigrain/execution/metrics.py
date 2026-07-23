@@ -6,6 +6,7 @@ numbers M2 needs without pulling in a metrics backend:
 
 * per-node wall time and row counts -> end-to-end makespan;
 * per-shard busy time at parallel stages -> **GPU idle bubble** (load imbalance);
+* anonymous per-shard input/output cardinality -> **fanout and skew traces**;
 * lineage footprint (records + ancestor entries + approx bytes) -> **lineage
   overhead**;
 * recovery counters (retried shards / recomputed rows) -> **recovery cost**.
@@ -33,6 +34,12 @@ class NodeMetric:
     # Per-shard busy seconds for a parallel stage. len == replicas actually run.
     # A single-task node records one entry equal to ``wall_s``.
     shard_busy_s: List[float] = field(default_factory=list)
+    # Anonymous cardinality trace aligned by shard index. These fields expose
+    # fanout/skew without storing record ids, display keys, or payload values.
+    shard_rows_in: List[int] = field(default_factory=list)
+    shard_rows_out: List[int] = field(default_factory=list)
+    relation_entries_out: int = 0
+    lineage_bytes_out: int = 0
     # Recovery accounting: how many shards were retried and how many rows those
     # retries recomputed (i.e. work spent on recovery, not first-pass progress).
     retries: int = 0
@@ -62,6 +69,11 @@ class NodeMetric:
             return 0.0
         return max(0.0, 1.0 - (self.stage_ideal_s / mk))
 
+    @property
+    def fanout_ratio(self) -> float:
+        """Aggregate output/input cardinality ratio for the first output port."""
+        return (self.rows_out / self.rows_in) if self.rows_in else 0.0
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -71,8 +83,13 @@ class NodeMetric:
             "rows_out": self.rows_out,
             "wall_s": self.wall_s,
             "shard_busy_s": list(self.shard_busy_s),
+            "shard_rows_in": list(self.shard_rows_in),
+            "shard_rows_out": list(self.shard_rows_out),
             "stage_makespan_s": self.stage_makespan_s,
             "idle_bubble_frac": self.idle_bubble_frac,
+            "fanout_ratio": self.fanout_ratio,
+            "relation_entries_out": self.relation_entries_out,
+            "lineage_bytes_out": self.lineage_bytes_out,
             "retries": self.retries,
             "recovery_rows": self.recovery_rows,
         }
@@ -119,9 +136,9 @@ class RunMetrics:
         }
 
 
-def _approx_str_bytes(value: str) -> int:
+def _approx_str_bytes(value: Any) -> int:
     # Cheap, deterministic proxy for the serialized size of a lineage token.
-    return len(value.encode("utf-8", "ignore"))
+    return len(str(value).encode("utf-8", "ignore"))
 
 
 def lineage_footprint(batches: Sequence[PortBatch]) -> Dict[str, int]:

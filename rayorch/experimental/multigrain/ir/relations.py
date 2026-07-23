@@ -34,7 +34,6 @@ class ChildrenOf:
     """The output creates children of one direct identity parent."""
 
     parent: PortRef
-    label: str
 
 
 @dataclass(frozen=True)
@@ -42,23 +41,14 @@ class AggregateOf:
     """The output returns to an anchor after consuming descendant groups."""
 
     anchor: PortRef
-    members: tuple[PortRef, ...]
     incomplete: IncompleteGroupPolicy = IncompleteGroupPolicy.FAIL_OPEN
 
 
 @dataclass(frozen=True)
-class RoleSource:
-    """One named parent role contributing to an M:N output identity."""
-
-    role: str
-    source: PortRef
-
-
-@dataclass(frozen=True)
 class RelatedFrom:
-    """The output identity derives from an ordered tuple of role parents."""
+    """The output identity derives from inputs under ordered role names."""
 
-    roles: tuple[RoleSource, ...]
+    roles: tuple[str, ...]
 
 
 OutputRelation: TypeAlias = (
@@ -72,7 +62,6 @@ __all__ = [
     "IncompleteGroupPolicy",
     "OutputRelation",
     "RelatedFrom",
-    "RoleSource",
     "SameAs",
     "SubsetOf",
 ]

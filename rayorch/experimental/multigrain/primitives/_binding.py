@@ -6,8 +6,7 @@ algorithms; those remain explicit in each relation family.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-import importlib
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from ._utils import (
@@ -19,16 +18,6 @@ from ._utils import (
 )
 from ..ir.operations import OperatorFactorySpec
 from ..ir.policy import RecoveryPolicy, WorkerPoolSpec
-
-
-def load_factory_object(ref: str) -> Any:
-    module_name, _, attr = ref.rpartition(".")
-    if not module_name or not attr:
-        raise ValueError(f"invalid object reference: {ref}")
-    target: Any = importlib.import_module(module_name)
-    for part in attr.split("."):
-        target = getattr(target, part)
-    return target
 
 
 @dataclass
@@ -71,6 +60,10 @@ class PrimitiveBinding:
     @property
     def op(self) -> Any:
         return self.lazy_op.get()
+
+    def with_name(self, name: str) -> "PrimitiveBinding":
+        """Return a facade binding that shares the same lazy operator recipe."""
+        return replace(self, name=name)
 
     def require_compilable(self, primitive: str) -> None:
         require_compilable_factory(self.op_cls, primitive)

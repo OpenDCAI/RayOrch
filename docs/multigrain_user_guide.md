@@ -6,7 +6,8 @@
 >
 > 相关设计文档：原语与 IR 评审见 `docs/todos/11-multigrain-primitive-api-ir-review.md`；
 > 三层关系模型见 `docs/todos/12-relation-model-three-tiers.md`；重排不变性定理见
-> `docs/todos/13-reordering-invariance-theorem.md`；真实 MinerU 图片对象驱动的图形、
+> `docs/todos/13-reordering-invariance-theorem.md`；受限 formal core 与条件化编译
+> 可靠性见 `docs/todos/20-relation-basis-adequacy.md`；真实 MinerU 图片对象驱动的图形、
 > 容灾和 LPT 集成测试与已知缺口见
 > `docs/todos/17-mineru-graph-integration-findings.md`；当前 primitive 内核边界见
 > `docs/todos/18-multigrain-primitive-core-convergence.md`。本文是**上手手册**，只讲怎么用。
@@ -21,8 +22,10 @@
 ## 0. 30 秒心智模型
 
 - **Grain（粒度）**：一条流水线里，数据可以处在不同粒度——`pdf` 粒度、`page` 粒度、`block` 粒度。
-- **Port（端口）/ Record（记录）**：每个粒度是一个 `PortBatch`，里面是**一列同粒度的记录**。
-  每条记录有框架分配的 `record_id`、`display_key`、`ancestors`（祖先各粒度的 id）——**这些你都看不到、也不用管**。
+- **Port（端口）/ Record（记录）**：每个 port 仍是一个 `PortBatch`，业务视角就是
+  **`list[obj]`**。框架用 `IdentityDomain` 区分 port、grain 与 identity namespace；
+  正确性 record key 是 `(IdentityDomain, record_id)`，只在当前 live port/closed
+  microbatch scope 内要求唯一；`record_id`、`ancestors`、`ParentRef` 都不会传给 UDF。
 - **Op UDF（算子）**：你只写一个类，`__init__` 里加载资源（模型等），`run(...)` 里对**一批值**做纯函数变换。
   **不接收、不依赖 id / 位置 / 血缘**。
 - **Primitive（原语）**：大原语 `Map / Filter / Expand / Reduce / Relate` 决定 invocation
@@ -123,7 +126,10 @@ graph = MinerUReal(output_dir="./out").compile()  # -> verified ExecutionGraph
   `OperatorFactorySpec(import_path, args, kwargs)`，并强制调用 `verify_graph()`。
 - graph 是不可变 `ExecutionGraph`；Local 和 Ray 执行前也会再次验证。
 - `Expand(parent=0)`：从第 0 个输入端口 fan-out；`child_label` 只是给子粒度起个可读名字。
-- `Reduce` 的输入是 `mg.group_by(anchor, *descendants)`：第一个是**锚粒度**（输出粒度），其余是要按血缘归并回锚的后代端口，框架会**按阅读序对齐**后分组喂给 `run`。
+- `Reduce` 的输入是 `mg.group_by(anchor, *descendants)`：第一个是**锚粒度**（输出粒度），
+  其余默认按 ancestry 归并回锚。same-domain self-join 等多父场景用
+  `mg.via(edges, role="left")` / `mg.via(edges, role="right")` 分别形成两个
+  `list[list[obj]]` 参数；不写 role 且存在歧义会 fail-fast。
 
 ---
 
@@ -140,6 +146,8 @@ print(out.errors)      # 隔离/连锁产生的 ErrorTrace 列表
 
 `source(values, name=, display_key=)` 是入口端口；`name` 要和
 `execute(graph, {name: ...})` 的键一致。
+同名 `source` admissions 默认属于同一逻辑 identity domain，以支持跨 microbatch
+恢复；若本地同时创建两个独立但同名的 root，请显式传入不同 `identity_domain`。
 本地执行器语义与 Ray 执行器**逐行一致**，是写单测的首选（快、无 GPU）。
 
 ---
@@ -154,7 +162,6 @@ from mg_bridge.ops import page_work
 
 metrics = RunMetrics()
 ex = MultigrainRayExecutor(
-    default_replicas=4,
     shard_planner=lpt_shard_planner(page_work),  # 见下：长尾均衡
     metrics=metrics,
 )
@@ -171,6 +178,10 @@ for out in ex.execute_stream(graph, microbatches, max_inflight=3):
 ex.shutdown()                        # 释放所有 actor 和 GPU
 ```
 
+每个 node 的副本数由 primitive 上的
+`workers=WorkerPoolSpec(replicas=4, gpus_per_worker=...)` 唯一声明；executor
+不再覆盖 graph 中的资源策略。
+
 - **统一 DAG coordinator**：`execute`、兼容接口 `execute_microbatches` 和流式
   `execute_stream` 走同一套节点调度。节点在全部输入端口 ready 后运行；不同
   microbatch 与独立分支可并发，支持多输出和 fan-in，不写死 MinerU 拓扑。
@@ -182,6 +193,11 @@ ex.shutdown()                        # 释放所有 actor 和 GPU
   planner 输出会经过 exact-partition validation：不能越界、重复或遗漏，必须恰好覆盖每行一次。
   - **contiguous（连续切分）**：按行号顺序等分——实现简单，但长尾负载会造成 GPU 空泡。
   - **`lpt_shard_planner(work_fn)`（LPT，最长优先）**：按 `work_fn(row)` 估算每行开销，贪心把最重的先分给当前最闲的副本 → 消除长尾空泡。`work_fn` 要对**非本粒度的行**鲁棒（比如上游是字符串就返回 1.0）。
+- **逻辑顺序不变**：shard merge 后按 source identity 或
+  parent logical position + child ordinal 恢复顺序；LPT 不改变用户看到的 `list[obj]`。
+- **closed microbatch**：当前 `StreamScope.CLOSED_MICROBATCH` 要求一个 Reduce group /
+  Relate 匹配域完整位于同一 microbatch。跨批 global join/window 尚未实现，缺 parent
+  会显式报 closure violation。
 
 > **object store 上限**：页图很大，`ray.init(object_store_memory=...)` 要设个上限，否则积压会把 plasma 撑爆、被 cgroup OOM 杀掉 raylet。
 
@@ -211,9 +227,15 @@ ex.shutdown()                        # 释放所有 actor 和 GPU
    ```
    evidence 项为 `(value, {role: local_index})`；同一父证据要产出多条时，使用
    `(value, {role: local_index}, stable_key)`，保证 relation identity 在重排后稳定。
+   编译时会解析路径并检查 callable；adapter 仍必须由用户保证置换等变，不能把 local
+   position 当业务证据。
    `relation_fn=` 是 eager-only。compiled Relate 必须使用 `on=` 产生的 `KeyJoinSpec`
    或 dotted `relation_adapter=` 产生的 `RelationAdapterSpec`，不能注入 live matcher。
    当前 `Relate` 明确只支持一个输出端口。
+
+`mg.via(port, role=...)` 只选择该 port 当前携带的直接 Relate parent。Expand 后的
+children 不继承父记录的 role edges，因此当前不支持跨 Expand 的 role path；这种图会在
+compile 时明确拒绝，而不是运行时猜测关系。
 
 `Relate` 满足重排不变性：任何合法的物理分片重排，输出与串行基线**逐条等价**（证明见 doc 13）。
 
@@ -382,6 +404,7 @@ grain，Expand 使用 child label，Reduce 返回 anchor grain，Relate 使用 `
 ## 10. Mixed-output Expand 状态
 
 当前多输出 Expand 仍要求所有 outputs 每个 parent 的 group lengths 相同，并共享 child
-identity。新的 `SameAs` / `ChildrenOf` relation IR 和 verifier 已能表示 mixed-output
-identity forest，但未来的 `mg.out.same` / `mg.out.children` marker 与 Local/Ray runtime
-materialization 尚未实现。不要在用户代码中调用这些 future APIs。
+identity。relation algebra 已为未来的 `SameAs` / `ChildrenOf` identity forest 保留
+词汇，但当前 `verify_graph()` 只接受可执行的 shared-`ChildrenOf` Expand。未来的
+`mg.out.same` / `mg.out.children` marker、验证规则与 Local/Ray materialization 尚未
+实现；不要在用户代码中调用这些 APIs。

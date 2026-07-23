@@ -185,9 +185,10 @@ def test_nested_expand_diamond_matches_ray_execution(artifact_docs, ray_cluster)
 
 def test_mn_relate_emits_full_cartesian_matches_and_preserves_both_roots(artifact_docs):
     graph = NestedRelatePipe().compile()
+    docs = _source(artifact_docs)
     summary, linked, visual, evidence = mg.MultigrainExecutor().execute(
         graph,
-        {"docs": _source(artifact_docs)},
+        {"docs": docs},
     )
     visual_counts = Counter(item["page_key"] for item in visual.values)
     evidence_counts = Counter(item["page_key"] for item in evidence.values)
@@ -199,7 +200,7 @@ def test_mn_relate_emits_full_cartesian_matches_and_preserves_both_roots(artifac
     assert len(linked) == expected
     assert sum(item["count"] for item in summary.values) == expected
     assert all({ref.role for ref in refs} == {"visual", "evidence"} for refs in linked.relations)
-    assert all("docs" in ancestors for ancestors in linked.ancestors)
+    assert all(docs.identity_domain in ancestors for ancestors in linked.ancestors)
 
 
 def test_multi_root_join_attaches_independent_catalog_lineage(artifact_docs):
@@ -219,6 +220,13 @@ def test_multi_root_join_attaches_independent_catalog_lineage(artifact_docs):
     )
 
     assert linked.values
-    assert all("docs" in row for row in linked.ancestors)
-    assert all("catalog" in row for row in linked.ancestors)
-    assert all({ref.port for ref in refs} >= {"root_visual", "catalog"} for refs in linked.relations)
+    assert all(docs.identity_domain in row for row in linked.ancestors)
+    assert all(catalog.identity_domain in row for row in linked.ancestors)
+    assert all(
+        {ref.role for ref in refs} == {"visual", "evidence"}
+        for refs in linked.relations
+    )
+    assert all(
+        any(ref.role == "evidence" and ref.port == "catalog" for ref in refs)
+        for refs in linked.relations
+    )

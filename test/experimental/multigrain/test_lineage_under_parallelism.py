@@ -126,7 +126,11 @@ def test_quarantine_localizes_same_page_under_reordered_parallelism() -> None:
     assert len(parallel.errors) == 1
     local_err, par_err = local.errors[0], parallel.errors[0]
 
-    # the trace localizes the *same* logical item no matter which worker ran it
+    # Every diagnostic field, including ancestry, display parent, grain and
+    # rendered error text, is invariant to worker/shard assignment.
+    assert par_err == local_err
+
+    # The trace localizes the *same* logical item no matter which worker ran it.
     assert par_err.logical_item == local_err.logical_item == f"{BOOM_DOC}/page={BOOM_PAGE}"
     assert par_err.source_item == local_err.source_item == BOOM_DOC
     assert par_err.failed_op == local_err.failed_op == "EmbedPage"

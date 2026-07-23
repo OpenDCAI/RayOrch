@@ -86,3 +86,23 @@ class AlwaysRetryableBadMap:
             if row.startswith("bad"):
                 raise BadRecordError("still temporary", index=index, retryable=True)
         return [f"ok:{row}" for row in rows]
+
+
+class TagSecondary:
+    def run(self, rows: list[str]) -> list[str]:
+        return [f"side:{row}" for row in rows]
+
+
+class RetryableOnceMerge:
+    def __init__(self) -> None:
+        self.seen: set[str] = set()
+
+    def run(self, rows: list[str], secondary: list[str]) -> list[str]:
+        for index, row in enumerate(rows):
+            if row.startswith("flaky") and row not in self.seen:
+                self.seen.add(row)
+                raise BadRecordError("temporary", index=index, retryable=True)
+        return [
+            f"ok:{row}|{side}"
+            for row, side in zip(rows, secondary)
+        ]

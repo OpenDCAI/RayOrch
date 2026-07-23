@@ -48,6 +48,14 @@ def test_local_executor_runs_compiled_expand_map_reduce_ir() -> None:
     assert markdown.record_ids == pdfs.record_ids
 
 
+def test_executor_rejects_graph_input_grain_mismatch() -> None:
+    graph = ExecMineruPipe().compile()
+    pdfs = mg.source(["a.pdf"], name="documents")
+
+    with pytest.raises(ValueError, match="runtime grain"):
+        mg.MultigrainExecutor().execute(graph, {"pdfs": pdfs})
+
+
 class _Left:
     def run(self, values):
         return [f"left:{value}" for value in values]
@@ -179,8 +187,8 @@ class ExecRelatePipe(mg.Pipeline):
 
 def test_local_executor_runs_compiled_relate_ir_with_relation_fn() -> None:
     graph = ExecRelatePipe().compile()
-    images = mg.source(["img-0", "img-1"], name="image")
-    captions = mg.source(["cap-1", "cap-0"], name="caption")
+    images = mg.source(["img-0", "img-1"], name="images")
+    captions = mg.source(["cap-1", "cap-0"], name="captions")
 
     pairs = mg.MultigrainExecutor().execute(
         graph, {"images": images, "captions": captions}

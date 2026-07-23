@@ -11,7 +11,6 @@ from ._utils import (
     checked_output_lists,
     require_same_trace_grain,
     normalize_mask,
-    output_name,
 )
 from .output import PortBatchBuilder, merge_aligned_inputs, select_filter_outputs
 from ._binding import BoundPrimitive, PrimitiveBinding
@@ -59,6 +58,13 @@ class Map(BoundPrimitive):
             workers=workers,
             recovery=recovery,
         )
+
+    @classmethod
+    def _from_binding(cls, binding: PrimitiveBinding) -> "Map":
+        """Build an internal Map facade without duplicating its lazy UDF."""
+        result = cls.__new__(cls)
+        result._binding = binding
+        return result
 
     def __call__(
         self,
@@ -138,7 +144,9 @@ class Map(BoundPrimitive):
                     upstream_path.append(step)
         upstream_path.append(self.name)
         ancestors = dict(base.ancestors[bad_index])
-        ancestors[base.name] = base.record_ids[bad_index]
+        if base.identity_domain is None:
+            raise ValueError("Map input has no identity domain")
+        ancestors[base.identity_domain] = base.record_ids[bad_index]
         return ErrorTrace(
             source_item=_source_item(base, bad_index),
             logical_item=base.display_keys[bad_index],
@@ -407,6 +415,9 @@ class Select(BoundPrimitive):
             workers=workers,
             recovery=recovery,
         )
+        self._annotation = Map._from_binding(
+            self._binding.with_name(f"{self.name}__map")
+        )
 
     def __call__(
         self,
@@ -414,19 +425,8 @@ class Select(BoundPrimitive):
     ) -> PortBatch | TracePort | tuple[PortBatch, ...] | tuple[TracePort, ...]:
         symbolic = ensure_trace_ports(ports)
         if symbolic is not None:
-            self._binding.require_compilable("Select")
             grain = require_same_trace_grain(f"Select '{self.name}'", symbolic)
-            annotate = symbolic[0].tracer.add_node(
-                name=f"{self.name}__map",
-                inputs=symbolic,
-                operation=MapOp(self.factory_spec),
-                output_grains=(grain,) * (1 + self.num_annotations),
-                relations=(SameAs(symbolic[0].ref),)
-                * (1 + self.num_annotations),
-                recovery=self.recovery,
-                workers=self.workers,
-            )
-            annotate_ports = as_tuple(annotate)
+            annotate_ports = as_tuple(self._annotation(*symbolic))
             filtered_sources = (*symbolic, *annotate_ports[1:])
             filtered = symbolic[0].tracer.add_node(
                 name=f"{self.name}__filter",
@@ -440,24 +440,7 @@ class Select(BoundPrimitive):
             return filtered
 
         aligned = _align_by_identity(ports)
-        raw_outputs = checked_output_lists(
-            _call_user(self.op, *[_as_columns(port) for port in aligned]),
-            expected=1 + self.num_annotations,
-            primitive="Select",
-            name=self.name,
-        )
-        annotated = tuple(
-            aligned[0].with_values(
-                values,
-                name=output_name(
-                    f"{self.name}__map",
-                    index,
-                    len(raw_outputs),
-                ),
-                op_name=f"{self.name}__map",
-            )
-            for index, values in enumerate(raw_outputs)
-        )
+        annotated = as_tuple(self._annotation(*aligned))
         outputs = select_filter_outputs(
             (*aligned, *annotated),
             mask_index=len(aligned),

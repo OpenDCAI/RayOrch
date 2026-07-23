@@ -208,8 +208,8 @@ def test_select_pipeline_executes_lowered_map_filter() -> None:
 
 def test_relate_pipeline_executes_with_relation_adapter() -> None:
     ir = RelatePipe().compile()
-    images = mg.source(["img0", "img1"], name="image")
-    captions = mg.source(["cap0", "cap1"], name="caption")
+    images = mg.source(["img0", "img1"], name="images")
+    captions = mg.source(["cap0", "cap1"], name="captions")
 
     pairs = mg.MultigrainExecutor().execute(
         ir, {"images": images, "captions": captions}

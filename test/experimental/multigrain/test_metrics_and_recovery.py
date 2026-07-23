@@ -50,13 +50,17 @@ _BUBBLE_DOCS = [
 ]
 
 
-def _pipe(replicas: int) -> mg.Pipeline:
+def _pipe(replicas: int, *, max_shard_retries: int = 2) -> mg.Pipeline:
     class Pipe(mg.Pipeline):
         def __init__(self) -> None:
             super().__init__()
             self.split = mg.Expand(MakeRows, parent=0, child_label="row")
             self.embed = mg.Map(
-                SleepMap, workers=WorkerPoolSpec(replicas=replicas)
+                SleepMap,
+                workers=WorkerPoolSpec(replicas=replicas),
+                recovery=mg.RecoveryPolicy(
+                    max_shard_retries=max_shard_retries
+                ),
             )
             self.assemble = mg.Reduce(Assemble)
 
@@ -126,6 +130,20 @@ def test_metrics_populated_for_every_stage() -> None:
     names = {node.name for node in metrics.nodes}
     assert {"MakeRows", "SleepMap", "Assemble"} <= names
     assert metrics.total_wall_s > 0.0
+    split = metrics.by_name("MakeRows")
+    mapped = metrics.by_name("SleepMap")
+    assert split is not None and mapped is not None
+    assert split.fanout_ratio > 1.0
+    assert sum(mapped.shard_rows_in) == mapped.rows_in
+    assert sum(mapped.shard_rows_out) == mapped.rows_out
+    assert mapped.lineage_bytes_out > 0
+    assert {
+        "shard_rows_in",
+        "shard_rows_out",
+        "fanout_ratio",
+        "relation_entries_out",
+        "lineage_bytes_out",
+    } <= mapped.to_dict().keys()
 
 
 # --------------------------------------------------------------------------
@@ -143,7 +161,6 @@ def test_injected_task_crash_is_retried_and_recovers_only_failed_shard() -> None
         shard_planner=lpt_shard_planner(row_work),
         metrics=metrics,
         faults=[FaultSpec(node="SleepMap", fail_shards=frozenset({0}))],
-        max_retries=2,
     ).execute(_pipe(REPLICAS).compile(), {"docs": docs})
 
     # crash was transparently recovered: identical output to the fault-free run
@@ -167,5 +184,7 @@ def test_fault_exhausting_retries_propagates() -> None:
                     fail_until_attempt=99,
                 )
             ],
-            max_retries=1,
-        ).execute(_pipe(REPLICAS).compile(), {"docs": docs})
+        ).execute(
+            _pipe(REPLICAS, max_shard_retries=1).compile(),
+            {"docs": docs},
+        )

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import random
 
+import pytest
+
 from rayorch.experimental import multigrain as mg
 from rayorch.experimental.multigrain.ray import lpt_shard_planner
 from rayorch.experimental.multigrain.ray.executor import _contiguous_ranges
@@ -75,3 +77,10 @@ def test_lpt_balances_survivors_after_a_data_dependent_filter() -> None:
     lpt = lpt_shard_planner(lambda w: w)(None, [batch], R)
     efficiency = sum(survivors) / (R * max(_loads(lpt, survivors)))
     assert efficiency >= 0.95
+
+
+@pytest.mark.parametrize("weight", [-1.0, float("inf"), float("nan")])
+def test_lpt_rejects_invalid_work_weights(weight: float) -> None:
+    batch = mg.source([weight], name="w")
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        lpt_shard_planner(lambda value: value)(None, [batch], R)
