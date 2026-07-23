@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
-from .api import ExecutionError
+from .api import CompiledPipeline, ExecutionError, Pipeline, Port
 from .grain import (
     AttemptToken,
     ConsumerIndex,
@@ -24,17 +24,28 @@ from .grain import (
     PortIndex,
     ProducerIndex,
     Success,
+    Suppressed,
     ValueIndex,
     expand_entity,
+    expand_grain_id,
+    RoleItems,
 )
 from .graph import (
+    BindingReceipt,
     CompiledGraph,
     PlanAction,
     PlanDecision,
     PlannerContractError,
     Primitive,
+    ReceiptState,
+    admit_source,
     ensure_decision,
     failed_outcome,
+    plan_expand,
+    plan_filter,
+    plan_map,
+    plan_reduce,
+    plan_relate_bounded,
 )
 from .worker import (
     BatchManifest,
@@ -45,6 +56,7 @@ from .worker import (
     RowTake,
     WorkerContractError,
     build_batch_manifest,
+    get_ray_worker_class,
 )
 
 
@@ -69,6 +81,7 @@ class ArenaLimits:
     max_grains: int = 10_000
     max_pending_dispatches: int = 64
     max_fanout_per_grain: int = 10_000
+    max_relation_cardinality: int = 10_000
     max_infra_retries: int = 1
 
     def __post_init__(self) -> None:
@@ -76,6 +89,7 @@ class ArenaLimits:
             self.max_grains <= 0
             or self.max_pending_dispatches <= 0
             or self.max_fanout_per_grain < 0
+            or self.max_relation_cardinality < 0
             or self.max_infra_retries < 0
         ):
             raise ValueError("arena limits must be positive/non-negative")
@@ -84,6 +98,12 @@ class ArenaLimits:
 @dataclass(frozen=True, slots=True)
 class LocalValue:
     block: int
+    row: int
+
+
+@dataclass(frozen=True, slots=True)
+class BlockSlice:
+    block: Any
     row: int
 
 
@@ -116,16 +136,47 @@ class DispatchRuntime:
 
 
 @dataclass(frozen=True, slots=True)
+class RayPending:
+    arena: "Arena"
+    plan: DispatchPlan
+    node: int
+    actor_index: int
+    manifest_ref: Any
+    output_refs: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RunResult:
     outputs: tuple[Any, ...] = ()
     failures: tuple[FailureSnapshot, ...] = ()
     sources: tuple[SourceSnapshot, ...] = ()
     metrics: Mapping[str, float] = field(default_factory=dict)
 
+    def get(self) -> tuple[Any, ...]:
+        """Resolve final Ray BlockSlices; local values pass through unchanged."""
+
+        slices = [
+            value for value in self.outputs if isinstance(value, BlockSlice)
+        ]
+        if not slices:
+            return self.outputs
+        import ray
+
+        blocks: dict[Any, tuple[Any, ...]] = {}
+        resolved = []
+        for value in self.outputs:
+            if not isinstance(value, BlockSlice):
+                resolved.append(value)
+                continue
+            if value.block not in blocks:
+                blocks[value.block] = ray.get(value.block)
+            resolved.append(blocks[value.block][value.row])
+        return tuple(resolved)
+
 
 @dataclass(frozen=True, slots=True)
 class CommitDelta:
-    blocks: tuple[tuple[int, tuple[Any, ...]], ...]
+    blocks: tuple[tuple[int, Any], ...]
     values: tuple[tuple[ItemRef, LocalValue], ...]
     outcomes: tuple[tuple[GrainRecord, AttemptToken, Success], ...]
     origins: tuple[tuple[Any, ExpandOrigin], ...]
@@ -171,7 +222,7 @@ class Arena:
         self.values = ValueIndex()
         self.expand_origins = ExpandOriginIndex()
 
-        self._blocks: dict[int, tuple[Any, ...]] = {}
+        self._blocks: dict[int, Any] = {}
         self._next_block = 0
         self._next_dispatch = 0
         self._dispatches: dict[int, DispatchRuntime] = {}
@@ -286,7 +337,43 @@ class Arena:
         except Exception as error:
             self._abort(f"source admission failed: {error}")
 
-    def _allocate_block(self, values: tuple[Any, ...]) -> int:
+    def admit_source_batch(
+        self,
+        records: tuple[GrainRecord, ...],
+        block_handle: Any,
+    ) -> None:
+        """Admit a coarse external source block without reading its values."""
+
+        self._require_running()
+        new_count = sum(
+            self.grains.get(record.id) is None for record in records
+        )
+        if len(self.grains) + new_count > self.limits.max_grains:
+            self._abort("max_grains_per_arena exceeded during source admission")
+        for record in records:
+            self._check_record_indexes(record)
+            if not isinstance(record.outcome, Success):
+                self._abort("external source block requires successful sources")
+        block = self._allocate_block(block_handle)
+        try:
+            for row, record in enumerate(records):
+                inserted = self.grains.add_terminal(record)
+                self.producers.register(inserted)
+                self.consumers.register(inserted)
+                self.ports.register(inserted.outcome)
+                emission = inserted.outcome.emissions_by_port[0][0]
+                self.values.put(emission.item, LocalValue(block, row))
+                self._sources.append(
+                    SourceSnapshot(
+                        inserted.id,
+                        inserted.output_slots[0],
+                        inserted.outcome,
+                    )
+                )
+        except Exception as error:
+            self._abort(f"source batch admission failed: {error}")
+
+    def _allocate_block(self, values: Any) -> int:
         block = self._next_block
         self._next_block += 1
         self._blocks[block] = values
@@ -314,7 +401,7 @@ class Arena:
         if len(self._dispatches) >= self.limits.max_pending_dispatches:
             return None
         node = self.graph.node(node_id)
-        if node.kind in {Primitive.SOURCE, Primitive.RELATE}:
+        if node.kind is Primitive.SOURCE:
             self._abort(f"{node.kind.value} is not dispatchable in Phase 2")
         assert node.execution is not None
 
@@ -389,6 +476,12 @@ class Arena:
             raise ArenaAbort("dispatch is not pending")
         return tuple(self._blocks[block] for block in runtime.input_blocks)
 
+    def input_block_handles(self, plan: DispatchPlan) -> tuple[Any, ...]:
+        runtime = self._dispatches.get(plan.id)
+        if runtime is None or runtime.plan != plan:
+            raise ArenaAbort("dispatch is not pending")
+        return tuple(self._blocks[block] for block in runtime.input_blocks)
+
     def _currentness(self, plan: DispatchPlan) -> CommitStatus:
         current: list[bool] = []
         for entry in plan.entries:
@@ -434,7 +527,7 @@ class Arena:
             cardinalities = self._validate_manifest(
                 plan,
                 manifest,
-                columns,
+                tuple(len(column) for column in columns),
             )
             delta = self._prepare_commit_delta(
                 plan,
@@ -444,38 +537,49 @@ class Arena:
             )
         except (ValueError, RuntimeError) as error:
             self._abort(f"manifest validation failed: {error}")
+        self._apply_commit_delta(plan, runtime, delta)
+        return CommitStatus.ACCEPTED
 
-        try:
-            for block, values in delta.blocks:
-                self._blocks[block] = values
-            for item, location in delta.values:
-                self.values.put(item, location)
-            for record, token, outcome in delta.outcomes:
-                self.producers.register(
-                    GrainRecord.sealed(
-                        id=record.id,
-                        node=record.node,
-                        inputs=record.inputs,
-                        output_slots=record.output_slots,
-                        outcome=outcome,
-                    )
-                )
-                self.ports.register(outcome)
-                record.seal(outcome, token=token)
-            for entity, origin in delta.origins:
-                self.expand_origins.add(entity, origin)
-            self._next_block += len(delta.blocks)
-            runtime.output_blocks = tuple(block for block, _ in delta.blocks)
+    def commit_external_manifest(
+        self,
+        plan: DispatchPlan,
+        manifest: BatchManifest,
+        output_blocks: tuple[Any, ...],
+    ) -> CommitStatus:
+        """Commit opaque Ray-style output blocks after reading only a manifest."""
+
+        self._require_running()
+        currentness = self._currentness(plan)
+        if currentness is CommitStatus.STALE:
             self._finish_dispatch(plan)
-        except Exception as error:
-            self._abort(f"commit apply failed: {error}")
+            return currentness
+        runtime = self._dispatches.get(plan.id)
+        if runtime is None or runtime.plan != plan:
+            self._abort("current dispatch has no runtime authority")
+        if len(output_blocks) != len(manifest.column_lengths):
+            self._abort("output block arity does not match manifest")
+        try:
+            cardinalities = self._validate_manifest(
+                plan,
+                manifest,
+                manifest.column_lengths,
+            )
+            delta = self._prepare_commit_delta(
+                plan,
+                manifest,
+                output_blocks,
+                cardinalities,
+            )
+        except (ValueError, RuntimeError) as error:
+            self._abort(f"manifest validation failed: {error}")
+        self._apply_commit_delta(plan, runtime, delta)
         return CommitStatus.ACCEPTED
 
     def _validate_manifest(
         self,
         plan: DispatchPlan,
         manifest: BatchManifest,
-        columns: tuple[tuple[Any, ...], ...],
+        column_lengths: tuple[int, ...],
     ) -> tuple[tuple[int, ...], ...]:
         node = self.graph.node(plan.node)
         output_arity = len(node.output_ports)
@@ -483,9 +587,9 @@ class Arena:
             raise ValueError("manifest dispatch id mismatch")
         if len(manifest.acks) != len(plan.entries):
             raise ValueError("manifest must ack every dispatch entry")
-        if len(columns) != output_arity:
+        if len(column_lengths) != output_arity:
             raise ValueError("output column arity mismatch")
-        if manifest.column_lengths != tuple(len(column) for column in columns):
+        if manifest.column_lengths != column_lengths:
             raise ValueError("manifest column lengths mismatch")
         if any(len(ack.spans_by_port) != output_arity for ack in manifest.acks):
             raise ValueError("ack output arity mismatch")
@@ -494,14 +598,14 @@ class Arena:
         ):
             raise ValueError("manifest tokens do not match DispatchPlan")
 
-        for port_index, column in enumerate(columns):
+        for port_index, column_length in enumerate(column_lengths):
             cursor = 0
             for ack in manifest.acks:
                 span = ack.spans_by_port[port_index]
                 if span.start != cursor or span.stop < span.start:
                     raise ValueError("output spans must form a contiguous partition")
                 cursor = span.stop
-            if cursor != len(column):
+            if cursor != column_length:
                 raise ValueError("output spans do not cover their column")
 
         cardinalities: list[tuple[int, ...]] = []
@@ -509,7 +613,11 @@ class Arena:
             counts = tuple(
                 span.stop - span.start for span in ack.spans_by_port
             )
-            if node.kind in {Primitive.MAP, Primitive.REDUCE}:
+            if node.kind in {
+                Primitive.MAP,
+                Primitive.REDUCE,
+                Primitive.RELATE,
+            }:
                 if any(count != 1 for count in counts):
                     raise ValueError(f"{node.kind.value} must emit one row per port")
             elif node.kind is Primitive.FILTER:
@@ -529,16 +637,16 @@ class Arena:
         self,
         plan: DispatchPlan,
         manifest: BatchManifest,
-        columns: tuple[tuple[Any, ...], ...],
+        block_payloads: tuple[Any, ...],
         cardinalities: tuple[tuple[int, ...], ...],
     ) -> CommitDelta:
         node = self.graph.node(plan.node)
         block_ids = tuple(
-            self._next_block + index for index in range(len(columns))
+            self._next_block + index for index in range(len(block_payloads))
         )
-        blocks = tuple(zip(block_ids, columns))
+        blocks = tuple(zip(block_ids, block_payloads))
         values: list[tuple[ItemRef, LocalValue]] = []
-        outcomes: list[tuple[GrainRecord, Any, Success]] = []
+        outcomes: list[tuple[GrainRecord, AttemptToken, Success]] = []
         origins: list[tuple[Any, ExpandOrigin]] = []
         pending_items: set[ItemRef] = set()
 
@@ -605,6 +713,37 @@ class Arena:
             outcomes=tuple(outcomes),
             origins=tuple(origins),
         )
+
+    def _apply_commit_delta(
+        self,
+        plan: DispatchPlan,
+        runtime: DispatchRuntime,
+        delta: CommitDelta,
+    ) -> None:
+        try:
+            for block, values in delta.blocks:
+                self._blocks[block] = values
+            for item, location in delta.values:
+                self.values.put(item, location)
+            for record, token, outcome in delta.outcomes:
+                self.producers.register(
+                    GrainRecord.sealed(
+                        id=record.id,
+                        node=record.node,
+                        inputs=record.inputs,
+                        output_slots=record.output_slots,
+                        outcome=outcome,
+                    )
+                )
+                self.ports.register(outcome)
+                record.seal(outcome, token=token)
+            for entity, origin in delta.origins:
+                self.expand_origins.add(entity, origin)
+            self._next_block += len(delta.blocks)
+            runtime.output_blocks = tuple(block for block, _ in delta.blocks)
+            self._finish_dispatch(plan)
+        except Exception as error:
+            self._abort(f"commit apply failed: {error}")
 
     def handle_infrastructure_failure(
         self,
@@ -724,7 +863,19 @@ class Arena:
             raise ArenaAbort("Phase 2 requires LocalValue locations")
         return self._blocks[location.block][location.row]
 
+    def slice(self, item: ItemRef) -> BlockSlice:
+        location = self.values.get(item)
+        if not isinstance(location, LocalValue):
+            raise ArenaAbort("value location is not row-addressable")
+        return BlockSlice(self._blocks[location.block], location.row)
+
+    def deliver_slices(self, outputs: tuple[ItemRef, ...]) -> RunResult:
+        return self._deliver(tuple(self.slice(item) for item in outputs))
+
     def deliver(self, outputs: tuple[ItemRef, ...]) -> RunResult:
+        return self._deliver(tuple(self.resolve(item) for item in outputs))
+
+    def _deliver(self, values: tuple[Any, ...]) -> RunResult:
         self._require_running()
         if self._dispatches:
             self._abort("cannot deliver with pending dispatches")
@@ -733,7 +884,6 @@ class Arena:
             for record in self.grains.values()
         ):
             self._abort("cannot deliver while logical grains are non-terminal")
-        values = tuple(self.resolve(item) for item in outputs)
         failures = tuple(
             FailureSnapshot(record.id, record.outcome.failure)
             for record in self.grains.values()
@@ -763,11 +913,470 @@ class Arena:
         return result
 
 
-class Executor:
-    """Factory for Phase 2 single-process arenas."""
+@dataclass(slots=True)
+class _PortDomain:
+    receipts: dict[Any, BindingReceipt] = field(default_factory=dict)
+    order: list[Any] = field(default_factory=list)
+    sealed: bool = False
 
-    def __init__(self, graph: CompiledGraph) -> None:
-        self.graph = graph
+    def publish(self, receipt: BindingReceipt) -> bool:
+        if receipt.item is None:
+            raise ExecutionError("published port receipt needs an ItemRef")
+        entity = receipt.item.entity
+        existing = self.receipts.get(entity)
+        if existing is not None:
+            if (
+                existing.state != receipt.state
+                or existing.item != receipt.item
+                or existing.cause != receipt.cause
+            ):
+                raise ExecutionError("port entity received conflicting receipts")
+            return False
+        self.receipts[entity] = receipt
+        self.order.append(entity)
+        return True
+
+
+class _PipelineDriver:
+    """Small event-loop driver for traced bounded DAG integration."""
+
+    def __init__(
+        self,
+        compiled: CompiledPipeline,
+        arena: Arena,
+        transport: "RayTransport",
+    ) -> None:
+        self.compiled = compiled
+        self.graph = compiled.graph
+        self.arena = arena
+        self.transport = transport
+        self.domains = {
+            port: _PortDomain()
+            for node in self.graph.nodes
+            for port in node.output_ports
+        }
+        self.processed: set[GrainId] = set()
+        self.planned: set[tuple[int, Any]] = set()
+        self.barriers: dict[tuple[int, Any], Any] = {}
+        self.relate_planned: set[int] = set()
+
+    def admit_sources(self, batches: tuple[Any, ...]) -> None:
+        import ray
+
+        if len(batches) != len(self.compiled.source_ports):
+            raise ExecutionError("source argument count does not match Pipeline.forward")
+        for public_port, values in zip(self.compiled.source_ports, batches):
+            if not isinstance(values, (list, tuple)):
+                raise ExecutionError("each source argument must be a finite sequence")
+            node = self.graph.producer(public_port.id)
+            records = tuple(
+                admit_source(node, self.arena.run_salt, position)
+                for position in range(len(values))
+            )
+            self.arena.admit_source_batch(records, ray.put(tuple(values)))
+            domain = self.domains[public_port.id]
+            for record in records:
+                domain.publish(
+                    BindingReceipt.present("source", record.output_slots[0])
+                )
+                self.processed.add(record.id)
+            domain.sealed = True
+
+    def _domain_receipt(
+        self,
+        binding: Any,
+        entity: Any,
+    ) -> BindingReceipt:
+        domain = self.domains[binding.port]
+        stored = domain.receipts.get(entity)
+        if stored is not None:
+            return BindingReceipt(
+                binding.role,
+                stored.state,
+                stored.item,
+                stored.cause,
+            )
+        expected = ItemRef(binding.port, entity)
+        if domain.sealed:
+            return BindingReceipt.absent(binding.role, expected)
+        return BindingReceipt.pending(binding.role, expected)
+
+    def _publish_terminal_records(self) -> bool:
+        progress = False
+        for record in self.arena.grains.values():
+            if record.id in self.processed or record.phase is not GrainPhase.SEALED:
+                continue
+            node = self.graph.node(record.node)
+            if isinstance(record.outcome, Success):
+                emitted: set[ItemRef] = set()
+                for port_index, emissions in enumerate(
+                    record.outcome.emissions_by_port
+                ):
+                    for emission in emissions:
+                        emitted.add(emission.item)
+                        progress |= self.domains[
+                            node.output_ports[port_index]
+                        ].publish(
+                            BindingReceipt.present(
+                                "output",
+                                emission.item,
+                            )
+                        )
+                for slot in record.output_slots:
+                    if slot not in emitted:
+                        progress |= self.domains[slot.port].publish(
+                            BindingReceipt.absent("output", slot)
+                        )
+            elif isinstance(record.outcome, Failed):
+                for slot in record.output_slots:
+                    progress |= self.domains[slot.port].publish(
+                        BindingReceipt.failed(
+                            "output",
+                            slot,
+                            record.id,
+                        )
+                    )
+            elif isinstance(record.outcome, Suppressed):
+                for slot in record.output_slots:
+                    progress |= self.domains[slot.port].publish(
+                        BindingReceipt.suppressed(
+                            "output",
+                            slot,
+                            record.id,
+                        )
+                    )
+            self.processed.add(record.id)
+        return progress
+
+    @staticmethod
+    def _driving_role(node: Any) -> str:
+        return {
+            Primitive.MAP: "primary",
+            Primitive.FILTER: "target",
+            Primitive.EXPAND: "parent",
+        }[node.kind]
+
+    def _plan_unary(self, node: Any) -> bool:
+        driving_role = self._driving_role(node)
+        driving_binding = next(
+            binding for binding in node.inputs if binding.role == driving_role
+        )
+        progress = False
+        for entity in tuple(self.domains[driving_binding.port].order):
+            key = (node.id, entity)
+            if key in self.planned:
+                continue
+            receipts = tuple(
+                self._domain_receipt(binding, entity)
+                for binding in node.inputs
+            )
+            planner = {
+                Primitive.MAP: plan_map,
+                Primitive.FILTER: plan_filter,
+                Primitive.EXPAND: plan_expand,
+            }[node.kind]
+            decision = planner(node, self.arena.run_salt, receipts)
+            if decision.action is PlanAction.WAIT:
+                continue
+            if decision.action is PlanAction.NORMAL_ABSENCE:
+                if node.kind is not Primitive.EXPAND:
+                    for port in node.output_ports:
+                        self.domains[port].publish(
+                            BindingReceipt.absent(
+                                "output",
+                                ItemRef(port, entity),
+                            )
+                        )
+            else:
+                self.arena.ensure_plans((decision,))
+            self.planned.add(key)
+            progress = True
+        return progress
+
+    def _reduce_origin(self, node: Any) -> tuple[Any, PortId]:
+        current = node.reduce_members
+        assert current is not None
+        while True:
+            producer = self.graph.producer(current)
+            if producer.kind is Primitive.MAP:
+                current = next(
+                    binding.port
+                    for binding in producer.inputs
+                    if binding.role == "primary"
+                )
+                continue
+            if producer.kind is Primitive.FILTER:
+                current = next(
+                    binding.port
+                    for binding in producer.inputs
+                    if binding.role == "target"
+                )
+                continue
+            if producer.kind is not Primitive.EXPAND:
+                raise ExecutionError("Reduce path lost its origin Expand")
+            return producer, current
+
+    def _plan_reduce(self, node: Any) -> bool:
+        anchor_binding = next(
+            binding for binding in node.inputs if binding.role == "anchor"
+        )
+        members_port = node.reduce_members
+        assert members_port is not None
+        origin_node, origin_port = self._reduce_origin(node)
+        progress = False
+        for entity in tuple(self.domains[anchor_binding.port].order):
+            key = (node.id, entity)
+            if key in self.planned:
+                continue
+            anchor = self._domain_receipt(anchor_binding, entity)
+            if anchor.state is ReceiptState.PENDING or anchor.item is None:
+                continue
+            origin_inputs = (RoleItems("parent", (anchor.item,)),)
+            origin_id = expand_grain_id(
+                self.arena.run_salt,
+                origin_node.id,
+                origin_inputs,
+            )
+            origin_record = self.arena.grains.get(origin_id)
+            if origin_record is None or origin_record.outcome is None:
+                continue
+            barrier_key = (node.id, entity)
+            barrier = self.barriers.get(barrier_key)
+            if barrier is None:
+                from .grain import FiberBarrier, FiberId
+
+                barrier = FiberBarrier(
+                    FiberId(node.id, anchor.item),
+                    origin_record.id,
+                )
+                self.barriers[barrier_key] = barrier
+            if isinstance(origin_record.outcome, Success):
+                emissions = origin_record.outcome.emissions_by_port[
+                    origin_port.slot
+                ]
+                barrier.set_expected(len(emissions))
+                member_domain = self.domains[members_port]
+                for emission in emissions:
+                    receipt = member_domain.receipts.get(emission.item.entity)
+                    if receipt is None:
+                        if member_domain.sealed:
+                            raise ExecutionError(
+                                "sealed members port lost a child occurrence"
+                            )
+                        continue
+                    if receipt.state is ReceiptState.PRESENT:
+                        assert receipt.item is not None
+                        barrier.settle_present(emission.ordinal, receipt.item)
+                    elif receipt.state is ReceiptState.NORMAL_ABSENCE:
+                        barrier.settle_dropped(emission.ordinal)
+                    elif receipt.state in {
+                        ReceiptState.FAILED,
+                        ReceiptState.SUPPRESSED,
+                    }:
+                        assert receipt.item is not None and receipt.cause is not None
+                        barrier.settle_failed(
+                            emission.ordinal,
+                            receipt.item,
+                            receipt.cause,
+                        )
+            else:
+                barrier.block_origin(origin_record.id)
+            decision = plan_reduce(
+                node,
+                self.arena.run_salt,
+                anchor,
+                barrier,
+            )
+            if decision.action is PlanAction.WAIT:
+                continue
+            if decision.action is not PlanAction.NORMAL_ABSENCE:
+                self.arena.ensure_plans((decision,))
+            self.planned.add(key)
+            progress = True
+        return progress
+
+    def _key_value(self, key_spec: Any, item: ItemRef) -> int:
+        if not isinstance(key_spec.by, Port):
+            raise ExecutionError(
+                "automatic Relate requires keyed(data, by=key_port)"
+            )
+        key_domain = self.domains[key_spec.by.id]
+        receipt = key_domain.receipts.get(item.entity)
+        if receipt is None or receipt.state is not ReceiptState.PRESENT:
+            raise ExecutionError("Relate key port is missing an aligned key")
+        assert receipt.item is not None
+        value = self.arena.slice(receipt.item)
+        import ray
+
+        key = ray.get(value.block)[value.row]
+        if type(key) is not int:
+            raise ExecutionError("bounded automatic Relate accepts int keys")
+        return key
+
+    def _plan_relate(self, node: Any) -> bool:
+        if node.id in self.relate_planned:
+            return False
+        key_ports = tuple(
+            key.by.id
+            for key in node.relate_keys
+            if isinstance(key.by, Port)
+        )
+        if len(key_ports) != len(node.relate_keys):
+            return False
+        if not all(
+            self.domains[binding.port].sealed for binding in node.inputs
+        ) or not all(self.domains[port].sealed for port in key_ports):
+            return False
+        roles = []
+        for binding, key_spec in zip(node.inputs, node.relate_keys):
+            rows = tuple(
+                (
+                    receipt.item,
+                    self._key_value(key_spec, receipt.item),
+                )
+                for receipt in self.domains[binding.port].receipts.values()
+                if receipt.state is ReceiptState.PRESENT
+                and receipt.item is not None
+            )
+            roles.append((binding.role, rows))
+        result = plan_relate_bounded(
+            node,
+            self.arena.run_salt,
+            tuple(roles),
+            sealed_roles=frozenset(binding.role for binding in node.inputs),
+            max_cardinality=self.arena.limits.max_relation_cardinality,
+        )
+        self.arena.ensure_plans(result.decisions)
+        self.relate_planned.add(node.id)
+        return True
+
+    def _node_terminal(self, node_id: int) -> bool:
+        return all(
+            record.phase is GrainPhase.SEALED
+            for record in self.arena.grains.values()
+            if record.node == node_id
+        )
+
+    def _seal_ports(self) -> bool:
+        progress = False
+        for node in self.graph.nodes:
+            if node.kind is Primitive.SOURCE:
+                continue
+            if all(self.domains[port].sealed for port in node.output_ports):
+                continue
+            if node.kind in {
+                Primitive.MAP,
+                Primitive.FILTER,
+                Primitive.EXPAND,
+            }:
+                driving = next(
+                    binding
+                    for binding in node.inputs
+                    if binding.role == self._driving_role(node)
+                )
+                ready = (
+                    all(self.domains[binding.port].sealed for binding in node.inputs)
+                    and all(
+                        (node.id, entity) in self.planned
+                        for entity in self.domains[driving.port].order
+                    )
+                    and self._node_terminal(node.id)
+                )
+            elif node.kind is Primitive.REDUCE:
+                anchor = next(
+                    binding
+                    for binding in node.inputs
+                    if binding.role == "anchor"
+                )
+                ready = (
+                    self.domains[anchor.port].sealed
+                    and all(
+                        (node.id, entity) in self.planned
+                        for entity in self.domains[anchor.port].order
+                    )
+                    and self._node_terminal(node.id)
+                )
+            else:
+                ready = (
+                    node.id in self.relate_planned
+                    and self._node_terminal(node.id)
+                )
+            if ready:
+                for port in node.output_ports:
+                    self.domains[port].sealed = True
+                progress = True
+        return progress
+
+    def _plan(self) -> bool:
+        progress = False
+        for node in self.graph.nodes:
+            if node.kind is Primitive.SOURCE:
+                continue
+            if node.kind in {
+                Primitive.MAP,
+                Primitive.FILTER,
+                Primitive.EXPAND,
+            }:
+                progress |= self._plan_unary(node)
+            elif node.kind is Primitive.REDUCE:
+                progress |= self._plan_reduce(node)
+            elif node.kind is Primitive.RELATE:
+                progress |= self._plan_relate(node)
+        return progress
+
+    def _dispatch(self) -> bool:
+        progress = False
+        for node in self.graph.nodes:
+            if node.kind is Primitive.SOURCE:
+                continue
+            while self.transport.can_submit(node.id):
+                plan = self.arena.reserve_dispatch(node.id)
+                if plan is None:
+                    break
+                if not self.transport.submit(self.arena, plan):
+                    raise ExecutionError("actor capacity changed during submit")
+                progress = True
+        return progress
+
+    def run(self) -> RunResult:
+        final_ports = tuple(port.id for port in self.compiled.outputs)
+        while True:
+            progress = self._publish_terminal_records()
+            progress |= self._plan()
+            progress |= self._seal_ports()
+            progress |= self._dispatch()
+            if self.transport.pending_dispatches:
+                result = self.transport.poll_one(timeout=1.0)
+                progress |= result is not None
+                continue
+            if all(self.domains[port].sealed for port in final_ports):
+                output_items = tuple(
+                    receipt.item
+                    for port in final_ports
+                    for entity in self.domains[port].order
+                    for receipt in (self.domains[port].receipts[entity],)
+                    if receipt.state is ReceiptState.PRESENT
+                    and receipt.item is not None
+                )
+                return self.arena.deliver_slices(output_items)
+            if not progress:
+                raise ExecutionError("pipeline reached a non-terminal deadlock")
+
+
+class Executor:
+    """Factory for explicit arenas and traced Pipeline execution."""
+
+    def __init__(self, graph: CompiledGraph | Pipeline | CompiledPipeline) -> None:
+        if isinstance(graph, Pipeline):
+            self.compiled_pipeline: CompiledPipeline | None = graph.compile()
+            self.graph = self.compiled_pipeline.graph
+        elif isinstance(graph, CompiledPipeline):
+            self.compiled_pipeline = graph
+            self.graph = graph.graph
+        else:
+            self.compiled_pipeline = None
+            self.graph = graph
+        self._next_arena = 0
 
     def new_arena(
         self,
@@ -778,12 +1387,222 @@ class Executor:
     ) -> Arena:
         return Arena(arena_id, self.graph, run_salt, limits=limits)
 
-    def run(self, *sources: Any) -> RunResult:
-        del sources
-        raise ExecutionError(
-            "Phase 2 exposes explicit single-process arenas; "
-            "automatic graph driving is not implemented yet"
+    def ray_transport(
+        self,
+        *,
+        max_pending_per_actor: int = 1,
+    ) -> "RayTransport":
+        return RayTransport(
+            self.graph,
+            max_pending_per_actor=max_pending_per_actor,
         )
+
+    def run(self, *sources: Any) -> RunResult:
+        if self.compiled_pipeline is None:
+            raise ExecutionError(
+                "Executor.run requires a traced Pipeline, not bare CompiledGraph"
+            )
+        import secrets
+
+        arena = self.new_arena(
+            self._next_arena,
+            secrets.token_bytes(16),
+        )
+        self._next_arena += 1
+        transport = self.ray_transport()
+        try:
+            driver = _PipelineDriver(
+                self.compiled_pipeline,
+                arena,
+                transport,
+            )
+            driver.admit_sources(tuple(sources))
+            return driver.run()
+        finally:
+            transport.shutdown()
+
+
+class RayTransport:
+    """Persistent-actor coarse-block transport for Phase 3 integration."""
+
+    def __init__(
+        self,
+        graph: CompiledGraph,
+        *,
+        max_pending_per_actor: int = 1,
+    ) -> None:
+        if max_pending_per_actor <= 0:
+            raise ValueError("max_pending_per_actor must be positive")
+        import ray
+
+        if not ray.is_initialized():
+            raise ExecutionError("Ray must be initialized before RayTransport")
+        self.graph = graph
+        self.max_pending_per_actor = max_pending_per_actor
+        self._worker_class = get_ray_worker_class()
+        self._actors: dict[int, list[Any]] = {}
+        self._actor_specs: dict[
+            int,
+            tuple[Any, tuple[Any, ...], dict[str, Any], dict[str, Any]],
+        ] = {}
+        self._pending_by_actor: dict[tuple[int, int], int] = {}
+        self._round_robin: dict[int, int] = {}
+        self._pending: dict[Any, RayPending] = {}
+
+        for node in graph.nodes:
+            if node.kind is Primitive.SOURCE:
+                continue
+            assert node.execution is not None
+            assert node.udf_recipe is not None
+            options = dict(node.execution.options)
+            spec = (
+                node.udf_recipe.target,
+                node.udf_recipe.init_args,
+                dict(node.udf_recipe.init_kwargs),
+                options,
+            )
+            self._actor_specs[node.id] = spec
+            actors = [
+                self._spawn_actor(node.id)
+                for _ in range(node.execution.replicas)
+            ]
+            self._actors[node.id] = actors
+            for index in range(len(actors)):
+                self._pending_by_actor[(node.id, index)] = 0
+
+    @property
+    def pending_dispatches(self) -> int:
+        return len(self._pending)
+
+    def can_submit(self, node: int) -> bool:
+        return any(
+            self._pending_by_actor[(node, index)]
+            < self.max_pending_per_actor
+            for index in range(len(self._actors[node]))
+        )
+
+    def _choose_actor(self, node: int) -> tuple[int, Any] | None:
+        actors = self._actors[node]
+        start = self._round_robin.get(node, 0)
+        for offset in range(len(actors)):
+            index = (start + offset) % len(actors)
+            if (
+                self._pending_by_actor[(node, index)]
+                < self.max_pending_per_actor
+            ):
+                self._round_robin[node] = (index + 1) % len(actors)
+                return index, actors[index]
+        return None
+
+    def _spawn_actor(self, node: int):
+        target, init_args, init_kwargs, options = self._actor_specs[node]
+        return self._worker_class.options(
+            max_task_retries=0,
+            **options,
+        ).remote(target, init_args, init_kwargs)
+
+    def _replace_actor(self, node: int, actor_index: int) -> None:
+        import ray
+
+        old = self._actors[node][actor_index]
+        try:
+            ray.kill(old)
+        except Exception:
+            pass
+        self._actors[node][actor_index] = self._spawn_actor(node)
+
+    def submit(self, arena: Arena, plan: DispatchPlan) -> bool:
+        import ray
+
+        choice = self._choose_actor(plan.node)
+        if choice is None:
+            return False
+        actor_index, actor = choice
+        node = self.graph.node(plan.node)
+        input_refs = arena.input_block_handles(plan)
+        if not all(isinstance(ref, ray.ObjectRef) for ref in input_refs):
+            raise ExecutionError(
+                "Ray dispatch inputs must be coarse ObjectRef blocks"
+            )
+        refs = actor.run.options(
+            num_returns=1 + len(node.output_ports),
+            max_task_retries=0,
+        ).remote(
+            node.kind.value,
+            len(node.output_ports),
+            tuple(binding.role for binding in node.inputs),
+            plan,
+            *input_refs,
+        )
+        refs_tuple = tuple(refs) if isinstance(refs, list) else tuple(refs)
+        pending = RayPending(
+            arena=arena,
+            plan=plan,
+            node=plan.node,
+            actor_index=actor_index,
+            manifest_ref=refs_tuple[0],
+            output_refs=refs_tuple[1:],
+        )
+        self._pending[pending.manifest_ref] = pending
+        self._pending_by_actor[(plan.node, actor_index)] += 1
+        return True
+
+    def poll_one(self, *, timeout: float | None = None) -> CommitStatus | None:
+        import ray
+
+        if not self._pending:
+            return None
+        ready, _ = ray.wait(
+            list(self._pending),
+            num_returns=1,
+            timeout=timeout,
+        )
+        if not ready:
+            return None
+        manifest_ref = ready[0]
+        pending = self._pending.pop(manifest_ref)
+        self._pending_by_actor[
+            (pending.node, pending.actor_index)
+        ] -= 1
+        try:
+            manifest = ray.get(manifest_ref)
+        except Exception:
+            self._replace_actor(pending.node, pending.actor_index)
+            return pending.arena.handle_infrastructure_failure(pending.plan)
+        if isinstance(manifest, BatchManifest):
+            return pending.arena.commit_external_manifest(
+                pending.plan,
+                manifest,
+                pending.output_refs,
+            )
+        if isinstance(manifest, DispatchErrorReport):
+            return pending.arena.handle_error(pending.plan, manifest)
+        pending.arena._abort("worker returned an unknown manifest type")
+        raise AssertionError("unreachable")
+
+    def drain(self) -> tuple[CommitStatus, ...]:
+        results: list[CommitStatus] = []
+        while self._pending:
+            result = self.poll_one()
+            if result is not None:
+                results.append(result)
+        return tuple(results)
+
+    def actor_stats(self, node: int) -> tuple[dict[str, int], ...]:
+        import ray
+
+        return tuple(
+            ray.get([actor.stats.remote() for actor in self._actors[node]])
+        )
+
+    def shutdown(self) -> None:
+        import ray
+
+        for actors in self._actors.values():
+            for actor in actors:
+                ray.kill(actor)
+        self._actors.clear()
+        self._pending.clear()
 
 
 def _one_role_item(record: GrainRecord, role: str) -> ItemRef:

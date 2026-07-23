@@ -80,7 +80,7 @@ def test_dispatch_entry_remains_role_general():
     assert len(plan.entries[0].role_takes[1]) == 2
 
 
-def test_executor_is_explicitly_feature_gated_before_phase_two():
+def test_bare_compiled_graph_requires_explicit_arena_or_traced_pipeline():
     graph = compile_graph((source_node(0),))
-    with pytest.raises(ExecutionError, match="Phase 2"):
+    with pytest.raises(ExecutionError, match="traced Pipeline"):
         Executor(graph).run([1, 2, 3])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import product
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -31,6 +32,8 @@ from .grain import (
     filter_grain_id,
     map_grain_id,
     reduce_grain_id,
+    relate_entity,
+    relate_grain_id,
     source_entity,
     source_grain_id,
 )
@@ -540,9 +543,105 @@ def plan_reduce(
     )
 
 
-def plan_relate(*args: Any, **kwargs: Any) -> PlanDecision:
-    del args, kwargs
-    raise CompileError("Relate execution is feature-gated until Phase 5")
+def plan_relate(
+    node: NodeSpec,
+    run_salt: bytes,
+    roles: tuple[tuple[str, tuple[tuple[ItemRef, int], ...]], ...],
+    *,
+    sealed_roles: frozenset[str],
+    max_cardinality: int,
+) -> "RelatePlanResult":
+    return plan_relate_bounded(
+        node,
+        run_salt,
+        roles,
+        sealed_roles=sealed_roles,
+        max_cardinality=max_cardinality,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RelatePlanResult:
+    decisions: tuple[PlanDecision, ...]
+    unmatched: tuple[ItemRef, ...]
+    complete: bool
+
+
+def plan_relate_bounded(
+    node: NodeSpec,
+    run_salt: bytes,
+    roles: tuple[tuple[str, tuple[tuple[ItemRef, int], ...]], ...],
+    *,
+    sealed_roles: frozenset[str],
+    max_cardinality: int,
+) -> RelatePlanResult:
+    """Bounded sealed-port int-key prototype used by integration coverage."""
+
+    if node.kind is not Primitive.RELATE:
+        raise PlannerContractError("bounded Relate needs a Relate NodeSpec")
+    role_names = tuple(role for role, _ in roles)
+    compiled_roles = tuple(binding.role for binding in node.inputs)
+    if role_names != compiled_roles:
+        raise PlannerContractError("Relate rows must follow compiled role order")
+    if sealed_roles != frozenset(role_names):
+        return RelatePlanResult((), (), False)
+    if max_cardinality < 0:
+        raise PlannerContractError("relation cardinality limit is negative")
+
+    by_role: dict[str, dict[int, list[ItemRef]]] = {}
+    for role, rows in roles:
+        keyed: dict[int, list[ItemRef]] = {}
+        for item, key in rows:
+            if type(key) is not int:
+                raise PlannerContractError(
+                    "bounded Relate accepts exact int keys only"
+                )
+            keyed.setdefault(key, []).append(item)
+        by_role[role] = keyed
+    matched_keys = (
+        set.intersection(*(set(by_role[role]) for role in role_names))
+        if role_names
+        else set()
+    )
+
+    parent_tuples: list[tuple[ItemRef, ...]] = []
+    for key in sorted(matched_keys):
+        parent_tuples.extend(
+            product(*(by_role[role][key] for role in role_names))
+        )
+        if len(parent_tuples) > max_cardinality:
+            raise PlannerContractError(
+                "max_relation_cardinality exceeded for node/arena"
+            )
+
+    matched: set[ItemRef] = set()
+    decisions: list[PlanDecision] = []
+    for parents in parent_tuples:
+        inputs = tuple(
+            RoleItems(role, (item,))
+            for role, item in zip(role_names, parents)
+        )
+        entity = relate_entity(run_salt, node.id, inputs)
+        slots = tuple(ItemRef(port, entity) for port in node.output_ports)
+        decisions.append(
+            PlanDecision(
+                PlanAction.ENSURE_EXECUTABLE,
+                GrainRecord(
+                    id=relate_grain_id(run_salt, node.id, inputs),
+                    node=node.id,
+                    inputs=inputs,
+                    output_slots=slots,
+                ),
+            )
+        )
+        matched.update(parents)
+    unmatched = tuple(
+        item
+        for role, rows in roles
+        for item, _ in rows
+        if item not in matched
+    )
+    return RelatePlanResult(tuple(decisions), unmatched, True)
 
 
 def ensure_decision(

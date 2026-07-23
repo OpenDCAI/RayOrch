@@ -77,7 +77,7 @@ def test_source_schema_is_internal_and_strict():
         compile_graph((invalid,))
 
 
-def test_relate_schema_is_retained_but_planner_is_feature_gated():
+def test_relate_schema_and_bounded_sealed_planner_are_retained():
     left = source_node(0)
     right = source_node(1)
     relate = NodeSpec(
@@ -98,8 +98,14 @@ def test_relate_schema_is_retained_but_planner_is_feature_gated():
 
     graph = compile_graph((left, right, relate))
     assert graph.node(2).relate_keys == relate.relate_keys
-    with pytest.raises(CompileError, match="Phase 5"):
-        plan_relate(graph, relate)
+    open_result = plan_relate(
+        relate,
+        bytes.fromhex("00" * 16),
+        (("left", ()), ("right", ())),
+        sealed_roles=frozenset({"left"}),
+        max_cardinality=10,
+    )
+    assert not open_result.complete
 
 
 def test_graph_must_be_topologically_ordered():

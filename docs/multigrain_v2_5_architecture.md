@@ -832,8 +832,10 @@ Relate 使用 strict、type-sensitive canonical key；Python hash/equality 不�
 不得虚构 key，也不得把该失败解释成正常 unmatched。
 
 Phase 1 保留 `Relate/keyed/Primitive.RELATE/NodeSpec.relate_keys/plan_relate`、relation identity、
-role-general DTO 与 `JoinIndex` 位置；production `plan_relate` 明确 feature-gate，完整 planner
-留到 Phase 5。Phase 0 reference 只覆盖 bounded int-key 1:1、M:N、unmatched/sealing。
+role-general DTO 与 `JoinIndex` 位置。Phase 3 integration prototype 只实现 bounded、sealed-port、
+显式小型 int-key Port 的 driver-side Cartesian relation；完整 typed-key codec、key projection
+failure boundary 与 chunked enumeration 留到 Phase 5。Phase 0 reference 覆盖 int-key
+1:1、M:N、unmatched/sealing。
 
 ### 8.6 首版 output cardinality 合同
 
@@ -1904,7 +1906,7 @@ test/experimental/multigrain_v2_5/
 - PortId/EntityId/ItemRef/GrainId；
 - GrainRecord/Outcome/Emission；
 - Producer/Consumer/Port/Value indexes；
-- 四个 executable core planners（Map/Filter/Expand/Reduce）与 `plan_relate` contract/stub；
+- 四个 executable core planners（Map/Filter/Expand/Reduce）与 bounded `plan_relate` contract；
 - ExpandOriginIndex 与 fiber barrier；
 - compile validation。
 
@@ -1931,6 +1933,10 @@ Phase 1 不在没有 executor 时宣称已验证。
 - actor replacement；
 - bounded retry；
 - generic-error isolation。
+- `Pipeline.forward` symbolic tracing 到同一 `CompiledGraph`；
+- public `Executor(Pipeline).run(...)` event-loop driving；
+- 每个 Dispatch/output-port 一个 coarse ObjectRef；
+- bounded sealed int-key Relate 只作为 integration generality case。
 
 ### Phase 4：real workloads
 
