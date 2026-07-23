@@ -203,6 +203,14 @@ class GrainRecord:
         self.validate_state()
         return True
 
+    def release_for_reexecution(self, token: AttemptToken) -> bool:
+        if self.active != token:
+            return False
+        self.active = None
+        self.phase = GrainPhase.READY
+        self.validate_state()
+        return True
+
     def seal(
         self,
         outcome: GrainOutcome,
@@ -657,6 +665,19 @@ class GrainTable:
 
     def get(self, grain_id: GrainId) -> GrainRecord | None:
         return self._records.get(grain_id)
+
+    def add_terminal(self, record: GrainRecord) -> GrainRecord:
+        if record.phase is not GrainPhase.SEALED or record.outcome is None:
+            raise GrainInvariantError("terminal insertion needs a SEALED grain")
+        existing = self._records.get(record.id)
+        if existing is None:
+            self._records[record.id] = record
+            return record
+        if _semantic_fields(existing) != _semantic_fields(record):
+            raise GrainInvariantError("same GrainId has conflicting semantic fields")
+        if existing.outcome != record.outcome:
+            raise GrainInvariantError("same GrainId has conflicting terminal outcome")
+        return existing
 
     def ensure_executable(self, record: GrainRecord) -> GrainRecord:
         if record.id in self._records:
