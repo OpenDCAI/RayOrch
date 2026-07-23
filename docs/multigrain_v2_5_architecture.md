@@ -1110,6 +1110,30 @@ ordinal 或 value。
 payload。该 projection 也必须编译成普通内部 Map grain；projection failure 首版终止当前
 microbatch arena，不建立单独执行协议。
 
+#### 11.1.1 Batch trigger
+
+每个 `(arena, node)` 只有一个 derived ready queue 和一个 tail wait timestamp，不创建 per-grain
+timer。trigger 固定优先级：
+
+```text
+isolation forced group
+→ ready_count >= batch_size
+→ node admission closed
+→ arena drain
+→ max_batch_wait_ms expired
+→ otherwise wait
+```
+
+`node admission closed` 表示所有 required input ports sealed，且所有 driving occurrences 已被
+planner 分类。默认 `max_batch_wait_ms=2.0`；full batch、sealed tail 和 drain 不等待，只有
+upstream 仍 open 的 underfilled tail 等待。full batch pop 后若留下不足 batch_size 的 tail，其
+wait timestamp 从该次 pop 重新开始；新 grains 加入已有 tail 不延长 deadline。
+
+只有 actor/pending capacity 已获得时才 reservation、增加 generation 并安装 AttemptToken；没有
+capacity 时 grain 保持 READY，不预排 RPC。driver turn 固定先处理 completion/commit/planner/
+sealing，再评估 triggers。timeout 通过 single event-loop 的 `ray.wait(timeout=next_deadline)`
+驱动，不使用 node/actor timer thread。
+
 ### 11.2 transport DTO
 
 `AttemptToken` 已在 §4 定义，并包含 `(arena, dispatch, grain, generation)`。其余 DTO：

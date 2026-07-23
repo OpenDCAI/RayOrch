@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .api import CompiledPipeline, ExecutionError, Pipeline, Port
 from .grain import (
@@ -133,6 +134,7 @@ class DispatchRuntime:
     pending_handle: Any = None
     output_blocks: tuple[int, ...] = ()
     isolation: IsolationContext | None = None
+    flush_reason: str = "full"
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,11 +209,13 @@ class Arena:
         run_salt: bytes,
         *,
         limits: ArenaLimits = ArenaLimits(),
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.id = arena_id
         self.graph = graph
         self.run_salt = run_salt
         self.limits = limits
+        self._clock = clock
         self.state = ArenaState.RUNNING
         self.abort_reason: str | None = None
 
@@ -228,6 +232,7 @@ class Arena:
         self._dispatches: dict[int, DispatchRuntime] = {}
         self._ready: dict[int, list[GrainId]] = {}
         self._ready_set: dict[int, set[GrainId]] = {}
+        self._tail_wait_started_at: dict[int, float | None] = {}
         self._forced: dict[
             int,
             list[tuple[tuple[GrainId, ...], IsolationContext]],
@@ -236,6 +241,15 @@ class Arena:
         self._dispatch_count = 0
         self._dispatched_grains = 0
         self._tail_or_isolation_dispatches = 0
+        self._dispatch_capacity = 0
+        self._ready_queue_high_watermark = 0
+        self._flush_reason_counts = {
+            "full": 0,
+            "timeout": 0,
+            "port_sealed": 0,
+            "arena_drain": 0,
+            "isolation": 0,
+        }
 
     def _require_running(self) -> None:
         if self.state is not ArenaState.RUNNING:
@@ -258,6 +272,7 @@ class Arena:
         self._dispatches.clear()
         self._ready.clear()
         self._ready_set.clear()
+        self._tail_wait_started_at.clear()
         self._forced.clear()
         self._sources.clear()
         self.state = ArenaState.RECLAIMED
@@ -385,8 +400,20 @@ class Arena:
         ready_set = self._ready_set.setdefault(record.node, set())
         if record.id in ready_set:
             return
+        queue = self._ready.setdefault(record.node, [])
+        was_empty = not queue
         ready_set.add(record.id)
-        self._ready.setdefault(record.node, []).append(record.id)
+        queue.append(record.id)
+        node = self.graph.node(record.node)
+        assert node.execution is not None
+        if len(queue) >= node.execution.batch_size:
+            self._tail_wait_started_at[record.node] = None
+        elif was_empty:
+            self._tail_wait_started_at[record.node] = self._clock()
+        self._ready_queue_high_watermark = max(
+            self._ready_queue_high_watermark,
+            len(queue),
+        )
 
     def _force_group(
         self,
@@ -396,19 +423,29 @@ class Arena:
     ) -> None:
         self._forced.setdefault(node, []).append((grains, context))
 
-    def reserve_dispatch(self, node_id: int) -> DispatchPlan | None:
+    def reserve_dispatch(
+        self,
+        node_id: int,
+        *,
+        admission_closed: bool = True,
+        draining: bool = False,
+        now: float | None = None,
+    ) -> DispatchPlan | None:
         self._require_running()
         if len(self._dispatches) >= self.limits.max_pending_dispatches:
             return None
+        now = self._clock() if now is None else now
         node = self.graph.node(node_id)
         if node.kind is Primitive.SOURCE:
             self._abort(f"{node.kind.value} is not dispatchable in Phase 2")
         assert node.execution is not None
 
         isolation: IsolationContext | None = None
+        flush_reason: str
         selected: list[GrainRecord] = []
         forced = self._forced.get(node_id)
         if forced:
+            flush_reason = "isolation"
             grain_ids, isolation = forced.pop(0)
             for grain_id in grain_ids:
                 record = self.grains.get(grain_id)
@@ -419,12 +456,35 @@ class Arena:
         else:
             queue = self._ready.setdefault(node_id, [])
             ready_set = self._ready_set.setdefault(node_id, set())
+            if not queue:
+                return None
+            if len(queue) >= node.execution.batch_size:
+                flush_reason = "full"
+            elif admission_closed:
+                flush_reason = "port_sealed"
+            elif draining:
+                flush_reason = "arena_drain"
+            else:
+                wait_started = self._tail_wait_started_at.get(node_id)
+                if wait_started is None:
+                    wait_started = now
+                    self._tail_wait_started_at[node_id] = wait_started
+                wait_seconds = node.execution.max_batch_wait_ms / 1000.0
+                if wait_seconds > 0 and now - wait_started < wait_seconds:
+                    return None
+                flush_reason = "timeout"
             while queue and len(selected) < node.execution.batch_size:
                 grain_id = queue.pop(0)
                 ready_set.discard(grain_id)
                 record = self.grains.get(grain_id)
                 if record is not None and record.phase is GrainPhase.READY:
                     selected.append(record)
+            if not queue:
+                self._tail_wait_started_at[node_id] = None
+            elif len(queue) >= node.execution.batch_size:
+                self._tail_wait_started_at[node_id] = None
+            else:
+                self._tail_wait_started_at[node_id] = now
         if not selected:
             return None
 
@@ -463,9 +523,12 @@ class Arena:
             plan=plan,
             input_blocks=tuple(input_blocks),
             isolation=isolation,
+            flush_reason=flush_reason,
         )
         self._dispatch_count += 1
         self._dispatched_grains += len(entries)
+        self._dispatch_capacity += node.execution.batch_size
+        self._flush_reason_counts[flush_reason] += 1
         if len(entries) < node.execution.batch_size or isolation is not None:
             self._tail_or_isolation_dispatches += 1
         return plan
@@ -475,6 +538,38 @@ class Arena:
         if runtime is None or runtime.plan != plan:
             raise ArenaAbort("dispatch is not pending")
         return tuple(self._blocks[block] for block in runtime.input_blocks)
+
+    def ready_count(self, node_id: int) -> int:
+        return len(self._ready.get(node_id, ()))
+
+    def batch_wait_remaining(
+        self,
+        node_id: int,
+        *,
+        now: float | None = None,
+    ) -> float | None:
+        if self._forced.get(node_id):
+            return 0.0
+        queue = self._ready.get(node_id, ())
+        if not queue:
+            return None
+        node = self.graph.node(node_id)
+        assert node.execution is not None
+        if len(queue) >= node.execution.batch_size:
+            return 0.0
+        now = self._clock() if now is None else now
+        started = self._tail_wait_started_at.get(node_id)
+        if started is None:
+            started = now
+            self._tail_wait_started_at[node_id] = started
+        deadline = started + node.execution.max_batch_wait_ms / 1000.0
+        return max(0.0, deadline - now)
+
+    def dispatch_flush_reason(self, plan: DispatchPlan) -> str:
+        runtime = self._dispatches.get(plan.id)
+        if runtime is None or runtime.plan != plan:
+            raise ArenaAbort("dispatch is not pending")
+        return runtime.flush_reason
 
     def input_block_handles(self, plan: DispatchPlan) -> tuple[Any, ...]:
         runtime = self._dispatches.get(plan.id)
@@ -875,6 +970,37 @@ class Arena:
     def deliver(self, outputs: tuple[ItemRef, ...]) -> RunResult:
         return self._deliver(tuple(self.resolve(item) for item in outputs))
 
+    def metrics_snapshot(self) -> dict[str, float]:
+        metrics = {
+            "grains_per_rpc": (
+                self._dispatched_grains / self._dispatch_count
+                if self._dispatch_count
+                else 0.0
+            ),
+            "rpc_count": float(self._dispatch_count),
+            "pending_dispatches": float(len(self._dispatches)),
+            "tail_or_isolation_rpc_fraction": (
+                self._tail_or_isolation_dispatches / self._dispatch_count
+                if self._dispatch_count
+                else 0.0
+            ),
+            "batch_fill_ratio": (
+                self._dispatched_grains / self._dispatch_capacity
+                if self._dispatch_capacity
+                else 0.0
+            ),
+            "ready_queue_high_watermark": float(
+                self._ready_queue_high_watermark
+            ),
+        }
+        metrics.update(
+            {
+                f"flush_{reason}": float(count)
+                for reason, count in self._flush_reason_counts.items()
+            }
+        )
+        return metrics
+
     def _deliver(self, values: tuple[Any, ...]) -> RunResult:
         self._require_running()
         if self._dispatches:
@@ -889,19 +1015,8 @@ class Arena:
             for record in self.grains.values()
             if isinstance(record.outcome, Failed)
         )
-        metrics = {
-            "grains_per_rpc": (
-                self._dispatched_grains / self._dispatch_count
-                if self._dispatch_count
-                else 0.0
-            ),
-            "pending_dispatches": 0.0,
-            "tail_or_isolation_rpc_fraction": (
-                self._tail_or_isolation_dispatches / self._dispatch_count
-                if self._dispatch_count
-                else 0.0
-            ),
-        }
+        metrics = self.metrics_snapshot()
+        metrics["pending_dispatches"] = 0.0
         result = RunResult(
             outputs=values,
             failures=failures,
@@ -1324,19 +1439,73 @@ class _PipelineDriver:
                 progress |= self._plan_relate(node)
         return progress
 
+    def _admission_closed(self, node: Any) -> bool:
+        if node.kind in {
+            Primitive.MAP,
+            Primitive.FILTER,
+            Primitive.EXPAND,
+        }:
+            driving = next(
+                binding
+                for binding in node.inputs
+                if binding.role == self._driving_role(node)
+            )
+            return (
+                all(self.domains[binding.port].sealed for binding in node.inputs)
+                and all(
+                    (node.id, entity) in self.planned
+                    for entity in self.domains[driving.port].order
+                )
+            )
+        if node.kind is Primitive.REDUCE:
+            anchor = next(
+                binding
+                for binding in node.inputs
+                if binding.role == "anchor"
+            )
+            return (
+                self.domains[anchor.port].sealed
+                and all(
+                    (node.id, entity) in self.planned
+                    for entity in self.domains[anchor.port].order
+                )
+            )
+        if node.kind is Primitive.RELATE:
+            return node.id in self.relate_planned
+        return True
+
     def _dispatch(self) -> bool:
         progress = False
         for node in self.graph.nodes:
             if node.kind is Primitive.SOURCE:
                 continue
             while self.transport.can_submit(node.id):
-                plan = self.arena.reserve_dispatch(node.id)
+                plan = self.arena.reserve_dispatch(
+                    node.id,
+                    admission_closed=self._admission_closed(node),
+                )
                 if plan is None:
                     break
                 if not self.transport.submit(self.arena, plan):
                     raise ExecutionError("actor capacity changed during submit")
                 progress = True
         return progress
+
+    def _next_batch_delay(self) -> float | None:
+        delays = []
+        for node in self.graph.nodes:
+            if node.kind is Primitive.SOURCE:
+                continue
+            if not self.transport.can_submit(node.id):
+                continue
+            if self._admission_closed(node):
+                if self.arena.ready_count(node.id):
+                    return 0.0
+                continue
+            delay = self.arena.batch_wait_remaining(node.id)
+            if delay is not None:
+                delays.append(delay)
+        return min(delays) if delays else None
 
     def run(self) -> RunResult:
         final_ports = tuple(port.id for port in self.compiled.outputs)
@@ -1346,7 +1515,9 @@ class _PipelineDriver:
             progress |= self._seal_ports()
             progress |= self._dispatch()
             if self.transport.pending_dispatches:
-                result = self.transport.poll_one(timeout=1.0)
+                delay = self._next_batch_delay()
+                timeout = 1.0 if delay is None else min(1.0, delay)
+                result = self.transport.poll_one(timeout=timeout)
                 progress |= result is not None
                 continue
             if all(self.domains[port].sealed for port in final_ports):
@@ -1360,6 +1531,10 @@ class _PipelineDriver:
                 )
                 return self.arena.deliver_slices(output_items)
             if not progress:
+                delay = self._next_batch_delay()
+                if delay is not None:
+                    time.sleep(delay)
+                    continue
                 raise ExecutionError("pipeline reached a non-terminal deadlock")
 
 

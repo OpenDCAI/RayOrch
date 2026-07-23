@@ -191,15 +191,12 @@ class _TraceContext:
             )
             bindings = tuple(bindings_list)
 
-        known = {
-            "replicas",
-            "batch_size",
-            "error_policy",
-            "max_retries",
-        }
         execution = ExecutionOptions(
             replicas=int(options.pop("replicas", 1)),
             batch_size=int(options.pop("batch_size", 1)),
+            max_batch_wait_ms=float(
+                options.pop("max_batch_wait_ms", 2.0)
+            ),
             error_policy=str(options.pop("error_policy", "raise")),
             max_retries=int(options.pop("max_retries", 0)),
             options=tuple(options.items()),

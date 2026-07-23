@@ -309,3 +309,59 @@ def test_native_pipeline_sleeping_stages_overlap():
         first_b["stop"],
         second_a["stop"],
     )
+
+
+class StaggerExpand:
+    def run(self, parents):
+        outputs = []
+        for parent in parents:
+            if parent == "slow":
+                time.sleep(0.3)
+            outputs.append([parent])
+        return outputs
+
+
+class ObservePhysicalBatch:
+    def run(self, children):
+        return [(child, len(children)) for child in children]
+
+
+class BatchTriggerPipeline(mg.Pipeline):
+    def __init__(self, wait_ms: float):
+        self.expand = mg.Expand(StaggerExpand).ray_options(
+            replicas=2,
+            batch_size=1,
+        )
+        self.map = mg.Map(ObservePhysicalBatch).ray_options(
+            replicas=1,
+            batch_size=2,
+            max_batch_wait_ms=wait_ms,
+        )
+
+    def forward(self, parents):
+        return self.map(self.expand(parents))
+
+
+@pytest.mark.parametrize(
+    "wait_ms,expected_batch_size,expected_reason",
+    [
+        (500.0, 2, "flush_full"),
+        (20.0, 1, "flush_timeout"),
+    ],
+)
+def test_native_pipeline_batch_wait_balances_coalescing_and_latency(
+    wait_ms,
+    expected_batch_size,
+    expected_reason,
+):
+    """Staggered Ray arrivals obey the configured coalescing latency cap."""
+
+    result = mg.Executor(BatchTriggerPipeline(wait_ms)).run(
+        ["fast", "slow"]
+    )
+    by_child = dict(result.get())
+    assert by_child == {
+        "fast": expected_batch_size,
+        "slow": expected_batch_size,
+    }
+    assert result.metrics[expected_reason] >= 1.0
