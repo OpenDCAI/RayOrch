@@ -1,0 +1,184 @@
+{
+  "expand": {
+    "id": "a171e41c2fb49692395a5fdd5d862a5c",
+    "inputs": [
+      {
+        "items": [
+          {
+            "entity": "6b694133f679534416c5442105028d6d",
+            "port": [
+              0,
+              0
+            ]
+          }
+        ],
+        "role": "parent"
+      }
+    ],
+    "node": 10,
+    "outcome": {
+      "kind": "success",
+      "ports": [
+        [
+          {
+            "item": {
+              "entity": "31687715e161f56183ced6964d7305e6",
+              "port": [
+                10,
+                0
+              ]
+            },
+            "ordinal": 0
+          },
+          {
+            "item": {
+              "entity": "66503086741183cbcc0ef2ccb231f9ac",
+              "port": [
+                10,
+                0
+              ]
+            },
+            "ordinal": 1
+          },
+          {
+            "item": {
+              "entity": "cdabb4bd24902a3601db34741f2654de",
+              "port": [
+                10,
+                0
+              ]
+            },
+            "ordinal": 2
+          }
+        ],
+        [
+          {
+            "item": {
+              "entity": "31687715e161f56183ced6964d7305e6",
+              "port": [
+                10,
+                1
+              ]
+            },
+            "ordinal": 0
+          },
+          {
+            "item": {
+              "entity": "66503086741183cbcc0ef2ccb231f9ac",
+              "port": [
+                10,
+                1
+              ]
+            },
+            "ordinal": 1
+          },
+          {
+            "item": {
+              "entity": "cdabb4bd24902a3601db34741f2654de",
+              "port": [
+                10,
+                1
+              ]
+            },
+            "ordinal": 2
+          }
+        ]
+      ]
+    },
+    "output_slots": []
+  },
+  "reduce": {
+    "id": "05f0ff55726ed582eebeb6dd6684bf07",
+    "inputs": [
+      {
+        "items": [
+          {
+            "entity": "6b694133f679534416c5442105028d6d",
+            "port": [
+              0,
+              0
+            ]
+          }
+        ],
+        "role": "anchor"
+      },
+      {
+        "items": [
+          {
+            "entity": "31687715e161f56183ced6964d7305e6",
+            "port": [
+              30,
+              0
+            ]
+          },
+          {
+            "entity": "cdabb4bd24902a3601db34741f2654de",
+            "port": [
+              30,
+              0
+            ]
+          }
+        ],
+        "role": "members"
+      }
+    ],
+    "node": 40,
+    "outcome": {
+      "kind": "success",
+      "ports": [
+        [
+          {
+            "item": {
+              "entity": "6b694133f679534416c5442105028d6d",
+              "port": [
+                40,
+                0
+              ]
+            },
+            "ordinal": 0
+          }
+        ]
+      ]
+    },
+    "output_slots": [
+      {
+        "entity": "6b694133f679534416c5442105028d6d",
+        "port": [
+          40,
+          0
+        ]
+      }
+    ]
+  },
+  "source": {
+    "id": "8a8b9002d2cc65599075fbacb8d3fdbb",
+    "inputs": [],
+    "node": 0,
+    "outcome": {
+      "kind": "success",
+      "ports": [
+        [
+          {
+            "item": {
+              "entity": "6b694133f679534416c5442105028d6d",
+              "port": [
+                0,
+                0
+              ]
+            },
+            "ordinal": 0
+          }
+        ]
+      ]
+    },
+    "output_slots": [
+      {
+        "entity": "6b694133f679534416c5442105028d6d",
+        "port": [
+          0,
+          0
+        ]
+      }
+    ]
+  }
+}
