@@ -144,7 +144,8 @@ python -u -m rayorch.experimental.multigrain_v2_5.benchmark.mineru_cli \
 | V2.5 性能回归 | 24 PDF，inflight 3 | 128 | 521.836 s | 13.5522 | 8.82% |
 | V2.5 中等 batch | 单 Arena | 64 | 597.149 s | 11.8429 | 5.40% |
 | V2.5 小 batch | 24 PDF，inflight 4 | 16 | 898.394 s | 7.8718 | 2.07% |
-| Flash-MinerU baseline | doc-grain，inflight 4 | 8 PDFs | 891.980 s | 7.9284 | 未记录 |
+| 当前原生 Flash-MinerU | doc-grain，inflight 4 | 8 PDFs | 818.001 s | 8.6455 | 未记录 |
+| 历史 Flash-MinerU baseline | doc-grain，inflight 4 | 8 PDFs | 891.980 s | 7.9284 | 未记录 |
 
 V2.5 性能回归与旧 MG LPT 的差异：
 
@@ -155,6 +156,11 @@ V2.5 性能回归与旧 MG LPT 的差异：
 
 该差异处于真实模型运行的正常波动范围内。实验表明，只要 OCR RPC
 规模相近，V2.5 elastic streaming scheduler 可以回归到旧 MG 的吞吐水平。
+
+当前原生 Flash-MinerU commit `7246a35` 的重新实测结果为 `818.001s`，
+因此当前版本的原生对照应以该数字为准。原生实现和外层 PDF batch 对照见：
+
+`docs/experiments/multigrain_v2_5/2026-07-24_native_flash_mineru_baseline.md`。
 
 ### 5.2 性能回归实验中的 OCR Dispatch
 
