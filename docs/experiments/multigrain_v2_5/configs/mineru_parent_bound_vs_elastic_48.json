@@ -1,0 +1,44 @@
+{
+  "experiment": "mineru_parent_bound_vs_elastic_48",
+  "common": {
+    "limit": 48,
+    "replicas": 4,
+    "microbatch_size": 24,
+    "max_inflight_arenas": 3,
+    "max_batch_wait_ms": 10,
+    "gpu_memory_utilization": 0.9,
+    "render_replicas": 4,
+    "reduce_replicas": 1,
+    "num_cpus": 32,
+    "object_store_gb": 60,
+    "rss_interval_s": 1
+  },
+  "runs": [
+    {"tag": "e2_r1_parent_bound_bs16", "pair": "r1_bs16", "rep": 1, "mode": "parent_bound", "batch_size": 16},
+    {"tag": "e2_r1_elastic_bs16", "pair": "r1_bs16", "rep": 1, "mode": "elastic", "batch_size": 16},
+    {"tag": "e2_r1_parent_bound_bs32", "pair": "r1_bs32", "rep": 1, "mode": "parent_bound", "batch_size": 32},
+    {"tag": "e2_r1_elastic_bs32", "pair": "r1_bs32", "rep": 1, "mode": "elastic", "batch_size": 32},
+    {"tag": "e2_r1_parent_bound_bs64", "pair": "r1_bs64", "rep": 1, "mode": "parent_bound", "batch_size": 64},
+    {"tag": "e2_r1_elastic_bs64", "pair": "r1_bs64", "rep": 1, "mode": "elastic", "batch_size": 64},
+    {"tag": "e2_r1_parent_bound_bs128", "pair": "r1_bs128", "rep": 1, "mode": "parent_bound", "batch_size": 128},
+    {"tag": "e2_r1_elastic_bs128", "pair": "r1_bs128", "rep": 1, "mode": "elastic", "batch_size": 128},
+
+    {"tag": "e2_r2_elastic_bs16", "pair": "r2_bs16", "rep": 2, "mode": "elastic", "batch_size": 16},
+    {"tag": "e2_r2_parent_bound_bs16", "pair": "r2_bs16", "rep": 2, "mode": "parent_bound", "batch_size": 16},
+    {"tag": "e2_r2_elastic_bs32", "pair": "r2_bs32", "rep": 2, "mode": "elastic", "batch_size": 32},
+    {"tag": "e2_r2_parent_bound_bs32", "pair": "r2_bs32", "rep": 2, "mode": "parent_bound", "batch_size": 32},
+    {"tag": "e2_r2_elastic_bs64", "pair": "r2_bs64", "rep": 2, "mode": "elastic", "batch_size": 64},
+    {"tag": "e2_r2_parent_bound_bs64", "pair": "r2_bs64", "rep": 2, "mode": "parent_bound", "batch_size": 64},
+    {"tag": "e2_r2_elastic_bs128", "pair": "r2_bs128", "rep": 2, "mode": "elastic", "batch_size": 128},
+    {"tag": "e2_r2_parent_bound_bs128", "pair": "r2_bs128", "rep": 2, "mode": "parent_bound", "batch_size": 128},
+
+    {"tag": "e2_r3_elastic_bs16", "pair": "r3_bs16", "rep": 3, "mode": "elastic", "batch_size": 16},
+    {"tag": "e2_r3_parent_bound_bs16", "pair": "r3_bs16", "rep": 3, "mode": "parent_bound", "batch_size": 16},
+    {"tag": "e2_r3_parent_bound_bs32", "pair": "r3_bs32", "rep": 3, "mode": "parent_bound", "batch_size": 32},
+    {"tag": "e2_r3_elastic_bs32", "pair": "r3_bs32", "rep": 3, "mode": "elastic", "batch_size": 32},
+    {"tag": "e2_r3_elastic_bs64", "pair": "r3_bs64", "rep": 3, "mode": "elastic", "batch_size": 64},
+    {"tag": "e2_r3_parent_bound_bs64", "pair": "r3_bs64", "rep": 3, "mode": "parent_bound", "batch_size": 64},
+    {"tag": "e2_r3_parent_bound_bs128", "pair": "r3_bs128", "rep": 3, "mode": "parent_bound", "batch_size": 128},
+    {"tag": "e2_r3_elastic_bs128", "pair": "r3_bs128", "rep": 3, "mode": "elastic", "batch_size": 128}
+  ]
+}
