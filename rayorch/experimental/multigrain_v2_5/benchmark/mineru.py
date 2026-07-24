@@ -8,7 +8,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -228,6 +228,22 @@ class RssSummary:
     driver_end: int
     driver_peak: int
     gpu_memory_peak: tuple[int, ...]
+    gpu_samples: tuple["GpuSample", ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GpuDeviceSample:
+    index: int
+    utilization_percent: int | None
+    memory_used: int
+    memory_total: int
+
+
+@dataclass(frozen=True, slots=True)
+class GpuSample:
+    wall_time_s: float
+    monotonic_s: float
+    devices: tuple[GpuDeviceSample, ...]
 
 
 class RssSampler:
@@ -242,6 +258,7 @@ class RssSampler:
         self.end_rss = self.start_rss
         self.peak_rss = self.start_rss
         self.gpu_peak: list[int] = []
+        self.gpu_samples: list[GpuSample] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -262,6 +279,7 @@ class RssSampler:
             self.end_rss,
             self.peak_rss,
             tuple(self.gpu_peak),
+            tuple(self.gpu_samples),
         )
 
     def _run(self) -> None:
@@ -271,33 +289,51 @@ class RssSampler:
                     self.peak_rss,
                     int(self.process.memory_info().rss),
                 )
-                gpu_values = _gpu_memory_used()
-                if len(self.gpu_peak) < len(gpu_values):
-                    self.gpu_peak.extend(
-                        [0] * (len(gpu_values) - len(self.gpu_peak))
+                devices = _gpu_device_samples()
+                self.gpu_samples.append(
+                    GpuSample(
+                        wall_time_s=time.time(),
+                        monotonic_s=time.monotonic(),
+                        devices=devices,
                     )
-                for index, value in enumerate(gpu_values):
-                    self.gpu_peak[index] = max(
-                        self.gpu_peak[index],
-                        value,
+                )
+                if len(self.gpu_peak) < len(devices):
+                    self.gpu_peak.extend(
+                        [0] * (len(devices) - len(self.gpu_peak))
+                    )
+                for device in devices:
+                    self.gpu_peak[device.index] = max(
+                        self.gpu_peak[device.index],
+                        device.memory_used,
                     )
             except Exception:
                 continue
 
 
-def _gpu_memory_used() -> tuple[int, ...]:
+def _gpu_device_samples() -> tuple[GpuDeviceSample, ...]:
     try:
         import pynvml
 
         pynvml.nvmlInit()
-        values = tuple(
-            int(
-                pynvml.nvmlDeviceGetMemoryInfo(
-                    pynvml.nvmlDeviceGetHandleByIndex(index)
-                ).used
+        devices = []
+        for index in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            try:
+                utilization = int(
+                    pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+                )
+            except Exception:
+                utilization = None
+            devices.append(
+                GpuDeviceSample(
+                    index=index,
+                    utilization_percent=utilization,
+                    memory_used=int(memory.used),
+                    memory_total=int(memory.total),
+                )
             )
-            for index in range(pynvml.nvmlDeviceGetCount())
-        )
+        values = tuple(devices)
         pynvml.nvmlShutdown()
         return values
     except Exception:
@@ -312,7 +348,24 @@ def _runtime_env(flash_repo: str) -> dict[str, Any]:
     return {"env_vars": {"PYTHONPATH": pythonpath}}
 
 
+def _configure_timeline_profiling() -> None:
+    os.environ.setdefault("RAY_PROFILING", "1")
+    # Ray 2.50 documents zero here, but zero disables profile-event
+    # reporting in the installed runtime. A short positive interval
+    # preserves task spans for ray.timeline().
+    if int(os.environ.get("RAY_task_events_report_interval_ms", "100")) <= 0:
+        os.environ["RAY_task_events_report_interval_ms"] = "100"
+    else:
+        os.environ.setdefault(
+            "RAY_task_events_report_interval_ms",
+            "100",
+        )
+
+
 def run_mineru_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    if args.timeline_dir:
+        _configure_timeline_profiling()
+
     import ray
 
     flash_repo = os.path.abspath(args.flash_repo)
@@ -349,11 +402,20 @@ def run_mineru_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     sampler.start()
     started = time.perf_counter()
     try:
-        result = Executor(pipeline).run(pdfs)
+        result = Executor(
+            pipeline,
+            microbatch_size=args.microbatch_size,
+            max_inflight_arenas=args.max_inflight_arenas,
+        ).run(pdfs)
     finally:
         rss = sampler.stop()
     outputs = result.get()
     end_to_end = time.perf_counter() - started
+    artifact_paths = _write_observation_artifacts(
+        args.timeline_dir,
+        result.timeline,
+        rss.gpu_samples,
+    )
 
     pages = sum(int(output.get("pages", 0)) for output in outputs)
     metrics = result.metrics
@@ -388,6 +450,8 @@ def run_mineru_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "max_batch_wait_ms": args.max_batch_wait_ms,
         "replicas": args.replicas,
+        "microbatch_size": args.microbatch_size,
+        "max_inflight_arenas": args.max_inflight_arenas,
         "startup_s": round(metrics["startup_time_s"], 3),
         "measured_wall_s": round(metrics["measured_wall_time_s"], 3),
         "end_to_end_wall_s": round(end_to_end, 3),
@@ -411,11 +475,20 @@ def run_mineru_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "parent_p99_s": metrics["parent_completion_p99_s"],
         "live_blocks_at_delivery": metrics["live_blocks_at_delivery"],
         "live_blocks_high_watermark": metrics["live_blocks_high_watermark"],
+        "active_arenas_high_watermark": metrics.get(
+            "active_arenas_high_watermark",
+            1.0,
+        ),
+        "live_blocks_across_arenas_high_watermark": metrics.get(
+            "live_blocks_across_arenas_high_watermark",
+            metrics["live_blocks_high_watermark"],
+        ),
         "driver_rss_start": rss.driver_start,
         "driver_rss_end": rss.driver_end,
         "driver_rss_peak": rss.driver_peak,
         "worker_rss_peak": metrics["worker_rss_peak_bytes"],
         "gpu_memory_peak": rss.gpu_memory_peak,
+        "observation_artifacts": artifact_paths,
         "baseline_s": BASELINE_WALL_S,
         "previous_v2_s": PREVIOUS_V2_WALL_S,
         "speedup_vs_baseline": (
@@ -437,11 +510,48 @@ def run_mineru_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def _write_observation_artifacts(
+    timeline_dir: str,
+    dispatch_timeline: tuple[Any, ...],
+    gpu_samples: tuple[GpuSample, ...],
+) -> dict[str, Any]:
+    if not timeline_dir:
+        return {}
+
+    import ray
+
+    root = Path(timeline_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    dispatch_path = root / "dispatch_timeline.jsonl"
+    with dispatch_path.open("w", encoding="utf-8") as handle:
+        for event in dispatch_timeline:
+            handle.write(
+                json.dumps(asdict(event), ensure_ascii=False) + "\n"
+            )
+    gpu_path = root / "gpu_samples.jsonl"
+    with gpu_path.open("w", encoding="utf-8") as handle:
+        for sample in gpu_samples:
+            handle.write(
+                json.dumps(asdict(sample), ensure_ascii=False) + "\n"
+            )
+    ray_path = root / "ray_timeline.json"
+    ray_events = ray.timeline()
+    ray_path.write_text(json.dumps(ray_events), encoding="utf-8")
+    return {
+        "ray_timeline": str(ray_path),
+        "dispatch_timeline": str(dispatch_path),
+        "gpu_samples": str(gpu_path),
+        "ray_timeline_events": len(ray_events),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["elastic", "parent_bound"], default="elastic")
     parser.add_argument("--limit", type=int, default=4)
     parser.add_argument("--replicas", type=int, default=4)
+    parser.add_argument("--microbatch-size", type=int, default=24)
+    parser.add_argument("--max-inflight-arenas", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-batch-wait-ms", type=float, default=5.0)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -450,6 +560,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-cpus", type=int, default=32)
     parser.add_argument("--object-store-gb", type=float, default=60.0)
     parser.add_argument("--rss-interval-s", type=float, default=1.0)
+    parser.add_argument(
+        "--timeline-dir",
+        default="",
+        help=(
+            "write ray_timeline.json, dispatch_timeline.jsonl, and "
+            "gpu_samples.jsonl; worker profiling is enabled before ray.init"
+        ),
+    )
     parser.add_argument("--flash-repo", default=DEFAULT_FLASH_REPO)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--output-dir", default="")

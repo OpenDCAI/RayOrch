@@ -58,7 +58,18 @@ Pipeline
 → Executor.run
 ```
 
-结果（模型加载/readiness 与 measured wall 分开）：
+单次 run 的 bounded stream path 已实现：
+
+```text
+microbatch_size=24
+max_inflight_arenas=3
+多个独立 Arena 共享同一 persistent actor pool
+source positions 在切 Arena 前按 run-global ordinal 冻结
+完成 Arena 立即 detached delivery + reclaim
+```
+
+以下 491.74 s 结果来自此前的单 Arena、OCR batch 256 实验。模型加载/readiness
+与 measured wall 分开：
 
 ```text
 startup                          41.98 s
@@ -97,6 +108,52 @@ token Jaccard >= 0.98           331/368 (89.95 %)
 
 该分布与既有 vLLM batching jitter 范围一致；不宣称 byte-identical。
 Benchmark CLI：`python -m rayorch.experimental.multigrain_v2_5.benchmark.mineru_cli`。
+
+### 小 OCR batch + microbatch inflight 复测
+
+48 PDFs / 992 pages / 4×H20，`microbatch_size=24`、
+`max_inflight_arenas=3`：
+
+| OCR batch | measured wall | pages/s | OCR bubble | worker RSS peak |
+|---:|---:|---:|---:|---:|
+| 16 | 104.19 s | 9.52 | 5.09 % | 11.51 GB |
+| 64 | 77.99 s | 12.72 | 8.75 % | 10.12 GB |
+
+与单 Arena 对照几乎相同（batch16 104.10 s；batch64 75.33 s）。说明 V2.5
+单 Arena 已经能在 grain 级别让 render/OCR/reduce 流水线重叠；multi-arena 的主要收益是
+bounded live set 和每 microbatch reclaim，而不是修复 actor starvation。
+
+Full 368-PDF batch64 单 Arena 结果为 597.15 s、OCR bubble 5.40 %、worker RSS peak
+37.60 GB；GPU actors 已经较忙，但 vLLM 小调用效率显著低于 batch256 的 491.74 s。
+因此暂不增加 per-actor queued pending/concurrency，后续优先精确区分 actor/EngineCore
+RSS/PSS/USS。
+
+使用旧 MG 的宏观参数重新运行 V2.5：
+
+```text
+microbatch_size                 24 PDFs
+max_inflight_arenas             3
+render replicas                 4
+OCR replicas                    4
+OCR batch_size                  128 pages/RPC/replica
+Reduce replicas                 1
+```
+
+全量 368-PDF 结果：
+
+```text
+V2.5 measured wall              521.836 s
+previous MG LPT                 519.950 s
+difference                        1.886 s / 0.36 %
+OCR RPC count                       65
+active Arena high watermark          3
+```
+
+这表明此前 batch16 的 898.394 s 主要是 OCR UDF 调用粒度回归，不是
+multi-Arena overlap 或单 driver event loop 失效。完整实验方法、timeline、
+GPU/RSS 采样和 artifact 路径见：
+
+`docs/experiments/multigrain_v2_5/2026-07-24_mineru_overlap_and_batching.md`。
 
 ---
 
