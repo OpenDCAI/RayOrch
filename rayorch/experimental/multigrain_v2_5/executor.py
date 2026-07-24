@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Mapping
@@ -157,6 +158,7 @@ class RunResult:
     sources: tuple[SourceSnapshot, ...] = ()
     metrics: Mapping[str, float] = field(default_factory=dict)
     timeline: tuple[DispatchTimeline, ...] = ()
+    parent_latencies_s: tuple[float, ...] = ()
 
     def get(self) -> tuple[Any, ...]:
         """Resolve final Ray BlockSlices; local values pass through unchanged."""
@@ -267,6 +269,13 @@ class Arena:
         self.state = ArenaState.ABORTED
         self._reclaim()
         raise ArenaAbort(reason)
+
+    def cancel(self, reason: str) -> None:
+        if self.state is ArenaState.RECLAIMED:
+            return
+        self.abort_reason = reason
+        self.state = ArenaState.ABORTED
+        self._reclaim()
 
     def _reclaim(self) -> None:
         self.grains = GrainTable()
@@ -599,6 +608,10 @@ class Arena:
 
     def ready_count(self, node_id: int) -> int:
         return len(self._ready.get(node_id, ()))
+
+    @property
+    def live_block_count(self) -> int:
+        return len(self._blocks)
 
     def batch_wait_remaining(
         self,
@@ -1037,21 +1050,7 @@ class Arena:
         return self._deliver(tuple(self.resolve(item) for item in outputs))
 
     def metrics_snapshot(self) -> dict[str, float]:
-        parent_latencies = []
-        for record in self.grains.values():
-            if self.graph.node(record.node).kind is not Primitive.REDUCE:
-                continue
-            completed = self._grain_completed_at.get(record.id)
-            if completed is None:
-                continue
-            anchor_roles = [
-                role for role in record.inputs if role.role == "anchor"
-            ]
-            if len(anchor_roles) != 1 or len(anchor_roles[0].items) != 1:
-                continue
-            admitted = self._source_time_for_item(anchor_roles[0].items[0])
-            if admitted is not None:
-                parent_latencies.append(completed - admitted)
+        parent_latencies = self.parent_latencies()
         metrics = {
             "grains_per_rpc": (
                 self._dispatched_grains / self._dispatch_count
@@ -1089,6 +1088,24 @@ class Arena:
             }
         )
         return metrics
+
+    def parent_latencies(self) -> list[float]:
+        parent_latencies = []
+        for record in self.grains.values():
+            if self.graph.node(record.node).kind is not Primitive.REDUCE:
+                continue
+            completed = self._grain_completed_at.get(record.id)
+            if completed is None:
+                continue
+            anchor_roles = [
+                role for role in record.inputs if role.role == "anchor"
+            ]
+            if len(anchor_roles) != 1 or len(anchor_roles[0].items) != 1:
+                continue
+            admitted = self._source_time_for_item(anchor_roles[0].items[0])
+            if admitted is not None:
+                parent_latencies.append(completed - admitted)
+        return parent_latencies
 
     def _source_time_for_item(
         self,
@@ -1138,6 +1155,7 @@ class Arena:
             failures=failures,
             sources=tuple(self._sources),
             metrics=metrics,
+            parent_latencies_s=tuple(self.parent_latencies()),
         )
         self.state = ArenaState.DELIVERED
         self._reclaim()
@@ -1191,18 +1209,35 @@ class _PipelineDriver:
         self.barriers: dict[tuple[int, Any], Any] = {}
         self.relate_planned: set[int] = set()
 
-    def admit_sources(self, batches: tuple[Any, ...]) -> None:
+    def admit_sources(
+        self,
+        batches: tuple[Any, ...],
+        *,
+        position_starts: tuple[int, ...] | None = None,
+    ) -> None:
         import ray
 
         if len(batches) != len(self.compiled.source_ports):
             raise ExecutionError("source argument count does not match Pipeline.forward")
-        for public_port, values in zip(self.compiled.source_ports, batches):
+        if position_starts is None:
+            position_starts = tuple(0 for _ in batches)
+        if len(position_starts) != len(batches):
+            raise ExecutionError("source position starts do not match source ports")
+        for public_port, values, position_start in zip(
+            self.compiled.source_ports,
+            batches,
+            position_starts,
+        ):
             if not isinstance(values, (list, tuple)):
                 raise ExecutionError("each source argument must be a finite sequence")
             node = self.graph.producer(public_port.id)
             records = tuple(
-                admit_source(node, self.arena.run_salt, position)
-                for position in range(len(values))
+                admit_source(
+                    node,
+                    self.arena.run_salt,
+                    position_start + local_position,
+                )
+                for local_position in range(len(values))
             )
             self.arena.admit_source_batch(records, ray.put(tuple(values)))
             domain = self.domains[public_port.id]
@@ -1665,41 +1700,275 @@ class _PipelineDriver:
                 delays.append(delay)
         return min(delays) if delays else None
 
-    def run(self) -> RunResult:
+    def step(self) -> bool:
+        progress = self._publish_terminal_records()
+        progress |= self._plan()
+        progress |= self._seal_ports()
+        progress |= self._dispatch()
+        return progress
+
+    def next_batch_delay(self) -> float | None:
+        return self._next_batch_delay()
+
+    def is_complete(self) -> bool:
         final_ports = tuple(port.id for port in self.compiled.outputs)
-        while True:
-            progress = self._publish_terminal_records()
-            progress |= self._plan()
-            progress |= self._seal_ports()
-            progress |= self._dispatch()
-            if self.transport.pending_dispatches:
-                delay = self._next_batch_delay()
+        return (
+            all(self.domains[port].sealed for port in final_ports)
+            and self.transport.pending_for_arena(self.arena.id) == 0
+        )
+
+    def finish(self) -> RunResult:
+        if not self.is_complete():
+            raise ExecutionError("cannot finish an incomplete microbatch arena")
+        final_ports = tuple(port.id for port in self.compiled.outputs)
+        output_items = tuple(
+            receipt.item
+            for port in final_ports
+            for entity in self.domains[port].order
+            for receipt in (self.domains[port].receipts[entity],)
+            if receipt.state is ReceiptState.PRESENT
+            and receipt.item is not None
+        )
+        return self.arena.deliver_slices(output_items)
+
+    def run(self) -> RunResult:
+        while not self.is_complete():
+            progress = self.step()
+            if self.transport.pending_for_arena(self.arena.id):
+                delay = self.next_batch_delay()
                 timeout = 1.0 if delay is None else min(1.0, delay)
-                result = self.transport.poll_one(timeout=timeout)
-                progress |= result is not None
+                self.transport.poll_one(timeout=timeout)
                 continue
-            if all(self.domains[port].sealed for port in final_ports):
-                output_items = tuple(
-                    receipt.item
-                    for port in final_ports
-                    for entity in self.domains[port].order
-                    for receipt in (self.domains[port].receipts[entity],)
-                    if receipt.state is ReceiptState.PRESENT
-                    and receipt.item is not None
-                )
-                return self.arena.deliver_slices(output_items)
             if not progress:
-                delay = self._next_batch_delay()
+                delay = self.next_batch_delay()
                 if delay is not None:
                     time.sleep(delay)
                     continue
                 raise ExecutionError("pipeline reached a non-terminal deadlock")
+        return self.finish()
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceChunk:
+    index: int
+    batches: tuple[tuple[Any, ...], ...]
+    position_starts: tuple[int, ...]
+
+
+class _RunCoordinator:
+    """Multiplex bounded microbatch Arenas over one persistent actor transport."""
+
+    def __init__(
+        self,
+        compiled: CompiledPipeline,
+        transport: "RayTransport",
+        chunks: tuple[_SourceChunk, ...],
+        *,
+        run_salt: bytes,
+        arena_id_start: int,
+        max_inflight: int,
+        limits: ArenaLimits,
+    ) -> None:
+        self.compiled = compiled
+        self.transport = transport
+        self.pending = deque(chunks)
+        self.run_salt = run_salt
+        self.next_arena_id = arena_id_start
+        self.max_inflight = max(1, max_inflight)
+        self.limits = limits
+        self.active: dict[int, _PipelineDriver] = {}
+        self.completed: dict[int, RunResult] = {}
+        self.active_high_watermark = 0
+        self.live_blocks_high_watermark = 0
+
+    def _admit(self) -> bool:
+        progress = False
+        while self.pending and len(self.active) < self.max_inflight:
+            chunk = self.pending.popleft()
+            arena = Arena(
+                self.next_arena_id,
+                self.compiled.graph,
+                self.run_salt,
+                limits=self.limits,
+            )
+            self.next_arena_id += 1
+            driver = _PipelineDriver(self.compiled, arena, self.transport)
+            driver.admit_sources(
+                chunk.batches,
+                position_starts=chunk.position_starts,
+            )
+            self.active[chunk.index] = driver
+            progress = True
+        self.active_high_watermark = max(
+            self.active_high_watermark,
+            len(self.active),
+        )
+        return progress
+
+    def _next_delay(self) -> float | None:
+        delays = [
+            delay
+            for driver in self.active.values()
+            for delay in (driver.next_batch_delay(),)
+            if delay is not None
+        ]
+        return min(delays) if delays else None
+
+    def _sample_live_blocks(self) -> None:
+        self.live_blocks_high_watermark = max(
+            self.live_blocks_high_watermark,
+            sum(
+                driver.arena.live_block_count
+                for driver in self.active.values()
+            ),
+        )
+
+    def _finish_completed(self) -> bool:
+        progress = False
+        for chunk_index, driver in tuple(self.active.items()):
+            if not driver.is_complete():
+                continue
+            self.completed[chunk_index] = driver.finish()
+            self.active.pop(chunk_index)
+            progress = True
+        return progress
+
+    def _cancel_all(self, reason: str) -> None:
+        for driver in self.active.values():
+            self.transport.cancel_arena(driver.arena.id)
+            driver.arena.cancel(reason)
+        self.active.clear()
+
+    def run(self) -> tuple[RunResult, int, int, int]:
+        try:
+            self._admit()
+            while self.pending or self.active or self.transport.pending_dispatches:
+                progress = False
+                for chunk_index in sorted(self.active):
+                    progress |= self.active[chunk_index].step()
+                self._sample_live_blocks()
+                progress |= self._finish_completed()
+                progress |= self._admit()
+                self._sample_live_blocks()
+
+                if self.transport.pending_dispatches:
+                    delay = self._next_delay()
+                    timeout = 1.0 if delay is None else min(1.0, delay)
+                    progress |= self.transport.poll_one(timeout=timeout) is not None
+                    continue
+                if not progress and (self.pending or self.active):
+                    delay = self._next_delay()
+                    if delay is not None:
+                        time.sleep(delay)
+                        continue
+                    raise ExecutionError(
+                        "multi-arena run reached a non-terminal deadlock"
+                    )
+        except Exception:
+            self._cancel_all("run coordinator fail-fast")
+            raise
+
+        parts = tuple(self.completed[index] for index in sorted(self.completed))
+        return (
+            _merge_partial_results(parts),
+            self.next_arena_id,
+            self.active_high_watermark,
+            self.live_blocks_high_watermark,
+        )
+
+
+def _merge_partial_results(parts: tuple[RunResult, ...]) -> RunResult:
+    outputs = tuple(value for part in parts for value in part.outputs)
+    failures = tuple(value for part in parts for value in part.failures)
+    sources = tuple(value for part in parts for value in part.sources)
+    latencies = tuple(
+        value for part in parts for value in part.parent_latencies_s
+    )
+    rpc_count = sum(part.metrics.get("rpc_count", 0.0) for part in parts)
+    grains = sum(
+        part.metrics.get("grains_per_rpc", 0.0)
+        * part.metrics.get("rpc_count", 0.0)
+        for part in parts
+    )
+    capacity = sum(
+        (
+            part.metrics.get("grains_per_rpc", 0.0)
+            * part.metrics.get("rpc_count", 0.0)
+            / part.metrics.get("batch_fill_ratio", 1.0)
+        )
+        if part.metrics.get("batch_fill_ratio", 0.0) > 0
+        else 0.0
+        for part in parts
+    )
+    tail_calls = sum(
+        part.metrics.get("tail_or_isolation_rpc_fraction", 0.0)
+        * part.metrics.get("rpc_count", 0.0)
+        for part in parts
+    )
+    metrics = {
+        "rpc_count": rpc_count,
+        "grains_per_rpc": grains / rpc_count if rpc_count else 0.0,
+        "batch_fill_ratio": grains / capacity if capacity else 0.0,
+        "tail_or_isolation_rpc_fraction": (
+            tail_calls / rpc_count if rpc_count else 0.0
+        ),
+        "pending_dispatches": 0.0,
+        "ready_queue_high_watermark": max(
+            (
+                part.metrics.get("ready_queue_high_watermark", 0.0)
+                for part in parts
+            ),
+            default=0.0,
+        ),
+        "live_blocks_at_delivery": max(
+            (
+                part.metrics.get("live_blocks_at_delivery", 0.0)
+                for part in parts
+            ),
+            default=0.0,
+        ),
+        "live_blocks_high_watermark": max(
+            (
+                part.metrics.get("live_blocks_high_watermark", 0.0)
+                for part in parts
+            ),
+            default=0.0,
+        ),
+        "parent_completion_count": float(len(latencies)),
+        "parent_completion_p50_s": percentile(list(latencies), 0.50),
+        "parent_completion_p95_s": percentile(list(latencies), 0.95),
+        "parent_completion_p99_s": percentile(list(latencies), 0.99),
+    }
+    for reason in (
+        "full",
+        "timeout",
+        "port_sealed",
+        "arena_drain",
+        "isolation",
+    ):
+        metrics[f"flush_{reason}"] = sum(
+            part.metrics.get(f"flush_{reason}", 0.0) for part in parts
+        )
+    return RunResult(
+        outputs=outputs,
+        failures=failures,
+        sources=sources,
+        metrics=metrics,
+        parent_latencies_s=latencies,
+    )
 
 
 class Executor:
     """Factory for explicit arenas and traced Pipeline execution."""
 
-    def __init__(self, graph: CompiledGraph | Pipeline | CompiledPipeline) -> None:
+    def __init__(
+        self,
+        graph: CompiledGraph | Pipeline | CompiledPipeline,
+        *,
+        microbatch_size: int | None = None,
+        max_inflight_arenas: int = 1,
+        arena_limits: ArenaLimits = ArenaLimits(),
+    ) -> None:
         if isinstance(graph, Pipeline):
             self.compiled_pipeline: CompiledPipeline | None = graph.compile()
             self.graph = self.compiled_pipeline.graph
@@ -1709,6 +1978,13 @@ class Executor:
         else:
             self.compiled_pipeline = None
             self.graph = graph
+        if microbatch_size is not None and microbatch_size <= 0:
+            raise ValueError("microbatch_size must be positive")
+        if max_inflight_arenas <= 0:
+            raise ValueError("max_inflight_arenas must be positive")
+        self.microbatch_size = microbatch_size
+        self.max_inflight_arenas = max_inflight_arenas
+        self.arena_limits = arena_limits
         self._next_arena = 0
 
     def new_arena(
@@ -1737,23 +2013,55 @@ class Executor:
             )
         import secrets
 
-        arena = self.new_arena(
-            self._next_arena,
-            secrets.token_bytes(16),
+        if not sources or any(
+            not isinstance(source, (list, tuple)) for source in sources
+        ):
+            raise ExecutionError("Executor.run sources must be finite sequences")
+        lengths = {len(source) for source in sources}
+        if len(lengths) != 1:
+            raise ExecutionError("all source sequences must have equal length")
+        total = next(iter(lengths))
+        chunk_size = self.microbatch_size or max(total, 1)
+        chunks = tuple(
+            _SourceChunk(
+                index=chunk_index,
+                batches=tuple(
+                    tuple(source[start : start + chunk_size])
+                    for source in sources
+                ),
+                position_starts=tuple(start for _ in sources),
+            )
+            for chunk_index, start in enumerate(range(0, total, chunk_size))
         )
-        self._next_arena += 1
+        if not chunks:
+            chunks = (
+                _SourceChunk(
+                    index=0,
+                    batches=tuple(() for _ in sources),
+                    position_starts=tuple(0 for _ in sources),
+                ),
+            )
+        run_salt = secrets.token_bytes(16)
         end_to_end_started_at = time.monotonic()
         transport = self.ray_transport()
         try:
             transport.ready()
             measured_started_at = time.monotonic()
-            driver = _PipelineDriver(
+            coordinator = _RunCoordinator(
                 self.compiled_pipeline,
-                arena,
                 transport,
+                chunks,
+                run_salt=run_salt,
+                arena_id_start=self._next_arena,
+                max_inflight=self.max_inflight_arenas,
+                limits=self.arena_limits,
             )
-            driver.admit_sources(tuple(sources))
-            result = driver.run()
+            (
+                result,
+                self._next_arena,
+                active_arenas_high_watermark,
+                live_blocks_across_arenas_high_watermark,
+            ) = coordinator.run()
             measured_finished_at = time.monotonic()
             timeline = transport.timeline()
             metrics = dict(result.metrics)
@@ -1767,6 +2075,12 @@ class Executor:
                     ),
                     "end_to_end_wall_time_s": (
                         measured_finished_at - end_to_end_started_at
+                    ),
+                    "active_arenas_high_watermark": float(
+                        active_arenas_high_watermark
+                    ),
+                    "live_blocks_across_arenas_high_watermark": float(
+                        live_blocks_across_arenas_high_watermark
                     ),
                 }
             )
@@ -1845,6 +2159,29 @@ class RayTransport:
     @property
     def pending_dispatches(self) -> int:
         return len(self._pending)
+
+    def pending_for_arena(self, arena_id: int) -> int:
+        return sum(
+            pending.arena.id == arena_id
+            for pending in self._pending.values()
+        )
+
+    def cancel_arena(self, arena_id: int) -> None:
+        """Best-effort cancel and forget all pending callbacks for one arena."""
+
+        import ray
+
+        for manifest_ref, pending in tuple(self._pending.items()):
+            if pending.arena.id != arena_id:
+                continue
+            self._pending.pop(manifest_ref, None)
+            self._pending_by_actor[
+                (pending.node, pending.actor_index)
+            ] -= 1
+            try:
+                ray.cancel(manifest_ref, force=True)
+            except Exception:
+                pass
 
     def can_submit(self, node: int) -> bool:
         return any(

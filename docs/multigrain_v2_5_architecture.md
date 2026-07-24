@@ -1971,6 +1971,8 @@ Phase 1 不在没有 executor 时宣称已验证。
 - generic-error isolation。
 - `Pipeline.forward` symbolic tracing 到同一 `CompiledGraph`；
 - public `Executor(Pipeline).run(...)` event-loop driving；
+- 单次 run 内 bounded microbatch Arenas 共享 persistent actors；
+- `microbatch_size` 与 `max_inflight_arenas` 提供跨 stage overlap 和 arena-level reclaim；
 - 每个 Dispatch/output-port 一个 coarse ObjectRef；
 - bounded sealed int-key Relate 只作为 integration generality case。
 
