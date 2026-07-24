@@ -1799,6 +1799,12 @@ grains 不跨 origin anchor 混合；默认和用户主路径仍是 `batch_scope
 bounded `DispatchTimeline`（node/actor/grain count/flush reason/submit-worker-commit timestamps），
 RunResult 只携带 detached timeline 与 parent completion percentiles，不引用 arena。
 
+实验 runner 在 source admission 前等待所有 persistent actors readiness，并分开记录
+`startup_time/measured_wall_time/end_to_end_wall_time`。parent-bound 与 elastic 使用同一
+fixed-seed workload 做 paired repetitions，执行顺序按 repetition 确定性打乱；所有 raw trials
+写 JSONL，summary JSON/CSV 只做 median/p25/p75/min/max 聚合，且每对模式必须具有相同 final
+output digest。完整矩阵通过 manual CLI 运行，不放入默认 pytest。
+
 ### 20.4 RQ2：fault containment
 
 比较：

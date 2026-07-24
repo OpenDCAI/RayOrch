@@ -15,6 +15,7 @@ from .grain import (
     ExpandOrigin,
     ExpandOriginIndex,
     Failed,
+    FiberState,
     GrainFailure,
     GrainId,
     GrainPhase,
@@ -231,6 +232,7 @@ class Arena:
 
         self._blocks: dict[int, Any] = {}
         self._next_block = 0
+        self._blocks_high_watermark = 0
         self._next_dispatch = 0
         self._dispatches: dict[int, DispatchRuntime] = {}
         self._ready: dict[int, list[GrainId]] = {}
@@ -410,6 +412,10 @@ class Arena:
         block = self._next_block
         self._next_block += 1
         self._blocks[block] = values
+        self._blocks_high_watermark = max(
+            self._blocks_high_watermark,
+            len(self._blocks),
+        )
         return block
 
     def enqueue_ready(self, record: GrainRecord) -> None:
@@ -871,6 +877,10 @@ class Arena:
         try:
             for block, values in delta.blocks:
                 self._blocks[block] = values
+            self._blocks_high_watermark = max(
+                self._blocks_high_watermark,
+                len(self._blocks),
+            )
             for item, location in delta.values:
                 self.values.put(item, location)
             for record, token, outcome in delta.outcomes:
@@ -1062,6 +1072,10 @@ class Arena:
             ),
             "ready_queue_high_watermark": float(
                 self._ready_queue_high_watermark
+            ),
+            "live_blocks_at_delivery": float(len(self._blocks)),
+            "live_blocks_high_watermark": float(
+                self._blocks_high_watermark
             ),
             "parent_completion_count": float(len(parent_latencies)),
             "parent_completion_p50_s": percentile(parent_latencies, 0.50),
@@ -1398,11 +1412,53 @@ class _PipelineDriver:
                         )
             else:
                 barrier.block_origin(origin_record.id)
+            aligned_roles: list[RoleItems] = []
+            aligned_causes: list[GrainId] = []
+            aligned_pending = False
+            if barrier.state is FiberState.READY:
+                member_items = barrier.present_members()
+                for binding in node.inputs:
+                    if binding.role in {"anchor", "members"}:
+                        continue
+                    domain = self.domains[binding.port]
+                    aligned_items: list[ItemRef] = []
+                    for member in member_items:
+                        receipt = domain.receipts.get(member.entity)
+                        if receipt is None:
+                            if domain.sealed:
+                                raise ExecutionError(
+                                    f"sealed aligned Reduce role "
+                                    f"{binding.role!r} lost entity"
+                                )
+                            aligned_pending = True
+                            break
+                        if receipt.state is ReceiptState.NORMAL_ABSENCE:
+                            raise ExecutionError(
+                                f"aligned Reduce role {binding.role!r} "
+                                "is normally absent"
+                            )
+                        assert receipt.item is not None
+                        aligned_items.append(receipt.item)
+                        if receipt.state in {
+                            ReceiptState.FAILED,
+                            ReceiptState.SUPPRESSED,
+                        }:
+                            assert receipt.cause is not None
+                            aligned_causes.append(receipt.cause)
+                    if aligned_pending:
+                        break
+                    aligned_roles.append(
+                        RoleItems(binding.role, tuple(aligned_items))
+                    )
+            if aligned_pending:
+                continue
             decision = plan_reduce(
                 node,
                 self.arena.run_salt,
                 anchor,
                 barrier,
+                aligned_roles=tuple(aligned_roles),
+                aligned_causes=tuple(aligned_causes),
             )
             if decision.action is PlanAction.WAIT:
                 continue
@@ -1686,8 +1742,11 @@ class Executor:
             secrets.token_bytes(16),
         )
         self._next_arena += 1
+        end_to_end_started_at = time.monotonic()
         transport = self.ray_transport()
         try:
+            transport.ready()
+            measured_started_at = time.monotonic()
             driver = _PipelineDriver(
                 self.compiled_pipeline,
                 arena,
@@ -1695,7 +1754,41 @@ class Executor:
             )
             driver.admit_sources(tuple(sources))
             result = driver.run()
-            return replace(result, timeline=transport.timeline())
+            measured_finished_at = time.monotonic()
+            timeline = transport.timeline()
+            metrics = dict(result.metrics)
+            metrics.update(
+                {
+                    "startup_time_s": (
+                        measured_started_at - end_to_end_started_at
+                    ),
+                    "measured_wall_time_s": (
+                        measured_finished_at - measured_started_at
+                    ),
+                    "end_to_end_wall_time_s": (
+                        measured_finished_at - end_to_end_started_at
+                    ),
+                }
+            )
+            metrics.update(
+                {
+                    f"actor_count_node_{node}": float(count)
+                    for node, count in transport.actor_counts().items()
+                }
+            )
+            worker_rss = [
+                event.worker_rss_bytes
+                for event in timeline
+                if event.worker_rss_bytes is not None
+            ]
+            metrics["worker_rss_peak_bytes"] = float(
+                max(worker_rss, default=0)
+            )
+            return replace(
+                result,
+                metrics=metrics,
+                timeline=timeline,
+            )
         finally:
             transport.shutdown()
 
@@ -1901,6 +1994,24 @@ class RayTransport:
             ray.get([actor.stats.remote() for actor in self._actors[node]])
         )
 
+    def ready(self) -> None:
+        """Block until every persistent actor has finished construction."""
+
+        import ray
+
+        refs = [
+            actor.stats.remote()
+            for actors in self._actors.values()
+            for actor in actors
+        ]
+        if refs:
+            ray.get(refs)
+
+    def actor_counts(self) -> dict[int, int]:
+        return {
+            node: len(actors) for node, actors in self._actors.items()
+        }
+
     def timeline(self) -> tuple[DispatchTimeline, ...]:
         return tuple(self._timeline)
 
@@ -1930,6 +2041,11 @@ class RayTransport:
                 ),
                 worker_finished_at=(
                     manifest.worker_finished_at
+                    if manifest is not None
+                    else None
+                ),
+                worker_rss_bytes=(
+                    manifest.worker_rss_bytes
                     if manifest is not None
                     else None
                 ),

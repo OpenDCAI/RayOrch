@@ -144,15 +144,19 @@ class _TraceContext:
         reduce_members = None
         relate_keys = ()
         if kind is Primitive.REDUCE:
-            if args or set(kwargs) != {"anchor", "members"}:
+            if args or not {"anchor", "members"}.issubset(kwargs):
                 raise CompileError(
-                    "Reduce must be called as reduce(anchor=..., members=...)"
+                    "Reduce must provide anchor=... and members=..."
                 )
             anchor = _require_port(kwargs["anchor"])
             members = _require_port(kwargs["members"])
             bindings = (
                 InputBinding("anchor", anchor.id),
                 InputBinding("members", members.id),
+            ) + tuple(
+                InputBinding(role, _require_port(value).id)
+                for role, value in kwargs.items()
+                if role not in {"anchor", "members"}
             )
             reduce_anchor = anchor.id
             reduce_members = members.id

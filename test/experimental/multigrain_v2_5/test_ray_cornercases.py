@@ -321,7 +321,9 @@ def test_filter_all_true_all_false_partial_and_absence_short_circuit():
             _resolve(arena.slice(record.output_slots[0]))
             for record in downstream_records
         ) == ("t0", "t1", "t2", "p0", "p2")
-        assert transport.actor_stats(2) == ({"calls": 1},)
+        assert tuple(
+            stats["calls"] for stats in transport.actor_stats(2)
+        ) == (1,)
     finally:
         transport.shutdown()
 
@@ -509,7 +511,9 @@ def test_expand_zero_skew_multi_output_and_reduce_empty_filtered_ordered():
             "all=>[]",
             "partial=>[partial:0,partial:2]",
         )
-        assert transport.actor_stats(3) == ({"calls": 1},)
+        assert tuple(
+            stats["calls"] for stats in transport.actor_stats(3)
+        ) == (1,)
     finally:
         transport.shutdown()
 

@@ -365,3 +365,61 @@ def test_native_pipeline_batch_wait_balances_coalescing_and_latency(
         "slow": expected_batch_size,
     }
     assert result.metrics[expected_reason] >= 1.0
+
+
+class PageExpand:
+    def run(self, documents):
+        return [
+            [
+                {"doc": document, "page": ordinal}
+                for ordinal in range(2)
+            ]
+            for document in documents
+        ]
+
+
+class PageOcr:
+    def run(self, pages):
+        return [f"text:{page['doc']}:{page['page']}" for page in pages]
+
+
+class AssembleWithPages:
+    def run(self, documents, contents, pages):
+        return [
+            (
+                document,
+                tuple(contents_group),
+                tuple(page["page"] for page in page_group),
+            )
+            for document, contents_group, page_group in zip(
+                documents,
+                contents,
+                pages,
+            )
+        ]
+
+
+class AlignedReducePipeline(mg.Pipeline):
+    def __init__(self):
+        self.expand = mg.Expand(PageExpand).ray_options(batch_size=2)
+        self.ocr = mg.Map(PageOcr).ray_options(batch_size=4)
+        self.reduce = mg.Reduce(AssembleWithPages).ray_options(batch_size=2)
+
+    def forward(self, documents):
+        pages = self.expand(documents)
+        contents = self.ocr(pages)
+        return self.reduce(
+            anchor=documents,
+            members=contents,
+            pages=pages,
+        )
+
+
+def test_native_reduce_receives_aligned_secondary_fiber_in_ordinal_order():
+    """Reduce can consume OCR contents plus the original ordered page records."""
+
+    result = mg.Executor(AlignedReducePipeline()).run(["a", "b"])
+    assert result.get() == (
+        ("a", ("text:a:0", "text:a:1"), (0, 1)),
+        ("b", ("text:b:0", "text:b:1"), (0, 1)),
+    )

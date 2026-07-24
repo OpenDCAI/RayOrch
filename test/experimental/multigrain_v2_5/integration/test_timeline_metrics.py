@@ -67,6 +67,12 @@ def test_reduce_completion_metrics_are_detached_and_monotonic():
 
     result = mg.Executor(TimelinePipeline()).run(["a", "b", "c", "d"])
     metrics = result.metrics
+    assert metrics["startup_time_s"] >= 0
+    assert metrics["measured_wall_time_s"] > 0
+    assert (
+        metrics["end_to_end_wall_time_s"]
+        >= metrics["measured_wall_time_s"]
+    )
     assert metrics["parent_completion_count"] == 4.0
     assert 0 < metrics["parent_completion_p50_s"]
     assert (

@@ -479,11 +479,24 @@ def plan_reduce(
     run_salt: bytes,
     anchor: BindingReceipt,
     barrier: FiberBarrier,
+    *,
+    aligned_roles: tuple[RoleItems, ...] = (),
+    aligned_causes: tuple[GrainId, ...] = (),
 ) -> PlanDecision:
     if node.kind is not Primitive.REDUCE:
         raise PlannerContractError("plan_reduce requires a Reduce NodeSpec")
     if anchor.role != "anchor":
         raise PlannerContractError("Reduce anchor receipt has wrong role")
+    expected_aligned_roles = tuple(
+        binding.role
+        for binding in node.inputs
+        if binding.role not in {"anchor", "members"}
+    )
+    provided_aligned_roles = tuple(role.role for role in aligned_roles)
+    if provided_aligned_roles and provided_aligned_roles != expected_aligned_roles:
+        raise PlannerContractError(
+            "Reduce aligned roles must follow compiled role order"
+        )
     if anchor.state is ReceiptState.NORMAL_ABSENCE:
         return PlanDecision(PlanAction.NORMAL_ABSENCE)
     if anchor.state is ReceiptState.PENDING:
@@ -513,15 +526,32 @@ def plan_reduce(
     if barrier.state is FiberState.OPEN:
         return PlanDecision(PlanAction.WAIT)
     if barrier.state is FiberState.READY:
+        if provided_aligned_roles != expected_aligned_roles:
+            raise PlannerContractError(
+                "executable Reduce is missing aligned member roles"
+            )
+        inputs = (
+            anchor_binding,
+            RoleItems("members", barrier.present_members()),
+            *aligned_roles,
+        )
+        if aligned_causes:
+            return PlanDecision(
+                PlanAction.ENSURE_SUPPRESSED,
+                GrainRecord.sealed(
+                    id=grain_id,
+                    node=node.id,
+                    inputs=inputs,
+                    output_slots=slots,
+                    outcome=Suppressed(aligned_causes),
+                ),
+            )
         return PlanDecision(
             PlanAction.ENSURE_EXECUTABLE,
             GrainRecord(
                 id=grain_id,
                 node=node.id,
-                inputs=(
-                    anchor_binding,
-                    RoleItems("members", barrier.present_members()),
-                ),
+                inputs=inputs,
                 output_slots=slots,
             ),
         )

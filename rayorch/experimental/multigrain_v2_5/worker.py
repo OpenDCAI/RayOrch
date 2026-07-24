@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +50,7 @@ class BatchManifest:
     column_lengths: tuple[int, ...]
     worker_started_at: float | None = None
     worker_finished_at: float | None = None
+    worker_rss_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +80,7 @@ def build_batch_manifest(
     *,
     worker_started_at: float | None = None,
     worker_finished_at: float | None = None,
+    worker_rss_bytes: int | None = None,
 ) -> tuple[BatchManifest, tuple[tuple[Any, ...], ...]]:
     """Flatten normalized ``[port][grain][row]`` outputs into coarse blocks."""
 
@@ -111,6 +114,7 @@ def build_batch_manifest(
         column_lengths=tuple(len(column) for column in columns),
         worker_started_at=worker_started_at,
         worker_finished_at=worker_finished_at,
+        worker_rss_bytes=worker_rss_bytes,
     )
     return manifest, tuple(columns)
 
@@ -177,6 +181,7 @@ def _role_columns(
     plan: DispatchPlan,
     input_blocks: tuple[tuple[Any, ...], ...],
     role_names: tuple[str, ...],
+    variadic_roles: frozenset[str] = frozenset({"members"}),
 ) -> tuple[list[Any], ...]:
     if not plan.entries:
         return ()
@@ -196,7 +201,7 @@ def _role_columns(
                     raise WorkerContractError("invalid input RowTake") from error
             columns[role_index].append(
                 values
-                if role_names[role_index] == "members"
+                if role_names[role_index] in variadic_roles
                 else (values[0] if len(values) == 1 else values)
             )
     return tuple(columns)
@@ -245,6 +250,11 @@ def get_ray_worker_class():
                     plan,
                     tuple(input_blocks),
                     role_names,
+                    variadic_roles=(
+                        frozenset(role_names[1:])
+                        if kind is Primitive.REDUCE
+                        else frozenset({"members"})
+                    ),
                 )
                 if kind is Primitive.FILTER:
                     if output_arity != 1 or not role_columns:
@@ -294,6 +304,7 @@ def get_ray_worker_class():
                     outputs,
                     worker_started_at=worker_started_at,
                     worker_finished_at=time.monotonic(),
+                    worker_rss_bytes=_process_rss_bytes(),
                 )
                 return (manifest, *columns)
             except BadRecordError as error:
@@ -327,7 +338,20 @@ def get_ray_worker_class():
                 return (report, *(tuple() for _ in range(output_arity)))
 
         def stats(self) -> dict[str, int]:
-            return {"calls": self.calls}
+            return {
+                "calls": self.calls,
+                "pid": os.getpid(),
+                "rss_bytes": _process_rss_bytes(),
+            }
 
     _RAY_WORKER_CLASS = RayWorker
     return RayWorker
+
+
+def _process_rss_bytes() -> int:
+    try:
+        import psutil
+
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        return 0

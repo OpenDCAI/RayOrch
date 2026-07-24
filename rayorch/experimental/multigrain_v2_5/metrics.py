@@ -44,6 +44,7 @@ class DispatchTimeline:
     committed_at: float
     worker_started_at: float | None
     worker_finished_at: float | None
+    worker_rss_bytes: int | None
     status: str
 
 

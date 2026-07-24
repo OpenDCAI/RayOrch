@@ -284,7 +284,7 @@ def test_ray_persistent_coarse_blocks_cross_parent_rebatch_and_reduce():
         assert transport.pending_dispatches == 0
 
         map_stats = transport.actor_stats(2)
-        assert map_stats == ({"calls": 2},)
+        assert tuple(stats["calls"] for stats in map_stats) == (2,)
     finally:
         transport.shutdown()
 

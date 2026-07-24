@@ -6,7 +6,11 @@ import json
 
 import pytest
 
-from ..benchmarks import generate_workload, run_benchmark, write_reports
+from rayorch.experimental.multigrain_v2_5.benchmark import (
+    generate_workload,
+    run_benchmark,
+    write_reports,
+)
 
 
 @pytest.mark.slow
@@ -44,18 +48,11 @@ def test_elastic_benchmark_preserves_results_and_emits_reports(tmp_path):
     assert parent_report.parent_p95_s > 0
     assert elastic_report.parent_p95_s > 0
 
-    json_path = tmp_path / "report.json"
-    csv_path = tmp_path / "report.csv"
-    write_reports(
+    raw_path, json_path, csv_path = write_reports(
         (parent_report, elastic_report),
-        json_path=json_path,
-        csv_path=csv_path,
+        output_dir=tmp_path,
     )
     rows = json.loads(json_path.read_text(encoding="utf-8"))
-    assert [row["mode"] for row in rows] == [
-        "parent_bound",
-        "elastic",
-    ]
-    assert csv_path.read_text(encoding="utf-8").splitlines()[0].startswith(
-        "mode,seed,parents,total_children"
-    )
+    assert {row["mode"] for row in rows} == {"parent_bound", "elastic"}
+    assert raw_path.read_text(encoding="utf-8").count("\n") == 2
+    assert "mode" in csv_path.read_text(encoding="utf-8").splitlines()[0]
