@@ -151,6 +151,35 @@ Reduce
 
 Source 是内部 compiled Stage，不是用户原语。
 
+### RayModule-like 配置合同
+
+公开构造和配置风格必须继续与 RayOrch `RayModule` 一致：
+
+```python
+self.ocr = (
+    Map(OcrUDF)
+    .pre_init(model_path, dtype="bf16")
+    .ray_options(
+        replicas=4,
+        batch_size=64,
+        max_batch_wait_ms=20,
+        num_gpus=1,
+    )
+)
+```
+
+```text
+pre_init(...)
+    只描述每个 persistent actor 内 UDF instance 的构造参数。
+
+ray_options(...)
+    描述 replicas、logical-grain batch trigger、recovery preset 和 Ray resources。
+```
+
+`Pipeline.forward()` 只连接 symbolic Port；UDF 实例在 Stage actor 构造时初始化一次，并在
+一次 run 的多个 dispatch 和多个 Arena 之间复用。V3 不退化为每 dispatch 初始化 UDF，
+也不允许 per-grain actor/RPC。
+
 Prototype 1 删除：
 
 ```text
@@ -326,6 +355,38 @@ flowchart LR
 - 不允许 per-emission ObjectRef；
 - Driver 正常只读取 small manifest；
 - ObjectRef、actor、dispatch、batch 不进入 GrainId/ItemRef。
+
+### Microbatch in-flight 与跨 Stage 流水线
+
+Executor 必须继续暴露：
+
+```python
+Executor(
+    pipeline,
+    microbatch_size=...,
+    max_inflight_arenas=...,
+)
+```
+
+```text
+microbatch_size
+    每个 Arena admission 的 source occurrence 数。
+
+max_inflight_arenas
+    一个 run 内同时 active 的 Arena 上限。
+```
+
+多个 Arena 共享同一组 persistent Stage actor pools，因此必须支持：
+
+```text
+Arena 0 正在 Stage B
+Arena 1 同时正在 Stage A
+Arena 2 等待某个 Stage replica
+```
+
+RunDriver 是 single-writer，但可以同时保有多个 pending Ray RPC；它不能按 Arena
+逐个阻塞执行。当前 elastic rebatching 仍限定在单 Arena 内，Stage actor capacity 则跨
+Arena 共享。
 
 ---
 
@@ -2173,12 +2234,17 @@ rayorch/experimental/multigrain_v3/
 ├── api.py
 ├── dag.py
 ├── model.py
-├── arena.py
+├── protocol.py
+├── arena/
+│   ├── __init__.py
+│   ├── state.py
+│   └── engine.py
 ├── driver.py
 ├── execution.py
 ├── worker.py
 ├── executor.py
-└── metrics.py
+└── benchmark/
+    └── mineru.py
 ```
 
 职责：
@@ -2187,13 +2253,15 @@ rayorch/experimental/multigrain_v3/
 |---|---|
 | `api.py` | Pipeline、Map/Filter/Expand/Reduce、optional/MISSING、配置 API |
 | `dag.py` | immutable CompiledDAG、trace、General DAG、compile validation |
-| `model.py` | IDs、Grain/Item records、BatchCall/Report 等稳定数据类型 |
-| `arena.py` | ArenaEngine：semantic/value state、routing、batch queue、commit、recovery state |
+| `model.py` | IDs、Grain/Item records 和 outcomes |
+| `protocol.py` | Arena/StageExecutor/Worker 间稳定、无 Ray 的 DTO |
+| `arena/state.py` | limits、invocation/group/recovery/lease 等小型 Arena-local records |
+| `arena/engine.py` | ArenaEngine：routing、batch queue、commit、recovery state machine |
 | `driver.py` | RunDriver：multi-Arena、Stage capacity、completion/timer、ordered merge |
 | `execution.py` | StageExecutor、actor pool、ObjectRef、pending RPC、actor replacement |
 | `worker.py` | wrapper、UDF ABI、BatchReport |
 | `executor.py` | public facade，编译并组装 DAG/Arena/Driver/StageExecutor |
-| `metrics.py` | timeline 和核心指标 |
+| `benchmark/mineru.py` | 可复现的 4×H20 MinerU 回归入口 |
 
 依赖方向：
 
@@ -2201,13 +2269,17 @@ rayorch/experimental/multigrain_v3/
 flowchart LR
     API["api.py"] --> DAG["dag.py"]
     DAG --> Model["model.py"]
-    Arena["arena.py"] --> DAG
+    Protocol["protocol.py"] --> Model
+    Arena["arena/engine.py"] --> DAG
     Arena --> Model
+    Arena --> Protocol
     Driver["driver.py"] --> Arena
     Driver --> DAG
+    Driver --> Protocol
     Execution["execution.py"] --> Model
+    Execution --> Protocol
     Driver --> Execution
-    Worker["worker.py"] --> Model
+    Worker["worker.py"] --> Protocol
     Executor["executor.py"] --> DAG
     Executor --> Driver
     Executor --> Execution
@@ -2217,7 +2289,7 @@ flowchart LR
 
 ```text
 dag.py        CompiledDAG
-arena.py      ArenaEngine
+arena/        ArenaEngine + small local state records
 driver.py     RunDriver
 execution.py  StageExecutor
 ```
@@ -2225,16 +2297,16 @@ execution.py  StageExecutor
 禁止的依赖：
 
 ```text
-dag.py       -> arena/driver/execution/ray
-arena.py     -> driver/execution/ray
+dag.py          -> arena/driver/execution/ray
+arena/engine.py -> driver/execution/ray
 execution.py -> arena internals
 worker.py    -> dag/arena/driver
 metrics.py   -> correctness/scheduling decision
 ```
 
-如果 `execution.py` 或 `arena.py` 在实现后确实过大，再按实际职责拆
-`protocol.py/transport.py` 或 `semantics.py/values.py`；Prototype 文档不预先制造薄层。
-`executor.py` 只负责组装和 public facade，不重新实现 semantic、batch 或 transport。
+Arena 拆包只移动纯 records，不用 mixin，也不产生第二 authority；`ArenaEngine` 仍是
+唯一单 Arena 状态机。`executor.py` 只负责组装和 public facade，不重新实现 semantic、
+batch 或 transport。
 
 ---
 
@@ -2405,6 +2477,7 @@ V3 不是只验证新单元测试，必须复现 V2.5 已验证的核心行为�
 
 必须覆盖：
 
+- RayModule-like `.pre_init(...).ray_options(...)` API 和 persistent UDF instance；
 - Source identity；
 - 等长多 Source positional Map fan-in；
 - Map multi-input diamond；
@@ -2431,6 +2504,9 @@ V3 不是只验证新单元测试，必须复现 V2.5 已验证的核心行为�
 - size/time/drain/isolation batch trigger；
 - elastic/parent-bound；
 - multi-Arena pipeline overlap；
+- `microbatch_size` 和 `max_inflight_arenas` 的有界 overlap；
+- Arena N 后级 Stage 与 Arena N+1 前级 Stage 的真实时间重叠；
+- Stage actor pool 跨 Arena 复用，且 UDF 不重复初始化；
 - Arena reclaim；
 - Arena completion 不会因 empty queue/pending RPC 短暂为空而提前结束；
 - ordered final output merge。
@@ -2498,6 +2574,8 @@ RPC 数不明显增加
 batch fill 不明显下降
 wall time 在 V2.5 ±5% 范围内
 driver RSS 和 live block peak 无明显回归
+active_arenas_high_watermark 达到配置值（输入充足时）
+timeline 证明跨 Arena、跨 Stage overlap
 ```
 
 Prototype 1 不要求立刻超过 V2.5，但不能丢失 elastic rebatching 收益。
