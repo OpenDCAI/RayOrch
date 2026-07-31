@@ -169,4 +169,3 @@ class DispatchLease:
     grain_ids: tuple[GrainId, ...]
     recovery: RecoveryTask | None = None
     flush_reason: str = "full"
-

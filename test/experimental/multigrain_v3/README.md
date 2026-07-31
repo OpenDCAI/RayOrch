@@ -26,4 +26,3 @@ rayorch.experimental.multigrain_v3.benchmark.mineru
 
 It is not part of pytest because it initializes four vLLM models and processes
 hundreds of PDFs.
-

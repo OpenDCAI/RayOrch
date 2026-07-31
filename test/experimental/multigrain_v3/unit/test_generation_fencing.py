@@ -82,4 +82,3 @@ def test_late_completion_from_retried_generation_is_ignored():
     arena.advance()
     result = arena.finish()
     assert result.outputs[0].block == ("new",)
-

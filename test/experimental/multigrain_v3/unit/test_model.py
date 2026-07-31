@@ -42,4 +42,3 @@ def test_run_salt_must_be_exactly_16_bytes():
 
     with pytest.raises(ValueError, match="16 bytes"):
         source_entity(b"short", 0)
-

@@ -48,4 +48,3 @@ __all__ = [
     "Suppressed",
     "optional",
 ]
-

@@ -126,4 +126,3 @@ dynamic fan-out
 
 本实验只证明该固定 MinerU 配置的性能与 correctness 回归，不证明通用 bounded-memory
 或所有 workload 的性能结论。
-
