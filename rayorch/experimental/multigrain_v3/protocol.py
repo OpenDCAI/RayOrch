@@ -1,4 +1,8 @@
-"""Stable DTOs exchanged by ArenaEngine, StageExecutor, and workers."""
+"""ArenaEngine、StageExecutor 与 Worker 之间的稳定协议 DTO。
+
+本模块只描述控制 manifest、row selectors、completion/failure 和 detached snapshots，
+不拥有状态、不依赖 Ray，也不解释 DAG lineage。
+"""
 
 from __future__ import annotations
 
@@ -11,18 +15,24 @@ from .model import AttemptToken, GrainFailure, GrainId, GroupShape, ItemRef
 
 @dataclass(frozen=True, slots=True)
 class RowTake:
-    """Select one row from one deduplicated RPC block argument."""
+    """从当前 RPC 去重后的某个 coarse block 参数中选择一行。"""
     ref_slot: int
     row: int
 
 
 @dataclass(frozen=True, slots=True)
 class ValueTake:
-    """Ordered row selectors for one scalar or grouped UDF input."""
+    """一个 scalar 或 GROUP UDF 输入的有序 row selectors。
+
+    GROUP 输入额外携带 GroupShape，Worker 据此在不读取 Driver payload 的情况下恢复
+    nested Python list。
+    """
     rows: tuple[RowTake, ...]
     group_shape: GroupShape | None = None
 
     def __post_init__(self) -> None:
+        """校验 GroupShape leaf 数量与 RowTake 数量一致。"""
+
         if self.group_shape is not None and (
             self.group_shape.leaf_count != len(self.rows)
         ):
@@ -31,7 +41,7 @@ class ValueTake:
 
 @dataclass(frozen=True, slots=True)
 class MissingTake:
-    """Explicit OPTIONAL_ONE absence; workers materialize MISSING."""
+    """显式 OPTIONAL_ONE 缺失；Worker 将其还原为 MISSING sentinel。"""
     pass
 
 
@@ -40,36 +50,59 @@ InputTake = ValueTake | MissingTake
 
 @dataclass(frozen=True, slots=True)
 class Invocation:
-    """One Logical Grain projected into a physical BatchCall."""
+    """一个 Logical Grain 到物理 BatchCall 的轻量投影。"""
     token: AttemptToken
     inputs: tuple[InputTake, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class BatchCall:
-    """Small control manifest sent to one persistent Stage actor."""
+    """发送给一个 persistent Stage actor 的小型控制 manifest。"""
     dispatch: int
     stage: int
     invocations: tuple[Invocation, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class InvocationAck:
-    """Per-Grain output shape or Filter keep decision."""
+class ValueAck:
+    """Map/Expand/Reduce 的单 Grain 输出行数确认。
+
+    `output_counts[i]` 表示该 Grain 在 output Port i 上占用多少行。它不携带业务值，
+    业务值位于对应 coarse output block。
+    """
+
     token: AttemptToken
-    output_counts: tuple[int, ...] | None = None
-    keep: bool | None = None
+    output_counts: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if (self.output_counts is None) == (self.keep is None):
-            raise ValueError("ack needs exactly one of output_counts or keep")
+        """校验所有输出行数均为非负整数。"""
+
+        if any(count < 0 for count in self.output_counts):
+            raise ValueError("output counts must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class FilterAck:
+    """Filter 的单 Grain bool mask 确认。
+
+    Filter 不返回业务 output block；Arena 根据 `keep` 决定 alias 输入位置或同步发布
+    DROPPED。
+    """
+
+    token: AttemptToken
+    keep: bool
 
 
 @dataclass(frozen=True, slots=True)
 class BatchReport:
-    """Bounded worker report; business values live in separate blocks."""
+    """有界 Worker report；业务值始终位于独立 coarse blocks。
+
+    同一个 report 中 ack 类型必须由 Stage kind 唯一决定：Filter 使用 FilterAck，
+    其他可执行原语使用 ValueAck。
+    """
+
     dispatch: int
-    acks: tuple[InvocationAck, ...]
+    acks: tuple[ValueAck | FilterAck, ...]
     column_lengths: tuple[int, ...]
     worker_started_at: float | None = None
     worker_finished_at: float | None = None
@@ -77,7 +110,7 @@ class BatchReport:
 
 
 class FailureKind(Enum):
-    """The intentionally small framework-level failure taxonomy."""
+    """框架刻意保持精简的失败分类。"""
     BAD_RECORD = "bad_record"
     UDF_ERROR = "udf_error"
     CONTRACT_ABORT = "contract_abort"
@@ -86,7 +119,7 @@ class FailureKind(Enum):
 
 @dataclass(frozen=True, slots=True)
 class DispatchFailure:
-    """Structured failure returned to the Arena through RunDriver."""
+    """StageExecutor 经 RunDriver 返回 Arena 的结构化失败。"""
     dispatch: int
     kind: FailureKind
     message: str
@@ -96,7 +129,10 @@ class DispatchFailure:
 
 @dataclass(frozen=True, slots=True)
 class DispatchIntent:
-    """Arena-produced physical work request for a StageExecutor."""
+    """Arena 生成、交给 StageExecutor 的物理执行请求。
+
+    `input_blocks` 是 opaque coarse block handles；Intent 不暴露 Arena 内部 tables。
+    """
     arena_id: int
     call: BatchCall
     input_blocks: tuple[Any, ...]
@@ -107,7 +143,7 @@ class DispatchIntent:
 
 @dataclass(frozen=True, slots=True)
 class DispatchCompletion:
-    """StageExecutor result routed back to the owning Arena."""
+    """StageExecutor 返回所属 Arena 的成功 completion。"""
     arena_id: int
     call: BatchCall
     report: BatchReport
@@ -119,7 +155,7 @@ class DispatchCompletion:
 
 @dataclass(frozen=True, slots=True)
 class DispatchTimeline:
-    """Observation-only timestamps for one accepted dispatch."""
+    """一个 accepted dispatch 的只读观测时间线，不参与调度决策。"""
     arena: int
     stage: int
     dispatch: int
@@ -137,35 +173,35 @@ class DispatchTimeline:
 
 @dataclass(frozen=True, slots=True)
 class SourceSnapshot:
-    """Detached source identity retained after Arena reclaim."""
+    """Arena reclaim 后仍保留的 detached source identity。"""
     grain: GrainId
     item: ItemRef
 
 
 @dataclass(frozen=True, slots=True)
 class FailureSnapshot:
-    """Detached Failed Grain snapshot retained after Arena reclaim."""
+    """Arena reclaim 后仍保留的 Failed Grain 快照。"""
     grain: GrainId
     failure: GrainFailure
 
 
 @dataclass(frozen=True, slots=True)
 class SuppressionSnapshot:
-    """Detached Suppressed Grain snapshot retained after Arena reclaim."""
+    """Arena reclaim 后仍保留的 Suppressed Grain 快照。"""
     grain: GrainId
     direct_causes: tuple[Any, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class BlockSlice:
-    """One final output row held by RunResult without driver-side get."""
+    """RunResult 持有的 final coarse block 行切片，delivery 前无需 driver-side get。"""
     block: Any
     row: int
 
 
 @dataclass(frozen=True, slots=True)
 class ArenaResult:
-    """Detached per-Arena delivery payload safe after state reclaim."""
+    """可在 Arena state reclaim 后安全使用的 per-Arena detached delivery。"""
     outputs: tuple[Any, ...]
     failures: tuple[FailureSnapshot, ...]
     suppressions: tuple[SuppressionSnapshot, ...]

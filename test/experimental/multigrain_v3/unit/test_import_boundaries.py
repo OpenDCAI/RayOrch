@@ -53,6 +53,7 @@ def test_arena_engine_does_not_import_ray_or_stage_executor():
     imports = _local_imports(engine)
     assert "execution" not in imports
     assert "ray" not in _absolute_import_roots(engine)
+    assert "api" not in imports
 
 
 def test_reduce_accumulator_is_pure_and_ray_free():
@@ -62,6 +63,19 @@ def test_reduce_accumulator_is_pure_and_ray_free():
     imports = _local_imports(reduce_module)
     assert not imports & {"engine", "driver", "execution", "worker"}
     assert "ray" not in _absolute_import_roots(reduce_module)
+
+
+def test_lower_layers_depend_on_contracts_not_authoring_api():
+    """Arena/Execution/Worker 共享底层合同，但不能反向依赖 authoring API。"""
+
+    lower_layers = (
+        ROOT / "arena" / "state.py",
+        ROOT / "arena" / "engine.py",
+        ROOT / "execution.py",
+        ROOT / "worker.py",
+    )
+    for path in lower_layers:
+        assert "api" not in _local_imports(path), path
 
 
 def test_driver_does_not_reach_into_arena_tables():
@@ -83,3 +97,33 @@ def test_driver_does_not_reach_into_arena_tables():
             continue
         if isinstance(node.value, ast.Name) and node.value.id == "arena":
             raise AssertionError(f"RunDriver reads arena.{node.attr}")
+
+
+def test_v3_classes_and_functions_have_chinese_docstrings():
+    """V3 新增类/函数必须留下中文功能与设计说明，避免维护语义漂移。"""
+
+    missing = []
+    english_only = []
+    for path in ROOT.rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(
+                node,
+                (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                continue
+            if node.name.startswith("__") and node.name not in {
+                "__init__",
+                "__post_init__",
+            }:
+                continue
+            docstring = ast.get_docstring(node)
+            label = f"{path.relative_to(ROOT)}:{node.lineno}:{node.name}"
+            if not docstring:
+                missing.append(label)
+            elif not any("\u4e00" <= char <= "\u9fff" for char in docstring):
+                english_only.append(label)
+    assert missing == []
+    assert english_only == []

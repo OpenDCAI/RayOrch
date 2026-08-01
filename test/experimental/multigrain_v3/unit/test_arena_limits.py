@@ -13,7 +13,7 @@ from rayorch.experimental.multigrain_v3.arena import (
 from rayorch.experimental.multigrain_v3.protocol import (
     BatchReport,
     DispatchCompletion,
-    InvocationAck,
+    ValueAck,
 )
 
 
@@ -51,7 +51,7 @@ def test_reduce_slot_limit_aborts_before_partial_accumulator_publication():
     arena.advance()
     intent = arena.reserve_dispatch(1)
     assert intent is not None
-    ack = InvocationAck(intent.call.invocations[0].token, (3,))
+    ack = ValueAck(intent.call.invocations[0].token, (3,))
     report = BatchReport(intent.call.dispatch, (ack,), (3,))
     with pytest.raises(ArenaAbort, match="max_reduce_slots"):
         arena.commit(

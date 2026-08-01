@@ -1,4 +1,9 @@
-"""RayModule-like authoring API for the Multigrain V3 prototype."""
+"""Multigrain V3 的 RayModule-like 用户编排 API。
+
+用户通过 Pipeline.forward 连接 symbolic Port；`pre_init` 描述 persistent UDF 构造参数，
+`ray_options` 描述副本、合批、恢复和 Ray 资源。该模块只负责 authoring/trace，不执行
+Arena 调度或 Ray RPC。
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ import inspect
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
+from .contracts import BadRecordError, ExecutionError, MISSING
 from .dag import (
     CompiledDAG,
     CompileError,
@@ -25,51 +31,21 @@ from .dag import (
 from .model import PortId
 
 
-class ExecutionError(RuntimeError):
-    """A run or bounded Arena failed."""
-
-
-class BadRecordError(Exception):
-    """Explicitly attribute a UDF error to one dispatch row."""
-
-    def __init__(self, message: str, *, index: int) -> None:
-        super().__init__(message)
-        if index < 0:
-            raise ValueError("bad record index must be non-negative")
-        self.index = index
-
-
-class _Missing:
-    """Pickle-stable sentinel for explicit optional input absence."""
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "MISSING"
-
-    def __reduce__(self):
-        return (_missing_singleton, ())
-
-
-def _missing_singleton() -> "_Missing":
-    return MISSING
-
-
-MISSING = _Missing()
-
-
 @dataclass(frozen=True, slots=True)
 class Port:
-    """Symbolic output handle used only while tracing Pipeline.forward."""
+    """仅在 trace Pipeline.forward 时使用的 symbolic output handle。"""
     id: PortId
 
 
 @dataclass(frozen=True, slots=True)
 class OptionalPort:
-    """Wrapper marking one aligned input as OPTIONAL_ONE."""
+    """把一个 aligned input 显式标记为 OPTIONAL_ONE 的 symbolic wrapper。"""
     port: Port
 
 
 def optional(port: Port) -> OptionalPort:
+    """声明某个 aligned Port 正常缺失时向 UDF 传 MISSING。"""
+
     if not isinstance(port, Port):
         raise CompileError("optional(...) requires a symbolic Port")
     return OptionalPort(port)
@@ -77,19 +53,23 @@ def optional(port: Port) -> OptionalPort:
 
 @dataclass(frozen=True, slots=True)
 class CompiledPipeline:
-    """Immutable DAG plus ordered public source and output Ports."""
+    """不可变 CompiledDAG 与有序 public source/output Ports 的组合。"""
     dag: CompiledDAG
     source_ports: tuple[Port, ...]
     outputs: tuple[Port, ...]
 
 
 class Pipeline:
-    """User authoring base class traced once into an immutable CompiledDAG."""
+    """用户 Pipeline 基类；forward 会被 symbolic trace 为 immutable CompiledDAG。"""
 
     def forward(self, *args: Any) -> Any:
+        """声明 symbolic DAG；子类必须实现且不能直接执行业务数据。"""
+
         raise NotImplementedError
 
     def compile(self) -> CompiledPipeline:
+        """执行一次 symbolic forward trace，并完成静态 DAG 校验。"""
+
         parameters = tuple(inspect.signature(self.forward).parameters.values())
         if any(
             parameter.kind
@@ -138,7 +118,7 @@ class Pipeline:
 
 @dataclass(slots=True)
 class _TraceContext:
-    """Mutable compiler state scoped to one symbolic forward trace."""
+    """一次 symbolic forward trace 内部使用的可变 compiler state。"""
     stages: list[StageSpec]
     next_stage: int
 
@@ -148,6 +128,8 @@ class _TraceContext:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Port | tuple[Port, ...]:
+        """把一次 primitive 调用编译成 StageSpec，并返回 symbolic output Ports。"""
+
         kind = {
             Map: Primitive.MAP,
             Filter: Primitive.FILTER,
@@ -259,6 +241,8 @@ class _TraceContext:
         anchor_port: PortId,
         members_port: PortId,
     ) -> tuple[int, ...]:
+        """根据 anchor/member scopes 推导唯一的 descendant Expand path。"""
+
         anchor_scope = self._scope(anchor_port)
         member_scope = self._scope(members_port)
         if (
@@ -278,6 +262,8 @@ class _TraceContext:
         scope_path: tuple[int, ...],
         optional_value: bool,
     ) -> InputMode:
+        """把额外 Reduce input 分类为 anchor-aligned scalar 或同路径 GROUP。"""
+
         anchor_scope = self._scope(anchor.id)
         value_scope = self._scope(value.id)
         if value_scope == anchor_scope:
@@ -293,6 +279,8 @@ class _TraceContext:
         raise CompileError("Reduce input is not anchor- or group-aligned")
 
     def _scope(self, port: PortId) -> tuple[int, ...]:
+        """递归推导一个 Port 所处的 Expand scope signature。"""
+
         producer = self.stages[port.stage]
         if producer.kind is Primitive.SOURCE:
             return ()
@@ -320,18 +308,24 @@ _ACTIVE_TRACE: contextvars.ContextVar[_TraceContext | None] = (
 
 
 def _port(value: Any) -> Port:
+    """校验 trace 参数是普通 symbolic Port。"""
+
     if not isinstance(value, Port):
         raise CompileError(f"expected symbolic Port, got {type(value)!r}")
     return value
 
 
 def _port_value(value: Any) -> tuple[Port, bool]:
+    """解包普通/OptionalPort，并返回是否 OPTIONAL_ONE。"""
+
     if isinstance(value, OptionalPort):
         return value.port, True
     return _port(value), False
 
 
 def _normalize_outputs(value: Any) -> tuple[Port, ...]:
+    """把 forward 返回值规范化为非空、有序 Port tuple。"""
+
     if isinstance(value, Port):
         return (value,)
     if isinstance(value, tuple) and value and all(
@@ -342,6 +336,8 @@ def _normalize_outputs(value: Any) -> tuple[Port, ...]:
 
 
 def _execution_spec(options: dict[str, Any]) -> ExecutionSpec:
+    """把 `.ray_options()` 捕获值编译为 immutable ExecutionSpec。"""
+
     preset_value = str(options.pop("recovery", options.pop("error_policy", "raise")))
     try:
         preset = RecoveryPreset(preset_value)
@@ -370,19 +366,25 @@ PrimitiveT = TypeVar("PrimitiveT", bound="_ConfiguredPrimitive")
 
 
 class _ConfiguredPrimitive(Generic[PrimitiveT]):
-    """RayModule-like UDF construction and execution-option builder."""
+    """RayModule-like UDF 构造和执行配置 builder。"""
     def __init__(self, udf: Any) -> None:
+        """保存 UDF target；初始化参数与执行参数后续链式设置。"""
+
         self.udf = udf
         self.init_args: tuple[Any, ...] = ()
         self.init_kwargs: dict[str, Any] = {}
         self.options: dict[str, Any] = {}
 
     def pre_init(self: PrimitiveT, *args: Any, **kwargs: Any) -> PrimitiveT:
+        """记录每个 persistent actor 构造 UDF instance 的参数。"""
+
         self.init_args = tuple(args)
         self.init_kwargs = dict(kwargs)
         return self
 
     def ray_options(self: PrimitiveT, **options: Any) -> PrimitiveT:
+        """记录 replicas、batch、recovery 和 Ray resource 配置。"""
+
         self.options.update(options)
         return self
 
@@ -394,20 +396,20 @@ class _ConfiguredPrimitive(Generic[PrimitiveT]):
 
 
 class Map(_ConfiguredPrimitive["Map"]):
-    """Entity-preserving value transformation."""
+    """保持 EntityId 的普通 value transformation 原语。"""
     pass
 
 
 class Filter(_ConfiguredPrimitive["Filter"]):
-    """Tuple-preserving bool mask over required aligned inputs."""
+    """对 required aligned tuple 计算 bool mask，并同步转发或 drop。"""
     pass
 
 
 class Expand(_ConfiguredPrimitive["Expand"]):
-    """Dynamic one-to-many Stage with stable ordinal child identities."""
+    """动态 one-to-many 原语，为每个 child 派生稳定 ordinal identity。"""
     pass
 
 
 class Reduce(_ConfiguredPrimitive["Reduce"]):
-    """Ordered many-to-one Stage with a semantic-only anchor."""
+    """有序 many-to-one 原语；anchor 只参与语义，不进入 Actor payload。"""
     pass

@@ -9,7 +9,7 @@ from rayorch.experimental.multigrain_v3.protocol import (
     DispatchCompletion,
     DispatchFailure,
     FailureKind,
-    InvocationAck,
+    ValueAck,
 )
 
 
@@ -52,7 +52,7 @@ def test_late_completion_from_retried_generation_is_ignored():
 
     retry_report = BatchReport(
         retry.call.dispatch,
-        (InvocationAck(retry.call.invocations[0].token, (1,)),),
+        (ValueAck(retry.call.invocations[0].token, (1,)),),
         (1,),
     )
     arena.commit(
@@ -67,7 +67,7 @@ def test_late_completion_from_retried_generation_is_ignored():
 
     old_report = BatchReport(
         old.call.dispatch,
-        (InvocationAck(old.call.invocations[0].token, (1,)),),
+        (ValueAck(old.call.invocations[0].token, (1,)),),
         (1,),
     )
     arena.commit(

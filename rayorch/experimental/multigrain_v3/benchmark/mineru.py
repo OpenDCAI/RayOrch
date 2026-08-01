@@ -1,4 +1,8 @@
-"""Real Flash-MinerU benchmark through the V3 public Pipeline API."""
+"""通过 V3 public Pipeline API 运行真实 Flash-MinerU 回归。
+
+本模块是手工 4×H20 benchmark 入口，只负责构造真实 UDF、采集 observation 数据和写
+复现实验产物，不参与 V3 runtime correctness。
+"""
 
 from __future__ import annotations
 
@@ -28,12 +32,16 @@ V25_ELASTIC_MEDIAN_S = 581.509
 
 
 class MinerUPdfToPages:
-    """Render each PDF into first-class page records on CPU actors."""
+    """在 CPU actor 中把每个 PDF 渲染为 first-class page records。"""
 
     def __init__(self, dpi: int = 200) -> None:
+        """保存 PDF 渲染分辨率。"""
+
         self.dpi = dpi
 
     def run(self, pdf_paths: list[str]) -> list[list[dict[str, Any]]]:
+        """逐 PDF 读取字节并返回按 page ordinal 排列的页面记录。"""
+
         from flash_mineru.mineru_core.utils.pdf_image_tools import (
             load_images_from_pdf,
         )
@@ -63,13 +71,15 @@ class MinerUPdfToPages:
 
 
 class MinerUVlmOcrPage:
-    """Run the real MinerU vLLM page extraction on one GPU actor."""
+    """在单个 GPU persistent actor 中运行真实 MinerU vLLM 页面抽取。"""
 
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
         gpu_memory_utilization: float = 0.8,
     ) -> None:
+        """加载 vLLM 模型并创建 MinerUClient；每个 actor 只初始化一次。"""
+
         from mineru_vl_utils import MinerUClient
         from vllm import LLM
 
@@ -83,6 +93,8 @@ class MinerUVlmOcrPage:
         )
 
     def run(self, pages: list[dict[str, Any]]) -> list[Any]:
+        """对一个 logical page batch 执行两阶段 VLM extraction。"""
+
         return list(
             self.client.batch_two_step_extract(
                 images=[page["img_pil"] for page in pages]
@@ -91,16 +103,20 @@ class MinerUVlmOcrPage:
 
 
 class PdfMetadata:
-    """Produce the lightweight parent context needed by the Reduce UDF."""
+    """生成 Reduce UDF 所需的轻量 parent context，避免传输 PDF anchor payload。"""
 
     def run(self, paths: list[str]) -> list[str]:
+        """把 PDF path 转为用于输出目录命名的 stem。"""
+
         return [Path(path).stem for path in paths]
 
 
 class MinerUAssembleDoc:
-    """Assemble ordered page results without receiving PDF anchor payloads."""
+    """在不接收 PDF anchor payload 的情况下组装有序页面结果。"""
 
     def __init__(self, output_dir: str, parse_method: str = "vlm") -> None:
+        """保存输出根目录和 MinerU parse method。"""
+
         self.output_dir = output_dir
         self.parse_method = parse_method
 
@@ -110,6 +126,8 @@ class MinerUAssembleDoc:
         grouped_pages: list[list[dict[str, Any]]],
         stems: list[str],
     ) -> list[dict[str, Any]]:
+        """把 ordered OCR/page GROUPs 写成 Markdown、layout JSON 和摘要。"""
+
         from flash_mineru.mineru_core.data.data_reader_writer import (
             FileBasedDataWriter,
         )
@@ -161,7 +179,7 @@ class MinerUAssembleDoc:
 
 
 class MinerUV3Pipeline(Pipeline):
-    """Real PDF→Page→OCR→Document DAG used for V3 performance regression."""
+    """用于 V3 性能回归的真实 PDF→Page→OCR→Document DAG。"""
     def __init__(
         self,
         *,
@@ -176,6 +194,8 @@ class MinerUV3Pipeline(Pipeline):
         reduce_replicas: int,
         runtime_env: dict[str, Any],
     ) -> None:
+        """按 benchmark 参数配置 render、metadata、OCR 和 assemble Stages。"""
+
         scope = "elastic" if mode == "elastic" else "parent_bound"
         self.render = (
             Expand(MinerUPdfToPages)
@@ -221,6 +241,8 @@ class MinerUV3Pipeline(Pipeline):
         )
 
     def forward(self, pdfs):
+        """声明 semantic-only PDF anchor 与 page-level elastic OCR DAG。"""
+
         pages = self.render(pdfs)
         contents = self.ocr(pages)
         metadata = self.metadata(pdfs)
@@ -234,15 +256,17 @@ class MinerUV3Pipeline(Pipeline):
 
 @dataclass(frozen=True, slots=True)
 class GpuSample:
-    """Observation-only GPU utilization and memory sample."""
+    """只用于观测的 GPU utilization 与 memory sample。"""
     monotonic_s: float
     utilization: tuple[int | None, ...]
     memory_used: tuple[int, ...]
 
 
 class ResourceSampler:
-    """Background driver RSS/GPU sampler with no scheduling authority."""
+    """后台采集 driver RSS/GPU 指标，不拥有任何调度 authority。"""
     def __init__(self, interval_s: float) -> None:
+        """初始化采样间隔、driver process 和后台线程。"""
+
         import psutil
 
         self.interval_s = interval_s
@@ -254,9 +278,13 @@ class ResourceSampler:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
+        """启动 daemon observation thread。"""
+
         self._thread.start()
 
     def stop(self) -> tuple[int, int, tuple[GpuSample, ...]]:
+        """停止采样并返回 driver RSS 起点/峰值和 GPU samples。"""
+
         self._stop.set()
         self._thread.join(timeout=max(2, self.interval_s * 2))
         return (
@@ -266,6 +294,8 @@ class ResourceSampler:
         )
 
     def _run(self) -> None:
+        """按固定间隔采集 driver RSS 与 GPU 状态，失败时跳过本次样本。"""
+
         while not self._stop.wait(self.interval_s):
             try:
                 self.driver_peak = max(
@@ -278,6 +308,8 @@ class ResourceSampler:
 
 
 def _gpu_sample() -> GpuSample:
+    """best-effort 采集所有可见 GPU 的 utilization 和 used memory。"""
+
     try:
         import pynvml
 
@@ -300,6 +332,8 @@ def _gpu_sample() -> GpuSample:
 
 
 def _runtime_env(flash_repo: str) -> dict[str, Any]:
+    """构造让 Ray actors 能导入 Flash-MinerU 与当前仓库的 runtime_env。"""
+
     current = os.environ.get("PYTHONPATH", "")
     pythonpath = os.pathsep.join(
         path for path in (flash_repo, os.getcwd(), current) if path
@@ -308,6 +342,8 @@ def _runtime_env(flash_repo: str) -> dict[str, Any]:
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    """运行一次真实 MinerU benchmark，并写 timeline/GPU/result artifacts。"""
+
     import ray
 
     flash_repo = os.path.abspath(args.flash_repo)
@@ -427,6 +463,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """构造 V3 MinerU 手工 benchmark CLI 参数。"""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("elastic", "parent_bound"), default="elastic")
     parser.add_argument("--limit", type=int, default=48)
@@ -450,6 +488,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """解析 CLI、执行 benchmark，并把摘要 JSON 打印到 stdout。"""
+
     args = build_parser().parse_args(argv)
     print(json.dumps(run_benchmark(args), ensure_ascii=False, indent=2))
     return 0

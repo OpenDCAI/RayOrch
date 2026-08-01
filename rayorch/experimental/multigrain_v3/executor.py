@@ -1,4 +1,8 @@
-"""Public Executor facade for Multigrain V3."""
+"""Multigrain V3 的 public Executor facade。
+
+本模块负责切 source microbatches、组装 ExecutionPool/RunDriver，并生成 detached
+RunResult；不实现 Arena 语义或 Ray actor 选择。
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,8 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
-from .api import CompiledPipeline, ExecutionError, Pipeline
+from .api import CompiledPipeline, Pipeline
+from .contracts import ExecutionError
 from .arena import (
     ArenaLimits,
 )
@@ -23,7 +28,7 @@ from .protocol import (
 
 @dataclass(frozen=True, slots=True)
 class RunResult:
-    """Detached outputs, lineage failures, metrics, and dispatch timeline."""
+    """run 完成后的 detached outputs、失败血缘、指标和 dispatch timeline。"""
     outputs: tuple[Any, ...] = ()
     failures: tuple[FailureSnapshot, ...] = ()
     suppressions: tuple[SuppressionSnapshot, ...] = ()
@@ -32,11 +37,13 @@ class RunResult:
     timeline: tuple[DispatchTimeline, ...] = ()
 
     def get(self) -> tuple[Any, ...]:
+        """解析最终 BlockSlice；同一 coarse block 只执行一次 ray.get。"""
+
         return resolve_outputs(self.outputs)
 
 
 class Executor:
-    """Compile one Pipeline and run finite aligned source sequences on Ray."""
+    """编译 Pipeline，并在 Ray 上执行有限、等长、按 position 对齐的 sources。"""
 
     def __init__(
         self,
@@ -47,6 +54,8 @@ class Executor:
         arena_limits: ArenaLimits = ArenaLimits(),
         max_pending_per_actor: int = 1,
     ) -> None:
+        """保存 compiled pipeline、microbatch/in-flight 边界和 Arena limits。"""
+
         self.compiled = (
             pipeline.compile() if isinstance(pipeline, Pipeline) else pipeline
         )
@@ -61,6 +70,8 @@ class Executor:
         self.next_arena_id = 0
 
     def run(self, *sources: Any) -> RunResult:
+        """启动 persistent Stage actors，运行多 Arena event loop 并返回 detached result。"""
+
         if not sources or any(
             not isinstance(source, (list, tuple)) for source in sources
         ):

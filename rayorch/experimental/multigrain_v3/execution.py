@@ -1,4 +1,8 @@
-"""Persistent per-Stage Ray actor pools and coarse-block RPC transport."""
+"""persistent per-Stage Ray actor pools 与 coarse-block RPC transport。
+
+本模块只拥有 Actor、ObjectRef 和 PendingRPC，不读取 Arena semantic tables，也不决定
+lineage/recovery 语义。
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .api import ExecutionError
+from .contracts import ExecutionError
 from .protocol import (
     BatchReport,
     DispatchCompletion,
@@ -20,7 +24,7 @@ from .worker import get_ray_worker_class
 
 @dataclass(frozen=True, slots=True)
 class PendingRPC:
-    """Transport-owned Ray handles for one submitted DispatchIntent."""
+    """Transport 对一个已提交 DispatchIntent 持有的 Ray handles。"""
     intent: DispatchIntent
     stage: int
     worker_slot: int
@@ -31,14 +35,14 @@ class PendingRPC:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionEvent:
-    """Completion/failure plus the Arena routing key."""
+    """completion/failure 与所属 Arena routing key 的组合。"""
     arena_id: int
     call: Any
     result: DispatchCompletion | DispatchFailure
 
 
 class StageExecutor:
-    """One Stage's persistent actor pool."""
+    """一个 Stage 对应的 persistent actor pool 与 per-actor backpressure。"""
 
     def __init__(
         self,
@@ -46,6 +50,8 @@ class StageExecutor:
         *,
         max_pending_per_actor: int = 1,
     ) -> None:
+        """按 StageSpec 创建固定 replicas，并初始化 pending 计数。"""
+
         import ray
 
         if stage.kind is Primitive.SOURCE:
@@ -72,6 +78,8 @@ class StageExecutor:
         self.pending: dict[Any, PendingRPC] = {}
 
     def _spawn(self):
+        """根据 UdfSpec 和 Ray options 创建一个 persistent actor。"""
+
         target, init_args, init_kwargs, options = self._actor_spec
         return self._worker_class.options(
             max_task_retries=0,
@@ -79,12 +87,16 @@ class StageExecutor:
         ).remote(self.stage, target, init_args, init_kwargs)
 
     def can_submit(self) -> bool:
+        """判断是否至少有一个 actor 未达到 pending 上限。"""
+
         return any(
             pending < self.max_pending_per_actor
             for pending in self.pending_by_slot
         )
 
     def _choose(self, intent: DispatchIntent) -> int | None:
+        """按 round-robin 和 actor policy 选择可用 worker slot。"""
+
         count = len(self.actors)
         choices = range(count)
         if intent.actor_policy == "fresh":
@@ -103,6 +115,8 @@ class StageExecutor:
         return None
 
     def submit(self, intent: DispatchIntent) -> bool:
+        """提交一个 coarse RPC，并登记 report/output ObjectRefs。"""
+
         slot = self._choose(intent)
         if slot is None:
             return False
@@ -131,11 +145,15 @@ class StageExecutor:
         return True
 
     def pop(self, report_ref: Any) -> PendingRPC:
+        """移除已完成 PendingRPC，并释放对应 actor pending credit。"""
+
         pending = self.pending.pop(report_ref)
         self.pending_by_slot[pending.worker_slot] -= 1
         return pending
 
     def replace(self, slot: int) -> None:
+        """杀死并重建指定 actor slot，用于基础设施失败恢复。"""
+
         import ray
 
         try:
@@ -145,6 +163,8 @@ class StageExecutor:
         self.actors[slot] = self._spawn()
 
     def cancel_arena(self, arena_id: int) -> None:
+        """best-effort 取消属于指定 Arena 的 pending reports。"""
+
         import ray
 
         for report_ref, pending in tuple(self.pending.items()):
@@ -158,6 +178,8 @@ class StageExecutor:
                 pass
 
     def shutdown(self) -> None:
+        """终止本 Stage 的全部 actors 并清空 transport 状态。"""
+
         import ray
 
         for actor in self.actors:
@@ -167,7 +189,7 @@ class StageExecutor:
 
 
 class ExecutionPool:
-    """All persistent StageExecutors shared across in-flight Arenas."""
+    """一次 run 内由所有 in-flight Arena 共享的 StageExecutor 集合。"""
     """All StageExecutors shared by every in-flight Arena in one run."""
 
     def __init__(
@@ -176,6 +198,8 @@ class ExecutionPool:
         *,
         max_pending_per_actor: int = 1,
     ) -> None:
+        """为所有非 Source Stage 创建独立 persistent actor pool。"""
+
         import ray
 
         self.dag = dag
@@ -191,9 +215,13 @@ class ExecutionPool:
 
     @property
     def pending_count(self) -> int:
+        """返回当前 run 的 pending RPC 总数。"""
+
         return sum(len(executor.pending) for executor in self.executors.values())
 
     def pending_for_arena(self, arena_id: int) -> int:
+        """返回指定 Arena 尚未完成的 RPC 数。"""
+
         return sum(
             pending.intent.arena_id == arena_id
             for executor in self.executors.values()
@@ -201,12 +229,18 @@ class ExecutionPool:
         )
 
     def can_submit(self, stage: int) -> bool:
+        """查询指定 Stage actor pool 是否仍有提交容量。"""
+
         return self.executors[stage].can_submit()
 
     def submit(self, intent: DispatchIntent) -> bool:
+        """把 DispatchIntent 转交给对应 StageExecutor。"""
+
         return self.executors[intent.call.stage].submit(intent)
 
     def ready(self) -> None:
+        """等待所有 persistent actors 完成构造和 UDF 初始化。"""
+
         refs = [
             actor.stats.remote()
             for executor in self.executors.values()
@@ -220,6 +254,8 @@ class ExecutionPool:
         *,
         timeout: float | None = None,
     ) -> ExecutionEvent | None:
+        """等待一个 report，并转换为带 arena_id 的 completion/failure event。"""
+
         refs = [
             report_ref
             for executor in self.executors.values()
@@ -289,10 +325,14 @@ class ExecutionPool:
         )
 
     def cancel_arena(self, arena_id: int) -> None:
+        """通知所有 StageExecutor 取消指定 Arena 的 pending RPC。"""
+
         for executor in self.executors.values():
             executor.cancel_arena(arena_id)
 
     def actor_stats(self) -> dict[int, tuple[dict[str, int], ...]]:
+        """收集每个 Stage actor 的调用次数、PID 和 RSS。"""
+
         return {
             stage: tuple(
                 self.ray.get([actor.stats.remote() for actor in executor.actors])
@@ -301,5 +341,6 @@ class ExecutionPool:
         }
 
     def shutdown(self) -> None:
+        """关闭所有 StageExecutor。"""
         for executor in self.executors.values():
             executor.shutdown()

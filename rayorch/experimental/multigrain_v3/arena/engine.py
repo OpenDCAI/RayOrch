@@ -1,7 +1,9 @@
-"""ArenaEngine facade for one microbatch's event-driven state machine.
+"""单个 microbatch 的事件驱动 ArenaEngine。
 
-The engine owns the complete lifetime of one bounded Arena, but delegates its
-small record types to :mod:`.state`.  It never imports Ray or StageExecutor.
+ArenaEngine 拥有一个 Arena 的完整生命周期和唯一可变 authority：Grain/Item 终态、
+receipt routing、ReduceAccumulator、StageBatchQueue、DispatchLease、ValueTable 与
+BlockTable。被动 records 位于 `.state`，纯 hierarchical Reduce 算法位于 `.reduce`。
+本模块不导入 Ray 或 StageExecutor。
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ import time
 from collections import deque
 from typing import Any, Callable
 
-from ..api import MISSING
+from ..contracts import MISSING
 from ..dag import (
     CompiledDAG,
     InputMode,
@@ -53,12 +55,14 @@ from ..protocol import (
     DispatchTimeline,
     FailureKind,
     FailureSnapshot,
+    FilterAck,
     Invocation,
     MissingTake,
     RowTake,
     SourceSnapshot,
     SuppressionSnapshot,
     ValueTake,
+    ValueAck,
 )
 from .state import (
     ArenaAbort,
@@ -73,10 +77,10 @@ from .reduce import ExpandInstance, FanoutTerminal, ReduceAccumulator
 
 
 class ArenaEngine:
-    """Single-writer state machine for one bounded source microbatch.
+    """一个 bounded source microbatch 的 single-writer 状态机。
 
-    Public methods are the only RunDriver integration surface.  Tables,
-    queues, accumulators, leases, and value locations remain Arena-private.
+    RunDriver 只能调用公开方法/属性；tables、queues、accumulators、leases 和 value
+    locations 均为 Arena 私有，禁止跨组件直接读写。
     """
 
     def __init__(
@@ -88,6 +92,8 @@ class ArenaEngine:
         limits: ArenaLimits = ArenaLimits(),
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        """初始化语义表、事件队列、物理 value 表和有界调度状态。"""
+
         self.id = arena_id
         self.dag = dag
         self.run_salt = run_salt
@@ -120,18 +126,24 @@ class ArenaEngine:
         self.timeline: list[DispatchTimeline] = []
 
     def _abort(self, message: str) -> None:
+        """以 run-control 错误立即中止当前 Arena。"""
+
         raise ArenaAbort(message)
 
     @property
     def live_block_count(self) -> int:
-        """Return the current number of Arena-owned coarse block handles."""
+        """返回当前 Arena 持有的 coarse block handle 数。"""
 
         return len(self.blocks)
 
     def _stage_queue(self, stage: int) -> StageBatchQueue:
+        """获取或惰性创建一个 Stage 的 Arena-local batch queue。"""
+
         return self.queues.setdefault(stage, StageBatchQueue())
 
     def _allocate_block(self, handle: Any) -> int:
+        """登记 opaque block handle，并在写入前检查 block hard limit。"""
+
         if len(self.blocks) + 1 > self.limits.max_blocks:
             self._abort("max_blocks_per_arena exceeded")
         block_id = self.next_block
@@ -146,6 +158,11 @@ class ArenaEngine:
         position_starts: tuple[int, ...],
         block_factory: Callable[[tuple[Any, ...]], Any] = tuple,
     ) -> None:
+        """把等长 source slices 作为 coarse blocks 和 Source Grains admission。
+
+        多 Source 相同 position 共享 EntityId，但各自拥有不同 PortId/Source GrainId。
+        """
+
         if len(source_values) != len(self.dag.source_ports):
             self._abort("source argument count does not match CompiledDAG")
         if len(position_starts) != len(source_values):
@@ -192,6 +209,8 @@ class ArenaEngine:
         self.admission_closed = True
 
     def advance(self, now: float | None = None) -> bool:
+        """消费全部 pending Item receipts，只推进直接受影响的 consumer 状态。"""
+
         del now
         progress = False
         while self.receipts:
@@ -218,6 +237,8 @@ class ArenaEngine:
         input_index: int,
         item_record: ItemRecord,
     ) -> bool:
+        """按 ANCHOR/GROUP/scalar mode 将 terminal receipt 路由到 Reduce 状态。"""
+
         mode = stage.inputs[input_index].mode
         if mode is InputMode.ANCHOR:
             return self._route_anchor(stage, input_index, item_record)
@@ -231,6 +252,8 @@ class ArenaEngine:
         input_index: int,
         item_record: ItemRecord,
     ) -> bool:
+        """把 ONE/OPTIONAL_ONE receipt 填入 `(stage, entity)` PendingInvocation。"""
+
         key = (stage.id, item_record.ref.entity)
         pending = self.pending_invocations.get(key)
         if pending is None:
@@ -255,6 +278,8 @@ class ArenaEngine:
         stage: StageSpec,
         refs: tuple[ItemRef, ...],
     ) -> None:
+        """在 aligned inputs 全部 terminal 后唯一分类 executable/drop/suppressed。"""
+
         records = tuple(self.items[ref] for ref in refs)
         assert stage.driving_input is not None
         driving = records[stage.driving_input]
@@ -294,6 +319,8 @@ class ArenaEngine:
         entity: EntityId,
         driving: ItemRecord,
     ) -> None:
+        """传播 driving normal absence；Expand 使用 dropped fanout fact 而不虚构 child。"""
+
         cause = driving.cause or driving.producer
         if stage.kind is Primitive.EXPAND:
             # No child coordinate exists when the parent occurrence is absent.
@@ -315,6 +342,8 @@ class ArenaEngine:
         inputs: tuple[InputBinding, ...],
         entity: EntityId,
     ) -> GrainRecord:
+        """幂等创建 READY Grain，并加入对应 StageBatchQueue。"""
+
         grain_id = stage_grain_id(self.run_salt, stage.id, inputs)
         existing = self.grains.get(grain_id)
         if existing is not None:
@@ -337,6 +366,8 @@ class ArenaEngine:
         entity: EntityId,
         causes: tuple[GrainId, ...],
     ) -> GrainRecord:
+        """幂等创建直接 SEALED 的 Suppressed Grain，并发布负 lineage。"""
+
         grain_id = stage_grain_id(self.run_salt, stage.id, inputs)
         existing = self.grains.get(grain_id)
         if existing is not None:
@@ -373,6 +404,8 @@ class ArenaEngine:
         input_index: int,
         item_record: ItemRecord,
     ) -> bool:
+        """处理 Reduce anchor terminal receipt，并创建对应 accumulator。"""
+
         del input_index
         if item_record.terminal is ItemTerminal.DROPPED:
             self._propagate_dropped(stage, item_record.ref.entity, item_record)
@@ -398,6 +431,8 @@ class ArenaEngine:
         input_index: int,
         item_record: ItemRecord,
     ) -> bool:
+        """记录 anchor-aligned ONE/OPTIONAL_ONE context，并尝试 finalize Reduce。"""
+
         anchor_spec = next(
             spec for spec in stage.inputs if spec.mode is InputMode.ANCHOR
         )
@@ -417,6 +452,8 @@ class ArenaEngine:
         input_index: int,
         item_record: ItemRecord,
     ) -> bool:
+        """把 GROUP leaf 按完整 ordinal path 写入 ReduceAccumulator。"""
+
         assert stage.reduce is not None
         try:
             anchor_entity, ordinal_path = self._resolve_scope_path(
@@ -453,6 +490,8 @@ class ArenaEngine:
         stage: StageSpec,
         anchor_record: ItemRecord,
     ) -> ReduceAccumulator:
+        """幂等创建一个 anchor 的 ReduceAccumulator，并登记 scalar inputs。"""
+
         key = (stage.id, anchor_record.ref.entity)
         existing = self.reduce_accumulators.get(key)
         if existing is not None:
@@ -483,6 +522,8 @@ class ArenaEngine:
         stage: StageSpec,
         accumulator: ReduceAccumulator,
     ) -> bool:
+        """判断 scalar inputs、fanout tree 和所有 required GROUP leaves 是否 complete。"""
+
         assert stage.reduce is not None
         scalar_indexes = tuple(
             index
@@ -502,6 +543,8 @@ class ArenaEngine:
         )
 
     def _route_fanout_to_reduces(self, expand: ExpandInstance) -> None:
+        """利用 CompiledDAG.reduces_by_expand 只路由给相关 Reduce stages。"""
+
         for reduce_stage in self.dag.reduces_by_expand.get(expand.stage, ()):
             stage = self.dag.stage(reduce_stage)
             assert stage.reduce is not None
@@ -523,7 +566,7 @@ class ArenaEngine:
                 self._finalize_reduce(accumulator)
 
     def _publish_expand_instance(self, instance: ExpandInstance) -> None:
-        """Publish one terminal fanout fact and route it to Reduce states."""
+        """幂等发布一个 terminal fanout fact，并触发 direct Reduce 路由。"""
 
         key = (instance.stage, instance.anchor.entity)
         existing = self.expand_instances.get(key)
@@ -539,6 +582,8 @@ class ArenaEngine:
         accumulator: ReduceAccumulator,
         expand: ExpandInstance,
     ) -> bool:
+        """把 fanout fact 映射成 accumulator 中的 `(depth, parent_path)`。"""
+
         depth = accumulator.depth_for(expand.stage)
         if depth is None:
             return False
@@ -559,6 +604,8 @@ class ArenaEngine:
         return True
 
     def _charge_reduce_slots(self, additions: int) -> None:
+        """按 accumulator 实际新增 metadata 检查并计入 Reduce slot hard limit。"""
+
         if not additions:
             return
         if self.reduce_slot_count + additions > self.limits.max_reduce_slots:
@@ -570,6 +617,8 @@ class ArenaEngine:
         accumulator: ReduceAccumulator,
         expand: ExpandInstance,
     ) -> None:
+        """中间 required fanout 失败时，以 anchor-only binding Suppress root Reduce。"""
+
         if expand.grain is None:
             self._abort("failed fanout has no GrainId")
         stage = self.dag.stage(accumulator.stage)
@@ -584,6 +633,8 @@ class ArenaEngine:
         )
 
     def _finalize_reduce(self, accumulator: ReduceAccumulator) -> None:
+        """构建 GroupShape、投影 surviving leaves，并创建 executable/suppressed Reduce。"""
+
         stage = self.dag.stage(accumulator.stage)
         assert stage.reduce is not None
         key = (stage.id, accumulator.anchor.entity)
@@ -674,6 +725,8 @@ class ArenaEngine:
         self._drop_reduce_accumulator(key)
 
     def _drop_reduce_accumulator(self, key: tuple[int, EntityId]) -> None:
+        """删除已完成 accumulator，并归还它实际占用的 slot budget。"""
+
         accumulator = self.reduce_accumulators.pop(key, None)
         if accumulator is not None:
             self.reduce_slot_count -= accumulator.slot_cost
@@ -683,6 +736,8 @@ class ArenaEngine:
         entity: EntityId,
         scope_path: tuple[int, ...],
     ) -> tuple[EntityId, tuple[int, ...]]:
+        """沿 EntityOrigin 反向解析指定 Expand scope_path 和完整 ordinal path。"""
+
         if not scope_path:
             return entity, ()
         expected = list(reversed(scope_path))
@@ -700,6 +755,8 @@ class ArenaEngine:
         return current, tuple(ordinals)
 
     def _publish_item(self, record: ItemRecord, location: BlockRow | None = None) -> None:
+        """原子发布一个 Item terminal receipt；PRESENT 同时登记 BlockRow。"""
+
         existing = self.items.get(record.ref)
         if existing is not None:
             if existing != record:
@@ -715,6 +772,8 @@ class ArenaEngine:
         self.receipts.append(record.ref)
 
     def _enqueue(self, record: GrainRecord) -> None:
+        """幂等把 READY Grain 放入 Stage normal queue，并启动 tail timer。"""
+
         queue = self._stage_queue(record.stage)
         if record.id in queue.normal_set:
             return
@@ -724,10 +783,14 @@ class ArenaEngine:
         queue.normal_set.add(record.id)
 
     def _check_grain_limit(self, additions: int) -> None:
+        """在 GrainTable 插入前检查 Arena aggregate grain hard limit。"""
+
         if len(self.grains) + additions > self.limits.max_grains:
             self._abort("max_grains_per_arena exceeded")
 
     def _normal_candidates(self, stage: StageSpec) -> tuple[GrainId, ...]:
+        """按 elastic 或 nearest-parent-bound 规则选择 normal queue candidates。"""
+
         queue = self._stage_queue(stage.id)
         if stage.execution.batch_scope == "elastic":
             return tuple(queue.normal)
@@ -747,10 +810,14 @@ class ArenaEngine:
         return tuple(groups[order[0]]) if order else ()
 
     def _nearest_parent_entity(self, entity: EntityId) -> EntityId:
+        """返回最近 Expand parent；source-scope Entity 返回自身。"""
+
         origin = self.entity_origins.get(entity)
         return origin.parent_entity if origin is not None else entity
 
     def next_deadline(self, now: float | None = None) -> float | None:
+        """返回当前 Arena 最近的 underfilled batch timeout 剩余秒数。"""
+
         now = self.clock() if now is None else now
         deadlines = []
         for stage_id, queue in self.queues.items():
@@ -772,6 +839,12 @@ class ArenaEngine:
         stage_id: int,
         now: float | None = None,
     ) -> DispatchIntent | None:
+        """从 recovery/normal/tail queue 预留一个 physical dispatch。
+
+        方法生成新 AttemptToken、构造 RowTake/MissingTake，并把 block handles 封装为
+        DispatchIntent；它不调用 Ray。
+        """
+
         if len(self.leases) >= self.limits.max_pending_dispatches:
             return None
         stage = self.dag.stage(stage_id)
@@ -884,9 +957,13 @@ class ArenaEngine:
         )
 
     def _normal_work_empty(self) -> bool:
+        """判断所有 Stage 是否已无 normal/immediate work，用于激活 tail recovery。"""
+
         return all(not queue.normal and not queue.immediate for queue in self.queues.values())
 
     def commit(self, completion: DispatchCompletion) -> None:
+        """校验 generation/report contract，并原子提交成功 completion。"""
+
         if completion.arena_id != self.id:
             self._abort("completion targets another Arena")
         lease = self.leases.get(completion.call.dispatch)
@@ -916,7 +993,7 @@ class ArenaEngine:
         if stage.kind is Primitive.FILTER:
             if completion.output_blocks or report.column_lengths:
                 self._abort("Filter must not return business output blocks")
-            if any(ack.keep is None or ack.output_counts is not None for ack in report.acks):
+            if any(not isinstance(ack, FilterAck) for ack in report.acks):
                 self._abort("Filter report shape is invalid")
             self._commit_filter(stage, lease, report)
         else:
@@ -924,7 +1001,7 @@ class ArenaEngine:
                 self._abort("output block arity mismatch")
             if len(report.column_lengths) != stage.output_count:
                 self._abort("output column length arity mismatch")
-            if any(ack.output_counts is None or ack.keep is not None for ack in report.acks):
+            if any(not isinstance(ack, ValueAck) for ack in report.acks):
                 self._abort("value-producing report shape is invalid")
             self._commit_values(stage, lease, report, completion.output_blocks)
         self.timeline.append(
@@ -952,12 +1029,14 @@ class ArenaEngine:
         lease: DispatchLease,
         report: BatchReport,
     ) -> None:
+        """提交 Filter mask：keep 时 alias 输入 BlockRow，drop 时同步发布 DROPPED。"""
+
         for record, invocation, ack in zip(
             (self.grains[grain_id] for grain_id in lease.grain_ids),
             lease.call.invocations,
             report.acks,
         ):
-            assert ack.keep is not None
+            assert isinstance(ack, FilterAck)
             emissions = []
             for output_index, (port, binding) in enumerate(
                 zip(stage.output_ports(), record.inputs)
@@ -994,6 +1073,8 @@ class ArenaEngine:
         report: BatchReport,
         output_blocks: tuple[Any, ...],
     ) -> None:
+        """提交 Map/Expand/Reduce output blocks、emissions、lineage 和 fanout facts。"""
+
         block_ids = tuple(self._allocate_block(block) for block in output_blocks)
         cursors = [0] * stage.output_count
         prepared: list[tuple[GrainRecord, AttemptToken, Success]] = []
@@ -1003,8 +1084,8 @@ class ArenaEngine:
             report.acks,
         ):
             record = self.grains[grain_id]
+            assert isinstance(ack, ValueAck)
             counts = ack.output_counts
-            assert counts is not None
             if len(counts) != stage.output_count:
                 self._abort("output count arity mismatch")
             if stage.kind in {Primitive.MAP, Primitive.REDUCE} and any(
@@ -1090,6 +1171,8 @@ class ArenaEngine:
                 )
 
     def _output_entity(self, record: GrainRecord, stage: StageSpec) -> EntityId:
+        """返回非 Expand Grain 的输出 Entity：Reduce 用 anchor，其余用 driving input。"""
+
         if stage.kind is Primitive.REDUCE:
             return next(
                 binding.items[0].entity
@@ -1100,6 +1183,8 @@ class ArenaEngine:
         return record.inputs[stage.driving_input].items[0].entity
 
     def handle_failure(self, failure: DispatchFailure) -> None:
+        """按四类 failure 分派 exact、UDF recovery、contract abort 或 infra retry。"""
+
         lease = self.leases.get(failure.dispatch)
         if lease is None:
             return
@@ -1119,6 +1204,8 @@ class ArenaEngine:
         lease: DispatchLease,
         failure: DispatchFailure,
     ) -> None:
+        """精确 Failed 指定 Grain，并把同 RPC 健康 sibling 释放回 READY。"""
+
         if failure.bad_token is None:
             self._abort("BAD_RECORD failure has no token")
         matched = False
@@ -1143,6 +1230,8 @@ class ArenaEngine:
         lease: DispatchLease,
         failure: DispatchFailure,
     ) -> None:
+        """在独立 infra budget 内换 generation 重试同一组 Logical Grains。"""
+
         assert stage.execution is not None
         limit = stage.execution.recovery.limits.max_infra_retries
         for invocation in lease.call.invocations:
@@ -1165,6 +1254,8 @@ class ArenaEngine:
         lease: DispatchLease,
         failure: DispatchFailure,
     ) -> None:
+        """按 Stage recovery preset 执行 abort/retry/tail/isolate/fail_batch。"""
+
         del failure
         assert stage.execution is not None
         preset = stage.execution.recovery.preset
@@ -1207,6 +1298,8 @@ class ArenaEngine:
                 self._schedule_split(stage, task)
 
     def _schedule_split(self, stage: StageSpec, task: RecoveryTask) -> None:
+        """把失败 recovery group 二分；singleton 仍失败时归因到该 Grain。"""
+
         limits = stage.execution.recovery.limits
         if len(task.grains) == 1:
             record = self.grains[task.grains[0]]
@@ -1235,6 +1328,8 @@ class ArenaEngine:
         record: GrainRecord,
         failure: GrainFailure,
     ) -> None:
+        """发布 Failed Grain 的 output receipts；Expand 发布 failed-before-output fact。"""
+
         stage = self.dag.stage(record.stage)
         if stage.kind is Primitive.EXPAND:
             parent = record.inputs[stage.driving_input].items[0]
@@ -1254,6 +1349,8 @@ class ArenaEngine:
         self.failure_count += 1
 
     def is_complete(self, pending_rpc_count: int = 0) -> bool:
+        """检查 admission、事件、fan-in、queues、leases、RPC 和 Grain 全部 terminal。"""
+
         return (
             self.admission_closed
             and not self.receipts
@@ -1274,6 +1371,8 @@ class ArenaEngine:
         )
 
     def finish(self) -> ArenaResult:
+        """生成 detached outputs/failure/suppression/metrics/timeline 后 reclaim Arena。"""
+
         if not self.is_complete():
             self._abort("cannot finish incomplete Arena")
         source_order = {
@@ -1342,6 +1441,8 @@ class ArenaEngine:
         entity: EntityId,
         source_order: dict[EntityId, int],
     ) -> tuple[int, ...]:
+        """构建 source position + nested ordinal path 的稳定 delivery 排序 key。"""
+
         ordinals: list[int] = []
         current = entity
         while current in self.entity_origins:
@@ -1352,6 +1453,8 @@ class ArenaEngine:
         return (source_order.get(current, len(source_order)), *ordinals)
 
     def _reclaim(self) -> None:
+        """清空 Arena-owned semantic/value/control state，释放中间 block handles。"""
+
         self.grains.clear()
         self.items.clear()
         self.entity_origins.clear()

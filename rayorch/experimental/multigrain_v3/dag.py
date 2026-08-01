@@ -1,4 +1,8 @@
-"""Immutable General-DAG schema and compile-time validation."""
+"""V3 不可变 General DAG schema 与编译期校验。
+
+该模块是静态图的唯一 authority：描述 Stage、输入模式、执行配置和 direct routing
+索引。它不导入 Arena、Driver、Worker 或 Ray，也不保存任何运行时状态。
+"""
 
 from __future__ import annotations
 
@@ -11,11 +15,11 @@ from .model import PortId
 
 
 class CompileError(ValueError):
-    """The user graph violates the V3 programming model."""
+    """表示用户 DAG 不满足 V3 编程模型或静态语义约束。"""
 
 
 class Primitive(Enum):
-    """Compiled Stage kinds supported by the V3 prototype."""
+    """V3 编译后支持的 Stage 原语类型。"""
     SOURCE = "source"
     MAP = "map"
     FILTER = "filter"
@@ -24,7 +28,7 @@ class Primitive(Enum):
 
 
 class InputMode(Enum):
-    """How one compiled input participates in alignment and actor payloads."""
+    """一个 input 在对齐语义和 Actor payload 中的参与方式。"""
     ONE = "one"
     OPTIONAL_ONE = "optional_one"
     GROUP = "group"
@@ -32,7 +36,7 @@ class InputMode(Enum):
 
 
 class RecoveryPreset(Enum):
-    """Small public presets mapped to Arena-local recovery actions."""
+    """对外暴露的少量恢复策略预设，由 Arena 映射为具体恢复动作。"""
     RAISE = "raise"
     RETRY_BATCH = "retry_batch"
     RETRY_TAIL = "retry_tail"
@@ -42,7 +46,10 @@ class RecoveryPreset(Enum):
 
 @dataclass(frozen=True, slots=True)
 class RecoveryLimits:
-    """Hard budgets for infrastructure retry and UDF recovery."""
+    """基础设施重试和 UDF recovery 的硬预算。
+
+    这些预算属于 Stage 静态执行合同；运行中的计数位于 Arena RecoveryTask。
+    """
     max_infra_retries: int = 1
     max_recovery_attempts: int = 2
     max_split_depth: int = 16
@@ -50,6 +57,8 @@ class RecoveryLimits:
     max_reexecuted_grains: int = 100_000
 
     def __post_init__(self) -> None:
+        """保证所有恢复预算非负。"""
+
         if min(
             self.max_infra_retries,
             self.max_recovery_attempts,
@@ -62,14 +71,14 @@ class RecoveryLimits:
 
 @dataclass(frozen=True, slots=True)
 class RecoverySpec:
-    """Immutable recovery policy attached to one Stage."""
+    """绑定到单个 Stage 的不可变 recovery preset 与预算。"""
     preset: RecoveryPreset = RecoveryPreset.RAISE
     limits: RecoveryLimits = RecoveryLimits()
 
 
 @dataclass(frozen=True, slots=True)
 class UdfSpec:
-    """How a persistent worker constructs the user UDF instance."""
+    """persistent Worker 构造用户 UDF instance 所需的 recipe。"""
     target: Any
     init_args: tuple[Any, ...] = ()
     init_kwargs: tuple[tuple[str, Any], ...] = ()
@@ -77,7 +86,7 @@ class UdfSpec:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionSpec:
-    """Physical replicas, batching, recovery, and Ray resource options."""
+    """Stage 的物理副本、合批、恢复和 Ray resource 配置。"""
     replicas: int = 1
     batch_size: int = 1
     max_batch_wait_ms: float = 2.0
@@ -86,6 +95,8 @@ class ExecutionSpec:
     ray_options: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
+        """校验 replicas、batch trigger 和 batch_scope 配置。"""
+
         if self.replicas <= 0 or self.batch_size <= 0:
             raise ValueError("replicas and batch_size must be positive")
         if self.max_batch_wait_ms < 0:
@@ -96,29 +107,45 @@ class ExecutionSpec:
 
 @dataclass(frozen=True, slots=True)
 class InputSpec:
-    """One named static edge into a Stage."""
+    """进入 Stage 的一条命名静态边。
+
+    `mode` 明确 scalar、optional、GROUP 或 semantic-only ANCHOR；运行时不再猜测输入
+    角色。
+    """
     name: str
     port: PortId
     mode: InputMode = InputMode.ONE
 
     def __post_init__(self) -> None:
+        """校验输入名称非空。"""
+
         if not self.name:
             raise ValueError("input name must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)
 class ReduceSpec:
-    """The minimal extra contract needed for ordered Expand-scoped Reduce."""
+    """ordered hierarchical Reduce 所需的最小静态合同。
+
+    `scope_path` 是 anchor scope 到 member scope 之间唯一的 Expand Stage 序列；每个
+    Expand 对应 UDF nested GROUP 中的一层 list。
+    """
     members_input: int
     scope_path: tuple[int, ...]
 
     def __post_init__(self) -> None:
+        """禁止没有 Expand 层级的 GROUP Reduce。"""
+
         if not self.scope_path:
             raise ValueError("Reduce scope_path must contain at least one Expand")
 
 @dataclass(frozen=True, slots=True)
 class StageSpec:
-    """Immutable compiled description of one logical Stage."""
+    """一个逻辑 Stage 的不可变编译结果。
+
+    输出 Port 由 `(id, output_index)` 推导，不重复存储 PortSpec；kind-specific 合法性由
+    compiler validator 保证。
+    """
     id: int
     kind: Primitive
     inputs: tuple[InputSpec, ...]
@@ -129,19 +156,25 @@ class StageSpec:
     reduce: ReduceSpec | None = None
 
     def output_ports(self) -> tuple[PortId, ...]:
+        """按 output_count 派生该 Stage 的全部 PortId。"""
+
         return tuple(PortId(self.id, index) for index in range(self.output_count))
 
 
 @dataclass(frozen=True, slots=True)
 class ConsumerEdge:
-    """Derived route from an output Port to one consumer input slot."""
+    """从 output Port 到 consumer input slot 的可重建 direct route。"""
     stage: int
     input_index: int
 
 
 @dataclass(frozen=True, slots=True)
 class CompiledDAG:
-    """Immutable General DAG shared read-only by every Arena in a run."""
+    """一次 run 中由所有 Arena 只读共享的不可变 General DAG。
+
+    `consumers_by_port` 驱动 Item receipt 路由；`reduces_by_expand` 驱动 fanout fact 只
+    投递到相关 hierarchical Reduce，避免全表扫描。
+    """
     stages: tuple[StageSpec, ...]
     consumers_by_port: Mapping[PortId, tuple[ConsumerEdge, ...]] = field(
         repr=False
@@ -153,6 +186,8 @@ class CompiledDAG:
     output_ports: tuple[PortId, ...] = ()
 
     def stage(self, stage_id: int) -> StageSpec:
+        """按 dense StageId 返回 StageSpec，并校验索引一致性。"""
+
         try:
             stage = self.stages[stage_id]
         except IndexError as error:
@@ -162,16 +197,22 @@ class CompiledDAG:
         return stage
 
     def producer(self, port: PortId) -> StageSpec:
+        """返回指定 PortId 的 producer Stage，并校验 output index。"""
+
         stage = self.stage(port.stage)
         if port.output >= stage.output_count:
             raise CompileError(f"unknown output port: {port}")
         return stage
 
     def consumers(self, port: PortId) -> tuple[ConsumerEdge, ...]:
+        """返回一个 output Port 的直接 consumer edges。"""
+
         return self.consumers_by_port.get(port, ())
 
 
 def _validate_stage_shape(stage: StageSpec) -> None:
+    """校验单个 StageSpec 的 kind-specific 字段组合。"""
+
     if stage.id < 0 or stage.output_count <= 0:
         raise CompileError("stage id/output_count must be valid")
     names = tuple(input_spec.name for input_spec in stage.inputs)
@@ -238,6 +279,8 @@ def _validate_stage_shape(stage: StageSpec) -> None:
 def _validate_scope_and_reduce(
     stages: tuple[StageSpec, ...],
 ) -> dict[PortId, tuple[int, ...]]:
+    """推导每个 Port 的 Expand scope，并校验 aligned/Reduce scope 关系。"""
+
     scopes: dict[PortId, tuple[int, ...]] = {}
     for stage in stages:
         if stage.kind is Primitive.SOURCE:
@@ -300,6 +343,8 @@ def compile_dag(
     source_ports: tuple[PortId, ...],
     output_ports: tuple[PortId, ...],
 ) -> CompiledDAG:
+    """校验拓扑并构建 immutable CompiledDAG 与 direct routing indexes。"""
+
     if tuple(stage.id for stage in stages) != tuple(range(len(stages))):
         raise CompileError("stage ids must be dense and topologically ordered")
 

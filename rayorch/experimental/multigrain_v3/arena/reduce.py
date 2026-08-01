@@ -1,7 +1,7 @@
-"""Hierarchical Reduce state and canonical nested-list shape construction.
+"""Hierarchical Reduce 状态与 canonical nested-list shape 构建。
 
-The module has no access to Arena tables or Ray. ArenaEngine routes terminal
-fanout/leaf facts into ReduceAccumulator and consumes its final GroupShape.
+本模块不访问 Arena tables 或 Ray。ArenaEngine 只把 terminal fanout/leaf facts 路由给
+ReduceAccumulator，并消费最终 GroupShape。这样一层和任意深度 Reduce 共享同一抽象。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from ..model import GrainId, GroupShape, InvariantError, ItemRecord, ItemRef
 
 
 class FanoutTerminal(Enum):
-    """Terminal classification for one parent/Expand occurrence."""
+    """一个 parent/Expand occurrence 的终态分类。"""
 
     SUCCESS = "success"
     DROPPED = "dropped"
@@ -22,7 +22,11 @@ class FanoutTerminal(Enum):
 
 @dataclass(frozen=True, slots=True)
 class ExpandInstance:
-    """One terminal dynamic fanout fact."""
+    """一个 terminal dynamic fanout fact。
+
+    SUCCESS 保存已知 cardinality；DROPPED 表示该 Expand 未执行且中间 node 应省略；
+    FAILED 表示 failed-before-output，并携带直接 Grain cause。
+    """
 
     grain: GrainId | None
     stage: int
@@ -39,6 +43,8 @@ class ExpandInstance:
         anchor: ItemRef,
         cardinality: int,
     ) -> "ExpandInstance":
+        """构造已知 cardinality 的成功 fanout fact。"""
+
         if cardinality < 0:
             raise ValueError("fanout cardinality must be non-negative")
         return cls(grain, stage, anchor, FanoutTerminal.SUCCESS, cardinality)
@@ -50,6 +56,8 @@ class ExpandInstance:
         anchor: ItemRef,
         cause: GrainId | None,
     ) -> "ExpandInstance":
+        """构造正常 absence 导致的未执行 fanout fact。"""
+
         return cls(None, stage, anchor, FanoutTerminal.DROPPED, cause=cause)
 
     @classmethod
@@ -59,16 +67,24 @@ class ExpandInstance:
         stage: int,
         anchor: ItemRef,
     ) -> "ExpandInstance":
+        """构造 failed-before-output 的 fanout fact。"""
+
         return cls(grain, stage, anchor, FanoutTerminal.FAILED, cause=grain)
 
 
 @dataclass(slots=True)
 class ReduceAccumulator:
-    """One anchor's arbitrary-depth GROUP state.
+    """一个 anchor 的任意深度 GROUP 累加器。
 
-    ``fanouts`` is keyed by ``(depth, parent_ordinal_path)`` and
-    ``leaf_groups`` by full ordinal path. A one-level Reduce is simply a
-    one-element ``scope_path``.
+    `fanouts` 以 `(depth, parent_ordinal_path)` 为 key，`leaf_groups` 以完整 ordinal
+    path 为 key。一层 Reduce 只是长度为 1 的 scope_path。
+
+    设计理念：
+
+    - 一个 Expand 固定对应一层 list；
+    - intermediate `N=0` 与 normal drop 保持不同语义；
+    - 多个 GROUP 共用同一 canonical tree shape；
+    - shape 算法保持纯函数式，不读取 Arena tables。
     """
 
     stage: int
@@ -84,6 +100,8 @@ class ReduceAccumulator:
     slot_cost: int = 0
 
     def depth_for(self, expand_stage: int) -> int | None:
+        """返回 Expand 在 scope_path 中的深度；不属于该 Reduce 时返回 None。"""
+
         try:
             return self.scope_path.index(expand_stage)
         except ValueError:
@@ -95,7 +113,7 @@ class ReduceAccumulator:
         parent_path: tuple[int, ...],
         instance: ExpandInstance,
     ) -> int:
-        """Store a fanout fact and return newly charged metadata slots."""
+        """写入一个 fanout fact，并返回新增 metadata slot 成本。"""
 
         key = (depth, parent_path)
         existing = self.fanouts.get(key)
@@ -118,7 +136,7 @@ class ReduceAccumulator:
         ordinal_path: tuple[int, ...],
         record: ItemRecord,
     ) -> int:
-        """Store a GROUP leaf receipt and return newly charged slots."""
+        """写入一个 GROUP leaf receipt，并返回新增 metadata slot 成本。"""
 
         group = self.leaf_groups.setdefault(input_index, {})
         existing = group.get(ordinal_path)
@@ -131,6 +149,8 @@ class ReduceAccumulator:
         return 1
 
     def expected_leaf_paths(self) -> set[tuple[int, ...]] | None:
+        """返回完整 tree 期望的 active leaf paths；尚未 settled 时返回 None。"""
+
         structure = self._active_structure()
         return None if structure is None else set(structure[1][-1])
 
@@ -140,6 +160,8 @@ class ReduceAccumulator:
         group_indexes: tuple[int, ...],
         scalar_indexes: tuple[int, ...],
     ) -> bool:
+        """判断所有 scalar inputs 和 required GROUP leaves 是否已 terminal。"""
+
         if not all(index in self.scalar_inputs for index in scalar_indexes):
             return False
         expected = self.expected_leaf_paths()
@@ -152,7 +174,10 @@ class ReduceAccumulator:
         self,
         selected: set[tuple[int, ...]] | None = None,
     ) -> tuple[GroupShape, tuple[tuple[int, ...], ...]]:
-        """Build canonical offsets and flat leaf path order."""
+        """构建 canonical CSR offsets 与 flat leaf path 顺序。
+
+        `selected` 用于 Filter 投影：保留 intermediate tree node，只在最内层省略未选 leaf。
+        """
 
         structure = self._active_structure()
         if structure is None:
@@ -184,7 +209,7 @@ class ReduceAccumulator:
         tuple[tuple[int, ...], ...],
         tuple[tuple[tuple[int, ...], ...], ...],
     ] | None:
-        """Return active paths, preserving N=0 and omitting dropped nodes."""
+        """生成 active paths：保留 successful N=0，省略 dropped intermediate node。"""
 
         parent_paths: list[tuple[int, ...]] = [()]
         offsets_by_level: list[tuple[int, ...]] = []
@@ -219,4 +244,3 @@ class ReduceAccumulator:
             paths_by_level.append(tuple(next_paths))
             parent_paths = next_paths
         return tuple(offsets_by_level), tuple(paths_by_level)
-

@@ -1,4 +1,8 @@
-"""RunDriver: bounded multi-Arena overlap over shared Stage executors."""
+"""RunDriver：在共享 StageExecutor 上协调有界 multi-Arena overlap。
+
+Driver 只调用 ArenaEngine 公共接口并转发 ExecutionEvent，不读取 GrainTable、ItemTable、
+ReduceAccumulator 或 ValueTable。
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-from .api import CompiledPipeline, ExecutionError
+from .api import CompiledPipeline
+from .contracts import ExecutionError
 from .arena import (
     ArenaEngine,
     ArenaLimits,
@@ -18,13 +23,15 @@ from .protocol import ArenaResult, BlockSlice, DispatchCompletion
 
 @dataclass(frozen=True, slots=True)
 class SourceChunk:
-    """One run-ordered source slice admitted as an Arena."""
+    """按 run 输入顺序切分、最终 admission 为一个 Arena 的 source slice。"""
     index: int
     values: tuple[tuple[Any, ...], ...]
     position_starts: tuple[int, ...]
 
 
 def _merge_metrics(parts: tuple[ArenaResult, ...]) -> dict[str, float]:
+    """按 grain/RPC 权重合并多个 ArenaResult 的核心指标。"""
+
     rpc_count = sum(part.metrics.get("rpc_count", 0.0) for part in parts)
     grains = sum(
         part.metrics.get("rpc_count", 0.0)
@@ -65,7 +72,7 @@ def _merge_metrics(parts: tuple[ArenaResult, ...]) -> dict[str, float]:
 
 
 class RunDriver:
-    """Coordinate active Arenas without reading their internal tables."""
+    """在不读取 Arena 内部 tables 的前提下协调 active Arenas。"""
 
     def __init__(
         self,
@@ -78,6 +85,8 @@ class RunDriver:
         max_inflight_arenas: int,
         limits: ArenaLimits,
     ) -> None:
+        """初始化待 admission chunks、共享执行池和 in-flight 边界。"""
+
         self.compiled = compiled
         self.execution = execution
         self.pending = deque(chunks)
@@ -91,6 +100,8 @@ class RunDriver:
         self.live_blocks_high_watermark = 0
 
     def _admit(self) -> bool:
+        """在 max_inflight 限制内创建 Arena，并用 coarse source blocks admission。"""
+
         progress = False
         while self.pending and len(self.active) < self.max_inflight:
             chunk = self.pending.popleft()
@@ -116,6 +127,8 @@ class RunDriver:
         return progress
 
     def _submit(self) -> bool:
+        """推进每个 Arena，并把可 dispatch Grain 提交给有容量的 StageExecutor。"""
+
         progress = False
         now = time.monotonic()
         for chunk_index in sorted(self.active):
@@ -140,6 +153,8 @@ class RunDriver:
         return progress
 
     def _nearest_deadline(self) -> float | None:
+        """返回所有 active Arena 中最近的 batch timeout 剩余时间。"""
+
         deadlines = [
             deadline
             for arena in self.active.values()
@@ -149,6 +164,8 @@ class RunDriver:
         return min(deadlines) if deadlines else None
 
     def _apply_event(self, event: ExecutionEvent) -> None:
+        """把 completion/failure 只路由给拥有该 arena_id 的 ArenaEngine。"""
+
         arena = next(
             (
                 arena
@@ -165,6 +182,8 @@ class RunDriver:
             arena.handle_failure(event.result)
 
     def _finish_completed(self) -> bool:
+        """完成、detach 并回收所有达到 completion 条件的 Arena。"""
+
         progress = False
         for chunk_index, arena in tuple(self.active.items()):
             if not arena.is_complete(
@@ -177,11 +196,15 @@ class RunDriver:
         return progress
 
     def _cancel_all(self) -> None:
+        """run 失败时 best-effort 取消所有 active Arena 的 pending RPC。"""
+
         for arena in self.active.values():
             self.execution.cancel_arena(arena.id)
         self.active.clear()
 
     def run(self) -> tuple[ArenaResult, int, int, int]:
+        """运行 single-writer event loop，直到所有 chunks 和 RPC 完成。"""
+
         try:
             self._admit()
             while self.pending or self.active or self.execution.pending_count:
@@ -228,7 +251,7 @@ class RunDriver:
 
 
 def resolve_outputs(outputs: tuple[Any, ...]) -> tuple[Any, ...]:
-    """Resolve final BlockSlices while coalescing gets per coarse block."""
+    """按 coarse block 合并 ray.get，并解析最终 BlockSlice。"""
 
     slices = [value for value in outputs if isinstance(value, BlockSlice)]
     if not slices:
