@@ -55,6 +55,15 @@ def test_arena_engine_does_not_import_ray_or_stage_executor():
     assert "ray" not in _absolute_import_roots(engine)
 
 
+def test_reduce_accumulator_is_pure_and_ray_free():
+    """Hierarchical shape logic owns no Arena tables, Driver, or Ray."""
+
+    reduce_module = ROOT / "arena" / "reduce.py"
+    imports = _local_imports(reduce_module)
+    assert not imports & {"engine", "driver", "execution", "worker"}
+    assert "ray" not in _absolute_import_roots(reduce_module)
+
+
 def test_driver_does_not_reach_into_arena_tables():
     """RunDriver may use ArenaEngine methods/properties, not internal tables."""
 

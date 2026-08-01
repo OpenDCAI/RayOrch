@@ -5,6 +5,14 @@ records remain in :mod:`.state` for focused review and testing.
 """
 
 from .engine import ArenaEngine
+from .reduce import ExpandInstance, FanoutTerminal, ReduceAccumulator
 from .state import ArenaAbort, ArenaLimits
 
-__all__ = ["ArenaAbort", "ArenaEngine", "ArenaLimits"]
+__all__ = [
+    "ArenaAbort",
+    "ArenaEngine",
+    "ArenaLimits",
+    "ExpandInstance",
+    "FanoutTerminal",
+    "ReduceAccumulator",
+]

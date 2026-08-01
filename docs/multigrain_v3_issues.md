@@ -28,5 +28,12 @@ This file records concrete implementation questions discovered while building
 - Arena keeps coarse blocks until delivery in Prototype 1, but enforces a
   `max_blocks` hard limit; early release remains benchmark-driven future work.
 - The Arena implementation is a package: `state.py` contains passive records
-  and `engine.py` contains the sole Arena state machine. No mixin or second
+  and queues, `reduce.py` owns the pure hierarchical ReduceAccumulator, and
+  `engine.py` contains the sole Arena state machine. No mixin or second
   runtime authority was introduced.
+- Hierarchical Reduce derives a canonical `scope_path` from anchor/member
+  scopes. One Expand equals one nested-list level; no extra API keyword is
+  required and implicit flattening remains unsupported.
+- Deep-scope regressions cover five binary levels, twenty unary levels,
+  intermediate N=0, intermediate drop, multiple aligned GROUPs, and
+  intermediate fanout failure containment.

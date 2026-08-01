@@ -113,8 +113,8 @@ def test_nested_reduce_closes_one_expand_scope_at_a_time():
     compiled = Nested().compile()
     inner = compiled.dag.stage(4)
     outer = compiled.dag.stage(6)
-    assert inner.reduce.origin_expand == 2
-    assert outer.reduce.origin_expand == 1
+    assert inner.reduce.scope_path == (2,)
+    assert outer.reduce.scope_path == (1,)
 
 
 class CrossTwoExpands(mg.Pipeline):
@@ -146,8 +146,9 @@ class MultiExpandSingleReduce(mg.Pipeline):
         return self.reduce(anchor=documents, members=regions)
 
 
-def test_multi_expand_single_reduce_is_rejected_as_ambiguous_scope():
-    """A Reduce cannot flatten two unclosed ordinal domains implicitly."""
+def test_multi_expand_single_reduce_compiles_to_canonical_scope_path():
+    """Cross-level Reduce derives one nested-list level per Expand."""
 
-    with pytest.raises(mg.CompileError):
-        MultiExpandSingleReduce().compile()
+    compiled = MultiExpandSingleReduce().compile()
+    reduce = compiled.dag.stages[-1]
+    assert reduce.reduce.scope_path == (1, 2)

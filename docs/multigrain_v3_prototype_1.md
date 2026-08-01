@@ -764,7 +764,7 @@ CompiledDAG
 | Stage output 数量 | `StageSpec.output_count` |
 | normal-drop driving input | `StageSpec.driving_input` |
 | Reduce members role | `ReduceSpec.members_input` |
-| Reduce scope/cardinality origin | `ReduceSpec.origin_expand` |
+| Reduce scope/cardinality path | `ReduceSpec.scope_path` |
 | Port consumers | 由 inputs 生成的 `consumers_by_port` |
 | nested scope stack | compile-only `ScopeSignature` |
 
@@ -925,7 +925,7 @@ input_spec = stage.inputs[edge.input_index]
 ```text
 ReduceSpec
 ├── members_input: int
-└── origin_expand: StageId
+└── scope_path: tuple[StageId, ...]
 ```
 
 这是 Reduce 唯一需要的额外静态结构：
@@ -934,7 +934,7 @@ ReduceSpec
 - grouped inputs 由所有 `mode == GROUP` 推导；
 - aligned scalar context 由 Reduce 中所有 `mode in {ONE, OPTIONAL_ONE}` 推导；
 - `members_input` 显式指出哪个 GROUP 决定 surviving/dropped ordinal；
-- `origin_expand` 唯一确定 cardinality、scope 和 ordinal domain。
+- `scope_path` 唯一确定 nested depth 和每层 ordinal domain。
 
 不再重复保存：
 
@@ -949,12 +949,11 @@ group_drop_policy
 
 Compiler 必须验证：
 
-- 唯一 ANCHOR 的 Port 是 origin Expand 的精确输入 Port；
+- 唯一 ANCHOR scope 是所有 GROUP scope 的严格前缀；
 - `members_input` 指向一个 GROUP；
-- 所有 GROUP 都唯一归属于同一个 `origin_expand`；
-- GROUP Item 共享 child EntityId/ordinal layout；
+- 所有 GROUP 都具有完全相同的 `scope_path`；
 - Reduce 中的 ONE/OPTIONAL_ONE input 与 anchor Entity 对齐；
-- nested Expand 已由 inner Reduce 闭合；
+- `scope_path` 中每个 Stage 都是 ancestor Expand；
 - 不允许跨 scope 错配。
 
 ## 4.6 UdfSpec 与 ExecutionSpec
@@ -1070,8 +1069,7 @@ Expand
     push 当前 Expand StageId
 
 Reduce
-    GROUP 顶层 scope 必须是 origin_expand
-    ANCHOR scope 必须等于 GROUP scope pop 后结果
+    GROUP scope 必须等于 ANCHOR scope + scope_path
     output scope 恢复为 ANCHOR scope
 ```
 
@@ -1088,7 +1086,7 @@ receipt 路由               consumers_by_port
 normal-drop 驱动输入       StageSpec.driving_input
 Stage output Port          StageSpec.output_count
 Reduce members 角色        ReduceSpec.members_input
-Reduce cardinality/scope   ReduceSpec.origin_expand
+Reduce cardinality/scope   ReduceSpec.scope_path
 ```
 
 静态 DAG 不保存或操作：
@@ -1324,7 +1322,7 @@ Region scope
 
 但每个 Entity 不复制完整 stack，只保存一个 parent link。
 
-Reduce 通过自己的 `ReduceSpec.origin_expand` 沿 ancestry 找到对应 anchor 和 ordinal。
+Reduce 通过自己的 `ReduceSpec.scope_path` 沿 ancestry 得到 anchor 和完整 ordinal path。
 
 ---
 
@@ -1528,49 +1526,36 @@ V3 将 `FiberBarrier` 改成更直观的：
 ReduceAccumulator
 ```
 
-它只负责：
-
-> 跟踪某个 Reduce Stage、某个 anchor 下，各 grouped input Port 的 ordinal 是否全部
-> terminal。
-
-结构：
+它负责跟踪某个 anchor 下完整 `scope_path` 的 fanout terminal facts 和 leaf receipts：
 
 ```text
 ReduceAccumulator
-├── reduce_stage
-├── anchor: ItemRef
-├── origin_expand: ExpandInstance
-├── slots_by_input
-│   ├── grouped input 0 -> GroupedSlots
-│   ├── grouped input 1 -> GroupedSlots
-│   └── ...
-└── total_remaining
+├── stage
+├── anchor
+├── scope_path
+├── fanouts[(depth, parent_ordinal_path)] -> ExpandInstance
+├── leaf_groups[input_index][full_ordinal_path] -> ItemRecord
+└── scalar_inputs
 ```
+
+Finalize 时构造：
 
 ```text
-GroupedSlots
-├── states: bytearray(N)
-├── items: list[ItemRef | None]
-├── causes: list[GrainId | None]
-└── remaining: int
+GroupShape(offsets_by_level)
++ flat ordered ItemRef leaves
 ```
 
-已知 N 后，Prototype 1 冻结使用紧凑 dense ordinal arrays：
-
-```text
-每个 grouped input Port 分配 N 个 slot
-```
-
-禁止为每个 ordinal 创建 `ReduceSlot` dataclass/Python 对象。`states` 使用紧凑状态码；
-`items/causes` 只保存已有对象的引用，不复制 ItemRef、GrainId 或业务 Payload。
+Worker 通过同一个 GroupShape 从 RowTake leaves 重建 nested Python list。普通一层 Reduce
+只是 `scope_path` 长度为 1 的特例。
 
 理由：
 
 - 状态最直观；
-- ordinal lookup O(1)；
-- 不需要 present/dropped/failed 三套容器；
-- completion 和 canonical order 无需 dict 排序；
-- bounded Arena 已有 fan-out hard limit。
+- 完整 ordinal path 唯一；
+- intermediate successful N=0 可保留空 list；
+- intermediate normal drop 可省略整个 node；
+- 多个 GROUP 共享同一个 canonical shape；
+- 不需要 depth-specific accumulator 或 nested API。
 
 硬边界：
 
@@ -1579,11 +1564,7 @@ max_fanout_per_grain
 max_reduce_slots_per_arena
 ```
 
-新 accumulator 所需 slot 数：
-
-```text
-cardinality × grouped_input_count
-```
+metadata 计数包括 fanout facts、预估 child slots 和 GROUP leaf receipts。
 
 如果加入后 Arena 累计 slot 数超过 hard limit，必须在分配前原子 Arena abort；不得部分
 创建 accumulator、暂停 source admission 代替 hard limit，或将 overflow 标成 Grain
@@ -1668,7 +1649,7 @@ Region Entity
 Inner Reduce：
 
 ```text
-origin_expand = PageToRegions
+scope_path = (PageToRegions,)
 anchor Entity = Page Entity
 output Entity = Page Entity
 ```
@@ -1676,13 +1657,27 @@ output Entity = Page Entity
 Outer Reduce：
 
 ```text
-origin_expand = PdfToPages
+scope_path = (PdfToPages,)
 anchor Entity = PDF Entity
 group member Entity = Page Entity
 ```
 
 Inner Reduce 输出恢复成 Page Entity 后，Page Entity 原有的 parent link 仍指向 PDF scope，
 所以自然参与 Outer Reduce。
+
+同一个 Reduce 也可以直接从 Region scope 回到 PDF anchor。此时 compiler 推导：
+
+```text
+scope_path = (PdfToPages, PageToRegions)
+```
+
+Reduce UDF 接收：
+
+```python
+list[list[RegionResult]]
+```
+
+默认不会 flatten；一个 Expand 永远对应一层 list。
 
 ```mermaid
 flowchart TD

@@ -168,19 +168,19 @@ class _TraceContext:
                 InputSpec("anchor", anchor.id, InputMode.ANCHOR),
                 InputSpec("members", members.id, InputMode.GROUP),
             ]
-            origin_expand = self._origin_expand(members.id)
+            scope_path = self._reduce_scope_path(anchor.id, members.id)
             for name, value in kwargs.items():
                 public_port, optional_value = _port_value(value)
                 mode = self._reduce_mode(
                     anchor,
                     public_port,
-                    origin_expand=origin_expand,
+                    scope_path=scope_path,
                     optional_value=optional_value,
                 )
                 bindings.append(InputSpec(name, public_port.id, mode))
             reduce_spec = ReduceSpec(
                 members_input=1,
-                origin_expand=origin_expand,
+                scope_path=scope_path,
             )
             driving_input = None
             output_count = int(output_count_option or 1)
@@ -254,18 +254,28 @@ class _TraceContext:
         ports = tuple(Port(port) for port in stage.output_ports())
         return ports[0] if len(ports) == 1 else ports
 
-    def _origin_expand(self, port: PortId) -> int:
-        scope = self._scope(port)
-        if scope:
-            return scope[-1]
-        raise CompileError("Reduce members do not have a unique origin Expand")
+    def _reduce_scope_path(
+        self,
+        anchor_port: PortId,
+        members_port: PortId,
+    ) -> tuple[int, ...]:
+        anchor_scope = self._scope(anchor_port)
+        member_scope = self._scope(members_port)
+        if (
+            len(member_scope) <= len(anchor_scope)
+            or member_scope[: len(anchor_scope)] != anchor_scope
+        ):
+            raise CompileError(
+                "Reduce members scope is not a descendant of anchor scope"
+            )
+        return member_scope[len(anchor_scope) :]
 
     def _reduce_mode(
         self,
         anchor: Port,
         value: Port,
         *,
-        origin_expand: int,
+        scope_path: tuple[int, ...],
         optional_value: bool,
     ) -> InputMode:
         anchor_scope = self._scope(anchor.id)
@@ -276,7 +286,7 @@ class _TraceContext:
                 if optional_value
                 else InputMode.ONE
             )
-        if value_scope == (*anchor_scope, origin_expand):
+        if value_scope == (*anchor_scope, *scope_path):
             if optional_value:
                 raise CompileError("optional(...) cannot wrap a Reduce GROUP")
             return InputMode.GROUP

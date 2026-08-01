@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from .model import AttemptToken, GrainFailure, GrainId, ItemRef
+from .model import AttemptToken, GrainFailure, GrainId, GroupShape, ItemRef
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +20,13 @@ class RowTake:
 class ValueTake:
     """Ordered row selectors for one scalar or grouped UDF input."""
     rows: tuple[RowTake, ...]
+    group_shape: GroupShape | None = None
+
+    def __post_init__(self) -> None:
+        if self.group_shape is not None and (
+            self.group_shape.leaf_count != len(self.rows)
+        ):
+            raise ValueError("ValueTake shape does not match selected rows")
 
 
 @dataclass(frozen=True, slots=True)

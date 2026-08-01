@@ -45,7 +45,7 @@ def test_reduce_slot_limit_aborts_before_partial_accumulator_publication():
         0,
         compiled.dag,
         bytes(range(16)),
-        limits=ArenaLimits(max_reduce_slots=2),
+        limits=ArenaLimits(max_reduce_slots=3),
     )
     arena.admit_sources(((3,),), position_starts=(0,))
     arena.advance()

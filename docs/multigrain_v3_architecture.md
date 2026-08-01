@@ -51,6 +51,9 @@ protocol.py
 arena/state.py
     Arena 内的小型被动状态记录
 
+arena/reduce.py
+    hierarchical ReduceAccumulator 和 canonical GroupShape
+
 arena/engine.py
     单 microbatch 如何推进
 
@@ -206,14 +209,14 @@ ANCHOR
 ```text
 ReduceSpec
 ├── members_input
-└── origin_expand
+└── scope_path: tuple[Expand StageId, ...]
 ```
 
 Compiler 负责验证：
 
 - anchor 是 origin Expand 的精确输入 Port；
-- GROUP 都属于同一个 Expand scope；
-- nested Expand 必须逐层 Reduce 闭合；
+- GROUP 都具有与 anchor 唯一对应的同一 scope path；
+- 每个 traversed Expand 对应 UDF 输入中的一层 list；
 - 两个独立 Expand 不能因长度相等而隐式 zip。
 
 ---
@@ -469,18 +472,26 @@ pages=Page       GROUP
 context=metadata ONE
 ```
 
-每个 GROUP 使用紧凑 dense arrays：
+`ReduceAccumulator` 使用统一的 hierarchical representation：
 
 ```text
-GroupedSlots
-├── states: bytearray(N)
-├── items: list[ItemRef | None]
-├── causes: list[GrainId | None]
-└── remaining
+scope_path
+fanouts[(depth, parent_ordinal_path)] -> ExpandInstance
+leaf_groups[input_index][full_ordinal_path] -> ItemRecord
 ```
 
-主 members GROUP 决定 surviving ordinals。其他 GROUP 按相同 ordinal 投影，避免 Filter
-后错位。
+Finalize 时生成：
+
+```text
+GroupShape(offsets_by_level)
++ flat ordered ItemRef leaves
+```
+
+Worker 根据 `GroupShape` 重建 Python nested list。深度 1 是普通 `list[Member]`，深度 N
+自然得到 N 层 list，不需要额外 `nested(...)` API。
+
+主 members GROUP 决定 surviving leaf paths。其他 GROUP 按同一 path 和 shape 投影，避免
+Filter 后错位。
 
 ```mermaid
 flowchart TB
@@ -497,7 +508,56 @@ flowchart TB
     Acc --> UDF
 ```
 
-Nested Reduce 逐层恢复 parent Entity；不允许一个 Reduce 隐式跨越两个未闭合 Expand。
+Reduce 可以逐层恢复 parent Entity，也可以直接跨越多层：
+
+```python
+reduce(anchor=document, members=region_results)
+```
+
+若静态 scope 差值是：
+
+```text
+(ExpandPages, ExpandRegions)
+```
+
+UDF 自动收到：
+
+```python
+list[list[RegionResult]]
+```
+
+当前回归进一步覆盖：
+
+```text
+五层二叉 Expand
+→ 32 个 leaf/parent
+→ 五层 inside-out Reduce
+→ 每一层都恢复 ordinal 0,1 顺序
+```
+
+并使用二十层一元 Expand/Reduce 验证 scope 深度本身不会触发特殊分支或状态泄漏。
+
+一个 Reduce 直接从第五层 leaf 回最上层 root 会得到五层 nested list。默认语义永远是
+“一个 Expand 对应一层 list”，不会自动 flatten。
+
+Canonical corner cases：
+
+```text
+intermediate Expand SUCCESS(N=0)
+    保留空 list；
+
+intermediate occurrence normal drop
+    从 parent list 省略整个 node；
+
+leaf normal drop
+    从最内层 list 省略；
+
+required intermediate/leaf failure
+    Suppress root Reduce；
+
+多个 GROUP
+    必须共享相同 scope_path 和 tree shape。
+```
 
 ---
 
@@ -776,4 +836,3 @@ docs/experiments/multigrain_v3/2026-08-01_v3_mineru_regression.md
 - distributed metadata；
 - early block ownership ledger；
 - 通用 recovery workflow。
-

@@ -57,12 +57,34 @@ def _input_columns(
                 ]
             except (IndexError, TypeError) as error:
                 raise WorkerContractError("invalid ValueTake") from error
-            columns[index].append(
-                values
-                if index in variadic_inputs
-                else (values[0] if len(values) == 1 else values)
-            )
+            if take.group_shape is not None:
+                columns[index].append(
+                    _restore_group(values, take.group_shape.offsets_by_level)
+                )
+            else:
+                columns[index].append(
+                    values
+                    if index in variadic_inputs
+                    else (values[0] if len(values) == 1 else values)
+                )
     return tuple(columns)
+
+
+def _restore_group(
+    leaves: list[Any],
+    offsets_by_level: tuple[tuple[int, ...], ...],
+) -> list[Any]:
+    """Reconstruct nested lists bottom-up from canonical CSR offsets."""
+
+    nodes: list[Any] = leaves
+    for offsets in reversed(offsets_by_level):
+        nodes = [
+            nodes[offsets[index] : offsets[index + 1]]
+            for index in range(len(offsets) - 1)
+        ]
+    if len(nodes) != 1:
+        raise WorkerContractError("group shape does not have one root")
+    return nodes[0]
 
 
 def _normalize_one(

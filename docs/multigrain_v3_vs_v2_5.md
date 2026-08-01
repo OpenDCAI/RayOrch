@@ -250,15 +250,14 @@ Planner 每轮从 members Port receipts 更新 barrier。
 `ReduceAccumulator`：
 
 ```text
-GroupedSlots
-├── states: bytearray(N)
-├── items: list
-├── causes: list
-└── remaining
+scope_path
+fanouts[(depth, parent_path)]
+leaf_groups[input_index][ordinal_path]
+GroupShape(offsets_by_level)
 ```
 
-GROUP receipt 到达时直接 settle ordinal。Nested Reduce 通过 EntityOrigin parent chain 逐层
-恢复 scope。
+GROUP receipt 到达时直接 settle完整 ordinal path。V3 既支持逐层 Reduce，也支持一个
+Reduce 跨多个 descendant Expand；每个 Expand 自动对应 UDF 输入中的一层 list。
 
 V3 anchor：
 
@@ -465,6 +464,7 @@ docs/experiments/multigrain_v3/2026-08-01_v3_mineru_regression.md
 | elastic rebatching | 是 | 是 |
 | ordered/empty/filtered Reduce | 是 | 是 |
 | nested Expand/Reduce | 可组合 | 明确测试 |
+| direct cross-level nested Reduce | 否 | 是 |
 | multi-Arena overlap | 是 | 是 |
 | exact bad record | 是 | 是 |
 | binary isolation | 是 | `isolate_tail` |
@@ -538,4 +538,3 @@ relation/shuffle 扩展，不能用普通 Map 或长度相等隐式模拟。
 - 不支持 cross-entity relation。
 
 这些是当前边界，不应被性能回归结果误解为已经解决。
-

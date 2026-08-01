@@ -67,17 +67,55 @@ class GrainId:
 
 
 @dataclass(frozen=True, slots=True)
+class GroupShape:
+    """Canonical nested-list shape encoded as per-level CSR offsets.
+
+    The first offset array maps the single Reduce anchor to level-1 nodes.
+    Each following array maps nodes at one Expand depth to the next depth.
+    The final offset value equals the number of flat leaf ``items``.
+    """
+
+    offsets_by_level: tuple[tuple[int, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not self.offsets_by_level:
+            raise ValueError("GroupShape requires at least one Expand level")
+        expected_parents = 1
+        for offsets in self.offsets_by_level:
+            if len(offsets) != expected_parents + 1:
+                raise ValueError("GroupShape offset arity is inconsistent")
+            if not offsets or offsets[0] != 0:
+                raise ValueError("GroupShape offsets must start at zero")
+            if any(left > right for left, right in zip(offsets, offsets[1:])):
+                raise ValueError("GroupShape offsets must be non-decreasing")
+            expected_parents = offsets[-1]
+
+    @property
+    def depth(self) -> int:
+        return len(self.offsets_by_level)
+
+    @property
+    def leaf_count(self) -> int:
+        return self.offsets_by_level[-1][-1]
+
+
+@dataclass(frozen=True, slots=True)
 class InputBinding:
     """One compiled input name bound to ordered logical items."""
 
     name: str
     items: tuple[ItemRef, ...]
+    group_shape: GroupShape | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("input binding name must be non-empty")
         if not isinstance(self.items, tuple):
             raise TypeError("InputBinding.items must be a tuple")
+        if self.group_shape is not None and (
+            self.group_shape.leaf_count != len(self.items)
+        ):
+            raise ValueError("GroupShape leaf count does not match items")
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,7 +361,14 @@ def canonical_encode(value: Any) -> bytes:
     if isinstance(value, GrainId):
         return b"g" + value.raw
     if isinstance(value, InputBinding):
-        return b"o" + canonical_encode(value.name) + canonical_encode(value.items)
+        return (
+            b"o"
+            + canonical_encode(value.name)
+            + canonical_encode(value.items)
+            + canonical_encode(value.group_shape)
+        )
+    if isinstance(value, GroupShape):
+        return b"h" + canonical_encode(value.offsets_by_level)
     raise TypeError(f"unsupported canonical identity type: {type(value)!r}")
 
 

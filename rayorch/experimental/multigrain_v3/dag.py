@@ -110,8 +110,11 @@ class InputSpec:
 class ReduceSpec:
     """The minimal extra contract needed for ordered Expand-scoped Reduce."""
     members_input: int
-    origin_expand: int
+    scope_path: tuple[int, ...]
 
+    def __post_init__(self) -> None:
+        if not self.scope_path:
+            raise ValueError("Reduce scope_path must contain at least one Expand")
 
 @dataclass(frozen=True, slots=True)
 class StageSpec:
@@ -141,6 +144,9 @@ class CompiledDAG:
     """Immutable General DAG shared read-only by every Arena in a run."""
     stages: tuple[StageSpec, ...]
     consumers_by_port: Mapping[PortId, tuple[ConsumerEdge, ...]] = field(
+        repr=False
+    )
+    reduces_by_expand: Mapping[int, tuple[int, ...]] = field(
         repr=False
     )
     source_ports: tuple[PortId, ...] = ()
@@ -262,22 +268,20 @@ def _validate_scope_and_reduce(
             for spec in stage.inputs:
                 input_scope = scopes[spec.port]
                 if spec.mode is InputMode.GROUP:
-                    if not input_scope or input_scope[-1] != stage.reduce.origin_expand:
+                    expected_scope = (*anchor_scope, *stage.reduce.scope_path)
+                    if input_scope != expected_scope:
                         raise CompileError(
-                            f"Reduce {stage.id} GROUP has wrong origin scope"
-                        )
-                    if input_scope[:-1] != anchor_scope:
-                        raise CompileError(
-                            f"Reduce {stage.id} anchor does not close GROUP scope"
+                            f"Reduce {stage.id} GROUP has wrong scope path"
                         )
                 elif spec.mode in {InputMode.ONE, InputMode.OPTIONAL_ONE}:
                     if input_scope != anchor_scope:
                         raise CompileError(
                             f"Reduce {stage.id} scalar context is not anchor-aligned"
                         )
-            origin = stages[stage.reduce.origin_expand]
-            if origin.kind is not Primitive.EXPAND:
-                raise CompileError("Reduce origin_expand must reference Expand")
+            for expand_id in stage.reduce.scope_path:
+                if stages[expand_id].kind is not Primitive.EXPAND:
+                    raise CompileError("Reduce scope_path must reference Expands")
+            origin = stages[stage.reduce.scope_path[0]]
             assert origin.driving_input is not None
             origin_parent = origin.inputs[origin.driving_input].port
             if anchor.port != origin_parent:
@@ -301,6 +305,7 @@ def compile_dag(
 
     producer_ports: set[PortId] = set()
     consumers: dict[PortId, list[ConsumerEdge]] = {}
+    reduces_by_expand: dict[int, list[int]] = {}
     for stage in stages:
         _validate_stage_shape(stage)
         for port in stage.output_ports():
@@ -314,6 +319,10 @@ def compile_dag(
             consumers.setdefault(input_spec.port, []).append(
                 ConsumerEdge(stage.id, index)
             )
+        if stage.kind is Primitive.REDUCE:
+            assert stage.reduce is not None
+            for expand_stage in stage.reduce.scope_path:
+                reduces_by_expand.setdefault(expand_stage, []).append(stage.id)
 
     _validate_scope_and_reduce(stages)
     for port in (*source_ports, *output_ports):
@@ -326,6 +335,12 @@ def compile_dag(
         stages=stages,
         consumers_by_port=MappingProxyType(
             {port: tuple(edges) for port, edges in consumers.items()}
+        ),
+        reduces_by_expand=MappingProxyType(
+            {
+                stage: tuple(reduces)
+                for stage, reduces in reduces_by_expand.items()
+            }
         ),
         source_ports=source_ports,
         output_ports=output_ports,

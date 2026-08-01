@@ -61,21 +61,15 @@ from ..protocol import (
     ValueTake,
 )
 from .state import (
-    DROPPED,
-    FAILED,
-    PRESENT,
-    SUPPRESSED,
     ArenaAbort,
     ArenaLimits,
     DispatchLease,
-    ExpandInstance,
-    GroupedSlots,
     PendingInvocation,
     RecoveryBudgetState,
     RecoveryTask,
-    ReduceAccumulator,
     StageBatchQueue,
 )
+from .reduce import ExpandInstance, FanoutTerminal, ReduceAccumulator
 
 
 class ArenaEngine:
@@ -303,6 +297,11 @@ class ArenaEngine:
         cause = driving.cause or driving.producer
         if stage.kind is Primitive.EXPAND:
             # No child coordinate exists when the parent occurrence is absent.
+            assert stage.driving_input is not None
+            parent = driving.ref
+            self._publish_expand_instance(
+                ExpandInstance.dropped(stage.id, parent, cause)
+            )
             return
         for port in stage.output_ports():
             item = ItemRef(port, entity)
@@ -354,15 +353,8 @@ class ArenaEngine:
         if stage.kind is Primitive.EXPAND:
             assert stage.driving_input is not None
             parent = inputs[stage.driving_input].items[0]
-            instance = ExpandInstance(
-                grain_id,
-                stage.id,
-                parent,
-                None,
-                failed=True,
-            )
-            self.expand_instances[(stage.id, parent.entity)] = instance
-            self._activate_reduce_placeholders(instance)
+            instance = ExpandInstance.failed(grain_id, stage.id, parent)
+            self._publish_expand_instance(instance)
             return record
         for port in stage.output_ports():
             self._publish_item(
@@ -427,9 +419,9 @@ class ArenaEngine:
     ) -> bool:
         assert stage.reduce is not None
         try:
-            anchor_entity, ordinal = self._resolve_scope(
+            anchor_entity, ordinal_path = self._resolve_scope_path(
                 item_record.ref.entity,
-                stage.reduce.origin_expand,
+                stage.reduce.scope_path,
             )
         except KeyError:
             self._abort("group item has no matching Expand ancestry")
@@ -442,14 +434,19 @@ class ArenaEngine:
             # Source/anchor receipt will create the accumulator later.
             return True
         accumulator = self._ensure_reduce_accumulator(stage, anchor_record)
-        group = accumulator.groups[input_index]
-        try:
-            changed = group.settle(ordinal, item_record)
-        except InvariantError as error:
-            self._abort(str(error))
-        if changed and accumulator.complete:
+        group = accumulator.leaf_groups[input_index]
+        existing = group.get(ordinal_path)
+        if existing is not None:
+            if existing != item_record:
+                self._abort("Reduce leaf settled inconsistently")
+            return False
+        if self.reduce_slot_count + 1 > self.limits.max_reduce_slots:
+            self._abort("max_reduce_slots_per_arena exceeded")
+        group[ordinal_path] = item_record
+        self.reduce_slot_count += 1
+        if self._reduce_inputs_complete(stage, accumulator):
             self._finalize_reduce(accumulator)
-        return changed
+        return True
 
     def _ensure_reduce_accumulator(
         self,
@@ -461,131 +458,130 @@ class ArenaEngine:
         if existing is not None:
             return existing
         assert stage.reduce is not None
-        origin = self.expand_instances.get(
-            (stage.reduce.origin_expand, anchor_record.ref.entity)
-        )
-        if origin is None:
-            # The anchor can arrive before the Expand terminal result.
-            return self._placeholder_reduce(stage, anchor_record)
         accumulator = ReduceAccumulator(
             stage.id,
             anchor_record.ref,
-            origin,
-            {},
-            {},
+            stage.reduce.scope_path,
+            leaf_groups={
+                index: {}
+                for index, spec in enumerate(stage.inputs)
+                if spec.mode is InputMode.GROUP
+            },
         )
         self.reduce_accumulators[key] = accumulator
-        self._activate_reduce_accumulator(stage, accumulator, origin)
+        for input_index, spec in enumerate(stage.inputs):
+            if spec.mode in {InputMode.ONE, InputMode.OPTIONAL_ONE}:
+                item = ItemRef(spec.port, anchor_record.ref.entity)
+                if item in self.items:
+                    accumulator.scalar_inputs[input_index] = item
+        if self._reduce_inputs_complete(stage, accumulator):
+            self._finalize_reduce(accumulator)
         return accumulator
 
-    @staticmethod
     def _reduce_inputs_complete(
+        self,
         stage: StageSpec,
         accumulator: ReduceAccumulator,
     ) -> bool:
         assert stage.reduce is not None
-        if (
-            accumulator.origin.cardinality is None
-            or stage.reduce.members_input not in accumulator.groups
-        ):
-            return False
         scalar_indexes = tuple(
             index
             for index, spec in enumerate(stage.inputs)
             if spec.mode in {InputMode.ONE, InputMode.OPTIONAL_ONE}
         )
-        return accumulator.complete and all(
-            index in accumulator.scalar_inputs for index in scalar_indexes
-        )
-
-    def _placeholder_reduce(
-        self,
-        stage: StageSpec,
-        anchor_record: ItemRecord,
-    ) -> ReduceAccumulator:
-        key = (stage.id, anchor_record.ref.entity)
-        placeholder = ReduceAccumulator(
-            stage.id,
-            anchor_record.ref,
-            ExpandInstance(
-                GrainId(b"\0" * 16),
-                stage.reduce.origin_expand,
-                anchor_record.ref,
-                None,
-            ),
-            {},
-            {},
-        )
-        self.reduce_accumulators[key] = placeholder
-        return placeholder
-
-    def _activate_reduce_placeholders(self, expand: ExpandInstance) -> None:
-        for stage in self.dag.stages:
-            if (
-                stage.kind is Primitive.REDUCE
-                and stage.reduce is not None
-                and stage.reduce.origin_expand == expand.stage
-            ):
-                key = (stage.id, expand.anchor.entity)
-                existing = self.reduce_accumulators.get(key)
-                if existing is not None and existing.groups:
-                    continue
-                anchor_record = self.items.get(
-                    ItemRef(
-                        next(
-                            spec.port
-                            for spec in stage.inputs
-                            if spec.mode is InputMode.ANCHOR
-                        ),
-                        expand.anchor.entity,
-                    )
-                )
-                if anchor_record is not None:
-                    if existing is None:
-                        self._ensure_reduce_accumulator(stage, anchor_record)
-                    else:
-                        self._activate_reduce_accumulator(
-                            stage,
-                            existing,
-                            expand,
-                        )
-
-    def _activate_reduce_accumulator(
-        self,
-        stage: StageSpec,
-        accumulator: ReduceAccumulator,
-        expand: ExpandInstance,
-    ) -> None:
-        if expand.failed:
-            inputs = (InputBinding("anchor", (accumulator.anchor,)),)
-            self._ensure_suppressed(
-                stage,
-                inputs,
-                accumulator.anchor.entity,
-                (expand.grain,),
-            )
-            self.reduce_accumulators.pop(
-                (stage.id, accumulator.anchor.entity),
-                None,
-            )
-            return
-        assert expand.cardinality is not None
+        if not all(index in accumulator.scalar_inputs for index in scalar_indexes):
+            return False
         group_indexes = tuple(
             index
             for index, spec in enumerate(stage.inputs)
             if spec.mode is InputMode.GROUP
         )
-        requested_slots = expand.cardinality * len(group_indexes)
-        if self.reduce_slot_count + requested_slots > self.limits.max_reduce_slots:
+        return accumulator.ready(
+            group_indexes=group_indexes,
+            scalar_indexes=scalar_indexes,
+        )
+
+    def _route_fanout_to_reduces(self, expand: ExpandInstance) -> None:
+        for reduce_stage in self.dag.reduces_by_expand.get(expand.stage, ()):
+            stage = self.dag.stage(reduce_stage)
+            assert stage.reduce is not None
+            depth = stage.reduce.scope_path.index(expand.stage)
+            try:
+                anchor_entity, _ = self._resolve_scope_path(
+                    expand.anchor.entity,
+                    stage.reduce.scope_path[:depth],
+                )
+            except KeyError:
+                continue
+            accumulator = self.reduce_accumulators.get(
+                (reduce_stage, anchor_entity)
+            )
+            if accumulator is None:
+                continue
+            self._route_fanout_to_accumulator(accumulator, expand)
+            if self._reduce_inputs_complete(stage, accumulator):
+                self._finalize_reduce(accumulator)
+
+    def _publish_expand_instance(self, instance: ExpandInstance) -> None:
+        """Publish one terminal fanout fact and route it to Reduce states."""
+
+        key = (instance.stage, instance.anchor.entity)
+        existing = self.expand_instances.get(key)
+        if existing is not None and existing != instance:
+            self._abort("Expand terminal fact changed")
+        if existing is not None:
+            return
+        self.expand_instances[key] = instance
+        self._route_fanout_to_reduces(instance)
+
+    def _route_fanout_to_accumulator(
+        self,
+        accumulator: ReduceAccumulator,
+        expand: ExpandInstance,
+    ) -> bool:
+        depth = accumulator.depth_for(expand.stage)
+        if depth is None:
+            return False
+        try:
+            anchor_entity, parent_path = self._resolve_scope_path(
+                expand.anchor.entity,
+                accumulator.scope_path[:depth],
+            )
+        except KeyError:
+            return False
+        if anchor_entity != accumulator.anchor.entity:
+            return False
+        self._charge_reduce_slots(
+            accumulator.settle_fanout(depth, parent_path, expand)
+        )
+        if expand.terminal is FanoutTerminal.FAILED:
+            self._suppress_reduce_from_fanout(accumulator, expand)
+        return True
+
+    def _charge_reduce_slots(self, additions: int) -> None:
+        if not additions:
+            return
+        if self.reduce_slot_count + additions > self.limits.max_reduce_slots:
             self._abort("max_reduce_slots_per_arena exceeded")
-        accumulator.origin = expand
-        accumulator.groups = {
-            index: GroupedSlots.create(expand.cardinality)
-            for index in group_indexes
-        }
-        self.reduce_slot_count += requested_slots
-        if self._reduce_inputs_complete(stage, accumulator):
-            self._finalize_reduce(accumulator)
+        self.reduce_slot_count += additions
+
+    def _suppress_reduce_from_fanout(
+        self,
+        accumulator: ReduceAccumulator,
+        expand: ExpandInstance,
+    ) -> None:
+        if expand.grain is None:
+            self._abort("failed fanout has no GrainId")
+        stage = self.dag.stage(accumulator.stage)
+        self._ensure_suppressed(
+            stage,
+            (InputBinding("anchor", (accumulator.anchor,)),),
+            accumulator.anchor.entity,
+            (expand.grain,),
+        )
+        self._drop_reduce_accumulator(
+            (accumulator.stage, accumulator.anchor.entity)
+        )
 
     def _finalize_reduce(self, accumulator: ReduceAccumulator) -> None:
         stage = self.dag.stage(accumulator.stage)
@@ -594,11 +590,15 @@ class ArenaEngine:
         if key not in self.reduce_accumulators:
             return
 
-        members = accumulator.groups[stage.reduce.members_input]
+        try:
+            shape, leaf_paths = accumulator.build_shape()
+        except InvariantError as error:
+            self._abort(str(error))
+        members = accumulator.leaf_groups[stage.reduce.members_input]
         surviving = tuple(
-            ordinal
-            for ordinal, state in enumerate(members.states)
-            if state == PRESENT
+            path
+            for path in leaf_paths
+            if members[path].terminal is ItemTerminal.PRESENT
         )
         causes: list[GrainId] = []
         bindings: list[InputBinding] = []
@@ -606,28 +606,39 @@ class ArenaEngine:
             if spec.mode is InputMode.ANCHOR:
                 bindings.append(InputBinding(spec.name, (accumulator.anchor,)))
             elif spec.mode is InputMode.GROUP:
-                group = accumulator.groups[input_index]
+                group = accumulator.leaf_groups[input_index]
                 if input_index == stage.reduce.members_input:
-                    selected_ordinals = tuple(
-                        ordinal
-                        for ordinal, state in enumerate(group.states)
-                        if state in {PRESENT, FAILED, SUPPRESSED}
+                    selected_paths = tuple(
+                        path
+                        for path in leaf_paths
+                        if group[path].terminal
+                        in {
+                            ItemTerminal.PRESENT,
+                            ItemTerminal.FAILED,
+                            ItemTerminal.SUPPRESSED,
+                        }
                     )
                 else:
-                    selected_ordinals = surviving
+                    selected_paths = surviving
                 selected_items = tuple(
-                    group.items[ordinal]
-                    for ordinal in selected_ordinals
-                    if group.items[ordinal] is not None
+                    group[path].ref for path in selected_paths
                 )
-                bindings.append(InputBinding(spec.name, selected_items))
-                for ordinal in selected_ordinals:
-                    state = group.states[ordinal]
-                    if state in {FAILED, SUPPRESSED} or (
+                projected_shape = accumulator.build_shape(
+                    set(selected_paths)
+                )[0]
+                bindings.append(
+                    InputBinding(spec.name, selected_items, projected_shape)
+                )
+                for path in selected_paths:
+                    record = group[path]
+                    if record.terminal in {
+                        ItemTerminal.FAILED,
+                        ItemTerminal.SUPPRESSED,
+                    } or (
                         input_index != stage.reduce.members_input
-                        and state != PRESENT
+                        and record.terminal is not ItemTerminal.PRESENT
                     ):
-                        cause = group.causes[ordinal]
+                        cause = record.cause or record.producer
                         if cause is not None:
                             causes.append(cause)
             else:
@@ -665,22 +676,28 @@ class ArenaEngine:
     def _drop_reduce_accumulator(self, key: tuple[int, EntityId]) -> None:
         accumulator = self.reduce_accumulators.pop(key, None)
         if accumulator is not None:
-            self.reduce_slot_count -= sum(
-                len(group.states) for group in accumulator.groups.values()
-            )
+            self.reduce_slot_count -= accumulator.slot_cost
 
-    def _resolve_scope(
+    def _resolve_scope_path(
         self,
         entity: EntityId,
-        expand_stage: int,
-    ) -> tuple[EntityId, int]:
+        scope_path: tuple[int, ...],
+    ) -> tuple[EntityId, tuple[int, ...]]:
+        if not scope_path:
+            return entity, ()
+        expected = list(reversed(scope_path))
+        ordinals: list[int] = []
         current = entity
-        while current in self.entity_origins:
+        for expand_stage in expected:
+            if current not in self.entity_origins:
+                raise KeyError(entity)
             origin = self.entity_origins[current]
-            if origin.expand_stage == expand_stage:
-                return origin.parent_entity, origin.ordinal
+            if origin.expand_stage != expand_stage:
+                raise KeyError(entity)
+            ordinals.append(origin.ordinal)
             current = origin.parent_entity
-        raise KeyError(entity)
+        ordinals.reverse()
+        return current, tuple(ordinals)
 
     def _publish_item(self, record: ItemRecord, location: BlockRow | None = None) -> None:
         existing = self.items.get(record.ref)
@@ -834,7 +851,7 @@ class ArenaEngine:
                         block_slots[location.block] = slot
                         input_blocks.append(location.block)
                     rows.append(RowTake(slot, location.row))
-                takes.append(ValueTake(tuple(rows)))
+                takes.append(ValueTake(tuple(rows), binding.group_shape))
             input_takes.append(tuple(takes))
 
         invocations = []
@@ -1057,20 +1074,20 @@ class ArenaEngine:
                     Success(tuple(emissions_by_port)),
                 )
             )
-            if stage.kind is Primitive.EXPAND:
-                assert parent is not None
-                instance = ExpandInstance(
-                    record.id,
-                    stage.id,
-                    parent,
-                    counts[0],
-                )
-                self.expand_instances[(stage.id, parent.entity)] = instance
-                self._activate_reduce_placeholders(instance)
         if tuple(cursors) != report.column_lengths:
             self._abort("output counts do not cover output blocks")
         for record, token, outcome in prepared:
             record.seal(outcome, token)
+            if stage.kind is Primitive.EXPAND:
+                parent = record.inputs[stage.driving_input].items[0]
+                self._publish_expand_instance(
+                    ExpandInstance.success(
+                        record.id,
+                        stage.id,
+                        parent,
+                        len(outcome.emissions_by_port[0]),
+                    )
+                )
 
     def _output_entity(self, record: GrainRecord, stage: StageSpec) -> EntityId:
         if stage.kind is Primitive.REDUCE:
@@ -1221,15 +1238,8 @@ class ArenaEngine:
         stage = self.dag.stage(record.stage)
         if stage.kind is Primitive.EXPAND:
             parent = record.inputs[stage.driving_input].items[0]
-            instance = ExpandInstance(
-                record.id,
-                stage.id,
-                parent,
-                None,
-                failed=True,
-            )
-            self.expand_instances[(stage.id, parent.entity)] = instance
-            self._activate_reduce_placeholders(instance)
+            instance = ExpandInstance.failed(record.id, stage.id, parent)
+            self._publish_expand_instance(instance)
         else:
             entity = self._output_entity(record, stage)
             for port in stage.output_ports():
@@ -1354,3 +1364,4 @@ class ArenaEngine:
         self.queues.clear()
         self.leases.clear()
         self.timeline.clear()
+        self.reduce_slot_count = 0
