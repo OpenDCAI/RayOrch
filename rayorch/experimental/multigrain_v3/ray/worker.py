@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import os
 import resource
 import time
 import traceback
@@ -623,6 +624,11 @@ class Worker:
         self.context = context
         self.udf = instantiate_udf(udf_recipe)
         self.calls = 0
+
+    def ready(self) -> dict[str, int]:
+        """Confirm actor/UDF initialization without executing a data batch."""
+
+        return {"pid": os.getpid(), "calls": self.calls}
 
     def execute(
         self,

@@ -190,6 +190,19 @@ class ActorPool:
             slot.incarnation = 0
             self.slots.append(slot)
 
+    def wait_ready(self, timeout_s: float | None = None) -> tuple[dict[str, int], ...]:
+        """Wait until every actor has initialized its persistent UDF instance."""
+
+        self.start()
+        refs = [slot.handle.ready.remote() for slot in self.slots]
+        if timeout_s is None:
+            results = ray.get(refs)
+        else:
+            if timeout_s <= 0 or not math.isfinite(timeout_s):
+                raise ValueError("timeout_s must be finite and positive")
+            results = ray.get(refs, timeout=timeout_s)
+        return tuple(results)
+
     def choose(self) -> tuple[int, ActorSlot] | None:
         """Choose an idle slot in round-robin order."""
 
@@ -205,6 +218,15 @@ class ActorPool:
                 self.next_slot = (index + 1) % slot_count
                 return index, slot
         return None
+
+    def can_submit(self) -> bool:
+        """Return whether at least one current actor incarnation is idle."""
+
+        if self._closed:
+            return False
+        if not self.slots:
+            self.start()
+        return any(slot.pending == 0 for slot in self.slots)
 
     def acquire(self, slot_index: int, lease: ActorLease) -> None:
         """CAS-acquire one exact idle actor incarnation."""
@@ -558,11 +580,34 @@ class RayTransport:
         for pool in self._pools.values():
             pool.start()
 
+    def wait_ready(self, timeout_s: float | None = None) -> dict[NodeId, tuple[dict[str, int], ...]]:
+        """Wait for all MAP pools to finish actor and UDF initialization."""
+
+        self._ensure_open()
+        started = float(self._clock())
+        ready: dict[NodeId, tuple[dict[str, int], ...]] = {}
+        for node, pool in self._pools.items():
+            remaining = None
+            if timeout_s is not None:
+                elapsed = float(self._clock()) - started
+                remaining = timeout_s - elapsed
+                if remaining <= 0:
+                    raise TimeoutError("RayTransport actor readiness timed out")
+            ready[node] = pool.wait_ready(remaining)
+        return ready
+
     def _ensure_open(self) -> None:
         """Reject operations after transport shutdown."""
 
         if self._closed:
             raise TransportClosedError("RayTransport is closed")
+
+    def can_submit(self, node: NodeId) -> bool:
+        """Return whether a MAP node has an idle actor without taking a lease."""
+
+        self._ensure_open()
+        pool = self._pools.get(node)
+        return pool is not None and pool.can_submit()
 
     @property
     def pending_count(self) -> int:

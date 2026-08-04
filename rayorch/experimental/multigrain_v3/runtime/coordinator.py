@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol
@@ -966,6 +966,14 @@ class CompiledGraphRunCoordinator:
         self._next_delivery_seq = 0
         self._closed = False
         self.transport_destroyed = False
+        self._metrics_started_at = self.clock()
+        self._active_roots_high_watermark = 0
+        self._dispatch_count_by_node: dict[Any, int] = {}
+        self._grain_count_by_node: dict[Any, int] = {}
+        self._batch_histogram_by_node: dict[Any, dict[int, int]] = {}
+        self._worker_busy_s_by_node: dict[Any, float] = {}
+        self._transport_backpressure_count = 0
+        self._capacity_skip_count = 0
 
     @property
     def complete(self) -> bool:
@@ -1014,6 +1022,11 @@ class CompiledGraphRunCoordinator:
             staged.append(root)
         if not staged:
             return 0
+
+        self._active_roots_high_watermark = max(
+            self._active_roots_high_watermark,
+            len(self.roots),
+        )
 
         source_ref = ray.put([root.source_record.value for root in staged])
         block = self.blocks.install(source_ref, len(staged))
@@ -1082,9 +1095,18 @@ class CompiledGraphRunCoordinator:
 
         submitted = 0
         budget = int(getattr(self.limits, "max_pending_dispatches", 64))
+        can_submit = getattr(self.transport, "can_submit", None)
+        eligible = can_submit if callable(can_submit) else None
         while submitted < budget:
-            selection = self.scheduler.select_batch(self.clock(), force=True)
+            now = self.clock()
+            selection = self.scheduler.select_batch(
+                now,
+                force=False,
+                eligible=eligible,
+            )
             if selection is None:
+                if eligible is not None and self.scheduler.has_ready(now):
+                    self._capacity_skip_count += 1
                 break
             try:
                 prepared = prepare_dispatch(
@@ -1105,8 +1127,19 @@ class CompiledGraphRunCoordinator:
                 self._rollback_prepared(prepared)
                 raise
             if pending is None:
+                self._transport_backpressure_count += 1
                 self._rollback_prepared(prepared)
                 break
+            node = prepared.node
+            size = len(prepared.attempts)
+            self._dispatch_count_by_node[node] = (
+                self._dispatch_count_by_node.get(node, 0) + 1
+            )
+            self._grain_count_by_node[node] = (
+                self._grain_count_by_node.get(node, 0) + size
+            )
+            histogram = self._batch_histogram_by_node.setdefault(node, {})
+            histogram[size] = histogram.get(size, 0) + 1
             submitted += 1
         return submitted
 
@@ -1175,6 +1208,11 @@ class CompiledGraphRunCoordinator:
                 )
             manifest = completion.manifest
             if isinstance(manifest, SuccessManifest):
+                self._worker_busy_s_by_node[pending.prepared.node] = (
+                    self._worker_busy_s_by_node.get(pending.prepared.node, 0.0)
+                    + manifest.worker_finished_at
+                    - manifest.worker_started_at
+                )
                 decision = self.transaction.prepare(
                     pending, manifest, tuple(pending.output_refs)
                 )
@@ -1203,6 +1241,41 @@ class CompiledGraphRunCoordinator:
             raise
         self.transport.finalize_physical(pending)
         self._release_dispatch_owners(pending.prepared)
+
+    def metrics_snapshot(self) -> dict[str, object]:
+        """Return JSON-compatible run and per-MAP dispatch metrics."""
+
+        nodes: dict[str, object] = {}
+        for node_id, dispatch_count in self._dispatch_count_by_node.items():
+            node = self.graph.node(node_id)
+            batch_cap = int(node.op.execution.batch.max_size)
+            grains = self._grain_count_by_node.get(node_id, 0)
+            histogram = self._batch_histogram_by_node.get(node_id, {})
+            nodes[node.name] = {
+                "node_id": int(node_id),
+                "dispatch_count": dispatch_count,
+                "grain_count": grains,
+                "batch_capacity": batch_cap,
+                "average_batch_size": (
+                    grains / dispatch_count if dispatch_count else 0.0
+                ),
+                "fill_ratio": (
+                    grains / (dispatch_count * batch_cap)
+                    if dispatch_count and batch_cap
+                    else 0.0
+                ),
+                "batch_histogram": {
+                    str(size): count for size, count in sorted(histogram.items())
+                },
+                "worker_busy_s": self._worker_busy_s_by_node.get(node_id, 0.0),
+            }
+        return {
+            "elapsed_s": max(0.0, self.clock() - self._metrics_started_at),
+            "active_roots_high_watermark": self._active_roots_high_watermark,
+            "capacity_skip_count": self._capacity_skip_count,
+            "transport_backpressure_count": self._transport_backpressure_count,
+            "nodes": nodes,
+        }
 
     def _apply_bad_grain(self, pending: Any, manifest: Any) -> None:
         """Fail one attributed root and return healthy batch peers to READY."""
@@ -1429,14 +1502,24 @@ class CompiledGraphRunCoordinator:
                 break
             if processed == 0:
                 idle_turns += 1
+                now = self.clock()
+                flush_at = self.scheduler.next_flush_at(now)
                 if _transport_has_pending(self.transport):
                     try:
-                        waited = self.poll_ray(timeout=0.05)
+                        wait_s = 0.05
+                        if flush_at is not None:
+                            wait_s = min(wait_s, max(0.0, flush_at - now))
+                        waited = self.poll_ray(timeout=wait_s)
                     except BaseException as error:
                         self.abort(error)
                         break
                     if waited:
                         idle_turns = 0
+                    elif flush_at is not None and flush_at <= self.clock():
+                        idle_turns = 0
+                elif flush_at is not None and flush_at > now:
+                    time.sleep(min(0.05, flush_at - now))
+                    idle_turns = 0
                 elif idle_turns > 1:
                     self.abort(CoordinatorInvariantError("compiled run made no progress"))
             else:
@@ -1665,6 +1748,16 @@ class ExecutorSession:
         """Return the one currently active stream, if any."""
 
         return self._active
+
+    def wait_ready(self, timeout_s: float | None = None) -> object:
+        """Wait for persistent MAP actors to finish UDF initialization."""
+
+        if self._closed:
+            raise RuntimeError("ExecutorSession is closed")
+        wait = getattr(self.transport, "wait_ready", None)
+        if wait is None:
+            return None
+        return wait(timeout_s)
 
     def run(self, source: Iterable[Any]) -> RunStream:
         """Start one lazy run and reject overlap within this session."""
@@ -1934,6 +2027,17 @@ def _default_graph_limits() -> _state.RuntimeLimits:
     )
 
 
+def default_runtime_limits(**overrides: int) -> _state.RuntimeLimits:
+    """Return complete compiled-graph limits with validated integer overrides."""
+
+    unknown = set(overrides).difference(_state.RuntimeLimits.__dataclass_fields__)
+    if unknown:
+        raise TypeError(
+            "unknown runtime limit(s): " + ", ".join(sorted(unknown))
+        )
+    return replace(_default_graph_limits(), **overrides)
+
+
 def _validate_supported_policies(graph: CompiledGraph) -> None:
     """Reject failure configurations whose retry/isolation semantics are absent."""
 
@@ -2031,4 +2135,5 @@ __all__ = [
     "SourceRecord",
     "Transport",
     "TransportCompletion",
+    "default_runtime_limits",
 ]

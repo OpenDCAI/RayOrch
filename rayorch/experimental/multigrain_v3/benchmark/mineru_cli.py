@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 from pathlib import Path
 from typing import Any
 
+from ..runtime import default_runtime_limits
 from .mineru import (
     DEFAULT_DUMMY_PAGE_COUNTS,
     DEFAULT_FLASH_REPO,
@@ -118,6 +118,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dummy-delay-scale-s", type=float, default=0.0)
     parser.add_argument("--ray-address", default="local")
     parser.add_argument("--num-cpus", type=int, default=16)
+    parser.add_argument(
+        "--object-store-gb",
+        type=float,
+        default=0.0,
+        help="local Ray object-store size; zero keeps Ray's default",
+    )
+    parser.add_argument("--max-active-roots", type=int, default=32)
+    parser.add_argument("--max-buffered-results", type=int, default=32)
+    parser.add_argument("--max-pending-dispatches", type=int, default=1024)
+    parser.add_argument("--readiness-timeout-s", type=float, default=600.0)
     return parser
 
 
@@ -134,6 +144,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         "assemble_batch_size": args.assemble_batch_size,
         "dpi": args.dpi,
         "num_cpus": args.num_cpus,
+        "max_active_roots": args.max_active_roots,
+        "max_buffered_results": args.max_buffered_results,
+        "max_pending_dispatches": args.max_pending_dispatches,
     }
     invalid = [name for name, value in positive.items() if value <= 0]
     if invalid:
@@ -146,6 +159,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
     if args.dummy_delay_scale_s < 0:
         raise ValueError("dummy_delay_scale_s must be non-negative")
+    if args.object_store_gb < 0:
+        raise ValueError("object_store_gb must be non-negative")
+    if args.readiness_timeout_s <= 0:
+        raise ValueError("readiness_timeout_s must be positive")
 
 
 def _ensure_ray(args: argparse.Namespace):
@@ -162,6 +179,10 @@ def _ensure_ray(args: argparse.Namespace):
     }
     if args.ray_address == "local":
         init_options["num_cpus"] = args.num_cpus
+        if args.object_store_gb:
+            init_options["object_store_memory"] = int(
+                args.object_store_gb * 1024**3
+            )
     ray.init(**init_options)
     return ray, True
 
@@ -218,23 +239,52 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
         )
 
     ray, owns_ray = _ensure_ray(args)
-    started = time.perf_counter()
+    limits = default_runtime_limits(
+        max_active_roots=args.max_active_roots,
+        max_buffered_results=args.max_buffered_results,
+        max_pending_dispatches=args.max_pending_dispatches,
+    )
     try:
-        documents = execute_pipeline(pipeline, source)
+        documents, execution_metrics = execute_pipeline(
+            pipeline,
+            source,
+            limits=limits,
+            readiness_timeout_s=args.readiness_timeout_s,
+            return_metrics=True,
+        )
     finally:
         if owns_ray:
             ray.shutdown()
-    elapsed_s = time.perf_counter() - started
     result_path = Path(args.result_jsonl).expanduser().resolve()
+    total_pages = sum(_page_count(document) for document in documents)
+    measured_wall_s = float(execution_metrics["measured_wall_s"])
 
     payload: dict[str, object] = {
         "workload": args.workload,
         "documents": jsonable(documents),
         "document_count": len(documents),
         "input_count": len(source),
-        "elapsed_s": round(elapsed_s, 6),
+        "elapsed_s": round(float(execution_metrics["end_to_end_s"]), 6),
+        "startup_s": round(float(execution_metrics["startup_s"]), 6),
+        "measured_wall_s": round(measured_wall_s, 6),
+        "teardown_s": round(float(execution_metrics["teardown_s"]), 6),
+        "total_pages": total_pages,
+        "pages_per_s": (
+            round(total_pages / measured_wall_s, 6)
+            if measured_wall_s > 0
+            else None
+        ),
         "replicas": args.replicas,
         "batch_size": args.batch_size,
+        "render_replicas": args.render_replicas,
+        "render_batch_size": args.render_batch_size,
+        "assemble_replicas": args.assemble_replicas,
+        "assemble_batch_size": args.assemble_batch_size,
+        "max_batch_wait_ms": args.max_batch_wait_ms,
+        "max_active_roots": args.max_active_roots,
+        "max_buffered_results": args.max_buffered_results,
+        "max_pending_dispatches": args.max_pending_dispatches,
+        "runtime_metrics": execution_metrics["runtime"],
         "input_dir": input_dir,
         "output_dir": output_dir,
         "result_jsonl": str(result_path),
@@ -243,6 +293,15 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
     with result_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
     return payload
+
+
+def _page_count(document: object) -> int:
+    """Extract a page count from real or dummy MinerU output records."""
+
+    if isinstance(document, dict):
+        return int(document.get("pages", 0))
+    page_ids = getattr(document, "page_ids", ())
+    return len(page_ids)
 
 
 def main(argv: list[str] | None = None) -> int:

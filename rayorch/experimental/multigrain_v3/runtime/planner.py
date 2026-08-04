@@ -743,6 +743,32 @@ class ReadyScheduler:
 
         return len(self._queued)
 
+    def has_ready(self, now: float | None = None) -> bool:
+        """Return whether a full, expired, or isolated batch is selectable."""
+
+        now = self.clock() if now is None else now
+        flush_at = self.next_flush_at(now)
+        return flush_at is not None and flush_at <= now
+
+    def next_flush_at(self, now: float | None = None) -> float | None:
+        """Return the earliest monotonic deadline for queued scheduler work."""
+
+        now = self.clock() if now is None else now
+        if self._isolation:
+            return now
+        earliest: float | None = None
+        for node in self.round_robin_nodes:
+            queue = self.queues[node]
+            max_size, wait_ms = self._policy(node)
+            deadline = (
+                now
+                if len(queue) >= max_size
+                else self.first_ready_at[node] + wait_ms / 1000.0
+            )
+            if earliest is None or deadline < earliest:
+                earliest = deadline
+        return earliest
+
     def enqueue(
         self,
         grain: Any,
@@ -794,17 +820,25 @@ class ReadyScheduler:
         now: float | None = None,
         *,
         force: bool = False,
+        eligible: Callable[[Any], bool] | None = None,
     ) -> BatchSelection | None:
-        """Select one full, expired, or explicitly forced same-node batch."""
+        """Select ready work whose MAP node currently has execution capacity."""
 
         if self._isolation:
-            return self._isolation.popleft()
+            for _ in range(len(self._isolation)):
+                selection = self._isolation[0]
+                if eligible is None or eligible(selection.node):
+                    return self._isolation.popleft()
+                self._isolation.rotate(-1)
+            return None
         if not self.round_robin_nodes:
             return None
         now = self.clock() if now is None else now
         for _ in range(len(self.round_robin_nodes)):
             node = self.round_robin_nodes[0]
             self.round_robin_nodes.rotate(-1)
+            if eligible is not None and not eligible(node):
+                continue
             queue = self.queues[node]
             max_size, wait_ms = self._policy(node)
             elapsed_ms = (now - self.first_ready_at[node]) * 1000.0

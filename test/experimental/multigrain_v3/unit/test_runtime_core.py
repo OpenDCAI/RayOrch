@@ -80,6 +80,23 @@ class _LocalGraph:
     nodes: tuple[object, ...] = ()
 
 
+@dataclass(slots=True)
+class _FakeClock:
+    """Expose deterministic monotonic time for scheduler deadline tests."""
+
+    now: float = 0.0
+
+    def __call__(self) -> float:
+        """Return the current synthetic monotonic timestamp."""
+
+        return self.now
+
+    def advance_ms(self, milliseconds: float) -> None:
+        """Advance synthetic monotonic time by ``milliseconds``."""
+
+        self.now += milliseconds / 1000.0
+
+
 def _limits(**changes: int) -> state.RuntimeLimits:
     """Build generous positive hard limits with optional focused overrides."""
 
@@ -189,6 +206,188 @@ def _present_list(
         sem.ReceiptState.PRESENT,
         producer,
     )
+
+
+def test_ready_scheduler_waits_until_inclusive_deadline() -> None:
+    """An underfilled queue becomes selectable exactly at its wait deadline."""
+
+    clock = _FakeClock()
+    scheduler = ReadyScheduler(
+        default_max_size=4,
+        default_wait_ms=10,
+        clock=clock,
+    )
+    scheduler.enqueue("grain-a", node="node-a")
+
+    deadline = scheduler.next_flush_at()
+    assert deadline == pytest.approx(0.010)
+    assert not scheduler.has_ready()
+    assert scheduler.select_batch() is None
+
+    assert deadline is not None
+    clock.now = deadline - 0.000_001
+    assert not scheduler.has_ready()
+    assert scheduler.select_batch() is None
+
+    clock.now = deadline
+    assert scheduler.has_ready()
+    assert scheduler.select_batch() == BatchSelection(
+        node="node-a",
+        grains=("grain-a",),
+    )
+    assert scheduler.next_flush_at() is None
+
+
+def test_ready_scheduler_zero_wait_is_immediately_ready() -> None:
+    """A zero wait policy makes an underfilled queue ready immediately."""
+
+    clock = _FakeClock(3.0)
+    scheduler = ReadyScheduler(
+        default_max_size=8,
+        default_wait_ms=0,
+        clock=clock,
+    )
+    scheduler.enqueue("grain-a", node="node-a")
+
+    assert scheduler.next_flush_at() == clock()
+    assert scheduler.has_ready()
+    assert scheduler.select_batch() == BatchSelection(
+        node="node-a",
+        grains=("grain-a",),
+    )
+
+
+def test_ready_scheduler_full_batches_preserve_node_round_robin() -> None:
+    """Readiness probes must not disturb full-batch node round-robin order."""
+
+    clock = _FakeClock(7.0)
+    scheduler = ReadyScheduler(
+        default_max_size=2,
+        default_wait_ms=100,
+        clock=clock,
+    )
+    for grain in ("a-1", "a-2"):
+        scheduler.enqueue(grain, node="node-a")
+    for grain in ("b-1", "b-2"):
+        scheduler.enqueue(grain, node="node-b")
+    original_ring = tuple(scheduler.round_robin_nodes)
+
+    assert scheduler.next_flush_at() == clock()
+    assert scheduler.has_ready()
+    assert tuple(scheduler.round_robin_nodes) == original_ring
+    assert scheduler.select_batch() == BatchSelection(
+        node="node-a",
+        grains=("a-1", "a-2"),
+    )
+    assert scheduler.select_batch() == BatchSelection(
+        node="node-b",
+        grains=("b-1", "b-2"),
+    )
+
+
+def test_ready_scheduler_tail_waits_for_restarted_deadline() -> None:
+    """A tail left by a full batch is selectable at its new deadline."""
+
+    clock = _FakeClock()
+    scheduler = ReadyScheduler(
+        default_max_size=2,
+        default_wait_ms=5,
+        clock=clock,
+    )
+    for grain in ("grain-1", "grain-2", "grain-3"):
+        scheduler.enqueue(grain, node="node-a")
+
+    assert scheduler.select_batch() == BatchSelection(
+        node="node-a",
+        grains=("grain-1", "grain-2"),
+    )
+    deadline = scheduler.next_flush_at()
+    assert deadline == pytest.approx(0.005)
+
+    assert deadline is not None
+    clock.now = deadline - 0.000_001
+    assert scheduler.select_batch() is None
+    clock.now = deadline
+    assert scheduler.select_batch() == BatchSelection(
+        node="node-a",
+        grains=("grain-3",),
+    )
+
+
+def test_ready_scheduler_reports_earliest_node_deadline_after_remove() -> None:
+    """Removing queues or fullness updates the global earliest flush time."""
+
+    clock = _FakeClock()
+    scheduler = ReadyScheduler(
+        default_max_size=4,
+        default_wait_ms=10,
+        clock=clock,
+    )
+    scheduler.enqueue("a-1", node="node-a")
+    clock.advance_ms(3)
+    for grain in ("b-1", "b-2", "b-3", "b-4"):
+        scheduler.enqueue(grain, node="node-b")
+
+    assert scheduler.next_flush_at() == clock()
+    assert scheduler.remove("b-4")
+    assert scheduler.next_flush_at() == pytest.approx(0.010)
+    assert scheduler.remove("a-1")
+    assert scheduler.next_flush_at() == pytest.approx(0.013)
+    for grain in ("b-1", "b-2", "b-3"):
+        assert scheduler.remove(grain)
+    assert scheduler.next_flush_at() is None
+    assert not scheduler.has_ready()
+
+
+def test_ready_scheduler_retains_explicit_force_flush() -> None:
+    """Explicit force still flushes an underfilled queue before its deadline."""
+
+    clock = _FakeClock()
+    scheduler = ReadyScheduler(
+        default_max_size=8,
+        default_wait_ms=100,
+        clock=clock,
+    )
+    scheduler.enqueue("grain-a", node="node-a")
+
+    assert not scheduler.has_ready()
+    assert scheduler.select_batch(force=False) is None
+    assert scheduler.select_batch(force=True) == BatchSelection(
+        node="node-a",
+        grains=("grain-a",),
+    )
+
+
+def test_ready_scheduler_skips_nodes_without_execution_capacity() -> None:
+    """An ineligible node must retain work while another node is selected."""
+
+    scheduler = ReadyScheduler(default_max_size=1, default_wait_ms=0)
+    scheduler.enqueue("a-1", node="node-a")
+    scheduler.enqueue("b-1", node="node-b")
+
+    selection = scheduler.select_batch(
+        eligible=lambda node: node == "node-b",
+    )
+
+    assert selection == BatchSelection(node="node-b", grains=("b-1",))
+    assert scheduler.select_batch(
+        eligible=lambda _node: False,
+    ) is None
+    assert scheduler.select_batch(
+        eligible=lambda node: node == "node-a",
+    ) == BatchSelection(node="node-a", grains=("a-1",))
+
+
+def test_ready_scheduler_ineligible_isolation_group_remains_queued() -> None:
+    """Isolation work must not be popped until its node has actor capacity."""
+
+    scheduler = ReadyScheduler(default_max_size=1, default_wait_ms=0)
+    scheduler.enqueue_isolation("node-a", ("grain-a",))
+
+    assert scheduler.select_batch(eligible=lambda _node: False) is None
+    assert scheduler.select_batch(
+        eligible=lambda node: node == "node-a",
+    ) == BatchSelection(node="node-a", grains=("grain-a",))
 
 
 def test_interleaved_reduce_settles_by_scope_and_ordinal() -> None:
@@ -631,6 +830,122 @@ def test_local_transaction_applies_success_and_rejects_conflict() -> None:
         transaction.apply(CommitDelta(receipts=(conflicting,)))
     assert receipts.require(item) == receipt
     assert values.has_binding(item)
+
+
+def test_local_transaction_does_not_copy_unrelated_live_history() -> None:
+    """A one-receipt delta must not inspect or copy old block payloads."""
+
+    class _NoDeepcopy:
+        """Fail loudly if the transaction copies an unrelated payload."""
+
+        def __deepcopy__(self, memo: dict[int, object]) -> object:
+            """Reject deepcopy while permitting normal opaque-ref storage."""
+
+            raise AssertionError("unrelated block ref was deepcopied")
+
+    run = sem.RunId.new()
+    root = sem.RootId.for_source(run, 0)
+    blocks = state.BlockStore()
+    blocks.install(_NoDeepcopy(), 1)
+    for index in range(511):
+        blocks.install(("historical", index), 1)
+    values = state.ValueNodeStore(blocks)
+    receipts = ReceiptStore(values)
+    events: list[object] = []
+    transaction = LocalTransaction(
+        SimpleNamespace(
+            blocks=blocks,
+            values=values,
+            controls=state.ControlStore(),
+            grains=sem.GrainStore(),
+            receipts=receipts,
+            credits=None,
+        ),
+        event_sink=events,
+    )
+    receipt = sem.Receipt(
+        sem.ItemRef(sem.PortId(2), sem.EntityId.source(run, 0)),
+        sem.OccurrenceContext(root),
+        sem.ReceiptState.NORMAL_ABSENCE,
+        sem.GrainId.derive("absent-output", run),
+    )
+
+    assert transaction.apply(CommitDelta(receipts=(receipt,))) == (receipt,)
+    assert len(blocks) == 512
+    assert receipts.require(receipt.item) == receipt
+    assert events == [receipt]
+
+
+def test_local_transaction_rolls_back_multi_output_fault_delta_sized() -> None:
+    """A fault after the second binding must hide every output atomically."""
+
+    class _FailAfterSecondBind(state.ValueNodeStore):
+        """Inject one post-mutation failure at the second output binding."""
+
+        def __init__(self, blocks: state.BlockStore) -> None:
+            """Initialize the store and its deterministic fault counter."""
+
+            super().__init__(blocks)
+            self.bind_count = 0
+
+        def bind_item(
+            self,
+            root: sem.RootId,
+            item: sem.ItemRef,
+            node: sem.ValueNodeId,
+        ) -> bool:
+            """Bind normally, then fail after the second mutation."""
+
+            installed = super().bind_item(root, item, node)
+            self.bind_count += 1
+            if self.bind_count == 2:
+                raise RuntimeError("injected second-bind failure")
+            return installed
+
+    run = sem.RunId.new()
+    root = sem.RootId.for_source(run, 0)
+    blocks = state.BlockStore()
+    values = _FailAfterSecondBind(blocks)
+    receipts = ReceiptStore(values)
+    transaction = LocalTransaction(
+        SimpleNamespace(
+            blocks=blocks,
+            values=values,
+            controls=state.ControlStore(),
+            grains=sem.GrainStore(),
+            receipts=receipts,
+            credits=None,
+        ),
+        event_sink=[],
+    )
+    items = tuple(
+        sem.ItemRef(sem.PortId(index + 1), sem.EntityId.source(run, 0))
+        for index in range(2)
+    )
+    delta = CommitDelta(
+        blocks=tuple(
+            PreparedBlock(sem.BlockId(index), (f"value-{index}",), 1)
+            for index in range(2)
+        ),
+        value_nodes=tuple(
+            PreparedValueNode(
+                sem.ValueNodeId(index),
+                state.ScalarNode(sem.BlockId(index), 0),
+            )
+            for index in range(2)
+        ),
+        item_bindings=tuple(
+            PreparedItemBinding(root, item, sem.ValueNodeId(index))
+            for index, item in enumerate(items)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="second-bind"):
+        transaction.apply(delta)
+
+    assert len(blocks) == 0
+    assert all(not values.has_binding(item) for item in items)
+    assert values._nodes == {}
 
 
 def test_prepared_dispatch_interns_blocks_across_roots() -> None:

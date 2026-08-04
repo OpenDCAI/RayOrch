@@ -8,7 +8,6 @@ it crosses a process boundary.
 
 from __future__ import annotations
 
-import copy
 import secrets
 from dataclasses import dataclass
 from enum import Enum
@@ -698,41 +697,43 @@ def _bit_at(bits: bytes, index: int) -> bool:
     return bool(bits[index // 8] & (1 << (index % 8)))
 
 
+class _UndoJournal:
+    """Record delta-sized inverse operations in application order."""
+
+    def __init__(self) -> None:
+        """Create an empty transaction-local inverse stack."""
+
+        self._entries: list[Callable[[], None]] = []
+
+    def add(self, undo: Callable[[], None]) -> None:
+        """Append one inverse that is safe before or after its mutation."""
+
+        self._entries.append(undo)
+
+    def rollback(self) -> None:
+        """Run every inverse in reverse order and surface the first failure."""
+
+        first_error: BaseException | None = None
+        for undo in reversed(self._entries):
+            try:
+                undo()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        self._entries.clear()
+        if first_error is not None:
+            raise DispatchInvariantError(
+                f"transaction rollback failed: {first_error}"
+            ) from first_error
+
+    def clear(self) -> None:
+        """Discard inverses after a successful atomic commit."""
+
+        self._entries.clear()
+
+
 class LocalTransaction:
     """Apply prepared semantic deltas atomically on the coordinator thread."""
-
-    _SNAPSHOT_ATTRS = (
-        "_blocks",
-        "_dispatch_owners",
-        "_event_owners",
-        "_grain_owners",
-        "_roots",
-        "_root_occurrences",
-        "_root_edges",
-        "_occurrence_reservations",
-        "_occurrence_owner",
-        "structural_leases",
-        "_items",
-        "_nodes",
-        "_items_by_root",
-        "_bools",
-        "_remaining_consumers",
-        "_by_root",
-        "_receipts",
-        "_grains",
-        "_states",
-        "_errors",
-        "grains",
-        "errors",
-        "_item_roots",
-        "_next_id",
-        "active_roots",
-        "live_grains",
-        "live_occurrences",
-        "live_structural_edges",
-        "pending_dispatches",
-        "local_events",
-    )
 
     def __init__(
         self,
@@ -785,26 +786,39 @@ class LocalTransaction:
         self._preflight(delta)
         events = tuple(delta.receipts) + tuple(delta.scope_events)
         reserved_by_sink, reservations = self._reserve_events(events)
-        snapshots = self._take_snapshots()
+        journal = _UndoJournal()
         self._applying = True
         try:
-            self._install_errors(delta.errors)
-            self._install_blocks(delta.blocks)
-            self._install_value_nodes(delta.value_nodes)
-            self._install_item_bindings(delta.item_bindings)
-            self._install_controls(delta.controls, delta.receipts)
-            self._seal_outcomes(delta.grain_outcomes)
-            self._publish_receipts(delta.receipts)
-            self._apply_credit_delta(delta.credit_delta)
+            self._install_errors(delta.errors, journal)
+            self._install_blocks(delta.blocks, journal)
+            self._install_value_nodes(delta.value_nodes, journal)
+            self._install_item_bindings(delta.item_bindings, journal)
+            self._install_controls(delta.controls, delta.receipts, journal)
+            self._seal_outcomes(delta.grain_outcomes, journal)
+            self._publish_receipts(delta.receipts, journal)
+            self._apply_credit_delta(delta.credit_delta, journal)
             self._append_events(
                 events,
                 reservations=reservations if reserved_by_sink else None,
             )
+            journal.clear()
             return events
-        except BaseException:
-            self._restore_snapshots(snapshots)
-            if reserved_by_sink:
-                self._release_reserved_events(reservations)
+        except BaseException as apply_error:
+            rollback_error: BaseException | None = None
+            try:
+                journal.rollback()
+            except BaseException as error:
+                rollback_error = error
+            try:
+                if reserved_by_sink:
+                    self._release_reserved_events(reservations)
+            except BaseException as error:
+                if rollback_error is None:
+                    rollback_error = error
+            if rollback_error is not None:
+                raise DispatchInvariantError(
+                    f"semantic apply failed ({apply_error}) and rollback was incomplete"
+                ) from rollback_error
             raise
         finally:
             self._applying = False
@@ -844,10 +858,12 @@ class LocalTransaction:
         setattr(pending, "semantic_applied", True)
         return CommitResult(decision=decision, applied=True, events=events)
 
-    def rollback(self, snapshots: tuple[Any, ...]) -> None:
-        """Restore snapshots captured by a caller performing fault injection."""
+    def rollback(self, journal: _UndoJournal) -> None:
+        """Apply a transaction-local undo journal for fault-injection callers."""
 
-        self._restore_snapshots(snapshots)
+        if not isinstance(journal, _UndoJournal):
+            raise TypeError("rollback requires a LocalTransaction undo journal")
+        journal.rollback()
 
     def _validate_header(self, pending: Any, manifest: Any) -> None:
         """Validate immutable manifest fields against the pending dispatch."""
@@ -902,6 +918,15 @@ class LocalTransaction:
             if prepared.token is not None and current is not None:
                 if not current(prepared.token):
                     raise DispatchInvariantError("outcome attempt is not current")
+        if delta.credit_delta is not None:
+            credits = self._store("credits")
+            if credits is None or not any(
+                callable(getattr(credits, name, None))
+                for name in ("undo_delta", "revert_delta")
+            ):
+                raise DispatchInvariantError(
+                    "credit delta requires an explicit inverse operation"
+                )
 
     def _reserve_events(
         self,
@@ -987,41 +1012,11 @@ class LocalTransaction:
             if existing is not None and existing_value is not value:
                 raise DispatchInvariantError("conflicting control bool")
 
-    def _take_snapshots(self) -> tuple[Any, ...]:
-        """Capture known mutable ledgers before atomic apply."""
-
-        snapshots: list[Any] = []
-        for name in (
-            "blocks",
-            "values",
-            "controls",
-            "grains",
-            "errors",
-            "receipts",
-            "credits",
-        ):
-            store = self._store(name)
-            if store is None:
-                continue
-            snapshot_method = getattr(store, "snapshot", None)
-            restore_method = getattr(store, "restore", None)
-            if snapshot_method is not None and restore_method is not None:
-                snapshots.append(("method", store, snapshot_method()))
-                continue
-            attrs: dict[str, Any] = {}
-            for attribute in self._SNAPSHOT_ATTRS:
-                if not hasattr(store, attribute):
-                    continue
-                value = getattr(store, attribute)
-                if isinstance(value, (dict, set, list)):
-                    attrs[attribute] = copy.deepcopy(value)
-                elif isinstance(value, (int, str, bytes, type(None))):
-                    attrs[attribute] = value
-            if attrs:
-                snapshots.append(("attrs", store, attrs))
-        return tuple(snapshots)
-
-    def _install_errors(self, errors: Iterable[Any]) -> None:
+    def _install_errors(
+        self,
+        errors: Iterable[Any],
+        journal: _UndoJournal,
+    ) -> None:
         """Install prepared semantic errors before failed outcomes reference them."""
 
         store = self._store("errors")
@@ -1029,35 +1024,40 @@ class LocalTransaction:
         if store is None and values:
             raise DispatchInvariantError("transaction has errors but no ErrorStore")
         for error in values:
+            mapping = getattr(store, "_errors", {})
+            if error.id not in mapping:
+                journal.add(
+                    lambda store=store, error=error: self._undo_indexed_insert(
+                        store,
+                        "_errors",
+                        error.id,
+                        "_by_root",
+                        error.root,
+                    )
+                )
             store.put(error)
 
-    def _restore_snapshots(self, snapshots: tuple[Any, ...]) -> None:
-        """Restore model stores after an apply-time exception."""
-
-        for kind, store, state in reversed(snapshots):
-            if kind == "method":
-                store.restore(state)
-                continue
-            for attribute, saved in state.items():
-                current = getattr(store, attribute)
-                if isinstance(current, dict):
-                    current.clear()
-                    current.update(saved)
-                elif isinstance(current, set):
-                    current.clear()
-                    current.update(saved)
-                elif isinstance(current, list):
-                    current[:] = saved
-                else:
-                    setattr(store, attribute, saved)
-
-    def _install_blocks(self, blocks: Iterable[PreparedBlock]) -> None:
+    def _install_blocks(
+        self,
+        blocks: Iterable[PreparedBlock],
+        journal: _UndoJournal,
+    ) -> None:
         """Install output blocks before any ValueNode can reference them."""
 
         store = self._store("blocks")
         if store is None and tuple(blocks):
             raise DispatchInvariantError("transaction has blocks but no BlockStore")
         for block in blocks:
+            existed = block.id in store
+            previous_next = getattr(store, "_next_id", None)
+            if not existed:
+                journal.add(
+                    lambda store=store,
+                    block_id=block.id,
+                    previous_next=previous_next: self._undo_block_install(
+                        store, block_id, previous_next
+                    )
+                )
             install_prepared = getattr(store, "install_prepared", None)
             if install_prepared is not None:
                 install_prepared(block)
@@ -1067,13 +1067,28 @@ class LocalTransaction:
             if installed != block.id:
                 raise DispatchInvariantError("BlockStore returned another prepared ID")
 
-    def _install_value_nodes(self, nodes: Iterable[PreparedValueNode]) -> None:
+    def _install_value_nodes(
+        self,
+        nodes: Iterable[PreparedValueNode],
+        journal: _UndoJournal,
+    ) -> None:
         """Install preallocated ValueNodes after their blocks exist."""
 
         store = self._store("values")
         if store is None and tuple(nodes):
             raise DispatchInvariantError("transaction has values but no ValueNodeStore")
         for node in nodes:
+            records = getattr(store, "_nodes", {})
+            existed = node.id in records
+            previous_next = getattr(store, "_next_id", None)
+            if not existed:
+                journal.add(
+                    lambda store=store,
+                    node_id=node.id,
+                    previous_next=previous_next: self._undo_value_install(
+                        store, node_id, previous_next
+                    )
+                )
             install = getattr(store, "install_prepared", None)
             if install is None:
                 install = getattr(store, "install_node", None)
@@ -1100,6 +1115,7 @@ class LocalTransaction:
     def _install_item_bindings(
         self,
         bindings: Iterable[PreparedItemBinding],
+        journal: _UndoJournal,
     ) -> None:
         """Bind output coordinates only after all referenced nodes exist."""
 
@@ -1108,12 +1124,20 @@ class LocalTransaction:
             existing = self._existing_item_node(binding.item)
             if existing == binding.node:
                 continue
+            journal.add(
+                lambda store=store,
+                item=binding.item,
+                node=binding.node: self._undo_item_binding(
+                    store, item, node
+                )
+            )
             store.bind_item(binding.root, binding.item, binding.node)
 
     def _install_controls(
         self,
         controls: Iterable[tuple[Any, ...]],
         receipts: Iterable[Any],
+        journal: _UndoJournal,
     ) -> None:
         """Install FILTER control projections before PRESENT receipts publish."""
 
@@ -1125,13 +1149,38 @@ class LocalTransaction:
             root = roots.get(item)
             if root is None:
                 raise DispatchInvariantError("control bool has no matching receipt root")
+            existing = getattr(store, "_bools", {}).get(item)
+            if existing is None:
+                journal.add(
+                    lambda store=store,
+                    item=item,
+                    root=root: self._undo_indexed_insert(
+                        store, "_bools", item, "_by_root", root
+                    )
+                )
             store.install_bool(root, item, value, remaining_consumers)
 
-    def _seal_outcomes(self, outcomes: Iterable[PreparedOutcome]) -> None:
+    def _seal_outcomes(
+        self,
+        outcomes: Iterable[PreparedOutcome],
+        journal: _UndoJournal,
+    ) -> None:
         """Seal each grain with its exact current attempt token."""
 
         grains = self._store("grains")
         for prepared in outcomes:
+            state = grains.require(prepared.grain)
+            previous = (
+                state.phase,
+                state.generation,
+                state.active_attempt,
+                state.outcome,
+            )
+            journal.add(
+                lambda state=state, previous=previous: self._restore_grain_state(
+                    state, previous
+                )
+            )
             seal = getattr(grains, "seal")
             authority = (
                 prepared.token if prepared.token is not None else prepared.grain
@@ -1148,14 +1197,34 @@ class LocalTransaction:
             else:
                 raise DispatchInvariantError("GrainStore.seal signature unsupported")
 
-    def _publish_receipts(self, receipts: Iterable[Any]) -> None:
+    def _publish_receipts(
+        self,
+        receipts: Iterable[Any],
+        journal: _UndoJournal,
+    ) -> None:
         """Publish all output receipts after values and outcomes are visible."""
 
         store = self._store("receipts")
         for receipt in receipts:
+            existing = store.get(receipt.item)
+            if existing is None:
+                journal.add(
+                    lambda store=store,
+                    receipt=receipt: self._undo_indexed_insert(
+                        store,
+                        "_receipts",
+                        receipt.item,
+                        "_by_root",
+                        receipt.context.root,
+                    )
+                )
             store.publish_once(receipt)
 
-    def _apply_credit_delta(self, delta: Any | None) -> None:
+    def _apply_credit_delta(
+        self,
+        delta: Any | None,
+        journal: _UndoJournal,
+    ) -> None:
         """Apply an optional owner-keyed credit delta last."""
 
         if delta is None:
@@ -1164,7 +1233,81 @@ class LocalTransaction:
         apply_delta = getattr(credits, "apply_delta", None)
         if apply_delta is None:
             raise DispatchInvariantError("CreditManager cannot apply credit delta")
+        undo = getattr(credits, "undo_delta", None)
+        if undo is None:
+            undo = getattr(credits, "revert_delta")
+        journal.add(lambda undo=undo, delta=delta: undo(delta))
         apply_delta(delta)
+
+    def _undo_indexed_insert(
+        self,
+        store: Any,
+        mapping_name: str,
+        key: Any,
+        index_name: str,
+        index_key: Any,
+    ) -> None:
+        """Remove one inserted key and only its matching root-index membership."""
+
+        mapping = getattr(store, mapping_name)
+        if key not in mapping:
+            return
+        mapping.pop(key, None)
+        index = getattr(store, index_name)
+        members = index.get(index_key)
+        if members is None:
+            return
+        members.discard(key)
+        if not members:
+            index.pop(index_key, None)
+
+    def _undo_block_install(
+        self,
+        store: Any,
+        block: Any,
+        previous_next: int | None,
+    ) -> None:
+        """Discard one newly installed unowned block and restore its allocator."""
+
+        if block in store:
+            store.discard_unleased(block)
+        if previous_next is not None:
+            store._next_id = previous_next
+
+    def _undo_value_install(
+        self,
+        store: Any,
+        node: Any,
+        previous_next: int | None,
+    ) -> None:
+        """Discard one newly installed unbound value node and its retained edges."""
+
+        records = getattr(store, "_nodes", {})
+        if node in records:
+            store.discard_unbound(node)
+        if previous_next is not None:
+            store._next_id = previous_next
+
+    def _undo_item_binding(self, store: Any, item: Any, node: Any) -> None:
+        """Unbind only the item installed by the current semantic delta."""
+
+        items = getattr(store, "_items", {})
+        if items.get(item) == node:
+            store.unbind_item(item)
+
+    def _restore_grain_state(
+        self,
+        state: Any,
+        previous: tuple[Any, int, Any, Any],
+    ) -> None:
+        """Restore the four mutable fields of one touched grain record."""
+
+        (
+            state.phase,
+            state.generation,
+            state.active_attempt,
+            state.outcome,
+        ) = previous
 
     def _append_events(
         self,

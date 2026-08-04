@@ -572,8 +572,11 @@ def execute_pipeline(
     source: Iterable[object],
     *,
     output_name: str = "document",
-) -> list[object]:
-    """Run a compiled V3 graph and materialize one named output per root."""
+    limits: object | None = None,
+    readiness_timeout_s: float | None = None,
+    return_metrics: bool = False,
+) -> list[object] | tuple[list[object], dict[str, object]]:
+    """Run a compiled graph and optionally return startup/runtime metrics."""
 
     try:
         from ..api import ExecutorSession
@@ -581,16 +584,27 @@ def execute_pipeline(
         from ..runtime import ExecutorSession
 
     graph = compile_pipeline(pipeline)
-    session = ExecutorSession(graph)
+    lifecycle_started = time.perf_counter()
+    session = ExecutorSession(graph, limits=limits)
     stream = None
+    startup_started = time.perf_counter()
+    session.wait_ready(readiness_timeout_s)
+    startup_s = time.perf_counter() - startup_started
+    measured_started = time.perf_counter()
+    runtime_metrics: dict[str, object] = {}
     try:
         stream = session.run(source)
         root_results = stream.collect(order="input")
-        return [
+        documents = [
             _materialize_output(root_result, output_name)
             for root_result in root_results
         ]
+        measured_wall_s = time.perf_counter() - measured_started
+        snapshot = getattr(stream.coordinator, "metrics_snapshot", None)
+        if callable(snapshot):
+            runtime_metrics = dict(snapshot())
     finally:
+        teardown_started = time.perf_counter()
         if stream is not None:
             close_stream = getattr(stream, "close", None)
             if callable(close_stream):
@@ -598,6 +612,15 @@ def execute_pipeline(
         close_session = getattr(session, "close", None)
         if callable(close_session):
             close_session()
+        teardown_s = time.perf_counter() - teardown_started
+    metrics = {
+        "startup_s": startup_s,
+        "measured_wall_s": measured_wall_s,
+        "teardown_s": teardown_s,
+        "end_to_end_s": time.perf_counter() - lifecycle_started,
+        "runtime": runtime_metrics,
+    }
+    return (documents, metrics) if return_metrics else documents
 
 
 def _materialize_output(root_result: object, output_name: str) -> object:
