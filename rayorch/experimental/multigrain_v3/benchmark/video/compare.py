@@ -13,6 +13,7 @@ from typing import Any
 from .data import (
     download_tiny_video,
     download_ucf101_samples,
+    load_video_manifest,
     probe_video,
 )
 from .ray_data import run_ray_data
@@ -20,23 +21,44 @@ from .v3 import run_v3
 from .workload import prepare_resnet18_weights
 
 
-def _paths(args: argparse.Namespace) -> list[str]:
-    """根据 CLI source 选择本地或 Hugging Face videos。"""
+def _sources(args: argparse.Namespace) -> tuple[list[str], str, str | None]:
+    """根据 CLI source 选择本地/HF videos，并返回可审计的数据集标签。"""
 
-    if args.paths:
+    if args.manifest:
+        entries = load_video_manifest(args.manifest)
+        datasets = {entry.dataset for entry in entries}
+        if len(datasets) != 1:
+            raise ValueError("video manifest must contain one dataset")
+        base = [entry.path for entry in entries]
+        dataset = next(iter(datasets))
+        manifest = str(Path(args.manifest).resolve())
+    elif args.paths:
         base = [str(Path(path).resolve()) for path in args.paths]
+        dataset = args.dataset or "local"
+        manifest = None
     else:
+        dataset = args.dataset or "tiny"
         cache = args.cache_dir or tempfile.mkdtemp(
             prefix="multigrain-v3-video-",
             dir="/tmp",
         )
-        if args.dataset == "tiny":
+        if dataset == "tiny":
             base = [download_tiny_video(cache)]
-        else:
+        elif dataset == "ucf101":
             base = list(download_ucf101_samples(cache))
+        else:
+            raise ValueError(
+                "--dataset without --paths/--manifest must be tiny or ucf101"
+            )
+        manifest = None
     if args.repeat_inputs <= 0:
         raise ValueError("repeat_inputs must be positive")
-    return base * args.repeat_inputs
+    if args.manifest and args.repeat_inputs != 1:
+        raise ValueError(
+            "--repeat-inputs is forbidden with --manifest; "
+            "formal inputs must remain independent sources"
+        )
+    return base * args.repeat_inputs, dataset, manifest
 
 
 def _run_once(
@@ -94,7 +116,7 @@ def run_compare(args: argparse.Namespace) -> dict[str, Any]:
 
     import ray
 
-    paths = _paths(args)
+    paths, dataset, manifest = _sources(args)
     metadata = [probe_video(path) for path in paths]
     if args.transform_backend == "resnet18":
         prepare_resnet18_weights()
@@ -102,10 +124,17 @@ def run_compare(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("warmup must be non-negative")
     if args.repeats <= 0:
         raise ValueError("repeats must be positive")
+    if args.num_gpus < 0:
+        raise ValueError("num_gpus must be non-negative")
+    if args.transform_num_gpus > args.num_gpus:
+        raise ValueError(
+            "transform_num_gpus exceeds Ray-visible --num-gpus"
+        )
     if not ray.is_initialized():
         ray.init(
             address="local",
             num_cpus=args.num_cpus,
+            num_gpus=args.num_gpus,
             include_dashboard=False,
         )
     common = {
@@ -116,6 +145,9 @@ def run_compare(args: argparse.Namespace) -> dict[str, Any]:
         "transform_batch_size": args.transform_batch_size,
         "transform_backend": args.transform_backend,
         "torch_num_threads": args.torch_num_threads,
+        "model_path": args.model_path,
+        "transform_num_gpus": args.transform_num_gpus,
+        "model_repeats": args.model_repeats,
     }
     warmups = [
         _run_once(
@@ -147,7 +179,8 @@ def run_compare(args: argparse.Namespace) -> dict[str, Any]:
     ray_data_walls = [trial["ray_data_wall_s"] for trial in trials]
     representative = trials[len(trials) // 2]
     return {
-        "dataset": args.dataset,
+        "dataset": dataset,
+        "manifest": manifest,
         "transform_backend": args.transform_backend,
         "videos": len(paths),
         "unique_videos": len(set(paths)),
@@ -186,8 +219,15 @@ def build_parser() -> argparse.ArgumentParser:
     """构造视频 compare CLI。"""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=("tiny", "ucf101"), default="tiny")
-    parser.add_argument("--paths", nargs="*")
+    parser.add_argument(
+        "--dataset",
+        choices=("tiny", "ucf101"),
+        default=None,
+        help="only used for built-in tiny/ucf101 sources; manifest supplies its dataset",
+    )
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument("--manifest")
+    sources.add_argument("--paths", nargs="*")
     parser.add_argument("--cache-dir")
     parser.add_argument(
         "--repeat-inputs",
@@ -202,10 +242,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transform-batch-size", type=int, default=16)
     parser.add_argument(
         "--transform-backend",
-        choices=("opencv", "resnet18"),
+        choices=("opencv", "resnet18", "vit"),
         default="opencv",
     )
     parser.add_argument("--torch-num-threads", type=int, default=1)
+    parser.add_argument("--model-path")
+    parser.add_argument("--transform-num-gpus", type=float, default=0.0)
+    parser.add_argument("--model-repeats", type=int, default=1)
     parser.add_argument(
         "--batch-scope",
         choices=("elastic", "parent_bound"),
@@ -214,6 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--microbatch-size", type=int, default=1)
     parser.add_argument("--max-inflight-arenas", type=int, default=2)
     parser.add_argument("--num-cpus", type=int, default=16)
+    parser.add_argument("--num-gpus", type=float, default=0.0)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=1)
     return parser

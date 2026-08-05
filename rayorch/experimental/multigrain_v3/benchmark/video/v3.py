@@ -38,12 +38,16 @@ class TransformFrames:
         self,
         backend: str = "opencv",
         torch_num_threads: int = 1,
+        model_path: str | None = None,
+        model_repeats: int = 1,
     ) -> None:
         """初始化共用 frame heavy-stage backend。"""
 
         self.transformer = FrameTransformer(
             backend,
             torch_num_threads=torch_num_threads,
+            model_path=model_path,
+            model_repeats=model_repeats,
         )
 
     def run(self, frames: list[Any]) -> list[Any]:
@@ -70,11 +74,15 @@ class VideoV3Pipeline(Pipeline):
         stride: int,
         max_frames: int | None,
         decode_replicas: int,
+        reduce_replicas: int,
         transform_replicas: int,
         transform_batch_size: int,
         batch_scope: str,
         transform_backend: str = "opencv",
         torch_num_threads: int = 1,
+        model_path: str | None = None,
+        transform_num_gpus: float = 0.0,
+        model_repeats: int = 1,
     ) -> None:
         """配置 decode、frame transform 和 summary stages。"""
 
@@ -92,16 +100,19 @@ class VideoV3Pipeline(Pipeline):
             .pre_init(
                 backend=transform_backend,
                 torch_num_threads=torch_num_threads,
+                model_path=model_path,
+                model_repeats=model_repeats,
             )
             .ray_options(
                 replicas=transform_replicas,
                 batch_size=transform_batch_size,
                 batch_scope=batch_scope,
                 num_cpus=max(1, torch_num_threads),
+                num_gpus=transform_num_gpus,
             )
         )
         self.summary = Reduce(SummarizeVideos).ray_options(
-            replicas=decode_replicas,
+            replicas=reduce_replicas,
             batch_size=4,
             num_cpus=1,
         )
@@ -120,13 +131,19 @@ def run_v3(
     stride: int = 1,
     max_frames: int | None = None,
     decode_replicas: int = 1,
+    reduce_replicas: int = 1,
     transform_replicas: int = 2,
     transform_batch_size: int = 16,
     batch_scope: str = "elastic",
     transform_backend: str = "opencv",
     torch_num_threads: int = 1,
+    model_path: str | None = None,
+    transform_num_gpus: float = 0.0,
+    model_repeats: int = 1,
     microbatch_size: int = 2,
     max_inflight_arenas: int = 2,
+    max_pending_per_actor: int = 1,
+    actor_max_concurrency: int = 1,
 ) -> RunResult:
     """执行 V3 视频 runner，调用方负责初始化本地/集群 Ray。"""
 
@@ -134,14 +151,20 @@ def run_v3(
         stride=stride,
         max_frames=max_frames,
         decode_replicas=decode_replicas,
+        reduce_replicas=reduce_replicas,
         transform_replicas=transform_replicas,
         transform_batch_size=transform_batch_size,
         batch_scope=batch_scope,
         transform_backend=transform_backend,
         torch_num_threads=torch_num_threads,
+        model_path=model_path,
+        transform_num_gpus=transform_num_gpus,
+        model_repeats=model_repeats,
     )
     return Executor(
         pipeline,
         microbatch_size=microbatch_size,
         max_inflight_arenas=max_inflight_arenas,
+        max_pending_per_actor=max_pending_per_actor,
+        actor_max_concurrency=actor_max_concurrency,
     ).run(paths)

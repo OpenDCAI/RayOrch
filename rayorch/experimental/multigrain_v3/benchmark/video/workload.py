@@ -32,6 +32,14 @@ class FrameFeature:
     digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class FrameCaption:
+    """一个 frame 的 deterministic VLM caption。"""
+
+    source_frame_index: int
+    text: str
+
+
 def decode_video(
     path: str,
     *,
@@ -80,25 +88,48 @@ class FrameTransformer:
         backend: str = "opencv",
         *,
         torch_num_threads: int = 1,
+        model_path: str | None = None,
+        model_repeats: int = 1,
     ) -> None:
-        """初始化轻量 OpenCV 或预训练 ResNet18 backend。"""
+        """初始化 OpenCV、ResNet18 或 HuggingFace ViT backend。"""
 
         self.backend = backend
         self.model = None
+        if model_repeats <= 0:
+            raise ValueError("model_repeats must be positive")
+        self.model_repeats = model_repeats
         if backend == "opencv":
             return
-        if backend != "resnet18":
+        if backend not in {"resnet18", "vit"}:
             raise ValueError(f"unsupported frame backend: {backend}")
         import torch
-        from torchvision.models import ResNet18_Weights, resnet18
 
         if torch_num_threads <= 0:
             raise ValueError("torch_num_threads must be positive")
         torch.set_num_threads(torch_num_threads)
         self.torch = torch
-        self.model = resnet18(
-            weights=ResNet18_Weights.IMAGENET1K_V1,
-        ).eval()
+        if backend == "resnet18":
+            from torchvision.models import ResNet18_Weights, resnet18
+
+            self.model = resnet18(
+                weights=ResNet18_Weights.IMAGENET1K_V1,
+            ).eval()
+            self.processor = None
+        else:
+            if model_path is None:
+                raise ValueError("ViT backend requires model_path")
+            from transformers import AutoImageProcessor, ViTModel
+
+            self.processor = AutoImageProcessor.from_pretrained(
+                model_path,
+                local_files_only=True,
+            )
+            self.model = ViTModel.from_pretrained(
+                model_path,
+                local_files_only=True,
+            ).eval()
+        if torch.cuda.is_available():
+            self.model = self.model.cuda()
 
     def transform(self, frames: list[FrameRecord]) -> list[FrameFeature]:
         """按 backend 处理一个物理 frame batch。"""
@@ -107,9 +138,15 @@ class FrameTransformer:
         if self.backend == "opencv" or not frames:
             return base
         assert self.model is not None
+        if self.backend == "vit":
+            return self._transform_vit(frames, base)
         tensors = [self._resnet_tensor(frame.image_bgr) for frame in frames]
+        device = self._model_device()
         with self.torch.inference_mode():
-            logits = self.model(self.torch.stack(tensors)).cpu().numpy()
+            batch = self.torch.stack(tensors).to(device)
+            for _ in range(self.model_repeats):
+                logits_tensor = self.model(batch)
+            logits = logits_tensor.cpu().numpy()
         return [
             FrameFeature(
                 source_frame_index=feature.source_frame_index,
@@ -119,6 +156,57 @@ class FrameTransformer:
                     ",".join(
                         str(int(class_id))
                         for class_id in logits[index].argsort()[-5:][::-1]
+                    ).encode("ascii"),
+                    digest_size=8,
+                ).hexdigest(),
+            )
+            for index, feature in enumerate(base)
+        ]
+
+    def _model_device(self):
+        """返回模型 device；测试替身没有 parameters 时使用 CPU。"""
+
+        try:
+            return next(self.model.parameters()).device
+        except AttributeError:
+            return self.torch.device("cpu")
+
+    def _transform_vit(
+        self,
+        frames: list[FrameRecord],
+        base: list[FrameFeature],
+    ) -> list[FrameFeature]:
+        """对一个物理 batch 执行 ViT embedding。"""
+
+        import cv2
+        import numpy as np
+
+        assert self.processor is not None and self.model is not None
+        images = [
+            cv2.cvtColor(frame.image_bgr, cv2.COLOR_BGR2RGB)
+            for frame in frames
+        ]
+        inputs = self.processor(images=images, return_tensors="pt")
+        device = self._model_device()
+        inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+        }
+        with self.torch.inference_mode():
+            for _ in range(self.model_repeats):
+                output = self.model(**inputs)
+            embeddings = output.last_hidden_state[:, 0].cpu().numpy()
+        return [
+            FrameFeature(
+                source_frame_index=feature.source_frame_index,
+                mean_bgr=feature.mean_bgr,
+                edge_density=feature.edge_density,
+                digest=hashlib.blake2b(
+                    ",".join(
+                        str(int(value))
+                        for value in np.argsort(
+                            np.abs(embeddings[index])
+                        )[-16:][::-1]
                     ).encode("ascii"),
                     digest_size=8,
                 ).hexdigest(),
@@ -155,6 +243,97 @@ class FrameTransformer:
         return (tensor - mean) / std
 
 
+class FrameCaptioner:
+    """SmolVLM 等 image-text model 的 persistent batch caption UDF。"""
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        prompt: str = "Describe the main action in five words.",
+        max_new_tokens: int = 12,
+    ) -> None:
+        """加载 fixed local model/processor，并使用 greedy generation。"""
+
+        import torch
+        from transformers import (
+            AutoModelForImageTextToText,
+            AutoProcessor,
+        )
+
+        self.torch = torch
+        self.processor = AutoProcessor.from_pretrained(
+            model_path,
+            local_files_only=True,
+        )
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            local_files_only=True,
+            torch_dtype=(
+                torch.float16 if torch.cuda.is_available() else torch.float32
+            ),
+        ).eval()
+        if torch.cuda.is_available():
+            self.model = self.model.cuda()
+        self.max_new_tokens = max_new_tokens
+        self.chat_prompt = self.processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+            add_generation_prompt=True,
+        )
+
+    def caption(self, frames: list[FrameRecord]) -> list[FrameCaption]:
+        """对一个物理 frame batch 执行 greedy caption generation。"""
+
+        import cv2
+        from PIL import Image
+
+        if not frames:
+            return []
+        images = [
+            Image.fromarray(
+                cv2.cvtColor(frame.image_bgr, cv2.COLOR_BGR2RGB)
+            )
+            for frame in frames
+        ]
+        inputs = self.processor(
+            text=[self.chat_prompt] * len(frames),
+            images=images,
+            return_tensors="pt",
+            padding=True,
+        )
+        device = next(self.model.parameters()).device
+        inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+        }
+        with self.torch.inference_mode():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+            )
+        prefix = inputs["input_ids"].shape[1]
+        texts = self.processor.batch_decode(
+            outputs[:, prefix:],
+            skip_special_tokens=True,
+        )
+        return [
+            FrameCaption(
+                source_frame_index=frame.source_frame_index,
+                text=text.strip(),
+            )
+            for frame, text in zip(frames, texts)
+        ]
+
+
 def prepare_resnet18_weights() -> None:
     """在 Driver 预下载固定 torchvision ResNet18 权重，避免 actor 下载竞争。"""
 
@@ -185,4 +364,23 @@ def summarize_video(features: list[FrameFeature]) -> dict[str, Any]:
             if features
             else 0.0
         ),
+    }
+
+
+def summarize_captions(
+    captions: list[FrameCaption],
+) -> dict[str, Any]:
+    """把有序 frame captions 汇总为稳定 video result。"""
+
+    source_indices = tuple(
+        caption.source_frame_index for caption in captions
+    )
+    if source_indices != tuple(sorted(source_indices)):
+        raise ValueError("video captions are not ordered")
+    texts = tuple(caption.text for caption in captions)
+    return {
+        "frames": len(captions),
+        "source_indices": source_indices,
+        "captions": texts,
+        "caption_chars": sum(len(text) for text in texts),
     }

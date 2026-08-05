@@ -62,12 +62,16 @@ class TransformFrameBatches:
         self,
         backend: str = "opencv",
         torch_num_threads: int = 1,
+        model_path: str | None = None,
+        model_repeats: int = 1,
     ) -> None:
         """初始化与 V3 相同的 heavy-stage backend。"""
 
         self.transformer = FrameTransformer(
             backend,
             torch_num_threads=torch_num_threads,
+            model_path=model_path,
+            model_repeats=model_repeats,
         )
 
     def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
@@ -170,6 +174,9 @@ def build_dataset(
     transform_batch_size: int = 16,
     transform_backend: str = "opencv",
     torch_num_threads: int = 1,
+    model_path: str | None = None,
+    transform_num_gpus: float = 0.0,
+    model_repeats: int = 1,
 ):
     """构造 lazy Ray Data 视频 DAG。"""
 
@@ -203,9 +210,12 @@ def build_dataset(
         batch_format="numpy",
         concurrency=transform_replicas,
         num_cpus=max(1, torch_num_threads),
+        num_gpus=transform_num_gpus,
         fn_constructor_kwargs={
             "backend": transform_backend,
             "torch_num_threads": torch_num_threads,
+            "model_path": model_path,
+            "model_repeats": model_repeats,
         },
     )
     return features.groupby(

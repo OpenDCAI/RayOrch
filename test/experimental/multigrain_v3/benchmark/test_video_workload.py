@@ -61,6 +61,7 @@ def test_resnet_signature_uses_semantic_top_classes(monkeypatch) -> None:
     transformer = object.__new__(FrameTransformer)
     transformer.backend = "resnet18"
     transformer.model = object()
+    transformer.model_repeats = 1
 
     class FakeInference:
         """模拟 torch.inference_mode context。"""
@@ -100,7 +101,17 @@ def test_resnet_signature_uses_semantic_top_classes(monkeypatch) -> None:
         def stack(self, tensors):
             """返回输入。"""
 
-            return tensors
+            return self
+
+        def to(self, device):
+            """模拟 tensor.to。"""
+
+            return self
+
+        def device(self, value):
+            """返回 fake device。"""
+
+            return value
 
     class FakeModel:
         """返回只在低位 float 上不同、top-5 相同的 logits。"""

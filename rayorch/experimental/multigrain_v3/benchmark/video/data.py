@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 TINY_VIDEO_REPO = "hf-internal-testing/tiny-video-dataset"
@@ -28,6 +28,37 @@ class VideoFrame:
     ordinal: int
     source_frame_index: int
     image_bgr: Any
+
+
+@dataclass(frozen=True, slots=True)
+class VideoManifestEntry:
+    """一个正式视频 benchmark source 的可审计元数据。
+
+    ``path`` 是实际交给 V3/Ray Data 的本地文件；其余字段固定数据集来源、split、原始
+    sample identity 与标签。运行前可由 ``validate_video_manifest`` 重 probe 文件属性，
+    防止手工替换/损坏视频后仍沿用旧实验结论。
+    """
+
+    path: str
+    dataset: str
+    split: str
+    source_id: str
+    label: str | None = None
+    duration_s: float | None = None
+    bytes: int | None = None
+
+    def to_json(self) -> dict[str, str | float | int | None]:
+        """转为稳定、可直接写入 JSONL/JSON array 的 manifest row。"""
+
+        return {
+            "path": self.path,
+            "dataset": self.dataset,
+            "split": self.split,
+            "source_id": self.source_id,
+            "label": self.label,
+            "duration_s": self.duration_s,
+            "bytes": self.bytes,
+        }
 
 
 def download_tiny_video(
@@ -87,6 +118,122 @@ def probe_video(path: str) -> dict[str, float | int | str]:
         }
     finally:
         capture.release()
+
+
+def video_manifest_entry(
+    path: str,
+    *,
+    dataset: str,
+    split: str,
+    source_id: str,
+    label: str | None = None,
+) -> VideoManifestEntry:
+    """probe 一个本地视频并构造带 duration/bytes 的正式 manifest entry。"""
+
+    resolved = Path(path).resolve()
+    metadata = probe_video(str(resolved))
+    fps = float(metadata["fps"])
+    frame_count = int(metadata["frame_count"])
+    duration_s = frame_count / fps if fps > 0 else None
+    return VideoManifestEntry(
+        path=str(resolved),
+        dataset=dataset,
+        split=split,
+        source_id=source_id,
+        label=label,
+        duration_s=duration_s,
+        bytes=resolved.stat().st_size,
+    )
+
+
+def write_video_manifest(
+    entries: Iterable[VideoManifestEntry],
+    path: str,
+) -> None:
+    """写入有序 JSON manifest，拒绝空集合和重复 source identity。"""
+
+    import json
+
+    rows = tuple(entries)
+    if not rows:
+        raise ValueError("video manifest must not be empty")
+    identities = [
+        (row.dataset, row.split, row.source_id)
+        for row in rows
+    ]
+    if len(set(identities)) != len(identities):
+        raise ValueError("video manifest has duplicate source identities")
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(
+            [row.to_json() for row in rows],
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_video_manifest(path: str) -> tuple[VideoManifestEntry, ...]:
+    """读取并重新验证正式 manifest 的本地文件身份和可 decode 属性。"""
+
+    import json
+
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("video manifest must be a non-empty JSON list")
+    entries = tuple(
+        VideoManifestEntry(
+            path=str(item["path"]),
+            dataset=str(item["dataset"]),
+            split=str(item["split"]),
+            source_id=str(item["source_id"]),
+            label=(
+                str(item["label"])
+                if item.get("label") is not None
+                else None
+            ),
+            duration_s=(
+                float(item["duration_s"])
+                if item.get("duration_s") is not None
+                else None
+            ),
+            bytes=(
+                int(item["bytes"])
+                if item.get("bytes") is not None
+                else None
+            ),
+        )
+        for item in raw
+    )
+    seen: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        identity = (entry.dataset, entry.split, entry.source_id)
+        if identity in seen:
+            raise ValueError("video manifest has duplicate source identities")
+        seen.add(identity)
+        actual = video_manifest_entry(
+            entry.path,
+            dataset=entry.dataset,
+            split=entry.split,
+            source_id=entry.source_id,
+            label=entry.label,
+        )
+        if entry.bytes is not None and entry.bytes != actual.bytes:
+            raise ValueError(
+                f"video bytes changed for source_id={entry.source_id}"
+            )
+        if (
+            entry.duration_s is not None
+            and actual.duration_s is not None
+            and abs(entry.duration_s - actual.duration_s) > 0.05
+        ):
+            raise ValueError(
+                f"video duration changed for source_id={entry.source_id}"
+            )
+    return entries
 
 
 def sample_frames(
