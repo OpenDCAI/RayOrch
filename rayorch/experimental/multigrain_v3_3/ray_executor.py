@@ -15,16 +15,14 @@ from .api import Pipeline
 from .execution_support import materialize_tree
 from .model import CallRef, GrainRef
 from .program import CompiledProgram
-from .protocol import OutputLayout, RowBinding
+from .protocol import (
+    InvocationPlan,
+    OutputLayout,
+    RemoteBlockRef,
+    RowBinding,
+)
 from .runtime import ArenaEngine
-from .worker import InvocationPlan, LocalWorker
-
-
-@dataclass(frozen=True, slots=True)
-class RemoteBlockRef:
-    """Ray object store 中一个粗粒度不可变块的引用。"""
-
-    object_ref: Any
+from .worker import LocalWorker
 
 
 class RayBlockStore:
@@ -232,6 +230,13 @@ class RayExecutor:
         if not slices:
             slices = [tuple(() for _ in columns)]
 
+        # actor pool 跨 run 持久化，但调度指标严格按 run 隔离。已有 actor
+        # 计为本次使用一次；运行中 replacement 会由 _create_actor 继续累加。
+        self.store.begin_batch()
+        self.metrics = {
+            call: RayCallMetrics(actor_starts=len(self._actors[call]))
+            for call in self.program.calls
+        }
         all_arenas: list[ArenaEngine | None] = [None] * len(slices)
         active: dict[int, _ArenaSlot] = {}
         completed: dict[int, object] = {}
@@ -249,7 +254,7 @@ class RayExecutor:
                 next_arena += 1
                 high_watermark = max(high_watermark, len(active))
 
-            dispatched = self._dispatch_ready(active, pending)
+            self._dispatch_ready(active, pending)
 
             # 只有没有 pending lease 的 Arena 才能离开 active 集合。
             pending_arenas = {lease.arena_index for lease in pending.values()}
@@ -291,9 +296,6 @@ class RayExecutor:
                     arena.commit_report(report)
             finally:
                 lease.actor.busy = False
-
-            # ``dispatched`` 仅用于显式表达该 turn 是否产生新 lease，便于调试。
-            del dispatched
 
         arenas = tuple(arena for arena in all_arenas if arena is not None)
         return RayRunResult(
@@ -357,10 +359,9 @@ class RayExecutor:
         self,
         active: dict[int, _ArenaSlot],
         pending: dict[Any, _Dispatch],
-    ) -> int:
+    ) -> None:
         """把 READY Grain 分配给空闲 actor；每个 batch 严格属于一个 Arena。"""
 
-        dispatched = 0
         for call, actors in self._actors.items():
             for actor in actors:
                 if actor.busy:
@@ -400,8 +401,6 @@ class RayExecutor:
                 metrics.rpcs += 1
                 metrics.grains += len(grains)
                 metrics.batch_sizes.append(len(grains))
-                dispatched += 1
-        return dispatched
 
     def _handle_failure(
         self,

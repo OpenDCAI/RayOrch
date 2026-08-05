@@ -166,10 +166,10 @@ def summarize_local(
         result.rpc_count,
         heavy.rpcs,
         heavy.average_batch,
-        sum(len(result.arena.entities(domain)) for domain in result.arena.program.domains),
-        len(result.arena.state.items),
-        len(result.arena.state.shapes),
-        len(result.store.blocks),
+        result.arena.entity_count,
+        result.arena.item_count,
+        result.arena.shape_count,
+        result.store.block_count,
         _digest(result.outputs),
     )
 
@@ -194,13 +194,9 @@ def summarize_ray(
         result.rpc_count,
         heavy.rpcs,
         heavy.average_batch,
-        sum(
-            len(arena.entities(domain))
-            for arena in result.arenas
-            for domain in arena.program.domains
-        ),
-        sum(len(arena.state.items) for arena in result.arenas),
-        sum(len(arena.state.shapes) for arena in result.arenas),
+        sum(arena.entity_count for arena in result.arenas),
+        sum(arena.item_count for arena in result.arenas),
+        sum(arena.shape_count for arena in result.arenas),
         None,
         _digest(result.outputs),
     )

@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 from .model import MISSING
 from .protocol import (
+    BlockRef,
     CallFailureReport,
     CallReport,
     ExpandedRows,
@@ -16,9 +17,11 @@ from .protocol import (
     OutputLayout,
     OutputReport,
     RecordFailure,
+    RemoteBlockRef,
     RowBinding,
     ScalarTake,
     WorkerReport,
+    restore_group,
 )
 
 
@@ -34,11 +37,10 @@ class ValueStore(Protocol):
 
         ...
 
-    def put(self, values: tuple[Any, ...]):
+    def put(self, values: tuple[Any, ...]) -> BlockRef | RemoteBlockRef:
         """写入一个粗粒度值块并返回逻辑块引用。"""
 
         ...
-
 
 
 class LocalWorker:
@@ -163,29 +165,14 @@ class LocalWorker:
                     columns[index].append(store.get(take.binding))
                 elif isinstance(take, GroupTake):
                     leaves = [store.get(binding) for binding in take.bindings]
-                    columns[index].append(
-                        cls.restore_group(leaves, take.offsets_by_level)
-                    )
+                    try:
+                        group = restore_group(leaves, take.offsets_by_level)
+                    except ValueError as error:
+                        raise WorkerContractError(str(error)) from error
+                    columns[index].append(group)
                 else:  # pragma: no cover - 封闭联合类型的防御分支
                     raise WorkerContractError(f"unsupported InputTake: {take!r}")
         return tuple(columns)
-
-    @staticmethod
-    def restore_group(
-        leaves: list[Any],
-        offsets_by_level: tuple[tuple[int, ...], ...],
-    ) -> list[Any]:
-        """由最内层叶子向上应用 offsets，恢复唯一根 group。"""
-
-        nodes: list[Any] = leaves
-        for offsets in reversed(offsets_by_level):
-            nodes = [
-                nodes[offsets[index] : offsets[index + 1]]
-                for index in range(len(offsets) - 1)
-            ]
-        if len(nodes) != 1:
-            raise WorkerContractError("GroupShape does not have one root")
-        return nodes[0]
 
     @classmethod
     def _normalize_outputs(
@@ -213,12 +200,7 @@ class LocalWorker:
 
 
 __all__ = [
-    "GroupTake",
-    "InputTake",
-    "InvocationPlan",
     "LocalWorker",
-    "MissingTake",
-    "OutputLayout",
-    "ScalarTake",
+    "ValueStore",
     "WorkerContractError",
 ]

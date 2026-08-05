@@ -103,12 +103,12 @@ class CrashPipeline(mg.Pipeline):
 
 @pytest.fixture(scope="module", autouse=True)
 def ray_runtime():
-    """连接已有集群；测试结束只关闭本进程客户端，不停止集群。"""
+    """优先遵循 RAY_ADDRESS；未配置时启动进程自有的本地集群。"""
 
     import ray
 
     if not ray.is_initialized():
-        ray.init(address="auto")
+        ray.init(address=os.environ.get("RAY_ADDRESS", "local"))
     yield
 
 
@@ -133,6 +133,24 @@ def test_persistent_actor_is_shared_by_multiple_arenas():
     assert all(arena.is_complete() for arena in result.arenas)
     assert result.released_values > 0
     assert all(not arena.state.values for arena in result.arenas)
+
+
+def test_reusing_ray_executor_does_not_accumulate_metrics():
+    """actor 可跨 run 复用，但上一份 RunResult 不得被后续运行修改。"""
+
+    with RayExecutor(IdentityPipeline()) as executor:
+        first = executor.run(range(7), arena_size=7)
+        first_metrics = next(iter(first.calls.values()))
+        first_batches = tuple(first_metrics.batch_sizes)
+
+        second = executor.run(range(2), arena_size=2)
+        second_metrics = next(iter(second.calls.values()))
+
+    assert first_metrics.rpcs == 3
+    assert tuple(first_metrics.batch_sizes) == first_batches == (3, 3, 1)
+    assert second_metrics.rpcs == 1
+    assert second_metrics.batch_sizes == [2]
+    assert first.actor_count == second.actor_count == 1
 
 
 def test_ray_dummy_matches_local_and_structural_relations_have_no_actors():

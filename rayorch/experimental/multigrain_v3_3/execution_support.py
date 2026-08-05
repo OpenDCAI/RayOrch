@@ -8,11 +8,10 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from .model import ItemOutcome, PortRef
+from .model import ItemOutcome, ItemRef, PortRef
 from .program import Program
-from .protocol import RowBinding
+from .protocol import RowBinding, restore_group
 from .runtime import ArenaEngine, GroupBinding
-from .worker import LocalWorker
 
 
 class ReadableStore(Protocol):
@@ -49,7 +48,7 @@ def materialize_tree(
 def _materialize_item(
     arena: ArenaEngine,
     store: ReadableStore,
-    item,
+    item: ItemRef,
 ) -> Any:
     """物化单个终态 Item；非 PRESENT 结果保留其语义 outcome。"""
 
@@ -62,7 +61,7 @@ def _materialize_item(
     if not isinstance(binding, GroupBinding):  # pragma: no cover - 防御分支
         raise RuntimeError(f"unsupported ValueBinding: {binding!r}")
     leaves = [store.get(row) for row in arena.group_rows(binding)]
-    return LocalWorker.restore_group(leaves, binding.shape.offsets_by_level)
+    return restore_group(leaves, binding.shape.offsets_by_level)
 
 
 __all__ = ["ReadableStore", "materialize_tree"]

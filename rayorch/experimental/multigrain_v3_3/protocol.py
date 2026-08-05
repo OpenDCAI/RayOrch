@@ -20,10 +20,17 @@ class BlockRef:
 
 
 @dataclass(frozen=True, slots=True)
+class RemoteBlockRef:
+    """远程对象存储中一个粗粒度不可变块的引用。"""
+
+    object_ref: Any
+
+
+@dataclass(frozen=True, slots=True)
 class RowBinding:
     """数据块内一行的物理定位，不携带业务 payload。"""
 
-    block: BlockRef
+    block: BlockRef | RemoteBlockRef
     row: int
 
     def __post_init__(self) -> None:
@@ -118,6 +125,23 @@ class OutputLayout:
     is_mask: bool = False
 
 
+def restore_group(
+    leaves: list[Any],
+    offsets_by_level: tuple[tuple[int, ...], ...],
+) -> list[Any]:
+    """由最内层叶子向上应用 CSR offsets，恢复唯一根 group。"""
+
+    nodes: list[Any] = leaves
+    for offsets in reversed(offsets_by_level):
+        nodes = [
+            nodes[offsets[index] : offsets[index + 1]]
+            for index in range(len(offsets) - 1)
+        ]
+    if len(nodes) != 1:
+        raise ValueError("GroupShape does not have one root")
+    return nodes[0]
+
+
 __all__ = [
     "BlockRef",
     "CallFailureReport",
@@ -130,7 +154,9 @@ __all__ = [
     "OutputLayout",
     "OutputReport",
     "RecordFailure",
+    "RemoteBlockRef",
     "RowBinding",
     "ScalarTake",
     "WorkerReport",
+    "restore_group",
 ]

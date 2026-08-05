@@ -103,6 +103,24 @@ class ArenaEngine:
 
         return len(self._ready)
 
+    @property
+    def entity_count(self) -> int:
+        """返回 Arena 已创建的 Entity 总数，供审计与 benchmark 使用。"""
+
+        return sum(len(entities) for entities in self._entities_by_domain.values())
+
+    @property
+    def item_count(self) -> int:
+        """返回 Arena 已终态化的 Item 总数。"""
+
+        return len(self.state.items)
+
+    @property
+    def shape_count(self) -> int:
+        """返回 Arena 已创建的 fan-out Shape 总数。"""
+
+        return len(self.state.shapes)
+
     def ready_calls(self) -> tuple[CallRef, ...]:
         """按 ready queue 首次出现顺序返回可调度 Call。"""
 

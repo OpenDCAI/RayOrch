@@ -35,6 +35,12 @@ class LocalBlockStore:
 
         return self.blocks[binding.block][binding.row]
 
+    @property
+    def block_count(self) -> int:
+        """返回本次运行创建的粗粒度块数。"""
+
+        return len(self.blocks)
+
 
 @dataclass(slots=True)
 class CallMetrics:
@@ -72,9 +78,12 @@ class LocalExecutor:
     """不导入、不初始化 Ray，但执行与 Ray 路径相同的 Worker ABI。"""
 
     def __init__(self, pipeline: Pipeline | CompiledProgram) -> None:
-        self.compiled = pipeline if isinstance(pipeline, CompiledProgram) else pipeline.compile()
+        self.compiled = (
+            pipeline
+            if isinstance(pipeline, CompiledProgram)
+            else pipeline.compile()
+        )
         self.program = self.compiled.program
-        self.store = LocalBlockStore()
         self.workers = {
             call: LocalWorker(
                 spec.kernel.target,
@@ -83,7 +92,6 @@ class LocalExecutor:
             )
             for call, spec in self.program.calls.items()
         }
-        self.metrics = {call: CallMetrics() for call in self.program.calls}
 
     def run(self, *source_columns: Iterable[Any]) -> LocalRunResult:
         """以行对齐 source columns 执行单个 Arena，直到严格完成。"""
@@ -94,10 +102,14 @@ class LocalExecutor:
         if len({len(column) for column in columns}) != 1:
             raise ValueError("source columns must be row-aligned")
 
+        # Store、Arena 和指标都属于一次 run；只有 UDF Worker 按执行器生命周期
+        # 持久化，从而与 Ray actor 的实例复用语义保持一致。
+        store = LocalBlockStore()
+        metrics_by_call = {call: CallMetrics() for call in self.program.calls}
         arena = ArenaEngine(self.program)
         source_bindings = {}
         for port, values in zip(self.program.source_ports, columns):
-            block = self.store.put(values)
+            block = store.put(values)
             source_bindings[port] = tuple(
                 RowBinding(block, index) for index in range(len(values))
             )
@@ -128,24 +140,23 @@ class LocalExecutor:
             reports = self.workers[call].execute(
                 invocations,
                 layouts,
-                self.store,
+                store,
             )
-            metrics = self.metrics[call]
+            metrics = metrics_by_call[call]
             metrics.rpcs += 1
             metrics.grains += len(grains)
             metrics.batch_sizes.append(len(grains))
             for report in reports:
                 arena.commit_report(report)
 
-        outputs = materialize_tree(self.program, arena, self.store)
+        outputs = materialize_tree(self.program, arena, store)
         return LocalRunResult(
             outputs,
             time.perf_counter() - started,
-            self.metrics,
+            metrics_by_call,
             arena,
-            self.store,
+            store,
         )
-
 
     @staticmethod
     def _deadlock_message(arena: ArenaEngine) -> str:
