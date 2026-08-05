@@ -91,6 +91,7 @@ class ExecutionSpec:
     batch_size: int = 1
     max_batch_wait_ms: float = 2.0
     batch_scope: str = "elastic"
+    max_outstanding_per_actor: int | None = None
     recovery: RecoverySpec = RecoverySpec()
     ray_options: tuple[tuple[str, Any], ...] = ()
 
@@ -103,6 +104,11 @@ class ExecutionSpec:
             raise ValueError("max_batch_wait_ms must be non-negative")
         if self.batch_scope not in {"elastic", "parent_bound"}:
             raise ValueError("batch_scope must be elastic or parent_bound")
+        if (
+            self.max_outstanding_per_actor is not None
+            and self.max_outstanding_per_actor <= 0
+        ):
+            raise ValueError("max_outstanding_per_actor must be positive")
 
 
 @dataclass(frozen=True, slots=True)

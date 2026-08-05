@@ -7,6 +7,7 @@ lineage/recovery 语义。
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +29,7 @@ class PendingRPC:
     intent: DispatchIntent
     stage: int
     worker_slot: int
+    worker_generation: int
     report_ref: Any
     output_refs: tuple[Any, ...]
     submitted_at: float
@@ -41,6 +43,68 @@ class ExecutionEvent:
     result: DispatchCompletion | DispatchFailure
 
 
+@dataclass(slots=True)
+class ActorCreditWindow:
+    """维护每个 actor slot 的有界 outstanding RPC credit。"""
+
+    max_outstanding_per_actor: int
+    outstanding_by_slot: list[int]
+
+    def __init__(self, actor_count: int, max_outstanding_per_actor: int) -> None:
+        """按固定 actor 数量创建 credit ledger，并校验正容量。"""
+
+        if actor_count <= 0:
+            raise ValueError("actor_count must be positive")
+        if max_outstanding_per_actor <= 0:
+            raise ValueError("max_outstanding_per_actor must be positive")
+        self.max_outstanding_per_actor = max_outstanding_per_actor
+        self.outstanding_by_slot = [0] * actor_count
+
+    def has_capacity(self) -> bool:
+        """返回是否至少有一个 actor slot 仍可接纳 RPC。"""
+
+        return any(
+            value < self.max_outstanding_per_actor
+            for value in self.outstanding_by_slot
+        )
+
+    def try_acquire(
+        self,
+        *,
+        start: int,
+        candidates: tuple[int, ...],
+    ) -> int | None:
+        """从 start 起轮询候选 slot，并原子占用一个可用 credit。"""
+
+        candidate_set = set(candidates)
+        count = len(self.outstanding_by_slot)
+        for offset in range(count):
+            slot = (start + offset) % count
+            if slot not in candidate_set:
+                continue
+            if (
+                self.outstanding_by_slot[slot]
+                >= self.max_outstanding_per_actor
+            ):
+                continue
+            self.outstanding_by_slot[slot] += 1
+            return slot
+        return None
+
+    def release(self, slot: int) -> None:
+        """终止一个 RPC 时释放 credit，并拒绝重复释放。"""
+
+        if self.outstanding_by_slot[slot] <= 0:
+            raise ExecutionError(f"actor slot {slot} credit released twice")
+        self.outstanding_by_slot[slot] -= 1
+
+    def clear(self) -> None:
+        """关闭执行池时清空全部 slot credit。"""
+
+        for slot in range(len(self.outstanding_by_slot)):
+            self.outstanding_by_slot[slot] = 0
+
+
 class StageExecutor:
     """一个 Stage 对应的 persistent actor pool 与 per-actor backpressure。"""
 
@@ -48,7 +112,8 @@ class StageExecutor:
         self,
         stage: StageSpec,
         *,
-        max_pending_per_actor: int = 1,
+        max_outstanding_per_actor: int = 1,
+        actor_max_concurrency: int = 1,
     ) -> None:
         """按 StageSpec 创建固定 replicas，并初始化 pending 计数。"""
 
@@ -58,11 +123,12 @@ class StageExecutor:
             raise ValueError("Source has no StageExecutor")
         if not ray.is_initialized():
             raise ExecutionError("Ray must be initialized before StageExecutor")
-        if max_pending_per_actor <= 0:
-            raise ValueError("max_pending_per_actor must be positive")
+        if max_outstanding_per_actor <= 0:
+            raise ValueError("max_outstanding_per_actor must be positive")
+        if actor_max_concurrency <= 0:
+            raise ValueError("actor_max_concurrency must be positive")
         assert stage.execution is not None and stage.udf is not None
         self.stage = stage
-        self.max_pending_per_actor = max_pending_per_actor
         self._worker_class = get_ray_worker_class()
         self._actor_spec = (
             stage.udf.target,
@@ -70,29 +136,55 @@ class StageExecutor:
             dict(stage.udf.init_kwargs),
             dict(stage.execution.ray_options),
         )
+        configured_concurrency = int(
+            self._actor_spec[3].get("max_concurrency", actor_max_concurrency)
+        )
+        configured_outstanding = (
+            stage.execution.max_outstanding_per_actor
+            if stage.execution.max_outstanding_per_actor is not None
+            else max_outstanding_per_actor
+        )
+        if configured_concurrency <= 0:
+            raise ValueError("actor max_concurrency must be positive")
+        if configured_outstanding < configured_concurrency:
+            raise ValueError(
+                "max_outstanding_per_actor must be greater than or equal to "
+                "actor max_concurrency"
+            )
+        self.max_outstanding_per_actor = configured_outstanding
+        self.actor_max_concurrency = configured_concurrency
         self.actors = [
             self._spawn() for _ in range(stage.execution.replicas)
         ]
-        self.pending_by_slot = [0] * len(self.actors)
+        self.worker_generations = [0] * len(self.actors)
+        self.credits = ActorCreditWindow(
+            len(self.actors), self.max_outstanding_per_actor
+        )
         self.round_robin = 0
         self.pending: dict[Any, PendingRPC] = {}
+
+    @property
+    def pending_by_slot(self) -> list[int]:
+        """兼容旧诊断代码，返回规范 outstanding credit 计数。"""
+
+        return self.credits.outstanding_by_slot
 
     def _spawn(self):
         """根据 UdfSpec 和 Ray options 创建一个 persistent actor。"""
 
         target, init_args, init_kwargs, options = self._actor_spec
+        options = dict(options)
+        options.pop("max_concurrency", None)
         return self._worker_class.options(
             max_task_retries=0,
+            max_concurrency=self.actor_max_concurrency,
             **options,
         ).remote(self.stage, target, init_args, init_kwargs)
 
     def can_submit(self) -> bool:
-        """判断是否至少有一个 actor 未达到 pending 上限。"""
+        """判断是否至少有一个 actor 未达到 outstanding 上限。"""
 
-        return any(
-            pending < self.max_pending_per_actor
-            for pending in self.pending_by_slot
-        )
+        return self.credits.has_capacity()
 
     def _choose(self, intent: DispatchIntent) -> int | None:
         """按 round-robin 和 actor policy 选择可用 worker slot。"""
@@ -105,14 +197,13 @@ class StageExecutor:
                 for index in range(count)
                 if index != intent.avoid_worker_slot
             ) or range(count)
-        for offset in range(count):
-            index = (self.round_robin + offset) % count
-            if index not in choices:
-                continue
-            if self.pending_by_slot[index] < self.max_pending_per_actor:
-                self.round_robin = (index + 1) % count
-                return index
-        return None
+        index = self.credits.try_acquire(
+            start=self.round_robin,
+            candidates=tuple(choices),
+        )
+        if index is not None:
+            self.round_robin = (index + 1) % count
+        return index
 
     def submit(self, intent: DispatchIntent) -> bool:
         """提交一个 coarse RPC，并登记 report/output ObjectRefs。"""
@@ -123,10 +214,14 @@ class StageExecutor:
         output_count = (
             0 if self.stage.kind is Primitive.FILTER else self.stage.output_count
         )
-        refs = self.actors[slot].run.options(
-            num_returns=1 + output_count,
-            max_task_retries=0,
-        ).remote(intent.call, *intent.input_blocks)
+        try:
+            refs = self.actors[slot].run.options(
+                num_returns=1 + output_count,
+                max_task_retries=0,
+            ).remote(intent.call, *intent.input_blocks)
+        except Exception:
+            self.credits.release(slot)
+            raise
         refs_tuple = (
             (refs,)
             if output_count == 0
@@ -136,19 +231,19 @@ class StageExecutor:
             intent,
             self.stage.id,
             slot,
+            self.worker_generations[slot],
             refs_tuple[0],
             refs_tuple[1:],
             time.monotonic(),
         )
         self.pending[pending.report_ref] = pending
-        self.pending_by_slot[slot] += 1
         return True
 
     def pop(self, report_ref: Any) -> PendingRPC:
-        """移除已完成 PendingRPC，并释放对应 actor pending credit。"""
+        """移除已完成 PendingRPC，并释放对应 actor outstanding credit。"""
 
         pending = self.pending.pop(report_ref)
-        self.pending_by_slot[pending.worker_slot] -= 1
+        self.credits.release(pending.worker_slot)
         return pending
 
     def replace(self, slot: int) -> None:
@@ -160,7 +255,27 @@ class StageExecutor:
             ray.kill(self.actors[slot])
         except Exception:
             pass
+        self.worker_generations[slot] += 1
         self.actors[slot] = self._spawn()
+
+    def fail_generation(
+        self,
+        slot: int,
+        generation: int,
+    ) -> tuple[PendingRPC, ...]:
+        """摘除故障 slot generation 的全部 RPC，释放 credit 并替换 actor。"""
+
+        failed = tuple(
+            pending
+            for pending in self.pending.values()
+            if pending.worker_slot == slot
+            and pending.worker_generation == generation
+        )
+        for pending in failed:
+            self.pending.pop(pending.report_ref)
+            self.credits.release(slot)
+        self.replace(slot)
+        return failed
 
     def cancel_arena(self, arena_id: int) -> None:
         """best-effort 取消属于指定 Arena 的 pending reports。"""
@@ -171,7 +286,7 @@ class StageExecutor:
             if pending.intent.arena_id != arena_id:
                 continue
             self.pending.pop(report_ref)
-            self.pending_by_slot[pending.worker_slot] -= 1
+            self.credits.release(pending.worker_slot)
             try:
                 ray.cancel(report_ref, force=True)
             except Exception:
@@ -186,17 +301,18 @@ class StageExecutor:
             ray.kill(actor)
         self.actors.clear()
         self.pending.clear()
+        self.credits.clear()
 
 
 class ExecutionPool:
     """一次 run 内由所有 in-flight Arena 共享的 StageExecutor 集合。"""
-    """All StageExecutors shared by every in-flight Arena in one run."""
 
     def __init__(
         self,
         dag: CompiledDAG,
         *,
-        max_pending_per_actor: int = 1,
+        max_outstanding_per_actor: int = 1,
+        actor_max_concurrency: int = 1,
     ) -> None:
         """为所有非 Source Stage 创建独立 persistent actor pool。"""
 
@@ -206,23 +322,30 @@ class ExecutionPool:
         self.executors = {
             stage.id: StageExecutor(
                 stage,
-                max_pending_per_actor=max_pending_per_actor,
+                max_outstanding_per_actor=max_outstanding_per_actor,
+                actor_max_concurrency=actor_max_concurrency,
             )
             for stage in dag.stages
             if stage.kind is not Primitive.SOURCE
         }
         self.ray = ray
+        self.buffered_events: deque[ExecutionEvent] = deque()
 
     @property
     def pending_count(self) -> int:
         """返回当前 run 的 pending RPC 总数。"""
 
-        return sum(len(executor.pending) for executor in self.executors.values())
+        return len(self.buffered_events) + sum(
+            len(executor.pending) for executor in self.executors.values()
+        )
 
-    def pending_for_arena(self, arena_id: int) -> int:
-        """返回指定 Arena 尚未完成的 RPC 数。"""
+    def has_outstanding(self, arena_id: int) -> bool:
+        """返回 transport 是否仍持有指定 Arena 的 RPC 或待路由事件。"""
 
-        return sum(
+        return any(
+            event.arena_id == arena_id
+            for event in self.buffered_events
+        ) or any(
             pending.intent.arena_id == arena_id
             for executor in self.executors.values()
             for pending in executor.pending.values()
@@ -256,6 +379,8 @@ class ExecutionPool:
     ) -> ExecutionEvent | None:
         """等待一个 report，并转换为带 arena_id 的 completion/failure event。"""
 
+        if self.buffered_events:
+            return self.buffered_events.popleft()
         refs = [
             report_ref
             for executor in self.executors.values()
@@ -272,21 +397,30 @@ class ExecutionPool:
             for executor in self.executors.values()
             if report_ref in executor.pending
         )
-        pending = executor.pop(report_ref)
+        pending = executor.pending[report_ref]
         try:
             report = self.ray.get(report_ref)
         except Exception as error:
-            executor.replace(pending.worker_slot)
-            return ExecutionEvent(
-                pending.intent.arena_id,
-                pending.intent.call,
-                DispatchFailure(
-                    pending.intent.call.dispatch,
-                    FailureKind.INFRA_FAILURE,
-                    f"{type(error).__name__}: {error}",
-                    worker_slot=pending.worker_slot,
-                ),
+            failed = executor.fail_generation(
+                pending.worker_slot,
+                pending.worker_generation,
             )
+            events = tuple(
+                ExecutionEvent(
+                    item.intent.arena_id,
+                    item.intent.call,
+                    DispatchFailure(
+                        item.intent.call.dispatch,
+                        FailureKind.INFRA_FAILURE,
+                        f"{type(error).__name__}: {error}",
+                        worker_slot=item.worker_slot,
+                    ),
+                )
+                for item in failed
+            )
+            self.buffered_events.extend(events[1:])
+            return events[0]
+        pending = executor.pop(report_ref)
         if isinstance(report, DispatchFailure):
             return ExecutionEvent(
                 pending.intent.arena_id,
@@ -327,10 +461,15 @@ class ExecutionPool:
     def cancel_arena(self, arena_id: int) -> None:
         """通知所有 StageExecutor 取消指定 Arena 的 pending RPC。"""
 
+        self.buffered_events = deque(
+            event
+            for event in self.buffered_events
+            if event.arena_id != arena_id
+        )
         for executor in self.executors.values():
             executor.cancel_arena(arena_id)
 
-    def actor_stats(self) -> dict[int, tuple[dict[str, int], ...]]:
+    def actor_stats(self) -> dict[int, tuple[dict[str, Any], ...]]:
         """收集每个 Stage actor 的调用次数、PID 和 RSS。"""
 
         return {
@@ -342,5 +481,6 @@ class ExecutionPool:
 
     def shutdown(self) -> None:
         """关闭所有 StageExecutor。"""
+        self.buffered_events.clear()
         for executor in self.executors.values():
             executor.shutdown()

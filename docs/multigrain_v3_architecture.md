@@ -642,10 +642,25 @@ Filter 只返回 mask report，不返回业务 block。
 StageExecutor
 ├── replicas
 ├── actor handles
-├── per-actor pending
+├── per-actor outstanding credit window
+├── worker slot generation
 ├── round-robin selection
 └── PendingRPC
 ```
+
+Outstanding window 是 transport admission control，不属于 Arena 语义。它统计 actor 上
+正在执行与 mailbox 排队的全部未终止 RPC，并保持：
+
+```text
+0 <= outstanding(slot) <= max_outstanding_per_actor
+max_outstanding_per_actor >= actor_max_concurrency
+```
+
+默认 `max_outstanding_per_actor=1` 与 `actor_max_concurrency=1` 表示没有额外预取。
+Stage 可以覆盖 Executor 默认值，但 ArenaEngine、GrainTable、batch/reduce/recovery 语义均
+不读取该配置。completion、failure、cancel 都必须精确释放一次 credit；actor 基础设施
+失败会按 worker slot generation 一次摘除该代全部 RPC，再替换 actor，避免旧 RPC 逐个
+失败和 credit 悬挂。
 
 Actor：
 
@@ -767,14 +782,23 @@ receipt events
 
 任何 preflight/contract 失败都不能暴露半提交状态。
 
-Arena 完成条件包括：
+ArenaEngine 的语义完成条件包括：
 
 - admission closed；
 - receipt queue empty；
 - 无 PendingInvocation/Open ReduceAccumulator；
 - Stage queues empty；
-- 无 IN_FLIGHT Grain/DispatchLease；
-- StageExecutor 无该 Arena pending RPC。
+- 无 IN_FLIGHT Grain/DispatchLease。
+
+ArenaEngine 不接收 RPC 数量。RunDriver 在回收前另做 transport join：
+
+```text
+arena.is_complete()
+and not execution.has_outstanding(arena.id)
+```
+
+由 ExecutionPool 独立确认该 Arena 没有 outstanding RPC 或尚未路由的 failure event，
+避免 transport 状态泄漏进 Arena 语义完成判定。
 
 `finish()` 在 reclaim 前构造 detached：
 

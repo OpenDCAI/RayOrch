@@ -1348,8 +1348,8 @@ class ArenaEngine:
                 )
         self.failure_count += 1
 
-    def is_complete(self, pending_rpc_count: int = 0) -> bool:
-        """检查 admission、事件、fan-in、queues、leases、RPC 和 Grain 全部 terminal。"""
+    def is_complete(self) -> bool:
+        """检查 admission、事件、fan-in、queues、leases 和 Grain 全部 terminal。"""
 
         return (
             self.admission_closed
@@ -1363,7 +1363,6 @@ class ArenaEngine:
                 for queue in self.queues.values()
             )
             and not self.leases
-            and pending_rpc_count == 0
             and all(
                 record.phase is GrainPhase.SEALED
                 for record in self.grains.values()

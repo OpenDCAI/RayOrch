@@ -314,13 +314,35 @@ def get_ray_worker_class():
             return (result, *blocks)
 
         def stats(self) -> dict[str, int]:
-            """返回 observation-only 的调用次数、PID 和进程 RSS。"""
+            """返回 observation-only 的调用次数、PID、RSS 和 UDF audit 快照。
 
-            return {
+            UDF 若暴露 ``batch_audit()`` 或 ``last_*_audit`` mapping，worker 只读取
+            其小型标量摘要；它不让 audit 参与 planner、lineage 或 retry 决策。
+            """
+
+            audit: dict[str, int | float | str] = {}
+            batch_audit = getattr(self.udf, "batch_audit", None)
+            if callable(batch_audit):
+                value = batch_audit()
+            else:
+                value = getattr(self.udf, "last_batch_audit", None)
+                if value is None:
+                    value = getattr(self.udf, "last_table_batch_audit", None)
+                if value is None:
+                    value = getattr(self.udf, "last_ocr_batch_audit", None)
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if isinstance(item, (int, float, str)):
+                        audit[str(key)] = item
+
+            result: dict[str, Any] = {
                 "calls": self.calls,
                 "pid": os.getpid(),
                 "rss_bytes": _rss_bytes(),
             }
+            if audit:
+                result["audit"] = audit
+            return result
 
     _RAY_WORKER = RayStageWorker
     return RayStageWorker

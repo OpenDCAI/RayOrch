@@ -338,6 +338,15 @@ def _normalize_outputs(value: Any) -> tuple[Port, ...]:
 def _execution_spec(options: dict[str, Any]) -> ExecutionSpec:
     """把 `.ray_options()` 捕获值编译为 immutable ExecutionSpec。"""
 
+    outstanding = options.pop("max_outstanding_per_actor", None)
+    legacy_outstanding = options.pop("max_pending_per_actor", None)
+    if outstanding is not None and legacy_outstanding is not None:
+        raise CompileError(
+            "use only max_outstanding_per_actor; "
+            "max_pending_per_actor is a compatibility alias"
+        )
+    if outstanding is None:
+        outstanding = legacy_outstanding
     preset_value = str(options.pop("recovery", options.pop("error_policy", "raise")))
     try:
         preset = RecoveryPreset(preset_value)
@@ -357,6 +366,9 @@ def _execution_spec(options: dict[str, Any]) -> ExecutionSpec:
         batch_size=int(options.pop("batch_size", 1)),
         max_batch_wait_ms=float(options.pop("max_batch_wait_ms", 2.0)),
         batch_scope=str(options.pop("batch_scope", "elastic")),
+        max_outstanding_per_actor=(
+            None if outstanding is None else int(outstanding)
+        ),
         recovery=RecoverySpec(preset, limits),
         ray_options=tuple(options.items()),
     )

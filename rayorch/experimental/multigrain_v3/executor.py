@@ -52,7 +52,9 @@ class Executor:
         microbatch_size: int | None = None,
         max_inflight_arenas: int = 1,
         arena_limits: ArenaLimits = ArenaLimits(),
-        max_pending_per_actor: int = 1,
+        max_outstanding_per_actor: int | None = None,
+        actor_max_concurrency: int = 1,
+        max_pending_per_actor: int | None = None,
     ) -> None:
         """保存 compiled pipeline、microbatch/in-flight 边界和 Arena limits。"""
 
@@ -63,11 +65,42 @@ class Executor:
             raise ValueError("microbatch_size must be positive")
         if max_inflight_arenas <= 0:
             raise ValueError("max_inflight_arenas must be positive")
+        if (
+            max_outstanding_per_actor is not None
+            and max_pending_per_actor is not None
+        ):
+            raise ValueError(
+                "use only max_outstanding_per_actor; "
+                "max_pending_per_actor is a compatibility alias"
+            )
+        outstanding = (
+            max_outstanding_per_actor
+            if max_outstanding_per_actor is not None
+            else max_pending_per_actor
+        )
+        if outstanding is None:
+            outstanding = 1
+        if outstanding <= 0:
+            raise ValueError("max_outstanding_per_actor must be positive")
+        if actor_max_concurrency <= 0:
+            raise ValueError("actor_max_concurrency must be positive")
+        if outstanding < actor_max_concurrency:
+            raise ValueError(
+                "max_outstanding_per_actor must be greater than or equal to "
+                "actor_max_concurrency"
+            )
         self.microbatch_size = microbatch_size
         self.max_inflight_arenas = max_inflight_arenas
         self.arena_limits = arena_limits
-        self.max_pending_per_actor = max_pending_per_actor
+        self.max_outstanding_per_actor = outstanding
+        self.actor_max_concurrency = actor_max_concurrency
         self.next_arena_id = 0
+
+    @property
+    def max_pending_per_actor(self) -> int:
+        """兼容旧实验代码，返回规范 outstanding window 配置。"""
+
+        return self.max_outstanding_per_actor
 
     def run(self, *sources: Any) -> RunResult:
         """启动 persistent Stage actors，运行多 Arena event loop 并返回 detached result。"""
@@ -104,7 +137,8 @@ class Executor:
         started = time.monotonic()
         execution = ExecutionPool(
             self.compiled.dag,
-            max_pending_per_actor=self.max_pending_per_actor,
+            max_outstanding_per_actor=self.max_outstanding_per_actor,
+            actor_max_concurrency=self.actor_max_concurrency,
         )
         try:
             execution.ready()
@@ -135,6 +169,13 @@ class Executor:
                 metrics[f"actor_calls_stage_{stage}"] = float(
                     sum(item["calls"] for item in stats)
                 )
+                audit_totals: dict[str, float] = {}
+                for item in stats:
+                    for key, value in item.get("audit", {}).items():
+                        if isinstance(value, (int, float)):
+                            audit_totals[key] = audit_totals.get(key, 0.0) + value
+                for key, value in audit_totals.items():
+                    metrics[f"actor_audit_stage_{stage}_{key}"] = value
             return RunResult(
                 outputs=arena_result.outputs,
                 failures=arena_result.failures,

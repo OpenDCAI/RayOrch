@@ -127,7 +127,7 @@ class RunDriver:
         return progress
 
     def _submit(self) -> bool:
-        """推进每个 Arena，并把可 dispatch Grain 提交给有容量的 StageExecutor。"""
+        """按 Arena 顺序推进，并把 ready Grain 提交给有容量的 StageExecutor。"""
 
         progress = False
         now = time.monotonic()
@@ -186,8 +186,9 @@ class RunDriver:
 
         progress = False
         for chunk_index, arena in tuple(self.active.items()):
-            if not arena.is_complete(
-                self.execution.pending_for_arena(arena.id)
+            if (
+                not arena.is_complete()
+                or self.execution.has_outstanding(arena.id)
             ):
                 continue
             self.completed[chunk_index] = arena.finish()
