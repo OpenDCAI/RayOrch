@@ -1,5 +1,9 @@
 # MultiGrain v3.5：静态语义编译边界
 
+首次发布前的动态状态机收敛合同见
+[`multigrain_v3_5_1.md`](multigrain_v3_5_1.md)。v3.5.1 删除输入 driver，
+并以可穷举 transition algebra 统一 F.*、Grain、Item 与 Shape 的运行时语义。
+
 ## 1. 结论
 
 v3.5 引入的不是通用优化器，而是一条固定、可关闭 canonicalization 的静态
@@ -136,7 +140,7 @@ Ray-free 回归覆盖：
 
 - primitive 语义表的完整集合；
 - `LogicalProgram` 与 derived facts 字段隔离；
-- keyword-only、反序 kwargs、默认参数跳过与 named driving input；
+- keyword-only、反序 kwargs 与默认参数跳过；
 - Arena 源码不含 Origin interpreter；
 - chained filter control fixed point；
 - group-valued mask 拒绝；

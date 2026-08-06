@@ -92,15 +92,10 @@ class CallSpec:
     kernel: KernelSpec
     execution_domain: DomainRef
     inputs: tuple[InputSpec, ...]
-    driving_input: int
 
     def __post_init__(self) -> None:
         if not self.inputs:
             raise ValueError("CallSpec requires at least one input")
-        if not 0 <= self.driving_input < len(self.inputs):
-            raise ValueError("driving_input is outside CallSpec.inputs")
-        if self.inputs[self.driving_input].mode is not InputMode.REQUIRED:
-            raise ValueError("driving input must be REQUIRED")
 
 
 @dataclass(frozen=True, slots=True)

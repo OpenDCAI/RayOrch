@@ -8,7 +8,6 @@ from typing import TypeAlias
 from ..model import (
     DomainRef,
     EntityRef,
-    GrainOutcome,
     GrainPhase,
     GrainRef,
     ItemOutcome,
@@ -32,12 +31,10 @@ class ShapeKey:
 
 @dataclass(frozen=True, slots=True)
 class EntityOrigin:
-    """子 Entity 的显式父引用、稳定 ordinal 与来源 Shape。"""
+    """子 Entity 的显式父引用与稳定 ordinal。"""
 
-    domain: DomainRef
     parent_entity: EntityRef
     ordinal: int
-    shape_key: ShapeKey
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,23 +54,28 @@ class ItemRecord:
 
 @dataclass(slots=True)
 class GrainRecord:
-    """Grain 的输入快照、阶段、终态与 retry generation。"""
+    """Grain 的执行阶段与 retry generation；身份由 table key 提供。"""
 
-    ref: GrainRef
-    inputs: tuple[ItemRef, ...]
     phase: GrainPhase
-    outcome: GrainOutcome | None = None
     generation: int = 0
     infra_failures: int = 0
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ShapeRecord:
-    """已经终态化的 fan-out cardinality 或失败原因。"""
+    """fan-out 终态；成功 Shape 直接拥有唯一的有序 children 事实。"""
 
     state: ShapeState
-    cardinality: int | None
+    children: tuple[EntityRef, ...] | None
     cause: object | None = None
+
+    def __post_init__(self) -> None:
+        if (self.state is ShapeState.SUCCEEDED) != (self.children is not None):
+            raise ValueError("only SUCCEEDED Shape may contain children")
+
+    @property
+    def cardinality(self) -> int | None:
+        return None if self.children is None else len(self.children)
 
 
 @dataclass(frozen=True, slots=True)

@@ -102,7 +102,9 @@ The cross-version ideas that V4 must preserve are tracked in
 [`docs/multigrain_v3_golden_designs.md`](docs/multigrain_v3_golden_designs.md).
 The v3.5 static semantic compiler boundary and its deliberately small
 optimization scope are documented in
-[`docs/multigrain_v3_5.md`](docs/multigrain_v3_5.md).
+[`docs/multigrain_v3_5.md`](docs/multigrain_v3_5.md); the pre-release v3.5.1
+runtime state algebra is fixed in
+[`docs/multigrain_v3_5_1.md`](docs/multigrain_v3_5_1.md).
 
 ## Minimal Example
 

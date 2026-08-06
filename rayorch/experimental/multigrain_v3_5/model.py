@@ -113,14 +113,6 @@ class GrainPhase(Enum):
     SEALED = auto()
 
 
-class GrainOutcome(Enum):
-    """已封闭 Grain 的最终计算结果。"""
-
-    SUCCESS = auto()
-    FAILED = auto()
-    SUPPRESSED = auto()
-
-
 class ShapeState(Enum):
     """一次 fan-out Shape 的终态及其 cardinality 可知性。"""
 
@@ -144,7 +136,6 @@ __all__ = [
     "CompileError",
     "DomainRef",
     "EntityRef",
-    "GrainOutcome",
     "GrainPhase",
     "GrainRef",
     "InputMode",

@@ -8,15 +8,16 @@ import rayorch.experimental.multigrain_v3_5 as mg
 from rayorch.experimental.multigrain_v3_5.logical import ExpandOrigin
 from rayorch.experimental.multigrain_v3_5.materialize import materialize_tree
 from rayorch.experimental.multigrain_v3_5.model import (
-    GrainOutcome,
     GrainPhase,
     ItemOutcome,
+    ItemRef,
 )
 from rayorch.experimental.multigrain_v3_5.protocol import (
     BlockRef,
     CallReport,
     ExpandedRows,
     OutputReport,
+    RecordFailure,
     RowBinding,
 )
 from rayorch.experimental.multigrain_v3_5.runtime import ArenaEngine, CommitError
@@ -96,7 +97,7 @@ def test_chained_filter_executes_from_control_fixed_point():
     assert outputs == [10, ItemOutcome.DROPPED, ItemOutcome.DROPPED]
 
 
-def test_keyword_only_input_preserves_default_and_driving_name():
+def test_keyword_only_input_preserves_default_without_identity_driver():
     class KeywordOnly:
         def run(self, values, scale=10, *, masks):
             return [
@@ -106,7 +107,7 @@ def test_keyword_only_input_preserves_default_and_driving_name():
 
     class KeywordPipeline(mg.Pipeline):
         def __init__(self) -> None:
-            self.call = mg.RayModule(KeywordOnly).driven_by("masks")
+            self.call = mg.RayModule(KeywordOnly)
 
         def forward(self, values, masks):
             return self.call(values, masks=masks)
@@ -119,7 +120,7 @@ def test_keyword_only_input_preserves_default_and_driving_name():
     call, spec = next(iter(compiled.logical.calls.items()))
 
     assert outputs == [10, -1, 30]
-    assert spec.driving_input == 1
+    assert not hasattr(spec, "driving_input")
     assert compiled.runtime.input_layouts_by_call[call].positional_count == 1
     assert compiled.runtime.input_layouts_by_call[call].keyword_names == ("masks",)
 
@@ -145,6 +146,87 @@ def test_reordered_keyword_inputs_keep_python_binding_semantics():
         "right",
         "left",
     )
+
+
+def test_all_optional_call_runs_with_missing_values_and_no_driver():
+    class MissingAware:
+        def run(self, left, right):
+            return [
+                -1 if lhs is mg.MISSING and rhs is mg.MISSING else lhs + rhs
+                for lhs, rhs in zip(left, right)
+            ]
+
+    class AllOptional(mg.Pipeline):
+        def __init__(self) -> None:
+            self.call = mg.RayModule(MissingAware)
+
+        def forward(self, left, right, masks):
+            selected_left = mg.F.filter(left, masks)
+            selected_right = mg.F.filter(right, masks)
+            return self.call(
+                mg.F.optional(selected_left),
+                mg.F.optional(selected_right),
+            )
+
+    outputs, _compiled, _arena = run_sync(
+        AllOptional(),
+        [10, 20],
+        [1, 2],
+        [False, True],
+    )
+    assert outputs == [-1, 22]
+
+
+def test_required_drop_is_symmetric_across_call_inputs():
+    class Add:
+        def run(self, left, right):
+            return [lhs + rhs for lhs, rhs in zip(left, right)]
+
+    class SymmetricDrop(mg.Pipeline):
+        def __init__(self) -> None:
+            self.call = mg.RayModule(Add)
+
+        def forward(self, left, right, left_mask, right_mask):
+            return self.call(
+                mg.F.filter(left, left_mask),
+                mg.F.filter(right, right_mask),
+            )
+
+    outputs, _compiled, _arena = run_sync(
+        SymmetricDrop(),
+        [10, 20],
+        [1, 2],
+        [False, True],
+        [True, False],
+    )
+    assert outputs == [ItemOutcome.DROPPED, ItemOutcome.DROPPED]
+
+
+def test_call_failure_dominates_required_drop_independent_of_arrival_order():
+    class Fail:
+        def run(self, values):
+            return [RecordFailure(f"bad {value}") for value in values]
+
+    class Add:
+        def run(self, left, right):
+            return [lhs + rhs for lhs, rhs in zip(left, right)]
+
+    class FailureAndDrop(mg.Pipeline):
+        def __init__(self) -> None:
+            self.fail = mg.RayModule(Fail)
+            self.add = mg.RayModule(Add)
+
+        def forward(self, values, masks):
+            dropped = mg.F.filter(values, masks)
+            failed = self.fail(values)
+            return self.add(dropped, failed)
+
+    outputs, _compiled, _arena = run_sync(
+        FailureAndDrop(),
+        [10, 20],
+        [False, False],
+    )
+    assert outputs == [ItemOutcome.SUPPRESSED, ItemOutcome.SUPPRESSED]
 
 
 def test_nested_expand_reduce_preserves_empty_groups():
@@ -229,7 +311,7 @@ def _start_manual():
 
 
 def test_retry_keeps_grain_identity_and_generation_fences_stale_report():
-    compiled, arena, _root, grain, output, expanded = _start_manual()
+    compiled, arena, root, grain, output, expanded = _start_manual()
     arena.retry(grain)
     assert arena.reserve_ready() == grain
     stale = CallReport(
@@ -246,8 +328,8 @@ def test_retry_keeps_grain_identity_and_generation_fences_stale_report():
             (OutputReport(output, expansions=(ExpandedRows(expanded, ()),)),),
         )
     )
-    assert arena.state.grains[grain].outcome is GrainOutcome.SUCCESS
     assert arena.state.grains[grain].phase is GrainPhase.SEALED
+    assert arena.item_outcome(ItemRef(output, root)) is ItemOutcome.PRESENT
     assert compiled.runtime is arena.plan
 
 

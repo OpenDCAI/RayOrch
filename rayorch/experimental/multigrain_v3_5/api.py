@@ -6,7 +6,7 @@ import contextvars
 import inspect
 import itertools
 from dataclasses import dataclass
-from typing import Any, Callable, Self, TypeVar, overload
+from typing import Any, Callable, Self, overload
 
 from .compiler import compile_logical
 from .logical import (
@@ -61,7 +61,6 @@ class RayModule:
         self.init_args: tuple[Any, ...] = ()
         self.init_kwargs: dict[str, Any] = {}
         self.options: dict[str, Any] = {}
-        self.driving_input: int | str = 0
 
     def returns(self, count: int) -> Self:
         """声明一次 Call 产生的逻辑输出 Port 数。"""
@@ -86,12 +85,6 @@ class RayModule:
         self.options.update(options)
         return self
 
-    def driven_by(self, input_: int | str) -> Self:
-        """显式选择决定执行 Domain 的必需输入槽。"""
-
-        self.driving_input = input_
-        return self
-
     def __call__(self, *args: Any, **kwargs: Any) -> Port | tuple[Port, ...]:
         builder = _ACTIVE_TRACE.get()
         if builder is None:
@@ -99,25 +92,26 @@ class RayModule:
         return builder.call(self, args, kwargs)
 
 
-F = TypeVar("F", bound=Callable[..., Any])
+@overload
+def function(fn: Callable[..., Any], *, num_outputs: int = 1) -> RayModule: ...
 
 
 @overload
-def function(fn: F, *, num_outputs: int = 1) -> RayModule: ...
-
-
-@overload
-def function(fn: None = None, *, num_outputs: int = 1) -> Callable[[F], RayModule]: ...
+def function(
+    fn: None = None,
+    *,
+    num_outputs: int = 1,
+) -> Callable[[Callable[..., Any]], RayModule]: ...
 
 
 def function(
-    fn: F | None = None,
+    fn: Callable[..., Any] | None = None,
     *,
     num_outputs: int = 1,
-) -> RayModule | Callable[[F], RayModule]:
+) -> RayModule | Callable[[Callable[..., Any]], RayModule]:
     """把普通 callable 适配成无状态的 RayModule 配方。"""
 
-    def wrap(target: F) -> RayModule:
+    def wrap(target: Callable[..., Any]) -> RayModule:
         return RayModule(target, num_outputs=num_outputs)
 
     return wrap if fn is None else wrap(fn)
@@ -225,9 +219,6 @@ class _ProgramBuilder:
                 "broadcast/reduce or an aligned relation"
             )
         execution_domain = next(iter(domains))
-        driving = self._driving_index(module.driving_input, inputs)
-        if inputs[driving].mode is InputMode.OPTIONAL:
-            raise CompileError("driving input cannot be optional")
 
         call = CallRef(self.next_call)
         self.next_call += 1
@@ -241,7 +232,6 @@ class _ProgramBuilder:
             kernel,
             execution_domain,
             tuple(inputs),
-            driving,
         )
         self.call_options[call] = tuple(module.options.items())
 
@@ -269,11 +259,13 @@ class _ProgramBuilder:
         if existing is not None:
             return tuple(self.public(ref) for ref in existing)
 
-        producers = tuple(spec.origin for spec in specs)
-        if not all(isinstance(origin, CallOutputOrigin) for origin in producers):
-            raise CompileError(
-                "expand inputs must be outputs of one producer Call"
-            )
+        producers: list[CallOutputOrigin] = []
+        for spec in specs:
+            if not isinstance(spec.origin, CallOutputOrigin):
+                raise CompileError(
+                    "expand inputs must be outputs of one producer Call"
+                )
+            producers.append(spec.origin)
         if len(ports) > 1:
             calls = {origin.call for origin in producers}
             if len(calls) != 1:
@@ -431,20 +423,6 @@ class _ProgramBuilder:
             self.spec(value, f"input {name}")
             return value, InputMode.REQUIRED
         raise CompileError(f"RayModule input {name!r} must be a Port")
-
-    @staticmethod
-    def _driving_index(
-        configured: int | str,
-        inputs: list[InputSpec],
-    ) -> int:
-        if isinstance(configured, int):
-            if not 0 <= configured < len(inputs):
-                raise CompileError("driving input index is out of range")
-            return configured
-        matches = [index for index, item in enumerate(inputs) if item.name == configured]
-        if len(matches) != 1:
-            raise CompileError(f"unknown or ambiguous driving input: {configured!r}")
-        return matches[0]
 
     def _is_ancestor(self, ancestor: DomainRef, child: DomainRef) -> bool:
         cursor: DomainRef | None = child

@@ -10,7 +10,6 @@ from ..model import (
     CallRef,
     DomainRef,
     EntityRef,
-    GrainOutcome,
     GrainPhase,
     GrainRef,
     InputMode,
@@ -18,6 +17,21 @@ from ..model import (
     ItemRef,
     PortRef,
     ShapeState,
+)
+from ..transitions import (
+    CallAction,
+    FilterCause,
+    GrainEvent,
+    GroupCause,
+    InvalidTransition,
+    broadcast_transition,
+    call_transition,
+    expansion_shape_transition,
+    filter_transition,
+    grain_transition,
+    group_transition,
+    item_transition,
+    shape_transition,
 )
 from ..plan import (
     BroadcastRoute,
@@ -73,7 +87,6 @@ class ArenaEngine:
         self._receipts: deque[ItemRef] = deque()
         self._ready: deque[GrainRef] = deque()
         self._entities_by_domain: dict[DomainRef, list[EntityRef]] = defaultdict(list)
-        self._children_by_shape: dict[ShapeKey, tuple[EntityRef, ...]] = {}
         self._admission_closed = False
 
     @property
@@ -139,7 +152,7 @@ class ArenaEngine:
                 continue
             if parent is None:
                 parent = candidate_parent
-            record.phase = GrainPhase.IN_FLIGHT
+            record.phase = grain_transition(record.phase, GrainEvent.RESERVE)
             selected.append(grain)
         self._ready = remaining
         return tuple(selected)
@@ -188,7 +201,8 @@ class ArenaEngine:
         record = self.state.grains[grain]
         call = self.plan.call(grain.call)
         takes = []
-        for input_spec, item in zip(call.inputs, record.inputs):
+        for input_spec in call.inputs:
+            item = ItemRef(input_spec.port, grain.entity)
             receipt = self.state.items[item]
             if (
                 input_spec.mode is InputMode.OPTIONAL
@@ -343,7 +357,7 @@ class ArenaEngine:
             grain = self._ready.popleft()
             record = self.state.grains[grain]
             if record.phase is GrainPhase.READY:
-                record.phase = GrainPhase.IN_FLIGHT
+                record.phase = grain_transition(record.phase, GrainEvent.RESERVE)
                 return grain
         raise LookupError("no READY Grain")
 
@@ -441,8 +455,7 @@ class ArenaEngine:
                 raise CommitError("Shape has already been published")
         # 至此所有 report/shape/cardinality 均已验证；后续 publication
         # 对状态机而言是一个不可分割的逻辑 turn。
-        record.phase = GrainPhase.SEALED
-        record.outcome = GrainOutcome.SUCCESS
+        record.phase = grain_transition(record.phase, GrainEvent.REPORT)
 
         commits_by_shape: dict[ShapeKey, list[_ExpansionCommit]] = defaultdict(list)
         for commit in expansion_commits:
@@ -450,11 +463,8 @@ class ArenaEngine:
 
         for shape, commits in commits_by_shape.items():
             count = len(commits[0].rows)
-            self.state.shapes[shape] = ShapeRecord(
-                ShapeState.SUCCEEDED,
-                count,
-            )
             children = self._create_children(shape, count)
+            self._publish_shape(shape, ShapeState.SUCCEEDED, children=children)
             for commit in commits:
                 leaves = []
                 controls = commit.controls or (None,) * len(commit.rows)
@@ -476,7 +486,6 @@ class ArenaEngine:
                         tuple(leaves),
                     ),
                 )
-            self._shape_terminal(shape)
 
         expanded_sources = {commit.source_port for commit in expansion_commits}
         for item, output in scalar_commits:
@@ -506,19 +515,17 @@ class ArenaEngine:
             raise CommitError("stale generation")
 
         outputs = self.plan.outputs_by_call[grain.call]
-        record.phase = GrainPhase.SEALED
-        record.outcome = GrainOutcome.FAILED
+        record.phase = grain_transition(record.phase, GrainEvent.REPORT)
         for output in outputs:
             self._publish(ItemRef(output, grain.entity), ItemOutcome.FAILED, cause=cause)
             for expansion in self.plan.expansions_by_source.get(output, ()):
                 shape = ShapeKey(expansion.child_domain, grain.entity)
                 if shape not in self.state.shapes:
-                    self.state.shapes[shape] = ShapeRecord(
+                    self._publish_shape(
+                        shape,
                         ShapeState.FAILED,
-                        None,
                         cause=cause,
                     )
-                    self._shape_terminal(shape)
         self.advance()
 
     def retry(self, grain: GrainRef) -> None:
@@ -529,7 +536,7 @@ class ArenaEngine:
             raise CommitError("only an IN_FLIGHT Grain can be retried")
         record.generation += 1
         record.infra_failures += 1
-        record.phase = GrainPhase.READY
+        record.phase = grain_transition(record.phase, GrainEvent.RETRY)
         self._ready.append(grain)
 
     def _publish(
@@ -544,6 +551,10 @@ class ArenaEngine:
         existing = self.state.items.get(item)
         record = ItemRecord(outcome, cause, control)
         if existing is not None:
+            try:
+                item_transition(existing.outcome, outcome)
+            except InvalidTransition as error:
+                raise CommitError(str(error)) from error
             existing_binding = self.state.values.get(item)
             if existing != record or existing_binding != binding:
                 raise CommitError(f"conflicting Item publication: {item}")
@@ -562,6 +573,29 @@ class ArenaEngine:
             self.state.values[item] = binding
         self._receipts.append(item)
 
+    def _publish_shape(
+        self,
+        shape: ShapeKey,
+        state: ShapeState,
+        *,
+        children: tuple[EntityRef, ...] | None = None,
+        cause: object | None = None,
+    ) -> None:
+        """单调发布一个 Shape 终态，并触发所有 parent-domain Group。"""
+
+        record = ShapeRecord(state, children, cause)
+        existing = self.state.shapes.get(shape)
+        try:
+            shape_transition(None if existing is None else existing.state, state)
+        except InvalidTransition as error:
+            raise CommitError(str(error)) from error
+        if existing is not None:
+            if existing != record:
+                raise CommitError(f"conflicting Shape publication: {shape}")
+            return
+        self.state.shapes[shape] = record
+        self._shape_terminal(shape)
+
     def _accept_call_input(self, edge: CallInputRoute, item: ItemRef) -> None:
         call = self.plan.call(edge.call)
         if item.entity.domain != call.execution_domain:
@@ -577,62 +611,52 @@ class ArenaEngine:
         if current is not None and current != item:
             raise CommitError("Call input slot received conflicting Items")
         pending.slots[edge.input_index] = item
-        if any(slot is None for slot in pending.slots):
-            return
+        if self._classify_call(grain, tuple(pending.slots)):
+            del self.state.pending[grain]
 
-        inputs = tuple(slot for slot in pending.slots if slot is not None)
-        del self.state.pending[grain]
-        self._classify_call(grain, inputs)
+    def _classify_call(
+        self,
+        grain: GrainRef,
+        inputs: tuple[ItemRef | None, ...],
+    ) -> bool:
+        """按纯输入代数封闭 Grain；返回是否已离开 WAITING。"""
 
-    def _classify_call(self, grain: GrainRef, inputs: tuple[ItemRef, ...]) -> None:
         call = self.plan.call(grain.call)
-        receipts = tuple(self.state.items[item] for item in inputs)
-
-        # driving input 被丢弃时，本 Grain 与输出同步 DROPPED；其他 REQUIRED
-        # 输入异常则产生 SUPPRESSED，二者不能合并成同一种传播语义。
-        driving = receipts[call.driving_input]
-
-        if driving.outcome is ItemOutcome.DROPPED:
-            self.state.grains[grain] = GrainRecord(
-                grain,
-                inputs,
-                GrainPhase.SEALED,
-                GrainOutcome.SUPPRESSED,
-            )
-            self._publish_call_outputs(grain, ItemOutcome.DROPPED, driving.cause)
-            return
-
-        suppress_cause = None
-        for input_spec, receipt in zip(call.inputs, receipts):
-            if receipt.outcome is ItemOutcome.PRESENT:
-                continue
-            if (
-                input_spec.mode is InputMode.OPTIONAL
-                and receipt.outcome is ItemOutcome.DROPPED
-            ):
-                continue
-            suppress_cause = receipt.cause or inputs[call.inputs.index(input_spec)]
-            break
-        if suppress_cause is not None:
-            self.state.grains[grain] = GrainRecord(
-                grain,
-                inputs,
-                GrainPhase.SEALED,
-                GrainOutcome.SUPPRESSED,
-            )
-            self._publish_call_outputs(
-                grain,
-                ItemOutcome.SUPPRESSED,
-                suppress_cause,
-            )
-            return
-
-        self.state.grains[grain] = GrainRecord(
-            grain,
-            inputs,
-            GrainPhase.READY,
+        outcomes = tuple(
+            None if item is None else self.state.items[item].outcome
+            for item in inputs
         )
-        self._ready.append(grain)
+        decision = call_transition(
+            tuple(input_.mode for input_ in call.inputs),
+            outcomes,
+        )
+        if decision.action is CallAction.WAIT:
+            return False
+        if decision.action is CallAction.READY:
+            self.state.grains[grain] = GrainRecord(
+                grain_transition(None, GrainEvent.INPUTS_READY)
+            )
+            self._ready.append(grain)
+            return True
+
+        assert decision.decisive_input is not None
+        decisive_item = inputs[decision.decisive_input]
+        assert decisive_item is not None
+        receipt = self.state.items[decisive_item]
+        self.state.grains[grain] = GrainRecord(
+            grain_transition(None, GrainEvent.INPUTS_TERMINAL)
+        )
+        output = (
+            ItemOutcome.DROPPED
+            if decision.action is CallAction.DROP_OUTPUTS
+            else ItemOutcome.SUPPRESSED
+        )
+        self._publish_call_outputs(
+            grain,
+            output,
+            decisive_item if receipt.cause is None else receipt.cause,
+        )
+        return True
 
     def _publish_call_outputs(
         self,
@@ -641,21 +665,18 @@ class ArenaEngine:
         cause: object | None,
     ) -> None:
         outputs = self.plan.outputs_by_call[grain.call]
+        shapes: list[ShapeKey] = []
         for output in outputs:
             self._publish(ItemRef(output, grain.entity), outcome, cause=cause)
             for expansion in self.plan.expansions_by_source.get(output, ()):
                 shape = ShapeKey(expansion.child_domain, grain.entity)
-                state = (
-                    ShapeState.DROPPED
-                    if outcome is ItemOutcome.DROPPED
-                    else ShapeState.FAILED
-                )
-                self.state.shapes[shape] = ShapeRecord(
-                    state,
-                    None,
-                    cause=cause,
-                )
-                self._shape_terminal(shape)
+                if shape not in shapes:
+                    shapes.append(shape)
+        state = expansion_shape_transition(outcome)
+        if state is ShapeState.SUCCEEDED:
+            raise CommitError("PRESENT expansion requires a successful Worker report")
+        for shape in shapes:
+            self._publish_shape(shape, state, cause=cause)
 
     def _try_filter(self, target_port: PortRef, entity: EntityRef) -> None:
         target = ItemRef(target_port, entity)
@@ -664,19 +685,20 @@ class ArenaEngine:
         rule = self.plan.filter_rules[target_port]
         source = ItemRef(rule.source_port, entity)
         mask = ItemRef(rule.mask_port, entity)
-        if source not in self.state.items or mask not in self.state.items:
+        source_record = self.state.items.get(source)
+        mask_record = self.state.items.get(mask)
+        try:
+            decision = filter_transition(
+                None if source_record is None else source_record.outcome,
+                None if mask_record is None else mask_record.outcome,
+                None if mask_record is None else mask_record.control,
+            )
+        except InvalidTransition as error:
+            raise CommitError(str(error)) from error
+        if decision.outcome is None:
             return
-        source_record = self.state.items[source]
-        mask_record = self.state.items[mask]
-        if source_record.outcome is not ItemOutcome.PRESENT:
-            self._publish(target, source_record.outcome, cause=source_record.cause)
-            return
-        if mask_record.outcome is not ItemOutcome.PRESENT:
-            self._publish(target, mask_record.outcome, cause=mask_record.cause)
-            return
-        if mask_record.control is None:
-            raise CommitError("Filter mask Port requires a worker control manifest")
-        if mask_record.control:
+        if decision.outcome is ItemOutcome.PRESENT:
+            assert source_record is not None
             control = None
             if rule.copy_source_control:
                 control = source_record.control
@@ -690,8 +712,16 @@ class ArenaEngine:
                 binding=self.state.values[source],
                 control=control,
             )
-        else:
-            self._publish(target, ItemOutcome.DROPPED, cause=mask)
+            return
+
+        cause_item = source if decision.cause is FilterCause.SOURCE else mask
+        cause_record = self.state.items.get(cause_item)
+        cause = None if cause_record is None else cause_record.cause
+        self._publish(
+            target,
+            decision.outcome,
+            cause=cause_item if cause is None else cause,
+        )
 
     def _try_group(self, target_port: PortRef, parent: EntityRef) -> None:
         target = ItemRef(target_port, parent)
@@ -700,43 +730,39 @@ class ArenaEngine:
         rule = self.plan.group_rules[target_port]
         shape_key = ShapeKey(rule.child_domain, parent)
         shape = self.state.shapes.get(shape_key)
-        # Reduce 只在 fan-out cardinality 已终态后判断成员，避免空 group
-        # 与尚未完成的 group 混淆。
         if shape is None:
             return
-        if shape.state is ShapeState.DROPPED:
-            self._publish(target, ItemOutcome.DROPPED, cause=shape.cause)
-            return
-        if shape.state is ShapeState.FAILED:
-            self._publish(target, ItemOutcome.SUPPRESSED, cause=shape.cause or shape_key)
-            return
-
-        children = self._children_by_shape[shape_key]
+        children = () if shape.children is None else shape.children
         member_items = tuple(ItemRef(rule.members_port, child) for child in children)
-        if any(item not in self.state.items for item in member_items):
-            return
-        for item in member_items:
-            outcome = self.state.items[item].outcome
-            if outcome in {ItemOutcome.FAILED, ItemOutcome.SUPPRESSED}:
-                self._publish(target, ItemOutcome.SUPPRESSED, cause=item)
-                return
-
-        # members Port 决定成员资格和稳定顺序；value Port 只提供 payload，
-        # 因而 filter 后 reduce 不需要复制或重写 lineage。
-        survivors = tuple(
-            child
-            for child, member in zip(children, member_items)
-            if self.state.items[member].outcome is ItemOutcome.PRESENT
+        value_items = tuple(ItemRef(rule.value_port, child) for child in children)
+        decision = group_transition(
+            shape.state,
+            tuple(
+                None if item not in self.state.items else self.state.items[item].outcome
+                for item in member_items
+            ),
+            tuple(
+                None if item not in self.state.items else self.state.items[item].outcome
+                for item in value_items
+            ),
         )
-        value_items = tuple(ItemRef(rule.value_port, child) for child in survivors)
-        if any(item not in self.state.items for item in value_items):
+        if decision.outcome is None:
             return
-        for item in value_items:
-            if self.state.items[item].outcome is not ItemOutcome.PRESENT:
-                self._publish(target, ItemOutcome.SUPPRESSED, cause=item)
-                return
+        if decision.outcome is not ItemOutcome.PRESENT:
+            cause: object = shape_key if shape.cause is None else shape.cause
+            if decision.cause is GroupCause.MEMBER:
+                assert decision.cause_index is not None
+                cause = member_items[decision.cause_index]
+            elif decision.cause is GroupCause.VALUE:
+                assert decision.cause_index is not None
+                cause = value_items[decision.cause_index]
+            self._publish(target, decision.outcome, cause=cause)
+            return
 
-        bindings = tuple(self.state.values[item] for item in value_items)
+        # members 决定资格，value 仅为纯状态机选出的 survivors 提供 payload。
+        survivor_items = tuple(value_items[index] for index in decision.survivors)
+
+        bindings = tuple(self.state.values[item] for item in survivor_items)
         # 一层 reduce 收集 RowBinding；多层 reduce 则拼接子 GroupShape，
         # 最终仍保持一个规范 CSR shape 和一份扁平叶子引用。
         value_depth = rule.value_depth
@@ -745,7 +771,7 @@ class ArenaEngine:
             flat_items = ()
         elif not bindings or all(isinstance(value, RowBinding) for value in bindings):
             group_shape = GroupShape.one_level(len(bindings))
-            flat_items = value_items
+            flat_items = survivor_items
         elif all(isinstance(value, GroupBinding) for value in bindings):
             groups = tuple(value for value in bindings if isinstance(value, GroupBinding))
             depth = groups[0].shape.depth if groups else rule.value_depth
@@ -794,7 +820,7 @@ class ArenaEngine:
         )
         self._publish(
             target,
-            record.outcome,
+            broadcast_transition(record.outcome),
             binding=binding,
             cause=record.cause,
             control=record.control if rule.copy_source_control else None,
@@ -811,10 +837,8 @@ class ArenaEngine:
         )
         for ordinal, child in enumerate(children):
             self.state.entity_lineage[child] = EntityOrigin(
-                shape.child_domain,
                 shape.parent_entity,
                 ordinal,
-                shape,
             )
             self._entities_by_domain[shape.child_domain].append(child)
             for broadcast in self.plan.broadcasts_by_target_domain.get(
@@ -822,7 +846,6 @@ class ArenaEngine:
                 (),
             ):
                 self._publish_broadcast(broadcast, child)
-        self._children_by_shape[shape] = children
         return children
 
     def _shape_terminal(self, shape: ShapeKey) -> None:
