@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .model import MISSING
@@ -27,6 +29,17 @@ from .protocol import (
 
 class WorkerContractError(RuntimeError):
     """UDF 返回值不满足已编译 Worker ABI。"""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerObservation:
+    """一次只读 Worker 快照；不参与执行语义或调度决策。"""
+
+    calls: int
+    pid: int
+    rss_bytes: int
+    audit: tuple[tuple[str, int | float | str], ...] = ()
+    error: str | None = None
 
 
 class ValueStore(Protocol):
@@ -57,6 +70,7 @@ class Worker:
         kwargs = dict(init_kwargs)
         self.udf = target(*init_args, **kwargs) if isinstance(target, type) else target
         self.input_layout = input_layout
+        self.calls = 0
 
     def execute(
         self,
@@ -68,6 +82,7 @@ class Worker:
 
         if not invocations:
             return ()
+        self.calls += 1
         columns = self._input_columns(invocations, store)
         layout = self.input_layout
         if layout.input_count != len(columns):
@@ -168,6 +183,32 @@ class Worker:
                 )
         return tuple(results)
 
+    def observe(self) -> WorkerObservation:
+        """读取小型标量 audit；业务状态不会反向影响 Worker ABI。"""
+
+        audit: dict[str, int | float | str] = {}
+        batch_audit = getattr(self.udf, "batch_audit", None)
+        if callable(batch_audit):
+            value = batch_audit()
+        else:
+            value = getattr(self.udf, "last_batch_audit", None)
+            if value is None:
+                value = getattr(self.udf, "last_table_batch_audit", None)
+            if value is None:
+                value = getattr(self.udf, "last_ocr_batch_audit", None)
+        if isinstance(value, dict):
+            audit.update(
+                (str(key), item)
+                for key, item in value.items()
+                if isinstance(item, (int, float, str))
+            )
+        return WorkerObservation(
+            calls=self.calls,
+            pid=os.getpid(),
+            rss_bytes=_rss_bytes(),
+            audit=tuple(sorted(audit.items())),
+        )
+
     @classmethod
     def _input_columns(
         cls,
@@ -220,8 +261,20 @@ class Worker:
         return tuple(value)
 
 
+def _rss_bytes() -> int:
+    """Best-effort current process RSS for benchmark diagnostics."""
+
+    try:
+        import psutil  # pyright: ignore[reportMissingModuleSource]
+
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        return 0
+
+
 __all__ = [
     "Worker",
+    "WorkerObservation",
     "ValueStore",
     "WorkerContractError",
 ]

@@ -59,6 +59,10 @@ def test_persistent_actor_is_shared_by_multiple_arenas():
     assert len(result.arenas) == 4
     assert all(arena.is_complete() for arena in result.arenas)
     assert all(not arena.state.values for arena in result.arenas)
+    assert executor.store._cache == {}
+    observations = next(iter(result.workers.values()))
+    assert len(observations) == 1
+    assert observations[0].calls == result.calls[next(iter(result.calls))].rpcs
 
 
 class KeywordOnlyAdd:

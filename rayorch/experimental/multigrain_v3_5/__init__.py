@@ -16,6 +16,7 @@ from .model import (
 from .logical import LogicalProgram
 from .plan import CompiledProgram, RuntimePlan
 from .executor import Executor
+from .worker import WorkerObservation
 
 # 文档与论文伪代码统一使用 F.expand/F.reduce；它只是 functional 模块别名。
 F = functional
@@ -37,6 +38,7 @@ __all__ = [
     "Port",
     "PortRef",
     "RuntimePlan",
+    "WorkerObservation",
     "Executor",
     "RayModule",
     "function",

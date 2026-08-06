@@ -23,7 +23,7 @@ from .protocol import (
     RowBinding,
 )
 from .runtime import ArenaEngine
-from .worker import Worker
+from .worker import Worker, WorkerObservation
 
 
 class _RayBlockStore:
@@ -33,8 +33,8 @@ class _RayBlockStore:
         self._ray = ray_module
         self._cache: dict[Any, tuple[Any, ...]] = {}
 
-    def begin_batch(self) -> None:
-        """清空上一批 payload cache，限制 actor 常驻内存。"""
+    def clear_cache(self) -> None:
+        """清空已解引用 payload cache；BlockRef 生命周期由 Arena 持有。"""
 
         self._cache.clear()
 
@@ -90,13 +90,18 @@ class _RayWorkerActor:
     ):
         """执行一批、一次返回；actor 不读取 Program 或 Arena。"""
 
-        self._store.begin_batch()
+        self._store.clear_cache()
         try:
             return self._worker.execute(invocations, layouts, self._store)
         finally:
             # actor 不跨 RPC 持有输入 blocks；输出 blocks 由返回的 RowBinding
             # 进入 driver/Arena 生命周期管理。
-            self._store.begin_batch()
+            self._store.clear_cache()
+
+    def observe(self) -> WorkerObservation:
+        """Expose one observation-only snapshot without leaking the UDF."""
+
+        return self._worker.observe()
 
 
 @dataclass(slots=True)
@@ -126,6 +131,7 @@ class RunResult:
     arenas: tuple[ArenaEngine, ...]
     max_active_arenas: int
     released_values: int
+    workers: dict[CallRef, tuple[WorkerObservation, ...]]
 
     @property
     def rpc_count(self) -> int:
@@ -244,7 +250,7 @@ class Executor:
 
         # actor pool 跨 run 持久化，但调度指标严格按 run 隔离。已有 actor
         # 计为本次使用一次；运行中 replacement 会由 _create_actor 继续累加。
-        self.store.begin_batch()
+        self.store.clear_cache()
         self.metrics = {
             call: CallMetrics(actor_starts=len(self._actors[call]))
             for call in self.plan.calls
@@ -277,6 +283,9 @@ class Executor:
                         slot.arena,
                         self.store,
                     )
+                    # materialize 已把最终业务对象复制到 driver output；cache
+                    # 只用于一次粗块去重，不能把所有 Arena 的 payload 留到 run 结束。
+                    self.store.clear_cache()
                     # 最终业务值已经复制到 driver 输出；清空 ValueTable 会释放
                     # page-image 等 ObjectRef，但 Item/Shape/Grain 仍可完整审计。
                     released_values += slot.arena.release_values()
@@ -309,14 +318,17 @@ class Executor:
             finally:
                 lease.actor.busy = False
 
+        elapsed_s = time.perf_counter() - started
         arenas = tuple(arena for arena in all_arenas if arena is not None)
+        workers = self._observe_workers()
         return RunResult(
             self._merge_outputs([completed[index] for index in range(len(slices))]),
-            time.perf_counter() - started,
+            elapsed_s,
             self.metrics,
             arenas,
             high_watermark,
             released_values,
+            workers,
         )
 
     def close(self) -> None:
@@ -326,6 +338,27 @@ class Executor:
             for actor in actors:
                 self.ray.kill(actor.handle, no_restart=True)
         self._actors.clear()
+
+    def _observe_workers(self) -> dict[CallRef, tuple[WorkerObservation, ...]]:
+        """Best-effort physical diagnostics must not invalidate business output."""
+
+        result = {}
+        for call, actors in self._actors.items():
+            observations = []
+            for actor in actors:
+                try:
+                    observations.append(self.ray.get(actor.handle.observe.remote()))
+                except Exception as error:
+                    observations.append(
+                        WorkerObservation(
+                            calls=0,
+                            pid=0,
+                            rss_bytes=0,
+                            error=repr(error),
+                        )
+                    )
+            result[call] = tuple(observations)
+        return result
 
     def __enter__(self):
         """支持用 context manager 约束 ExecutionPool 生命周期。"""

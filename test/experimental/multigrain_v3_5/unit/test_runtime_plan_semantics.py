@@ -16,6 +16,7 @@ from rayorch.experimental.multigrain_v3_5.protocol import (
     BlockRef,
     CallReport,
     ExpandedRows,
+    InputLayout,
     OutputReport,
     RecordFailure,
     RowBinding,
@@ -37,6 +38,24 @@ class MemoryStore:
 
     def get(self, binding: RowBinding) -> object:
         return self.blocks[binding.block][binding.row]
+
+
+def test_worker_observation_is_scalar_and_read_only():
+    class Audited:
+        def batch_audit(self):
+            return {
+                "jobs": 7,
+                "mode": "batch",
+                "ignored": object(),
+            }
+
+    worker = Worker(Audited, input_layout=InputLayout(1))
+    observation = worker.observe()
+
+    assert observation.calls == 0
+    assert observation.pid > 0
+    assert observation.rss_bytes >= 0
+    assert dict(observation.audit) == {"jobs": 7, "mode": "batch"}
 
 
 def run_sync(pipeline: mg.Pipeline, *columns, optimize: bool = True):

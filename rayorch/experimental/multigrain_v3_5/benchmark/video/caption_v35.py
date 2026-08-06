@@ -1,0 +1,106 @@
+"""SmolVLM frame-caption workload on Multigrain v3.5."""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+from ....multigrain_v3.benchmark.video.caption_v3 import (
+    CaptionFrames,
+    SummarizeCaptionVideos,
+)
+from ....multigrain_v3.benchmark.video.v3 import DecodeFrames
+from ... import F, Executor, Pipeline, Port, RayModule
+from ...executor import RunResult
+
+
+class VideoCaptionV35Pipeline(Pipeline):
+    """Video→Frame→SmolVLM caption→Video with an explicit frame Domain."""
+
+    def __init__(
+        self,
+        *,
+        model_path: str,
+        stride: int,
+        max_frames: int | None,
+        batch_scope: str,
+        caption_batch_size: int = 16,
+        caption_replicas: int = 1,
+        decode_replicas: int = 4,
+        reduce_replicas: int = 1,
+        max_new_tokens: int = 12,
+        max_retries: int = 1,
+    ) -> None:
+        if not model_path:
+            raise ValueError("model_path must be non-empty")
+        if stride <= 0:
+            raise ValueError("stride must be positive")
+        if max_frames is not None and max_frames <= 0:
+            raise ValueError("max_frames must be positive when provided")
+        if batch_scope not in {"elastic", "parent_bound"}:
+            raise ValueError("batch_scope must be elastic or parent_bound")
+        if min(caption_replicas, decode_replicas, reduce_replicas) <= 0:
+            raise ValueError("all replica counts must be positive")
+        if caption_batch_size <= 0:
+            raise ValueError("caption_batch_size must be positive")
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+
+        self.decode = (
+            RayModule(DecodeFrames)
+            .pre_init(stride=stride, max_frames=max_frames)
+            .ray_options(
+                replicas=decode_replicas,
+                batch_size=1,
+                num_cpus=1,
+                max_retries=max_retries,
+            )
+        )
+        self.caption = (
+            RayModule(CaptionFrames)
+            .pre_init(
+                model_path=model_path,
+                max_new_tokens=max_new_tokens,
+            )
+            .ray_options(
+                replicas=caption_replicas,
+                batch_size=caption_batch_size,
+                batch_scope=batch_scope,
+                num_cpus=1,
+                num_gpus=1,
+                max_retries=max_retries,
+            )
+        )
+        self.summary = RayModule(SummarizeCaptionVideos).ray_options(
+            replicas=reduce_replicas,
+            batch_size=4,
+            num_cpus=1,
+            max_retries=max_retries,
+        )
+
+    def forward(self, videos: Port) -> Port:  # pyright: ignore[reportIncompatibleMethodOverride]
+        frames = F.expand(cast(Port, self.decode(videos)))
+        captions = cast(Port, self.caption(frames))
+        groups = F.reduce(captions)
+        return cast(Port, self.summary(groups))
+
+
+def run_caption_v35(
+    paths: list[str],
+    *,
+    arena_size: int = 16,
+    max_in_flight: int = 1,
+    **pipeline_options: Any,
+) -> RunResult:
+    """Run the v3.5 caption pipeline."""
+
+    with Executor(VideoCaptionV35Pipeline(**pipeline_options)) as executor:
+        return executor.run(
+            paths,
+            arena_size=arena_size,
+            max_in_flight=max_in_flight,
+        )
+
+
+__all__ = ["VideoCaptionV35Pipeline", "run_caption_v35"]
