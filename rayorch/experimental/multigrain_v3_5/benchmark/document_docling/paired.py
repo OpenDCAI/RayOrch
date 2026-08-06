@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, cast
 
@@ -35,6 +37,17 @@ _V3_ONLY_OPTIONS = frozenset(
         "actor_max_concurrency",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class DoclingManifest:
+    """Validated ordered sources and their independently checkable totals."""
+
+    paths: tuple[str, ...]
+    pdf_ids: tuple[str, ...]
+    input_bytes: int
+    expected_pages: int | None
+    manifest_sha256: str
 
 
 def _arm_options(
@@ -77,6 +90,7 @@ def _compare_documents(
     if len(left) != len(right):
         return {
             "document_count_matches": False,
+            "identity_exact": (),
             "structure_exact": (),
             "markdown_exact": (),
             "markdown_jaccard": (),
@@ -84,6 +98,9 @@ def _compare_documents(
     structure_fields = ("pages", "texts", "tables", "pictures")
     return {
         "document_count_matches": True,
+        "identity_exact": tuple(
+            a.get("pdf") == b.get("pdf") for a, b in zip(left, right)
+        ),
         "structure_exact": tuple(
             all(a.get(field) == b.get(field) for field in structure_fields)
             for a, b in zip(left, right)
@@ -102,6 +119,50 @@ def _compare_documents(
             )
             for a, b in zip(left, right)
         ),
+    }
+
+
+def _validate_arm_outputs(
+    engine: str,
+    documents: tuple[Mapping[str, Any], ...],
+    manifest: DoclingManifest,
+    *,
+    expected_tables: int | None,
+) -> dict[str, int]:
+    """Require each arm to match the source contract, not only each other."""
+
+    actual_ids = tuple(str(document.get("pdf", "")) for document in documents)
+    if actual_ids != manifest.pdf_ids:
+        mismatch = next(
+            (
+                index
+                for index, (actual, expected) in enumerate(
+                    zip(actual_ids, manifest.pdf_ids)
+                )
+                if actual != expected
+            ),
+            min(len(actual_ids), len(manifest.pdf_ids)),
+        )
+        raise ValueError(
+            f"{engine} output identity/order differs from manifest at "
+            f"document index {mismatch}"
+        )
+    pages = sum(int(document["pages"]) for document in documents)
+    tables = sum(int(document["tables"]) for document in documents)
+    if manifest.expected_pages is not None and pages != manifest.expected_pages:
+        raise ValueError(
+            f"{engine} produced {pages} pages; manifest requires "
+            f"{manifest.expected_pages}"
+        )
+    if expected_tables is not None and tables != expected_tables:
+        raise ValueError(
+            f"{engine} produced {tables} tables; golden requires "
+            f"{expected_tables}"
+        )
+    return {
+        "documents": len(documents),
+        "pages": pages,
+        "tables": tables,
     }
 
 
@@ -203,7 +264,7 @@ def _gpu_summary(monitor: GpuMonitor, samples: Iterable[Any]) -> dict[str, Any]:
 
 
 def _run_trial(
-    paths: list[str],
+    manifest: DoclingManifest,
     v3_options: dict[str, Any],
     v35_options: dict[str, Any],
     *,
@@ -211,11 +272,13 @@ def _run_trial(
     max_in_flight: int,
     order: str,
     minimum_jaccard: float,
+    expected_tables: int | None,
     gpu_monitor_dir: str | None = None,
 ) -> dict[str, Any]:
     if order not in {"v3_first", "v35_first"}:
         raise ValueError(f"unknown trial order: {order}")
     sequence = ("v3", "v35") if order == "v3_first" else ("v35", "v3")
+    paths = list(manifest.paths)
     documents: dict[str, tuple[Mapping[str, Any], ...]] = {}
     summaries: dict[str, dict[str, Any]] = {}
     for engine in sequence:
@@ -262,15 +325,22 @@ def _run_trial(
             samples = monitor.stop()
         summaries[engine]["outer_wall_s"] = time.perf_counter() - wall_started
         summaries[engine]["gpu_monitor"] = _gpu_summary(monitor, samples)
-        summaries[engine]["documents"] = len(docs)
-        summaries[engine]["pages"] = sum(int(doc["pages"]) for doc in docs)
-        summaries[engine]["tables"] = sum(int(doc["tables"]) for doc in docs)
+        summaries[engine].update(
+            _validate_arm_outputs(
+                engine,
+                docs,
+                manifest,
+                expected_tables=expected_tables,
+            )
+        )
         documents[engine] = docs
 
     comparison = _compare_documents(documents["v3"], documents["v35"])
     jaccard = comparison["markdown_jaccard"]
     if not comparison["document_count_matches"]:
         raise ValueError("V3 and V3.5 document counts differ")
+    if not all(comparison["identity_exact"]):
+        raise ValueError("V3 and V3.5 document identity/order differs")
     if not all(comparison["structure_exact"]):
         raise ValueError("V3 and V3.5 document structures differ")
     if jaccard and min(jaccard) < minimum_jaccard:
@@ -290,6 +360,7 @@ def _run_trial(
         )
     comparison_summary = {
         "document_count_matches": True,
+        "identity_exact_count": sum(comparison["identity_exact"]),
         "structure_exact_count": sum(comparison["structure_exact"]),
         "markdown_exact_count": sum(comparison["markdown_exact"]),
         "markdown_jaccard_min": min(jaccard, default=1.0),
@@ -303,19 +374,65 @@ def _run_trial(
     }
 
 
-def _read_paths(manifest: str, limit: int) -> list[str]:
-    raw = json.loads(Path(manifest).read_text(encoding="utf-8"))
+def _read_manifest(manifest: str, limit: int) -> DoclingManifest:
+    manifest_path = Path(manifest)
+    encoded = manifest_path.read_bytes()
+    raw = json.loads(encoded)
     if not isinstance(raw, list):
         raise ValueError("manifest must be a JSON list")
-    paths = [
+    if limit:
+        raw = raw[:limit]
+    if not raw:
+        raise FileNotFoundError("manifest contains no inputs")
+    object_rows = [isinstance(item, dict) for item in raw]
+    if any(object_rows) and not all(object_rows):
+        raise ValueError("manifest must not mix path and object rows")
+    if all(object_rows) and any("path" not in item for item in raw):
+        raise ValueError("every manifest object must contain path")
+
+    paths = tuple(
         str(item["path"] if isinstance(item, dict) else item)
         for item in raw
-    ]
-    if limit:
-        paths = paths[:limit]
-    if not paths or any(not Path(path).is_file() for path in paths):
-        raise FileNotFoundError("manifest contains no inputs or missing PDFs")
-    return paths
+    )
+    if any(not Path(path).is_file() for path in paths):
+        raise FileNotFoundError("manifest contains missing PDFs")
+    if len(set(paths)) != len(paths):
+        raise ValueError("manifest contains duplicate PDF paths")
+
+    pdf_ids = tuple(Path(path).stem for path in paths)
+    if len(set(pdf_ids)) != len(pdf_ids):
+        raise ValueError("manifest PDF stems are not unique output identities")
+
+    metadata_rows = [item for item in raw if isinstance(item, dict)]
+    pages_present = ["pages" in item for item in metadata_rows]
+    if pages_present and any(pages_present) and not all(pages_present):
+        raise ValueError("manifest pages metadata is only partially populated")
+    expected_pages = (
+        sum(int(item["pages"]) for item in metadata_rows)
+        if len(metadata_rows) == len(raw) and pages_present and all(pages_present)
+        else None
+    )
+    if expected_pages is not None and expected_pages <= 0:
+        raise ValueError("manifest expected page total must be positive")
+
+    input_bytes = 0
+    for item, path in zip(raw, paths):
+        actual_bytes = Path(path).stat().st_size
+        if isinstance(item, dict) and "size_bytes" in item:
+            expected_bytes = int(item["size_bytes"])
+            if expected_bytes != actual_bytes:
+                raise ValueError(
+                    f"manifest size mismatch for {path}: "
+                    f"{expected_bytes} != {actual_bytes}"
+                )
+        input_bytes += actual_bytes
+    return DoclingManifest(
+        paths=paths,
+        pdf_ids=pdf_ids,
+        input_bytes=input_bytes,
+        expected_pages=expected_pages,
+        manifest_sha256=hashlib.sha256(encoded).hexdigest(),
+    )
 
 
 def run_paired(args: argparse.Namespace) -> dict[str, Any]:
@@ -323,9 +440,11 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.limit < 0 or args.warmup < 0 or args.repeats <= 0:
         raise ValueError("limit/warmup/repeats are invalid")
+    if args.expected_tables is not None and args.expected_tables < 0:
+        raise ValueError("expected_tables must be non-negative")
     if not 0 <= args.minimum_jaccard <= 1:
         raise ValueError("minimum_jaccard must be in [0, 1]")
-    paths = _read_paths(args.manifest, args.limit)
+    manifest = _read_manifest(args.manifest, args.limit)
     config = CoreMatrixConfig(
         device=args.device,
         ocr_device=args.ocr_device,
@@ -351,7 +470,7 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
         max_inflight_arenas=args.max_in_flight,
     )
     v3_options, v35_options = _arm_options(
-        len(paths),
+        len(manifest.paths),
         config,
         args.batch_scope,
     )
@@ -372,13 +491,14 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
     try:
         all_trials = [
             _run_trial(
-                paths,
+                manifest,
                 v3_options,
                 v35_options,
                 arena_size=args.arena_size,
                 max_in_flight=args.max_in_flight,
                 order="v3_first" if index % 2 == 0 else "v35_first",
                 minimum_jaccard=args.minimum_jaccard,
+                expected_tables=args.expected_tables,
                 gpu_monitor_dir=args.gpu_monitor_dir,
             )
             for index in range(args.warmup + args.repeats)
@@ -396,8 +516,14 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": 1,
         "workload": "docling_document_page_tablejob_page_document",
         "manifest": str(Path(args.manifest).resolve()),
-        "pdfs": len(paths),
-        "input_bytes": sum(Path(path).stat().st_size for path in paths),
+        "pdfs": len(manifest.paths),
+        "input_bytes": manifest.input_bytes,
+        "input_contract": {
+            "manifest_sha256": manifest.manifest_sha256,
+            "ordered_pdf_ids": list(manifest.pdf_ids),
+            "expected_pages": manifest.expected_pages,
+            "expected_tables": args.expected_tables,
+        },
         "batch_scope": args.batch_scope,
         "v3_options": v3_options,
         "v35_options": v35_options,
@@ -448,6 +574,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--minimum-jaccard", type=float, default=0.99)
+    parser.add_argument("--expected-tables", type=int)
     parser.add_argument(
         "--batch-scope",
         choices=("elastic", "parent_bound"),
@@ -497,4 +624,4 @@ if __name__ == "__main__":  # pragma: no cover - CLI entry point
     raise SystemExit(main())
 
 
-__all__ = ["build_parser", "run_paired"]
+__all__ = ["DoclingManifest", "build_parser", "run_paired"]

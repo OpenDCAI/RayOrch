@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_stages import (
@@ -171,6 +173,7 @@ def test_docling_paired_correctness_reports_exact_structure_and_jaccard():
     comparison = paired._compare_documents(old, new)
 
     assert comparison["document_count_matches"]
+    assert comparison["identity_exact"] == (True,)
     assert comparison["structure_exact"] == (True,)
     assert comparison["markdown_exact"] == (False,)
     assert comparison["markdown_jaccard"] == (0.75,)
@@ -212,3 +215,82 @@ def test_docling_paired_cli_defaults_to_promoted_full_gate_configuration():
         args.table_replicas,
         args.reduce_replicas,
     ) == (16, 2, 6, 2, 4)
+
+
+def test_docling_manifest_and_each_arm_have_independent_identity_gates(
+    tmp_path,
+):
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            [
+                {"path": str(first), "pages": 2, "size_bytes": 5},
+                {"path": str(second), "pages": 3, "size_bytes": 6},
+            ]
+        )
+    )
+
+    manifest = paired._read_manifest(str(manifest_path), limit=0)
+
+    assert manifest.paths == (str(first), str(second))
+    assert manifest.pdf_ids == ("first", "second")
+    assert manifest.expected_pages == 5
+    assert manifest.input_bytes == 11
+    documents = (
+        {"pdf": "first", "pages": 2, "tables": 1},
+        {"pdf": "second", "pages": 3, "tables": 2},
+    )
+    assert paired._validate_arm_outputs(
+        "v35",
+        documents,
+        manifest,
+        expected_tables=3,
+    ) == {"documents": 2, "pages": 5, "tables": 3}
+
+    with pytest.raises(ValueError, match="identity/order"):
+        paired._validate_arm_outputs(
+            "v35",
+            tuple(reversed(documents)),
+            manifest,
+            expected_tables=3,
+        )
+    with pytest.raises(ValueError, match="golden requires 4"):
+        paired._validate_arm_outputs(
+            "v35",
+            documents,
+            manifest,
+            expected_tables=4,
+        )
+
+
+def test_docling_manifest_rejects_partial_or_stale_metadata(tmp_path):
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            [
+                {"path": str(first), "pages": 2, "size_bytes": 5},
+                {"path": str(second), "size_bytes": 6},
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="partially populated"):
+        paired._read_manifest(str(manifest_path), limit=0)
+
+    manifest_path.write_text(
+        json.dumps([{"path": str(first), "pages": 2, "size_bytes": 99}])
+    )
+    with pytest.raises(ValueError, match="size mismatch"):
+        paired._read_manifest(str(manifest_path), limit=0)
+
+    manifest_path.write_text(json.dumps([str(first), {"path": str(second)}]))
+    with pytest.raises(ValueError, match="must not mix"):
+        paired._read_manifest(str(manifest_path), limit=0)

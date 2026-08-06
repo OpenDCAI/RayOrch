@@ -52,6 +52,19 @@ Worker 新增一次 run 尾部的只读 `WorkerObservation`：只包含 calls、
 真实 GPU gate 当前没有启动：此前“回归只用 MinerU、不用 Docling”的指令与后续迁移
 Docling 目标冲突，需要用户明确允许后再占用 4×H20。
 
+GPU 执行前的 gate 审计已把输入从裸 `list[str]` 收敛为显式 `DoclingManifest`：冻结
+manifest SHA-256、有序 PDF identity、实际 bytes 和 manifest page total。V3 与 V3.5
+每一臂必须先独立对齐该合同，再进行两臂 Markdown/结构比较；这避免“两臂共同重排或共同
+漏页仍互相相等”的假阳性。表格数不硬编码进通用 runner，由 full gate 显式传入
+`--expected-tables 3312`。当前 manifest 静态复核为：
+
+```text
+manifest SHA-256    b9030601160f0873d4790de7494d6c9a3bc9a8486778daaa9556872ba08cbb53
+PDFs                368（output identity 全部唯一）
+pages               7,072
+input bytes         1,101,539,712
+```
+
 ### Video
 
 入口：
@@ -160,6 +173,23 @@ short decode、byte mismatch、content duplicate 均为零，ordered content dig
 2. 48 PDF：相同 gate，并诊断 batch/RPC/GPU；
 3. 368 PDF：至少两次交替 paired trial；主 outer-wall 中位数不得比 V3 慢超过 `5%`；
 4. 368/368 documents、7,072 pages、3,312 tables 应与冻结 manifest/golden 对齐。
+
+授权后的正式命令固定为：
+
+```bash
+python -m \
+  rayorch.experimental.multigrain_v3_5.benchmark.document_docling.paired \
+  --manifest /tmp/mgv3-docling-368/manifest.json \
+  --limit 0 --repeats 2 --minimum-jaccard 0.99 \
+  --expected-tables 3312 \
+  --table-batch-mode v1_batch --reduce-replicas 4 \
+  --output /tmp/mgv35-docling/full368-paired.json \
+  --gpu-monitor-dir /tmp/mgv35-docling/gpu
+```
+
+该命令两轮自动使用 `V3-first` / `V3.5-first`，共执行四个完整 arm。4/48 gate 使用同一
+命令分别传 `--limit 4/48`，但不传 full-only 的 `--expected-tables 3312`；page total 会由
+manifest prefix 自动得到 48/992。
 
 ### Video
 
