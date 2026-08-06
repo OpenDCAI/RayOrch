@@ -443,8 +443,19 @@ Page/Table cluster
 → restore Page TableStructurePrediction
 ```
 
-默认仍走 reference kernel。只有未来完成真正 batch-aware decoder、并通过 shadow
-`OTSL/cells/spans/bbox/Markdown` gate 后，才允许启用加速路径。
+V1 默认仍走 reference kernel，历史 `decoder_accelerated` 路径和 368-PDF 证据保持不变。
+当前新增的 V2 不修改 V1，而是独立实现：
+
+```text
+TableJobV2
+→ public encode_images / forward
+→ per-row EOS batch decoder
+→ lineage bbox split
+→ deterministic OTSL/cell postprocess
+```
+
+它不访问 V1 的 `_prepare_image/_encoder/_tag_transformer`，也不 monkeypatch model method；
+只有通过 `OTSL/cells/spans/bbox/Markdown` gate 后，`v2_batch` 才能作为显式实验配置使用。
 
 ### 7.2 RapidOCR
 
@@ -458,20 +469,39 @@ for page:
 ```
 
 P1 保持 detector 不变，只将 detector 产出的 text crops 做跨 rect/page recognition batch。
-为了保护原预处理语义：
+早期低层 kernel 版本物化归一化 tensor 并直接调用 session；当前生产 adapter 只保留
+normalized-width compatibility key，模型执行仍调用 RapidOCR facade：
 
 ```text
 crop
-→ 单 crop normalized recognizer tensor
-→ exact (shape, dtype, normalization key) bucket
-→ batch recognizer
+→ stable cross-page gather
+→ derive normalized width（不物化 tensor）
+→ recognize_txt(list[compatible crops])
 → shadow 单条 compare
 → per-job fallback
 → original Docling post_process_cells
 ```
 
-不允许仅按原图宽高猜测 bucket，也不允许为了凑 batch 改变 `max_wh_ratio`。文本严格比较，
-score 使用显式 tolerance；任何 decode 漂移默认回退原单条结果。
+V3 只读取 `text_rec.rec_image_shape` 这项版本钉死的只读 compatibility metadata，避免
+极端长宽比 crop 放大同一 RapidOCR minibatch；不访问 session、预处理或 decoder。
+RapidOCR 自己完成排序、`rec_batch_num` 切分并恢复输入顺序。文本严格比较，score 使用
+显式 tolerance；shadow 中任何 decode 漂移默认回退原单条结果。
+
+V3 的生产 adapter 直接持有 `RapidOcrModel`，不再经由
+`OcrAutoModel._engine`。跨 rect/page gather 以后直接调用 RapidOCR 已有的：
+
+```text
+preprocess_img / detect_and_crop / cls_and_rotate
+→ recognize_txt(list[crop])
+→ build_final_output
+→ Docling post_process_cells
+```
+
+每个 compatibility group 调用一次 recognizer facade；RapidOCR 自己按宽高比排序，并按
+`rec_batch_num` 构造 minibatch。V3 只拥有跨 page 的 gather、lineage scatter 和
+fallback；recognizer 的 resize/normalize、session、CTC decode、RTL 恢复和结果对象
+构造继续由 RapidOCR 实现。这样 UDF 合同不会绑定 V3 的
+`Pipeline/Map/Expand/Reduce` 写法，迁移到 `RayModule + F.*` 时只需改 authoring/lowering。
 
 ### 7.3 输出合同
 
@@ -495,13 +525,15 @@ adapter 公开两个默认关闭的实验开关：
 table_batch_mode:
   reference        默认，原 TableStructureModel
   encoder_shadow   batch TableFormer encoder + 原单表 decoder + reference fallback
+  v2_batch         独立 TableFormerV2 batch decoder 与 TableJobV2 contract
 
 ocr_batch_mode:
   reference            默认，原 RapidOCR rect 路径
   recognition_shadow   detector/classifier 原样 + compatible recognizer shadow
+  recognition_accelerated  同一 facade/kernel，不重复执行 reference
 ```
 
-两者的 shadow 模式首先是 correctness/audit 工具，不是性能开关：
+两个 shadow 模式首先是 correctness/audit 工具，不是性能开关：
 
 ```text
 candidate batch
@@ -512,4 +544,24 @@ candidate batch
 
 在严格 shadow 打开时通常不会产生净加速，因为 reference 仍会执行。只有收集充分
 `exact/fallback fraction/Markdown` 数据并冻结可接受风险后，才可引入明确命名的
-non-shadow accelerate mode；该模式不应默认开启。
+non-shadow accelerate mode；该模式不应默认开启。`v2_batch` 与
+`recognition_accelerated` 只在独立实验配置显式启用；其当前实现、证据和全量 gate 见
+`2026-08-05_docling_direct_v2.md`。
+
+full368 gate 的最终边界是：direct RapidOCR + V1 在前 48 PDF 对历史 artifact 48/48
+Markdown byte-exact；TableV2 的真实 batch 与 singleton 也 byte-exact，证明 adapter/kernel
+合同成立。但 V2 full368 比 V1 median 慢 10.09%，且复杂表出现 512-token runaway 与明显
+行合并，所以 `v2_batch` 保持 opt-in，不能替代 V1 golden。这个结果说明“可替换 kernel”
+不等于“任一新模型自动晋升”；模型质量 gate 与 batch 抽象 gate 必须分开。
+
+### 7.5 跨版本不变量
+
+Docling workload 固定为以下 UDF 数据边界：
+
+```text
+Document → Page → OCR/Layout values → TableJob → Page → Document
+```
+
+V3 使用 `Pipeline + Expand/Map/Reduce` 表达；V3.1+ 可用 `RayModule + F.*` 表达，但
+Page/TableJob DTO、模型 adapter、batch kernel、lineage key 和输出合同不应随 authoring
+API 复制一份。TableFormer V1/V2 也只能替换 `TableJob → Table` kernel，不改变图结构。

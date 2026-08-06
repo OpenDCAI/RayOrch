@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
-from typing import Any
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +31,34 @@ class DoclingOcrResult:
 
 
 @dataclass(frozen=True, slots=True)
+class OcrCropJob:
+    """One detector crop plus the stable lineage needed for OCR scatter."""
+
+    page: int
+    rect: int
+    crop: int
+    local_order: int
+    image: Any
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def page_index(self) -> int:
+        return self.page
+
+    @property
+    def rect_index(self) -> int:
+        return self.rect
+
+    @property
+    def crop_index(self) -> int:
+        return self.crop
+
+    @property
+    def order_key(self) -> tuple[int, int, int, int]:
+        return (self.page, self.rect, self.crop, self.local_order)
+
+
+@dataclass(frozen=True, slots=True)
 class DoclingPostprocessedPage:
     """Table fan-out 和 Page Reduce 共享的 immutable page value。"""
 
@@ -50,6 +78,22 @@ class DoclingTableJob:
     table_image: Any
     scale_factor: float
     scale: float
+
+
+@dataclass(frozen=True, slots=True)
+class DoclingTableV2Job:
+    """一个按 TableFormerV2 原生 2× crop 合同构造的独立 table job。
+
+    V1 会先把整页缩放到固定高度再裁表，V2 则从 2× page image 直接裁表；两者不能
+    共用同一个 image payload。``text_cells`` 只保留当前 table bbox 附近的原 page
+    textline cells，供 V2 cell matching 在 cluster cells 为空时回退。
+    """
+
+    page_no: int
+    table_cluster: Any
+    table_bbox: tuple[float, float, float, float]
+    table_image: Any
+    text_cells: tuple[Any, ...]
 
 
 @dataclass(frozen=True, slots=True)

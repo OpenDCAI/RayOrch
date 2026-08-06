@@ -15,12 +15,24 @@ from .core_table_workflow import (
     DoclingPostprocessPages,
     DoclingTableCore,
     ExpandDoclingTableJobs,
+    ExpandDoclingTableV2Jobs,
     ReduceDoclingPage,
 )
+from .tableformer_v1_batch import DoclingTableFormerV1BatchCore
+from .tableformer_v2_batch import DoclingTableFormerV2BatchCore
 
 
 class DoclingTableJobV3Pipeline(Pipeline):
     """Page->TableJob->Page->Document with elastic cross-PDF batching."""
+
+    table_job_stage = ExpandDoclingTableJobs
+    table_core_stage = DoclingTableCore
+    table_batch_modes = {
+        "reference",
+        "encoder_shadow",
+        "encoder_accelerated",
+        "decoder_accelerated",
+    }
 
     def __init__(
         self,
@@ -73,12 +85,7 @@ class DoclingTableJobV3Pipeline(Pipeline):
             raise ValueError(
                 "ocr_actor_concurrency must be 1 for recognition batching"
             )
-        if table_batch_mode not in {
-            "reference",
-            "encoder_shadow",
-            "encoder_accelerated",
-            "decoder_accelerated",
-        }:
+        if table_batch_mode not in self.table_batch_modes:
             raise ValueError("unsupported table_batch_mode")
         if table_batch_max_jobs <= 0:
             raise ValueError("table_batch_max_jobs must be positive")
@@ -87,7 +94,7 @@ class DoclingTableJobV3Pipeline(Pipeline):
             raise ValueError("table_core_batch_size must be positive")
         if table_batch_mode != "reference" and table_actor_concurrency != 1:
             raise ValueError(
-                "table_actor_concurrency must be 1 for encoder batching"
+                "table_actor_concurrency must be 1 for table batching"
             )
 
         layout_device = layout_device or device
@@ -146,7 +153,7 @@ class DoclingTableJobV3Pipeline(Pipeline):
             num_cpus=actor_num_cpus,
             max_concurrency=1,
         )
-        self.table_jobs = Expand(ExpandDoclingTableJobs).ray_options(
+        self.table_jobs = Expand(self.table_job_stage).ray_options(
             replicas=table_prepare_replicas,
             batch_size=table_batch_size,
             max_batch_wait_ms=table_batch_wait_ms,
@@ -155,7 +162,7 @@ class DoclingTableJobV3Pipeline(Pipeline):
             max_concurrency=1,
         )
         self.table_core = (
-            Map(DoclingTableCore)
+            Map(self.table_core_stage)
             .pre_init(
                 device=table_device,
                 num_threads=num_threads,
@@ -196,3 +203,27 @@ class DoclingTableJobV3Pipeline(Pipeline):
             pages=postprocessed,
         )
         return self.reduce(anchor=documents, members=assembled_pages)
+
+
+class DoclingTableFormerV2BatchV3Pipeline(DoclingTableJobV3Pipeline):
+    """Independent V3 authoring of RapidOCR-direct + TableFormerV2 batch."""
+
+    table_job_stage = ExpandDoclingTableV2Jobs
+    table_core_stage = DoclingTableFormerV2BatchCore
+    table_batch_modes = {"v2_batch"}
+
+    def __init__(self, **options: Any) -> None:
+        options.setdefault("table_batch_mode", "v2_batch")
+        super().__init__(**options)
+
+
+class DoclingTableFormerV1BatchV3Pipeline(DoclingTableJobV3Pipeline):
+    """V1 golden semantics behind an explicit, mutation-free batch kernel."""
+
+    table_job_stage = ExpandDoclingTableJobs
+    table_core_stage = DoclingTableFormerV1BatchCore
+    table_batch_modes = {"v1_batch"}
+
+    def __init__(self, **options: Any) -> None:
+        options.setdefault("table_batch_mode", "v1_batch")
+        super().__init__(**options)

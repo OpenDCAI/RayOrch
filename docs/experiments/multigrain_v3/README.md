@@ -273,6 +273,19 @@ python -m \
 2026-08-03_docling_368_four_gpu.md
 ```
 
+V3 当前的 RapidOCR 直接函数适配、TableFormerV2 batch kernel、V1 历史证据边界与
+368-PDF 回归清单见：
+
+```text
+2026-08-05_docling_direct_v2.md
+```
+
+TableFormer V1 clean batch kernel 的设计、准确率与双轮 full-368 性能晋升证据见：
+
+```text
+2026-08-06_docling_v1_batch_kernel.md
+```
+
 ## 测试
 
 快速、无模型测试：

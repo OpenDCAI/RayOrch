@@ -157,6 +157,8 @@ class CoreMatrixConfig:
             "encoder_shadow",
             "encoder_accelerated",
             "decoder_accelerated",
+            "v1_batch",
+            "v2_batch",
         }:
             raise ValueError("unsupported table_batch_mode")
         if self.table_batch_max_jobs <= 0:
@@ -166,7 +168,7 @@ class CoreMatrixConfig:
             and self.table_actor_concurrency != 1
         ):
             raise ValueError(
-                "table_actor_concurrency must be 1 for encoder batching"
+                "table_actor_concurrency must be 1 for table batching"
             )
 
     def resolved_native_tuned_batch_size(self, sources: int) -> int:
@@ -777,6 +779,7 @@ def run_single_arm(
             "platform": platform.platform(),
             "docling": _package_version("docling"),
             "docling_core": _package_version("docling-core"),
+            "docling_ibm_models": _package_version("docling-ibm-models"),
             "ray": _package_version("ray"),
             "torch": _package_version("torch"),
         },
@@ -934,7 +937,9 @@ def _read_paths(args: argparse.Namespace) -> list[str]:
         paths = sorted(
             str(path)
             for path in Path(args.pdf_dir).glob("*.pdf")
-        )[: args.limit]
+        )
+    if args.limit > 0:
+        paths = paths[: args.limit]
     if not paths:
         raise FileNotFoundError("no PDF inputs")
     missing = [path for path in paths if not Path(path).is_file()]
@@ -956,10 +961,11 @@ def _read_manifest_metadata(
         return None, None
     if not all("pages" in item for item in raw):
         return None, None
-    page_counts = tuple(int(item["pages"]) for item in raw)
+    selected = raw[: len(paths)]
+    page_counts = tuple(int(item["pages"]) for item in selected)
     sizes = tuple(
         int(item.get("size_bytes", Path(path).stat().st_size))
-        for item, path in zip(raw, paths)
+        for item, path in zip(selected, paths)
     )
     return page_counts, sizes
 
@@ -1021,6 +1027,8 @@ def build_parser() -> argparse.ArgumentParser:
             "encoder_shadow",
             "encoder_accelerated",
             "decoder_accelerated",
+            "v1_batch",
+            "v2_batch",
         ),
         default="reference",
     )

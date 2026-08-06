@@ -10,6 +10,8 @@ import pytest
 from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_compare import (
     ARM_ORDER,
     CoreMatrixConfig,
+    _read_manifest_metadata,
+    _read_paths,
     _compare_documents,
     _timeline_summary,
     _write_timeline,
@@ -19,6 +21,37 @@ from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_compare 
 from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_native import (
     NativeCoreConfig,
 )
+
+
+def test_limit_applies_to_manifest_paths_and_metadata(tmp_path) -> None:
+    """单 PDF smoke 的 limit 不能因 manifest 输入而悄悄变成全量实验。"""
+
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            [
+                {"path": str(first), "pages": 3, "size_bytes": 5},
+                {"path": str(second), "pages": 7, "size_bytes": 6},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    from argparse import Namespace
+
+    args = Namespace(
+        manifest=str(manifest),
+        paths=None,
+        pdf_dir=".",
+        limit=1,
+    )
+    paths = _read_paths(args)
+
+    assert paths == [str(first)]
+    assert _read_manifest_metadata(args, paths) == ((3,), (5,))
 
 
 def test_four_arm_plan_freezes_only_document_concurrency_and_scope() -> None:
@@ -66,6 +99,45 @@ def test_table_encoder_acceleration_is_wired_into_both_v3_arms() -> None:
     assert parent.pop("batch_scope") == "parent_bound"
     assert elastic.pop("batch_scope") == "elastic"
     assert parent == elastic
+
+
+def test_tableformer_v2_batch_is_wired_without_changing_v1_default() -> None:
+    """V2 是独立 opt-in 路径；默认 V1 历史实验合同保持不变。"""
+
+    default_plan = build_matrix_plan(12, CoreMatrixConfig())
+    assert default_plan[3].options["table_batch_mode"] == "reference"
+
+    v2_plan = build_matrix_plan(
+        12,
+        CoreMatrixConfig(
+            table_batch_mode="v2_batch",
+            table_batch_max_jobs=8,
+        ),
+    )
+    parent = dict(v2_plan[2].options)
+    elastic = dict(v2_plan[3].options)
+
+    assert parent["table_batch_mode"] == "v2_batch"
+    assert parent["table_batch_max_jobs"] == 8
+    assert parent.pop("batch_scope") == "parent_bound"
+    assert elastic.pop("batch_scope") == "elastic"
+    assert parent == elastic
+
+
+def test_tableformer_v1_batch_path_remains_separate_from_historical_golden() -> None:
+    """The recommended clean path and historical reproducibility arm stay explicit."""
+
+    golden = build_matrix_plan(
+        12,
+        CoreMatrixConfig(table_batch_mode="decoder_accelerated"),
+    )
+    candidate = build_matrix_plan(
+        12,
+        CoreMatrixConfig(table_batch_mode="v1_batch"),
+    )
+
+    assert golden[3].options["table_batch_mode"] == "decoder_accelerated"
+    assert candidate[3].options["table_batch_mode"] == "v1_batch"
 
 
 def test_table_core_batch_size_is_independent_in_both_v3_arms() -> None:

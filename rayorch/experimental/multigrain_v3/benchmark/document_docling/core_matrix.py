@@ -184,6 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
             "encoder_shadow",
             "encoder_accelerated",
             "decoder_accelerated",
+            "v1_batch",
+            "v2_batch",
         ),
         default="reference",
     )

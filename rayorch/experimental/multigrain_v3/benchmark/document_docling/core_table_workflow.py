@@ -18,6 +18,7 @@ from .core_values import (
     DoclingPageSource,
     DoclingPostprocessedPage,
     DoclingTableJob,
+    DoclingTableV2Job,
     PdfRenderCache,
     page_from_source,
 )
@@ -194,8 +195,161 @@ class ExpandDoclingTableJobs:
         return dict(self.total_audit)
 
 
+class ExpandDoclingTableV2Jobs:
+    """Expand Page -> TableV2Job using Docling V2's native 2x crop contract."""
+
+    def __init__(self, scale: float = 2.0) -> None:
+        if scale <= 0:
+            raise ValueError("scale must be positive")
+        self.scale = scale
+        self.render_cache = PdfRenderCache()
+        self.total_audit = {
+            "pages": 0,
+            "table_pages": 0,
+            "skipped_pages": 0,
+            "jobs": 0,
+        }
+
+    def run(
+        self,
+        pages: list[DoclingPostprocessedPage],
+    ) -> list[list[DoclingTableV2Job]]:
+        """Crop each table directly from the 2x page image without V1 resize."""
+
+        outputs: list[list[DoclingTableV2Job]] = []
+        self.total_audit["pages"] += len(pages)
+        table_labels = {"table", "document_index"}
+        for value in pages:
+            clusters = [
+                cluster
+                for cluster in value.layout.clusters
+                if getattr(cluster.label, "value", cluster.label)
+                in table_labels
+            ]
+            if not clusters:
+                self.total_audit["skipped_pages"] += 1
+                outputs.append([])
+                continue
+
+            import numpy
+
+            self.total_audit["table_pages"] += 1
+            page = page_from_source(
+                value.source,
+                layout=value.layout,
+                ocr=value.ocr,
+                render_cache=self.render_cache,
+            )
+            page_image = numpy.asarray(page.get_image(scale=self.scale))
+            textline_cells = tuple(
+                copy.deepcopy(value.ocr.segmented_page.textline_cells)
+            )
+            jobs = []
+            for cluster in clusters:
+                scaled_box = (
+                    round(cluster.bbox.l) * self.scale,
+                    round(cluster.bbox.t) * self.scale,
+                    round(cluster.bbox.r) * self.scale,
+                    round(cluster.bbox.b) * self.scale,
+                )
+                x1, y1, x2, y2 = [int(coordinate) for coordinate in scaled_box]
+                table_image = page_image[y1:y2, x1:x2]
+                if table_image.size == 0:
+                    raise ValueError("TableFormerV2 crop is empty")
+                table_bbox = tuple(
+                    coordinate / self.scale for coordinate in scaled_box
+                )
+                nearby_cells = tuple(
+                    cell
+                    for cell in textline_cells
+                    if cell.rect.to_bounding_box().get_intersection_bbox(
+                        cluster.bbox
+                    )
+                    is not None
+                )
+                jobs.append(
+                    DoclingTableV2Job(
+                        page_no=value.source.page_no,
+                        table_cluster=copy.deepcopy(cluster),
+                        table_bbox=table_bbox,
+                        table_image=numpy.ascontiguousarray(table_image),
+                        text_cells=nearby_cells,
+                    )
+                )
+            outputs.append(jobs)
+            self.total_audit["jobs"] += len(jobs)
+        return outputs
+
+    def batch_audit(self) -> dict[str, int]:
+        return dict(self.total_audit)
+
+
+def normalize_v1_table_grid(
+    responses: list[dict[str, Any]],
+    details: dict[str, Any],
+) -> None:
+    """Normalize sparse V1 row/column offsets into a dense Docling grid."""
+
+    start_cols = sorted({cell["start_col_offset_idx"] for cell in responses})
+    start_rows = sorted({cell["start_row_offset_idx"] for cell in responses})
+    max_end_col = 0
+    max_end_row = 0
+    for cell in responses:
+        cell["start_col_offset_idx"] = start_cols.index(
+            cell["start_col_offset_idx"]
+        )
+        cell["end_col_offset_idx"] = (
+            cell["start_col_offset_idx"] + cell["col_span"]
+        )
+        max_end_col = max(max_end_col, cell["end_col_offset_idx"])
+        cell["start_row_offset_idx"] = start_rows.index(
+            cell["start_row_offset_idx"]
+        )
+        cell["end_row_offset_idx"] = (
+            cell["start_row_offset_idx"] + cell["row_span"]
+        )
+        max_end_row = max(max_end_row, cell["end_row_offset_idx"])
+    details["num_cols"] = max_end_col
+    details["num_rows"] = max_end_row
+
+
+def build_v1_table(
+    job: DoclingTableJob,
+    responses: list[dict[str, Any]],
+    details: dict[str, Any],
+) -> Any:
+    """Build one Docling Table from explicit V1 postprocess outputs."""
+
+    from docling.datamodel.base_models import Table
+    from docling_core.types.doc import TableCell
+
+    normalize_v1_table_grid(responses, details)
+    table_cells = []
+    for element in responses:
+        cell = TableCell.model_validate(element)
+        if cell.bbox is not None:
+            cell.bbox = cell.bbox.scaled(1 / job.scale)
+        table_cells.append(cell)
+    cluster = job.table_cluster
+    return Table(
+        otsl_seq=details.get("prediction", {}).get("rs_seq", []),
+        table_cells=table_cells,
+        num_rows=details.get("num_rows", 0),
+        num_cols=details.get("num_cols", 0),
+        id=cluster.id,
+        page_no=job.page_no,
+        cluster=cluster,
+        label=cluster.label,
+    )
+
+
 class DoclingTableCore:
-    """Load only TableFormer; each input grain is one table crop."""
+    """Reference and legacy-reproduction TableFormer V1 UDF.
+
+    New accelerated experiments use ``DoclingTableFormerV1BatchCore``.  The
+    mutation-based modes remain here only so historical artifacts can be
+    reproduced; new behavior must not be added to them.
+    """
 
     def __init__(
         self,
@@ -306,9 +460,6 @@ class DoclingTableCore:
         job: DoclingTableJob,
         eval_res_preds: dict[str, Any] | None = None,
     ) -> Any:
-        from docling.datamodel.base_models import Table
-        from docling_core.types.doc import TableCell
-
         tf_responses, predict_details = self.table.tf_predictor.predict(
             job.iocr_page,
             list(job.table_bbox),
@@ -317,64 +468,7 @@ class DoclingTableCore:
             eval_res_preds,
             False,
         )
-        self._sort_row_col_indexes(tf_responses, predict_details)
-        table_cells = []
-        for element in tf_responses:
-            cell = TableCell.model_validate(element)
-            if cell.bbox is not None:
-                cell.bbox = cell.bbox.scaled(1 / job.scale)
-            table_cells.append(cell)
-        cluster = job.table_cluster
-        return Table(
-            otsl_seq=(
-                predict_details.get("prediction", {}).get("rs_seq", [])
-            ),
-            table_cells=table_cells,
-            num_rows=predict_details.get("num_rows", 0),
-            num_cols=predict_details.get("num_cols", 0),
-            id=cluster.id,
-            page_no=job.page_no,
-            cluster=cluster,
-            label=cluster.label,
-        )
-
-    @staticmethod
-    def _sort_row_col_indexes(
-        tf_responses: list[dict[str, Any]],
-        predict_details: dict[str, Any],
-    ) -> None:
-        """Reproduce TFPredictor.multi_table_predict index normalization."""
-
-        start_cols: list[int] = []
-        start_rows: list[int] = []
-        for cell in tf_responses:
-            col = cell["start_col_offset_idx"]
-            row = cell["start_row_offset_idx"]
-            if col not in start_cols:
-                start_cols.append(col)
-            if row not in start_rows:
-                start_rows.append(row)
-        start_cols.sort()
-        start_rows.sort()
-        max_end_col = 0
-        max_end_row = 0
-        for cell in tf_responses:
-            cell["start_col_offset_idx"] = start_cols.index(
-                cell["start_col_offset_idx"]
-            )
-            cell["end_col_offset_idx"] = (
-                cell["start_col_offset_idx"] + cell["col_span"]
-            )
-            max_end_col = max(max_end_col, cell["end_col_offset_idx"])
-            cell["start_row_offset_idx"] = start_rows.index(
-                cell["start_row_offset_idx"]
-            )
-            cell["end_row_offset_idx"] = (
-                cell["start_row_offset_idx"] + cell["row_span"]
-            )
-            max_end_row = max(max_end_row, cell["end_row_offset_idx"])
-        predict_details["num_cols"] = max_end_col
-        predict_details["num_rows"] = max_end_row
+        return build_v1_table(job, tf_responses, predict_details)
 
 
 class ReduceDoclingPage:

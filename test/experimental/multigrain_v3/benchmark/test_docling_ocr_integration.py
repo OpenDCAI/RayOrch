@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy
 import pytest
 
 from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_stages import (
+    DoclingOcrPages,
     rapidocr_outputs_semantically_equal,
     select_rapidocr_rect_output,
+)
+from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_values import (
+    OcrCropJob,
 )
 from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_v3 import (
     DoclingCoreV3Pipeline,
@@ -116,3 +121,88 @@ def test_rect_candidate_semantic_contract_uses_reference_on_drift() -> None:
         selected, fallback = select_rapidocr_rect_output(reference, candidate)
         assert selected is reference
         assert fallback is True
+
+
+def test_v3_ocr_batch_calls_rapidocr_recognize_txt_facade() -> None:
+    """V3 只按声明宽度分组，模型执行仍调用 facade 并按 lineage scatter。"""
+
+    class FakeTextRecOutput:
+        def __init__(
+            self,
+            *,
+            imgs,
+            txts,
+            scores,
+            word_results,
+            elapse,
+            viser,
+        ) -> None:
+            self.imgs = imgs
+            self.txts = txts
+            self.scores = scores
+            self.word_results = word_results
+            self.elapse = elapse
+            self.viser = viser
+
+    seen_batches = []
+
+    class FakeRecognizer:
+        rec_image_shape = (3, 48, 320)
+
+    class FakeReader:
+        text_rec = FakeRecognizer()
+        return_word_box = False
+
+        @staticmethod
+        def recognize_txt(images):
+            seen_batches.append(images)
+            return FakeTextRecOutput(
+                imgs=images,
+                txts=tuple(f"crop-{index}" for index in range(len(images))),
+                scores=[0.9] * len(images),
+                word_results=(None,) * len(images),
+                elapse=0.01,
+                viser=None,
+            )
+
+    stage = object.__new__(DoclingOcrPages)
+    stage.ocr_recognition_batch_size = 8
+    stage.last_ocr_batch_audit = {
+        "jobs": 0,
+        "batches": 0,
+        "rect_fallbacks": 0,
+        "batch_errors": 0,
+    }
+    images = [
+        numpy.zeros((20, 40, 3), dtype=numpy.uint8),
+        numpy.zeros((30, 180, 3), dtype=numpy.uint8),
+        numpy.zeros((20, 200, 3), dtype=numpy.uint8),
+    ]
+    jobs = [
+        OcrCropJob(
+            page=0,
+            rect=0,
+            crop=index,
+            local_order=index,
+            image=image,
+            metadata={"work_index": 0},
+        )
+        for index, image in enumerate(images)
+    ]
+    work = SimpleNamespace(recognitions={}, failed=False)
+
+    stage._run_text_recognition_batch(
+        FakeReader(),
+        jobs,
+        [work],
+        text_rec_output=FakeTextRecOutput,
+    )
+
+    assert seen_batches == [images[:2], images[2:]]
+    assert [work.recognitions[index].txts for index in range(3)] == [
+        ("crop-0",),
+        ("crop-1",),
+        ("crop-0",),
+    ]
+    assert stage.last_ocr_batch_audit["batches"] == 2
+    assert stage.last_ocr_batch_audit["batch_errors"] == 0

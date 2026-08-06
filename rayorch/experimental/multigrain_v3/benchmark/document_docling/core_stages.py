@@ -16,17 +16,13 @@ from typing import Any
 
 from .core_values import (
     DoclingOcrResult,
+    OcrCropJob,
     DoclingPageAssembly,
     DoclingPostprocessedPage,
     DoclingPageSource,
     DoclingTableJob,
     PdfRenderCache,
     page_from_source,
-)
-from .ocr_batching import (
-    OcrCropJob,
-    RecognitionBatchPlanner,
-    RecognizerInput,
 )
 from .table_batching import (
     TableBatchPlanner,
@@ -38,8 +34,8 @@ from .table_batching import (
 class _RapidOcrRectWork:
     """一个 OCR rect 的候选重建上下文。
 
-    detector/classifier 保持每个 rect 单独运行；只有 ``crops`` 中的 TextRecognizer
-    输入会在随后跨 rect/page 分桶。``reference`` 始终是原 RapidOCR reader 的完整
+    detector/classifier 保持每个 rect 单独运行；``crops`` 中的 TextRecognizer
+    输入会在随后跨 rect/page gather。``reference`` 始终是原 RapidOCR reader 的完整
     输出，候选任一步出错或语义不同都会选用它。
     """
 
@@ -304,7 +300,7 @@ class DoclingLayoutPages:
 
 
 class DoclingOcrPages:
-    """复用 Docling OcrAutoModel，并只返回 OCR 后 segmented page。"""
+    """直接适配 Docling RapidOcrModel，并只返回 OCR 后 segmented page。"""
 
     def __init__(
         self,
@@ -314,9 +310,9 @@ class DoclingOcrPages:
         ocr_batch_mode: str = "reference",
         ocr_recognition_batch_size: int = 6,
     ) -> None:
-        """初始化与原生默认配置一致的 OcrAutoModel。
+        """初始化与原生 auto 路径一致的 RapidOCR/ONNX Runtime backend。
 
-        ``ocr_batch_mode="reference"`` 完全保留原始 ``OcrAutoModel`` 路径。
+        ``ocr_batch_mode="reference"`` 完全保留原始 ``RapidOcrModel`` 路径。
         ``"recognition_shadow"`` 是保守实验模式：每个 OCR rect 均先执行原 reader
         作为 shadow reference；候选路径只跨 rect/page 批处理 ``TextRecognizer`` 的
         crop，detector/classifier 仍逐 rect 调用。候选 ``RapidOCROutput`` 的
@@ -338,13 +334,18 @@ class DoclingOcrPages:
             raise ValueError("ocr_recognition_batch_size must be positive")
 
         from docling.datamodel.accelerator_options import AcceleratorOptions
-        from docling.datamodel.pipeline_options import OcrAutoOptions
-        from docling.models.stages.ocr.auto_ocr_model import OcrAutoModel
+        from docling.datamodel.pipeline_options import RapidOcrOptions
+        from docling.models.stages.ocr.rapid_ocr_model import RapidOcrModel
 
-        self.model = OcrAutoModel(
+        self.model = RapidOcrModel(
             enabled=True,
             artifacts_path=None,
-            options=OcrAutoOptions(),
+            options=RapidOcrOptions(
+                backend="onnxruntime",
+                rapidocr_params={
+                    "Rec.rec_batch_num": ocr_recognition_batch_size,
+                },
+            ),
             accelerator_options=AcceleratorOptions(
                 device=device,
                 num_threads=num_threads,
@@ -479,10 +480,10 @@ class DoclingOcrPages:
             if strict_shadow
             else None
         )
-        rapid_model = getattr(self.model, "_engine", None)
+        rapid_model = self.model
         if not self._is_rapidocr_engine(rapid_model):
             self._record_ocr_batch_error(
-                "OcrAutoModel did not select RapidOcrModel; "
+                "RapidOcrModel does not expose the required facade; "
                 "recognition batching kept the reference path"
             )
             return reference_pages or self._reference_pages_across_documents(
@@ -540,8 +541,12 @@ class DoclingOcrPages:
         return (
             callable(getattr(engine, "get_ocr_rects", None))
             and callable(getattr(engine, "post_process_cells", None))
-            and callable(reader)
-            and callable(getattr(reader, "text_rec", None))
+            and callable(getattr(reader, "__call__", None))
+            and callable(getattr(reader, "preprocess_img", None))
+            and callable(getattr(reader, "detect_and_crop", None))
+            and callable(getattr(reader, "cls_and_rotate", None))
+            and callable(getattr(reader, "recognize_txt", None))
+            and callable(getattr(reader, "build_final_output", None))
         )
 
     def _run_recognition_candidate(
@@ -567,7 +572,6 @@ class DoclingOcrPages:
         from rapidocr.ch_ppocr_cls import TextClsOutput
         from rapidocr.ch_ppocr_det import TextDetOutput
         from rapidocr.ch_ppocr_rec import TextRecOutput
-        from rapidocr.main import RapidOCRError
 
         reader = rapid_model.reader
         works: list[_RapidOcrRectWork] = []
@@ -630,12 +634,11 @@ class DoclingOcrPages:
         self.last_ocr_batch_audit["jobs"] = int(
             self.last_ocr_batch_audit["jobs"]
         ) + len(jobs)
-        self._run_text_recognition_buckets(
+        self._run_text_recognition_batch(
             reader,
             jobs,
             works,
             text_rec_output=TextRecOutput,
-            rapidocr_error=RapidOCRError,
         )
 
         selected_by_page: dict[int, list[tuple[Any, Any]]] = {}
@@ -848,65 +851,58 @@ class DoclingOcrPages:
             reference=None,
         )
 
-    def _run_text_recognition_buckets(
+    def _run_text_recognition_batch(
         self,
         reader: Any,
         jobs: list[OcrCropJob],
         works: list[_RapidOcrRectWork],
         *,
         text_rec_output: Any,
-        rapidocr_error: type[Exception],
     ) -> None:
-        """按 normalized tensor 兼容键分桶，并直接调用 recognizer session。"""
+        """按归一化宽度 gather 后调用 RapidOCR facade，再按 lineage scatter。
+
+        adapter 只读取 recognizer 声明的 ``rec_image_shape`` 计算最终 tensor width；
+        resize/normalize、排序、session、CTC decode、RTL 恢复和结果对象构造仍全部由
+        ``recognize_txt(list[crop])`` 拥有。这个兼容 key 隔离极端长宽比 crop，避免
+        RapidOCR 把同一内部 minibatch 的其他 crop pad 到该长尾宽度。
+        """
 
         if not jobs:
             return
-        text_recognizer = reader.text_rec
+        try:
+            _, model_height, model_width = reader.text_rec.rec_image_shape[:3]
+            base_ratio = model_width / model_height
+            buckets: dict[Any, list[OcrCropJob]] = {}
+            for job in jobs:
+                image_height, image_width = job.image.shape[:2]
+                ratio = max(base_ratio, image_width / float(image_height))
+                normalized_width = int(model_height * ratio)
+                key = (
+                    normalized_width,
+                    ratio if reader.return_word_box else None,
+                )
+                buckets.setdefault(key, []).append(job)
+        except Exception as error:
+            self._record_ocr_batch_error(f"{type(error).__name__}: {error}")
+            for job in jobs:
+                works[int(job.metadata["work_index"])].failed = True
+            return
 
-        def preprocessor(job: OcrCropJob) -> RecognizerInput:
-            image = job.image
-            image_height, image_width = image.shape[:2]
-            _, model_height, model_width = text_recognizer.rec_image_shape[:3]
-            max_wh_ratio = max(
-                model_width / model_height,
-                image_width / float(image_height),
-            )
-            # planner 以逐 crop normalization tensor 的 shape/dtype/语义 key 分桶；
-            # 后续直接 stack 这些 tensor，禁止 TextRecognizer 按 batch 重算 padding。
-            tensor = text_recognizer.resize_norm_img(image, max_wh_ratio)
-            return RecognizerInput(
-                tensor=tensor,
-                key=(
-                    "rapidocr-text-recognizer-v1",
-                    tuple(text_recognizer.rec_image_shape),
-                    max_wh_ratio,
-                    bool(reader.return_word_box),
-                    str(getattr(text_recognizer.cfg, "lang_type", "")),
-                ),
-            )
-
-        planner = RecognitionBatchPlanner(
-            preprocessor,
-            max_batch_size=self.ocr_recognition_batch_size,
-        )
-        batches = planner.plan(jobs)
-        self.last_ocr_batch_audit["batches"] = int(
-            self.last_ocr_batch_audit["batches"]
-        ) + len(batches)
-        for batch in batches:
-            bucket_jobs = [normalized.job for normalized in batch.jobs]
+        for bucket_jobs in buckets.values():
+            self.last_ocr_batch_audit["batches"] = int(
+                self.last_ocr_batch_audit["batches"]
+            ) + (
+                len(bucket_jobs) + self.ocr_recognition_batch_size - 1
+            ) // self.ocr_recognition_batch_size
             try:
-                rec_res = self._recognize_prepared_batch(
-                    text_recognizer,
-                    batch,
-                    return_word_box=reader.return_word_box,
-                    text_rec_output=text_rec_output,
+                rec_res = reader.recognize_txt(
+                    [job.image for job in bucket_jobs]
                 )
                 if rec_res.txts is None:
-                    raise rapidocr_error("The text recognize result is empty")
+                    raise RuntimeError("RapidOCR recognizer returned no text")
                 if len(rec_res.txts) != len(bucket_jobs):
                     raise RuntimeError(
-                        "TextRecognizer result count does not match bucket jobs"
+                        "TextRecognizer result count does not match gathered jobs"
                     )
                 for job_index, job in enumerate(bucket_jobs):
                     work_index = int(job.metadata["work_index"])
@@ -925,74 +921,13 @@ class DoclingOcrPages:
                     works[int(job.metadata["work_index"])].failed = True
 
     @staticmethod
-    def _recognize_prepared_batch(
-        text_recognizer: Any,
-        batch: Any,
-        *,
-        return_word_box: bool,
-        text_rec_output: Any,
-    ) -> Any:
-        """把已逐 crop 归一化的同 shape tensor 直接送入原 session/decoder。"""
-
-        import time
-
-        import numpy
-        from rapidocr.utils.model_resolver import normalize_lang
-        from rapidocr.utils.utils import reorder_bidi_for_display
-        from rapidocr.utils.vis_res import VisRes
-
-        started = time.perf_counter()
-        normalized = numpy.stack(
-            [job.recognizer_input.tensor for job in batch.jobs],
-            axis=0,
-        ).astype(numpy.float32, copy=False)
-        raw_images = [job.job.image for job in batch.jobs]
-        wh_ratio_list = [
-            image.shape[1] / float(image.shape[0]) for image in raw_images
-        ]
-        _, model_height, model_width = text_recognizer.rec_image_shape[:3]
-        max_wh_ratio = max(
-            model_width / model_height,
-            max(wh_ratio_list),
-        )
-        predictions = text_recognizer.session(normalized)
-        line_results, word_results = text_recognizer.postprocess_op(
-            predictions,
-            return_word_box,
-            wh_ratio_list=wh_ratio_list,
-            max_wh_ratio=max_wh_ratio,
-        )
-        txts, scores = zip(*line_results)
-        if (
-            normalize_lang(text_recognizer.cfg.lang_type)
-            in text_recognizer.RTL_LANGS
-        ):
-            txts = reorder_bidi_for_display(txts)
-        output_word_results = (
-            tuple(word_results)
-            if return_word_box
-            else tuple(None for _ in raw_images)
-        )
-        return text_rec_output(
-            imgs=raw_images,
-            txts=tuple(txts),
-            scores=list(scores),
-            word_results=output_word_results,
-            elapse=time.perf_counter() - started,
-            viser=VisRes(
-                lang_type=text_recognizer.cfg.lang_type,
-                font_path=text_recognizer.cfg.font_path,
-            ),
-        )
-
-    @staticmethod
     def _recognition_item(
         rec_res: Any,
         item_index: int,
         *,
         text_rec_output: Any,
     ) -> Any:
-        """从 bucket 的 TextRecOutput 提取一个 crop 的原字段结果。"""
+        """从 compatible-group TextRecOutput 提取一个 crop 的原字段结果。"""
 
         word_results = rec_res.word_results
         return text_rec_output(

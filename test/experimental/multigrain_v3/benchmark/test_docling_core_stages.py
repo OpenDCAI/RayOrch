@@ -10,6 +10,7 @@ from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_stages i
 from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_table_workflow import (
     DoclingTableCore,
     ExpandDoclingTableJobs,
+    ExpandDoclingTableV2Jobs,
 )
 from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_v3 import (
     DoclingCoreV3Pipeline,
@@ -70,8 +71,13 @@ def test_table_core_physical_batch_is_independent() -> None:
     assert compiled.dag.stages[7].execution.batch_size == 16
 
 
+@pytest.mark.parametrize(
+    "stage_type",
+    (ExpandDoclingTableJobs, ExpandDoclingTableV2Jobs),
+)
 def test_no_table_page_skips_render_and_emits_empty_child_group(
     monkeypatch,
+    stage_type,
 ) -> None:
     """无表页必须保留 Page lineage，但不能触发 2x page render。"""
 
@@ -85,7 +91,7 @@ def test_no_table_page_skips_render_and_emits_empty_child_group(
         "core_table_workflow.page_from_source",
         unexpected_render,
     )
-    stage = ExpandDoclingTableJobs()
+    stage = stage_type()
     page = SimpleNamespace(
         source=SimpleNamespace(),
         layout=SimpleNamespace(clusters=[]),

@@ -1,8 +1,12 @@
-"""RapidOCR 识别阶段的保守跨 rect/page batching 辅助工具。
+"""RapidOCR 识别阶段早期 tensor-planner 的 Ray-free 契约工具。
 
 本模块刻意不依赖 Docling、RapidOCR、Ray 或 NumPy。它只处理已经由 detector
 切出的 crop，并把真正的分类器、预处理器、识别器以 callable 注入。因此它可以在
 接入真实 ``TextRecognizer`` 前独立做语义验证。
+
+当前 V3 生产 adapter 不使用这个 planner：它把稳定排序的原始 crops 一次交给
+``RapidOCR.recognize_txt``，由上游拥有 resize、排序、minibatch 和 decode。本模块保留为
+历史低层 kernel 的契约测试，不能据此推断当前生产调用边界。
 
 P1 的关键约束是：每个 crop 必须先独立完成与原识别器一致的预处理，只有归一化后的
 tensor shape、dtype 和调用方给出的 normalization key 全部相同，才允许放入同一个
@@ -17,49 +21,10 @@ RapidOCR 的 ``TextRecognizer`` 会从一个 batch 的最大宽高比推导 ``ma
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Hashable, Literal, Mapping, Protocol, Sequence
 
-
-@dataclass(frozen=True, slots=True)
-class OcrCropJob:
-    """一个 detector 已经产出的 OCR crop 的稳定定位与载荷。
-
-    ``page``、``rect``、``crop``、``local_order`` 一起定义恢复到 Docling page/rect
-    顺序时使用的稳定排序键。``image`` 保留调用方交给本模块的原对象；本模块不会把
-    bytes 解码后再编码，也不会修改其内容。
-    """
-
-    page: int
-    rect: int
-    crop: int
-    local_order: int
-    image: Any
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-    @property
-    def page_index(self) -> int:
-        """兼容使用 ``*_index`` 命名的调用点。"""
-
-        return self.page
-
-    @property
-    def rect_index(self) -> int:
-        """兼容使用 ``*_index`` 命名的调用点。"""
-
-        return self.rect
-
-    @property
-    def crop_index(self) -> int:
-        """兼容使用 ``*_index`` 命名的调用点。"""
-
-        return self.crop
-
-    @property
-    def order_key(self) -> tuple[int, int, int, int]:
-        """返回 page/rect/crop/local 的确定性恢复顺序。"""
-
-        return (self.page, self.rect, self.crop, self.local_order)
+from .core_values import OcrCropJob
 
 
 @dataclass(frozen=True, slots=True)

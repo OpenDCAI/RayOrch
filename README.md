@@ -31,6 +31,76 @@ The lifecycle and feature boundary between lightweight `RayModule` and
 executor-managed `RuntimeRayModule` is documented in
 [`docs/runtime_module_lifecycle.md`](docs/runtime_module_lifecycle.md).
 
+### MultiGrain V3 control plane
+
+The experimental MultiGrain V3 runtime separates semantic scheduling from Ray
+transport control. An `Arena` owns grains, lineage, batching, reduce state, and
+recovery. The shared execution pool owns actors, RPCs, replica selection, and
+backpressure. The driver connects them without reading business payloads:
+
+```text
+source inputs
+  -> microbatch_size: split inputs into Arena-sized source chunks
+  -> max_inflight_arenas: admit a bounded number of active Arenas
+  -> Arena-major scheduling: earlier active Arenas claim available Stage credit
+  -> Stage batch_size: reserve at most one Stage-sized physical dispatch
+  -> max_outstanding_per_actor: bound unfinished RPCs on each actor
+  -> actor_max_concurrency: bound methods that an actor may execute concurrently
+```
+
+These controls have separate ownership, with an explicit capacity constraint
+between actor concurrency and its outstanding window:
+
+| Control | Scope | What it bounds |
+| --- | --- | --- |
+| `microbatch_size` | admission | source items placed in one Arena |
+| `max_inflight_arenas` | run | Arenas simultaneously admitted to the pipeline |
+| Stage `batch_size` | semantic batching | grains packed into one physical RPC |
+| Stage `replicas` | execution | persistent actors available to that Stage |
+| `max_outstanding_per_actor` | transport | submitted but unfinished RPCs per actor |
+| `actor_max_concurrency` | actor | actor methods allowed to execute concurrently |
+
+`max_outstanding_per_actor` is the outstanding window. It counts both an RPC that
+is executing and RPCs waiting in the actor mailbox; it does not change the
+Stage batch size. It must be greater than or equal to actor concurrency. With
+`actor_max_concurrency=1`:
+
+```text
+max_outstanding_per_actor=1  [executing]                 # no extra prefetch
+max_outstanding_per_actor=2  [executing][mailbox]        # prefetch one RPC
+max_outstanding_per_actor=4  [executing][mailbox x 3]    # deep actor queue
+```
+
+The default `1` is intentionally shallow: completion releases one credit, then
+the driver chooses fresh ready work. This limits early actor binding and
+head-of-line blocking for variable-duration work such as PDF parsing, OCR, and
+table extraction. A value of `2` may hide Ray round-trip latency for short,
+uniform RPCs, but should be justified by measurement. Larger values trade
+backpressure and dynamic load balance for deeper prefetch.
+
+The canonical option is `max_outstanding_per_actor`. The former
+`max_pending_per_actor` spelling remains only as an Executor and Stage-option
+compatibility alias for existing experiment commands. New code should not use
+it. A Stage can override the Executor default through `.ray_options(...)`:
+
+```python
+Map(MyUdf).ray_options(
+    max_concurrency=1,
+    max_outstanding_per_actor=2,
+)
+```
+
+The driver uses Arena-major ordering; it does not round-robin Stage credit
+across Arenas. This preserves Arena-local packing and pipeline overlap still
+comes from multiple admitted Arenas sharing independent Stage actor pools. The
+execution pool may round-robin among replicas within one Stage; that is actor
+selection, not cross-Arena scheduling.
+
+V3's detailed semantic and transport boundaries are documented in
+[`docs/multigrain_v3_architecture.md`](docs/multigrain_v3_architecture.md).
+The cross-version ideas that V4 must preserve are tracked in
+[`docs/multigrain_v3_golden_designs.md`](docs/multigrain_v3_golden_designs.md).
+
 ## Minimal Example
 
 ```python

@@ -207,7 +207,11 @@ class _LegacyPageBoundDoclingCoreV3Pipeline(Pipeline):
         return self.reduce(anchor=documents, members=assembled_pages)
 
 # 公共入口保持兼容，但实际 DAG 已切换为 Page -> TableJob -> Page -> Document。
-from .core_v3_table import DoclingTableJobV3Pipeline
+from .core_v3_table import (
+    DoclingTableFormerV1BatchV3Pipeline,
+    DoclingTableFormerV2BatchV3Pipeline,
+    DoclingTableJobV3Pipeline,
+)
 
 DoclingCoreV3Pipeline = DoclingTableJobV3Pipeline
 
@@ -223,8 +227,16 @@ def run_v3(
 ) -> RunResult:
     """运行 Docling core-stage V3 pipeline。"""
 
+    pipeline_type = {
+        "v1_batch": DoclingTableFormerV1BatchV3Pipeline,
+        "v2_batch": DoclingTableFormerV2BatchV3Pipeline,
+    }.get(
+        pipeline_options.get("table_batch_mode"),
+        DoclingCoreV3Pipeline,
+    )
+
     return Executor(
-        DoclingCoreV3Pipeline(**pipeline_options),
+        pipeline_type(**pipeline_options),
         microbatch_size=microbatch_size,
         max_inflight_arenas=max_inflight_arenas,
         max_pending_per_actor=max_pending_per_actor,
