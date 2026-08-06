@@ -9,6 +9,7 @@ from typing import get_args
 import pytest
 
 import rayorch.experimental.multigrain_v3_5 as mg
+from rayorch.experimental.multigrain_v3_5 import compiler
 from rayorch.experimental.multigrain_v3_5.logical import (
     BroadcastOrigin,
     CallOutputOrigin,
@@ -67,6 +68,7 @@ def test_every_origin_has_one_explicit_semantic_descriptor():
     assert describe_origin(FilterOrigin(p0, p1)).control_demands == (p1,)
     assert describe_origin(FilterOrigin(p0, p1)).control_predecessors == (p0,)
     assert describe_origin(GroupOrigin(p0, p1)).rejects_control
+    assert describe_origin(SourceOrigin(0, "source")).source_index == 0
 
 
 def test_arena_module_has_no_logical_origin_interpreter():
@@ -75,6 +77,12 @@ def test_arena_module_has_no_logical_origin_interpreter():
     assert "FilterOrigin" not in source
     assert "BroadcastOrigin" not in source
     assert ".origin" not in source
+
+
+def test_compiler_only_decodes_concrete_origins_through_semantic_descriptor():
+    source = inspect.getsource(compiler)
+    for origin_type in get_args(PortOrigin):
+        assert origin_type.__name__ not in source
 
 
 def test_chained_filter_control_is_a_fixed_point_analysis():

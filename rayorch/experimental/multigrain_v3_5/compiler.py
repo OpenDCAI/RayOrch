@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Mapping, assert_never
 
 from .analysis import CallUse, DerivedFacts, PrimitiveUse, analyze
-from .logical import CallOutputOrigin, LogicalProgram, SourceOrigin
+from .logical import LogicalProgram
 from .model import CallRef, CompileError, DomainRef, PoolRef, PortRef
 from .plan import (
     BroadcastRoute,
@@ -109,10 +109,11 @@ def verify_logical(logical: LogicalProgram) -> None:
     for port in logical.source_ports:
         if port not in logical.ports:
             raise CompileError("source_ports contains an unknown Port")
-        origin = logical.port(port).origin
-        if not isinstance(origin, SourceOrigin):
+        semantic = semantics[port]
+        if semantic.kind is not PrimitiveKind.SOURCE:
             raise CompileError("source_ports must contain only Source origins")
-        source_indices.append(origin.source_index)
+        assert semantic.source_index is not None
+        source_indices.append(semantic.source_index)
     if source_indices != list(range(len(source_indices))):
         raise CompileError("source indices must be contiguous and ordered")
     root = roots[0]
@@ -130,6 +131,7 @@ def verify_logical(logical: LogicalProgram) -> None:
                     raise CompileError("source Port must belong to root Domain")
             case PrimitiveKind.CALL_OUTPUT:
                 call = semantic.producing_call
+                assert call is not None
                 if call not in logical.calls:
                     raise CompileError("CallOutput references an unknown Call")
                 if spec.domain != logical.call(call).execution_domain:
@@ -139,7 +141,7 @@ def verify_logical(logical: LogicalProgram) -> None:
                 if group in expanded_sources:
                     raise CompileError("a group Port cannot drive two Expand relations")
                 expanded_sources.add(group)
-                if not isinstance(logical.port(group).origin, CallOutputOrigin):
+                if semantics[group].kind is not PrimitiveKind.CALL_OUTPUT:
                     raise CompileError("Expand source must be a Call output")
                 if logical.domain(spec.domain).parent != logical.port(group).domain:
                     raise CompileError("Expand target Domain must be one level below source")

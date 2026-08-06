@@ -57,14 +57,18 @@ class PrimitiveSemantics:
     rejects_control: bool = False
     producing_call: CallRef | None = None
     output_index: int | None = None
+    source_index: int | None = None
 
 
 def describe_origin(origin: PortOrigin) -> PrimitiveSemantics:
     """把每个 PortOrigin 穷尽翻译成统一语义描述。"""
 
     match origin:
-        case SourceOrigin():
-            return PrimitiveSemantics(PrimitiveKind.SOURCE)
+        case SourceOrigin(source_index=source_index):
+            return PrimitiveSemantics(
+                PrimitiveKind.SOURCE,
+                source_index=source_index,
+            )
         case CallOutputOrigin(call=call, output_index=output_index):
             return PrimitiveSemantics(
                 PrimitiveKind.CALL_OUTPUT,
