@@ -1,5 +1,8 @@
 # MultiGrain v3.5.1：封闭状态机与无飞线语义
 
+面向新使用者和维护者的逐步教程见
+[`multigrain_v3_5_tutorial.md`](multigrain_v3_5_tutorial.md)。
+
 ## 1. 目标与边界
 
 v3.5.1 在首次发布前收敛 v3.5 的动态语义，不增加通用 optimizer、registry

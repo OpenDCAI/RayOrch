@@ -82,6 +82,59 @@ def run_sync(pipeline: mg.Pipeline, *columns, optimize: bool = True):
     return materialize_tree(plan, arena, store), compiled, arena
 
 
+def test_tutorial_document_pipeline_example():
+    """Keep the tutorial's full structural example executable."""
+
+    class Split:
+        def run(self, documents):
+            return [
+                [
+                    document[index : index + 2]
+                    for index in range(0, len(document), 2)
+                ]
+                for document in documents
+            ]
+
+    class LongEnough:
+        def run(self, chunks, thresholds):
+            return [
+                len(chunk) >= threshold
+                for chunk, threshold in zip(chunks, thresholds)
+            ]
+
+    class Summarize:
+        def run(self, documents, chunk_groups):
+            return [
+                (document, tuple(chunks))
+                for document, chunks in zip(documents, chunk_groups)
+            ]
+
+    class DocumentPipeline(mg.Pipeline):
+        def __init__(self) -> None:
+            self.split = mg.RayModule(Split)
+            self.long_enough = mg.RayModule(LongEnough)
+            self.summarize = mg.RayModule(Summarize)
+
+        def forward(self, documents, thresholds):
+            chunks = mg.F.expand(self.split(documents))
+            chunk_thresholds = mg.F.broadcast(thresholds, like=chunks)
+            masks = self.long_enough(chunks, chunk_thresholds)
+            selected = mg.F.filter(chunks, masks)
+            chunk_groups = mg.F.reduce(selected)
+            return self.summarize(documents, chunk_groups)
+
+    outputs, _compiled, _arena = run_sync(
+        DocumentPipeline(),
+        ["abcde", "xy"],
+        [2, 2],
+    )
+
+    assert outputs == [
+        ("abcde", ("ab", "cd")),
+        ("xy", ("xy",)),
+    ]
+
+
 def test_chained_filter_executes_from_control_fixed_point():
     class Chained(mg.Pipeline):
         def forward(self, values, bools, membership):

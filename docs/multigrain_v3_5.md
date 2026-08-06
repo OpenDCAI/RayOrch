@@ -3,6 +3,8 @@
 首次发布前的动态状态机收敛合同见
 [`multigrain_v3_5_1.md`](multigrain_v3_5_1.md)。v3.5.1 删除输入 driver，
 并以可穷举 transition algebra 统一 F.*、Grain、Item 与 Shape 的运行时语义。
+第一次阅读或准备维护源码时，建议从
+[`multigrain_v3_5_tutorial.md`](multigrain_v3_5_tutorial.md) 开始。
 
 ## 1. 结论
 
