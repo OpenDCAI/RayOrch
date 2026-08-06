@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -27,10 +28,32 @@ from rayorch.experimental.multigrain_v3_5.benchmark.video import (
     VideoMultimodalV35Pipeline,
     VideoV35Pipeline,
 )
+from rayorch.experimental.multigrain_v3_5.benchmark.video import audit
 from rayorch.experimental.multigrain_v3_5.benchmark.video import paired
 from rayorch.experimental.multigrain_v3_5.benchmark.video import kinetics50
 from rayorch.experimental.multigrain_v3_5.benchmark.video import model_paired
 from rayorch.experimental.multigrain_v3_5.logical import ExpandOrigin, GroupOrigin
+from rayorch.experimental.multigrain_v3_5.model import CallRef
+
+
+def _fake_v35_result(outputs, *, rpc_count: int, grains: int):
+    metric = SimpleNamespace(
+        actor_starts=1,
+        rpcs=rpc_count,
+        grains=grains,
+        average_batch=grains / rpc_count,
+        batch_sizes=[grains],
+        retries=0,
+    )
+    return SimpleNamespace(
+        outputs=outputs,
+        rpc_count=rpc_count,
+        calls={CallRef(0): metric},
+        workers={},
+        elapsed_s=0.1,
+        max_active_arenas=1,
+        released_values=grains,
+    )
 
 
 def _feature_pipeline(batch_scope: str = "elastic") -> VideoV35Pipeline:
@@ -193,11 +216,7 @@ def test_paired_trial_materializes_v3_and_requires_exact_output(monkeypatch):
         calls.append("v35")
         assert paths == ["video.mp4"]
         assert options["arena_size"] == 2
-        return SimpleNamespace(
-            outputs=list(expected),
-            rpc_count=3,
-            calls={0: SimpleNamespace(grains=2), 1: SimpleNamespace(grains=2)},
-        )
+        return _fake_v35_result(list(expected), rpc_count=3, grains=4)
 
     monkeypatch.setattr(paired, "run_v3", fake_v3)
     monkeypatch.setattr(paired, "run_v35", fake_v35)
@@ -212,6 +231,9 @@ def test_paired_trial_materializes_v3_and_requires_exact_output(monkeypatch):
     assert calls == ["v35", "v3", "v3.get"]
     assert result["v3_rpc_count"] == result["v35_rpc_count"] == 3
     assert result["sampled_frames"] == [2]
+    assert result["sampled_frame_count"] == 2
+    assert result["sampled_frame_histogram"] == {2: 1}
+    assert result["correctness"]["outputs_exact"]
 
 
 def test_paired_trial_reports_first_business_output_difference(monkeypatch):
@@ -219,11 +241,7 @@ def test_paired_trial_reports_first_business_output_difference(monkeypatch):
         get=lambda: ({"frames": 1},),
         metrics={"rpc_count": 1, "grains_per_rpc": 1.0},
     )
-    new = SimpleNamespace(
-        outputs=[{"frames": 2}],
-        rpc_count=1,
-        calls={0: SimpleNamespace(grains=1)},
-    )
+    new = _fake_v35_result([{"frames": 2}], rpc_count=1, grains=1)
     monkeypatch.setattr(paired, "run_v3", lambda *args, **kwargs: old)
     monkeypatch.setattr(paired, "run_v35", lambda *args, **kwargs: new)
 
@@ -235,6 +253,47 @@ def test_paired_trial_reports_first_business_output_difference(monkeypatch):
             max_in_flight=1,
             order="v3_first",
         )
+
+
+def test_paired_model_output_allows_only_bounded_digest_drift(monkeypatch):
+    old = SimpleNamespace(
+        get=lambda: (
+            {
+                "frames": 2,
+                "source_indices": (0, 4),
+                "digests": ("a", "b"),
+                "mean_edge_density": 0.5,
+            },
+        ),
+        metrics={"rpc_count": 1, "grains_per_rpc": 2.0},
+    )
+    new = _fake_v35_result(
+        [
+            {
+                "frames": 2,
+                "source_indices": (0, 4),
+                "digests": ("a", "c"),
+                "mean_edge_density": 0.5,
+            }
+        ],
+        rpc_count=1,
+        grains=2,
+    )
+    monkeypatch.setattr(paired, "run_v3", lambda *args, **kwargs: old)
+    monkeypatch.setattr(paired, "run_v35", lambda *args, **kwargs: new)
+
+    result = paired._run_trial(
+        ["video.mp4"],
+        {},
+        arena_size=1,
+        max_in_flight=1,
+        order="v3_first",
+        maximum_digest_mismatch=0.5,
+    )
+
+    assert result["correctness"]["structure_exact"]
+    assert result["correctness"]["digest_mismatch_rate"] == 0.5
+    assert not result["correctness"]["outputs_exact"]
 
 
 def test_paired_cli_defaults_to_manifest_preserving_full_run():
@@ -257,6 +316,101 @@ def test_kinetics50_plan_is_frozen_unique_and_plan_only_by_default(tmp_path):
     assert summary["expected_archive_gb_decimal"] == pytest.approx(50.607623297)
     assert args.action == "plan"
     assert args.download_workers == 2
+
+
+def test_kinetics50_manifest_keeps_split_and_shard_identity(
+    tmp_path,
+    monkeypatch,
+):
+    video_root = tmp_path / "videos"
+    first = video_root / "val" / "part_0" / "same.mp4"
+    second = video_root / "train" / "part_0" / "same.mp4"
+    rejected = video_root / "train" / "part_1" / "bad.mp4"
+    for path in (first, second, rejected):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"video")
+
+    probes = (
+        SimpleNamespace(path=str(first.resolve()), duration_s=1.0, bytes=5),
+        SimpleNamespace(path=str(second.resolve()), duration_s=2.0, bytes=5),
+    )
+    monkeypatch.setattr(kinetics50, "probe_candidates", lambda root: probes)
+    output = tmp_path / "manifest.json"
+
+    report = kinetics50.build_decodable_manifest(str(tmp_path), str(output))
+
+    assert report["candidate_files"] == 3
+    assert report["decodable_files"] == 2
+    assert report["rejected_files"] == 1
+    assert report["source_identity_unique"]
+    assert report["split_counts"] == {"train": 1, "val": 1}
+    rows = json.loads(output.read_text())
+    assert [row["source_id"] for row in rows] == [
+        "val/part_0/same.mp4",
+        "train/part_0/same.mp4",
+    ]
+
+
+def test_kinetics50_manifest_action_requires_explicit_output():
+    with pytest.raises(ValueError, match="manifest-output"):
+        kinetics50.main(["--action", "manifest"])
+
+
+def test_full_video_audit_decodes_and_hashes_manifest(tmp_path):
+    import cv2
+    import numpy as np
+
+    video = tmp_path / "tiny.avi"
+    writer = cv2.VideoWriter(
+        str(video),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        10.0,
+        (32, 24),
+    )
+    if not writer.isOpened():
+        pytest.skip("OpenCV build cannot create MJPG AVI fixture")
+    try:
+        for index in range(3):
+            writer.write(np.full((24, 32, 3), index * 20, dtype=np.uint8))
+    finally:
+        writer.release()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            [
+                {
+                    "path": str(video),
+                    "dataset": "fixture",
+                    "split": "test",
+                    "source_id": "tiny",
+                    "bytes": video.stat().st_size,
+                }
+            ]
+        )
+    )
+
+    report = audit.audit_manifest(str(manifest), workers=1)
+
+    assert report["passed"]
+    assert report["clips"] == 1
+    assert report["decoded_frames"] == 3
+    assert report["decode_errors"] == 0
+    assert report["content_duplicate_files"] == 0
+
+    duplicate_manifest = tmp_path / "duplicate-manifest.json"
+    rows = json.loads(manifest.read_text())
+    rows.append({**rows[0], "source_id": "same-content-second-source"})
+    duplicate_manifest.write_text(json.dumps(rows))
+
+    duplicate_report = audit.audit_manifest(
+        str(duplicate_manifest),
+        workers=1,
+    )
+
+    assert not duplicate_report["passed"]
+    assert duplicate_report["source_identity_unique"]
+    assert duplicate_report["content_duplicate_groups"] == 1
+    assert duplicate_report["content_duplicate_files"] == 2
 
 
 def test_caption_model_pair_allows_bounded_text_drift_but_exact_structure(

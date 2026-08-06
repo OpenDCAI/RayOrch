@@ -16,10 +16,20 @@ import json
 import shutil
 import tarfile
 import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
+
+from rayorch.experimental.multigrain_v3.benchmark.video.data import (
+    VideoManifestEntry,
+    write_video_manifest,
+)
+from rayorch.experimental.multigrain_v3.benchmark.video.manifest import (
+    VIDEO_SUFFIXES,
+    probe_candidates,
+)
 
 
 _BASE = "https://s3.amazonaws.com/kinetics/400"
@@ -188,6 +198,69 @@ def extract_archives(root: str) -> tuple[str, ...]:
     return tuple(_extract_one(resolved, spec) for spec in archive_plan())
 
 
+def build_decodable_manifest(root: str, output: str) -> dict[str, object]:
+    """Write every metadata-decodable clip with its stable shard identity.
+
+    The official snapshot contains a small number of truncated source files.
+    They are rejected during dataset preparation instead of being silently
+    skipped by a benchmark worker.  ``source_id`` is the path relative to the
+    extraction root, so equal basenames in different shards remain distinct.
+    """
+
+    video_root = (Path(root).resolve() / "videos")
+    candidate_files = tuple(
+        sorted(
+            path
+            for path in video_root.rglob("*")
+            if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
+        )
+    )
+    probes = probe_candidates(str(video_root))
+    entries = []
+    for probe in probes:
+        relative = Path(probe.path).relative_to(video_root)
+        if len(relative.parts) < 3 or relative.parts[0] not in {"train", "val"}:
+            raise ValueError(
+                "Kinetics clip must live under videos/{train,val}/part_N: "
+                f"{probe.path}"
+            )
+        entries.append(
+            VideoManifestEntry(
+                path=probe.path,
+                dataset="kinetics-400-cvdf-snapshot",
+                split=relative.parts[0],
+                source_id=relative.as_posix(),
+                duration_s=probe.duration_s,
+                bytes=probe.bytes,
+            )
+        )
+    write_video_manifest(entries, output)
+
+    split_counts = Counter(entry.split for entry in entries)
+    split_bytes = Counter()
+    for entry in entries:
+        split_bytes[entry.split] += entry.bytes or 0
+    report = {
+        "schema_version": 1,
+        "dataset": "kinetics-400-cvdf-snapshot",
+        "video_root": str(video_root),
+        "output": str(Path(output).resolve()),
+        "candidate_files": len(candidate_files),
+        "decodable_files": len(entries),
+        "rejected_files": len(candidate_files) - len(entries),
+        "decodable_bytes": sum(entry.bytes or 0 for entry in entries),
+        "duration_s": sum(entry.duration_s or 0.0 for entry in entries),
+        "split_counts": dict(sorted(split_counts.items())),
+        "split_bytes": dict(sorted(split_bytes.items())),
+        "source_identity_unique": len({
+            (entry.dataset, entry.split, entry.source_id) for entry in entries
+        }) == len(entries),
+    }
+    report_path = Path(output).with_suffix(".report.json")
+    _write_plan(str(report_path), report)
+    return report
+
+
 def _write_plan(path: str, payload: dict[str, object]) -> None:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -203,9 +276,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan-output")
     parser.add_argument(
         "--action",
-        choices=("plan", "download", "extract", "all"),
+        choices=("plan", "download", "extract", "manifest", "all"),
         default="plan",
     )
+    parser.add_argument("--manifest-output")
     parser.add_argument("--download-workers", type=int, default=2)
     return parser
 
@@ -215,11 +289,22 @@ def main(argv: Iterable[str] | None = None) -> int:
     payload = plan_summary(args.root)
     if args.plan_output:
         _write_plan(args.plan_output, payload)
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    if args.action != "manifest":
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
     if args.action in {"download", "all"}:
         download_archives(args.root, workers=args.download_workers)
     if args.action in {"extract", "all"}:
         extract_archives(args.root)
+    if args.action == "manifest":
+        if not args.manifest_output:
+            raise ValueError("--manifest-output is required for manifest action")
+        print(
+            json.dumps(
+                build_decodable_manifest(args.root, args.manifest_output),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     return 0
 
 
@@ -230,6 +315,7 @@ if __name__ == "__main__":  # pragma: no cover - CLI entry point
 __all__ = [
     "ArchiveSpec",
     "archive_plan",
+    "build_decodable_manifest",
     "build_parser",
     "download_archives",
     "extract_archives",

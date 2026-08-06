@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 import rayorch.experimental.multigrain_v3_5 as mg
+from rayorch.experimental.multigrain_v3_5.executor import Executor
 from rayorch.experimental.multigrain_v3_5.logical import ExpandOrigin
 from rayorch.experimental.multigrain_v3_5.materialize import materialize_tree
 from rayorch.experimental.multigrain_v3_5.model import (
+    CallRef,
     GrainPhase,
     ItemOutcome,
     ItemRef,
@@ -22,7 +26,7 @@ from rayorch.experimental.multigrain_v3_5.protocol import (
     RowBinding,
 )
 from rayorch.experimental.multigrain_v3_5.runtime import ArenaEngine, CommitError
-from rayorch.experimental.multigrain_v3_5.worker import Worker
+from rayorch.experimental.multigrain_v3_5.worker import Worker, WorkerObservation
 
 
 class MemoryStore:
@@ -56,6 +60,53 @@ def test_worker_observation_is_scalar_and_read_only():
     assert observation.pid > 0
     assert observation.rss_bytes >= 0
     assert dict(observation.audit) == {"jobs": 7, "mode": "batch"}
+
+
+def test_executor_submits_all_worker_observations_before_waiting():
+    events = []
+    first_ref, second_ref = object(), object()
+    expected = {
+        first_ref: WorkerObservation(calls=2, pid=1, rss_bytes=10),
+        second_ref: WorkerObservation(calls=3, pid=2, rss_bytes=20),
+    }
+
+    def endpoint(name, reference):
+        def remote():
+            events.append(f"submit:{name}")
+            return reference
+
+        return SimpleNamespace(remote=remote)
+
+    class FakeRay:
+        def wait(self, pending, *, num_returns):
+            assert num_returns == 1
+            assert events[:2] == ["submit:first", "submit:second"]
+            events.append("wait")
+            return [pending[0]], pending[1:]
+
+        def get(self, reference):
+            events.append("get")
+            return expected[reference]
+
+    executor = object.__new__(Executor)
+    executor.ray = FakeRay()
+    executor._actors = {
+        CallRef(0): [
+            SimpleNamespace(
+                handle=SimpleNamespace(observe=endpoint("first", first_ref))
+            ),
+            SimpleNamespace(
+                handle=SimpleNamespace(observe=endpoint("second", second_ref))
+            ),
+        ]
+    }
+
+    observations = executor._observe_workers()
+
+    assert observations[CallRef(0)] == (
+        expected[first_ref],
+        expected[second_ref],
+    )
 
 
 def run_sync(pipeline: mg.Pipeline, *columns, optimize: bool = True):

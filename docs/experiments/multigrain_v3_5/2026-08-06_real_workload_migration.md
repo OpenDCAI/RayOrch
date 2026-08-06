@@ -1,7 +1,8 @@
 # Multigrain v3.5 真实 workload 迁移与性能验证
 
 日期：2026-08-06；状态：MinerU full gate 已有结果，Docling/Video authoring 已迁移，
-Docling GPU gate 待明确授权，Kinetics-400 约 50GB 数据正在准备。
+Docling GPU gate 待明确授权，Kinetics-400 约 50GB 数据与 manifest 已冻结，全量内容审计
+正在执行。
 
 ## 目标与证据边界
 
@@ -40,7 +41,8 @@ concurrency 和 shallow outstanding window 不会被 v3.5 接受或静默忽略�
 - V3：timed wait + shallow outstanding；
 - V3.5：immediate work-conserving。
 
-主性能口径是两臂一致的 outer wall，包含 actor startup、最终输出物化和 teardown。旧 V3
+主性能口径是两臂一致的 outer wall，包含 actor startup、最终输出物化和 Executor
+teardown，但不包含外层 Ray cluster init/shutdown。旧 V3
 内部 measured 不含 `RunResult.get()`，v3.5 measured 含物化，所以二者只作为诊断字段，
 不能直接作为 paired 主结论。
 
@@ -67,10 +69,30 @@ Docling 目标冲突，需要用户明确允许后再占用 4×H20。
 digest 和 edge density 完全一致；两版物理 RPC 都是 6。旧 V3 必须通过其公开 `get()`
 物化 `BlockSlice` 后再比较，不能直接拿 ObjectRef wrapper 与 v3.5 业务对象比较。
 
+Kinetics CPU-only paired gate 已完成三档诊断。最初 48-video 中，串行读取 12 个 worker
+observation 造成固定尾巴；改为先并发提交全部只读快照后，1,513 帧 exact，V3/V3.5
+中位数为 `6.879/6.957s`（v3.5 慢 `1.11%`）。放大到 256-video 后，8,120 帧仍 exact，
+二者为 `26.962/27.426s`（v3.5 慢 `1.69%`），RPC 为约 `1,010/1,020`。4096-video/
+`6,461,514,035` bytes scale gate 中，二者为 `409.873/410.395s`（v3.5 慢 `0.13%`），
+RPC `16,073/16,177`、平均 batch `8.537/8.483`，输出仍全字段 exact。该结果证明 CPU
+OpenCV 路径未显著回退，不等价于尚未执行的四卡 ViT 性能结论。
+
+最终 full 32,790-video / `50,561,755,359` bytes gate 已完成：1,034,374 sampled frames
+全字段 exact，output digest 均为 `bace0b2b38a5819a3e1b75fbdc1862fb`。V3 为
+`3268.429s`，V3.5 为 `3223.813s`，V3.5 快 `1.38%`（`1.0138×`）。总 RPC 为
+`129,244/129,875`，平均 grain/RPC 为 `8.511/8.469`；V3.5 transform Call 的
+64,262/65,006 个 RPC 达到满 batch 16。V3.5 无 retry、无 worker observation error，
+`max_active_arenas=4`，materialize 后释放 `2,199,908` 个 value bindings，Ray 最终
+shutdown 且无残留实例。
+
 Caption gate 沿用历史语义：video/frame/source-index 必须 exact，但 greedy generation 会因
 batch padding/GEMM shape 有少量 token 漂移，因此单独报告 raw/normalized mismatch，默认
 normalized 上限为 `2%`，不错误要求文本 byte exact。Whisper+ViT smoke 的最终结构化摘要
 仍要求 exact。
+
+Feature gate 对 OpenCV backend 要求完整输出 exact。ResNet/ViT 的 video/frame/source-index
+与 edge density 必须 exact，仅 top-k digest 允许显式上限，默认 `0.01%`；这对应历史 ViT
+实测 `0.0053%` 的 batch-shape 浮点漂移，不能用于放宽结构错误。
 
 ## 约 50GB 数据合同
 
@@ -94,9 +116,10 @@ Kinetics 原 clip 来自第三方视频；这里只做本地研究回归，不�
 
 数据准备 CLI 默认只打印 plan。只有显式 `--action download/extract/all` 才写正文；下载使用
 可恢复 `.part`、冻结 Content-Length 校验，解压使用 Python safe tar filter，并把每个 shard
-放进独立目录。解压后仍必须用 V3 已有 manifest builder 对每个文件重新 decode/probe，
-按实际视频 bytes 选择接近 50GB 的独立 source，并记录 source identity；archive bytes 不能
-冒充 workload bytes。
+放进独立目录。解压结果为 32,881 个 MP4、`50,941,325,414` bytes；其中 91 个容器不能
+通过 OpenCV metadata gate。显式 `--action manifest` 固化剩余 32,790 个 source：
+`50,561,755,359` bytes、`313,674.449s`（约 87.13 小时），train 12,913、val 19,877。
+每个 `source_id` 都是 `split/shard/filename`，身份唯一；archive bytes 不冒充 workload bytes。
 
 ```bash
 python -m rayorch.experimental.multigrain_v3_5.benchmark.video.kinetics50 \
@@ -104,15 +127,23 @@ python -m rayorch.experimental.multigrain_v3_5.benchmark.video.kinetics50 \
   --plan-output /tmp/mgv35-kinetics50/plan.json \
   --action all --download-workers 8
 
-python -m rayorch.experimental.multigrain_v3.benchmark.video.manifest \
-  --input-root /tmp/mgv35-kinetics50/videos \
-  --output /tmp/mgv35-kinetics50/manifest-50g.json \
-  --dataset kinetics400-cvdf --split val+train \
-  --target-gib 45 --min-count 10000 --seed 20260806
+python -m rayorch.experimental.multigrain_v3_5.benchmark.video.kinetics50 \
+  --root /tmp/mgv35-kinetics50 --action manifest \
+  --manifest-output /tmp/mgv35-kinetics50/manifest-full-decodable.json
+
+python -m rayorch.experimental.multigrain_v3_5.benchmark.video.audit \
+  --manifest /tmp/mgv35-kinetics50/manifest-full-decodable.json \
+  --output /tmp/mgv35-kinetics50/manifest-full-decodable.audit.json \
+  --workers 64
 ```
 
-`45 GiB` 是约 `48.3 GB` 的实际解压视频下限；如果解压后的可 decode 总量足够，会在正式
-run 前把 target 上调并冻结最终 manifest/report。不得通过复制路径或重复 source_id 达标。
+全量 audit 会读完每个文件、逐帧 decode、核对 manifest bytes，并计算 ordered content
+digest 和内容重复组；任何打开失败、零帧、短 decode 或 bytes 漂移都会使 gate 失败。
+不得通过复制路径或重复 source_id 达标。
+
+本次 full audit 实测 32,790/32,790 clips、`8,613,414` frames 全部通过；decode error、
+short decode、byte mismatch、content duplicate 均为零，ordered content digest 为
+`10f74cef2e7a4d359100d1953a5812d0`。
 
 ## 冻结 gate
 
@@ -128,7 +159,8 @@ run 前把 target 上调并冻结最终 manifest/report。不得通过复制路�
 1. 2/48 video correctness smoke：V3/V3.5 完整业务输出 exact；
 2. 现有 1.3GB MSR-VTT 与 4GB UCF101：确认历史 workload 不回退；
 3. Kinetics 约 50GB：manifest 的 source identity 唯一、实际 bytes 达标、全量 decode 无坏片；
-4. V3↔V3.5 使用交替顺序，主 startup-inclusive wall 中位数回归带为 `±5%`；
+4. V3↔V3.5 使用交替顺序，主 actor-startup/materialization/Executor-teardown-inclusive
+   wall 中位数回归带为 `±5%`；
 5. caption 与 multimodal 先做小型真实性 gate，再决定是否值得对 50GB 全量执行昂贵模型；
 6. 报告吞吐、RPC/batch、Arena high watermark、RSS/GPU 和最终输出 digest，不只报 wall time。
 

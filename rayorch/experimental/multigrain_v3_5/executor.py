@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 from .api import Pipeline
 from .materialize import materialize_tree
@@ -68,7 +68,7 @@ class _RayWorkerActor:
         init_kwargs: tuple[tuple[str, Any], ...],
         input_layout: InputLayout,
     ) -> None:
-        import ray
+        import ray  # pyright: ignore[reportMissingImports]
 
         self._store = _RayBlockStore(ray)
         self._worker = Worker(
@@ -192,7 +192,7 @@ class Executor:
     ) -> None:
         """编译 Pipeline、连接 Ray，并按 Call 创建持久 actor pools。"""
 
-        import ray
+        import ray  # pyright: ignore[reportMissingImports]
 
         self.ray = ray
         self.compiled = (
@@ -342,23 +342,47 @@ class Executor:
     def _observe_workers(self) -> dict[CallRef, tuple[WorkerObservation, ...]]:
         """Best-effort physical diagnostics must not invalidate business output."""
 
-        result = {}
+        result: dict[CallRef, list[WorkerObservation | None]] = {
+            call: [None] * len(actors)
+            for call, actors in self._actors.items()
+        }
+        pending = {}
         for call, actors in self._actors.items():
-            observations = []
-            for actor in actors:
+            for index, actor in enumerate(actors):
                 try:
-                    observations.append(self.ray.get(actor.handle.observe.remote()))
+                    reference = actor.handle.observe.remote()
                 except Exception as error:
-                    observations.append(
-                        WorkerObservation(
-                            calls=0,
-                            pid=0,
-                            rss_bytes=0,
-                            error=repr(error),
-                        )
+                    result[call][index] = WorkerObservation(
+                        calls=0,
+                        pid=0,
+                        rss_bytes=0,
+                        error=repr(error),
                     )
-            result[call] = tuple(observations)
-        return result
+                else:
+                    pending[reference] = (call, index)
+        while pending:
+            ready, _ = self.ray.wait(list(pending), num_returns=1)
+            reference = ready[0]
+            call, index = pending.pop(reference)
+            try:
+                result[call][index] = self.ray.get(reference)
+            except Exception as error:
+                result[call][index] = WorkerObservation(
+                    calls=0,
+                    pid=0,
+                    rss_bytes=0,
+                    error=repr(error),
+                )
+        if any(
+            observation is None
+            for observations in result.values()
+            for observation in observations
+        ):
+            raise AssertionError("worker observation collection lost an actor")
+        return {
+            call: cast(tuple[WorkerObservation, ...], tuple(observations))
+            for call, observations in result.items()
+        }
 
     def __enter__(self):
         """支持用 context manager 约束 ExecutionPool 生命周期。"""
@@ -513,10 +537,14 @@ class Executor:
 
         first = outputs[0]
         if isinstance(first, list):
-            return [item for output in outputs for item in output]
+            list_outputs = cast(list[list[object]], outputs)
+            return [item for output in list_outputs for item in output]
         if isinstance(first, tuple):
+            tuple_outputs = cast(list[tuple[object, ...]], outputs)
             return tuple(
-                cls._merge_outputs([output[index] for output in outputs])
+                cls._merge_outputs(
+                    [output[index] for output in tuple_outputs]
+                )
                 for index in range(len(first))
             )
         raise RuntimeError("invalid materialized output tree")

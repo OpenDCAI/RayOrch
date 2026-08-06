@@ -7,8 +7,12 @@ import pytest
 
 from rayorch.experimental.multigrain_v3.benchmark.video.data import (
     UCF101_SAMPLE_FILES,
+    VideoManifestEntry,
+    load_video_manifest,
     probe_video,
     sample_frames,
+    video_manifest_entry,
+    write_video_manifest,
 )
 
 
@@ -76,3 +80,26 @@ def test_ucf101_smoke_manifest_is_small_and_explicit() -> None:
         "v_BabyCrawling_g19_c02.avi",
         "v_BasketballDunk_g14_c06.avi",
     )
+
+
+def test_load_manifest_limit_validates_only_the_stable_prefix(tmp_path) -> None:
+    first = tmp_path / "first.avi"
+    _write_video(first, frames=2)
+    entry = video_manifest_entry(
+        str(first),
+        dataset="fixture",
+        split="test",
+        source_id="first",
+    )
+    missing = VideoManifestEntry(
+        path=str(tmp_path / "missing.avi"),
+        dataset="fixture",
+        split="test",
+        source_id="missing",
+    )
+    manifest = tmp_path / "manifest.json"
+    write_video_manifest((entry, missing), str(manifest))
+
+    assert load_video_manifest(str(manifest), limit=1) == (entry,)
+    with pytest.raises(ValueError, match="limit"):
+        load_video_manifest(str(manifest), limit=0)

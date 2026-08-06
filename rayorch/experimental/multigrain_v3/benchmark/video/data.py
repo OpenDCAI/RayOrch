@@ -176,14 +176,26 @@ def write_video_manifest(
     )
 
 
-def load_video_manifest(path: str) -> tuple[VideoManifestEntry, ...]:
-    """读取并重新验证正式 manifest 的本地文件身份和可 decode 属性。"""
+def load_video_manifest(
+    path: str,
+    *,
+    limit: int | None = None,
+) -> tuple[VideoManifestEntry, ...]:
+    """读取并重新验证正式 manifest 的本地文件身份和可 decode 属性。
+
+    ``limit`` 在验证前截取稳定前缀，供大型 manifest 的 smoke gate 使用；正式全量
+    gate 保持默认 ``None``，逐条验证全部输入。
+    """
 
     import json
 
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(raw, list) or not raw:
         raise ValueError("video manifest must be a non-empty JSON list")
+    if limit is not None:
+        if limit <= 0:
+            raise ValueError("video manifest limit must be positive")
+        raw = raw[:limit]
     entries = tuple(
         VideoManifestEntry(
             path=str(item["path"]),
