@@ -266,6 +266,13 @@ class FrameCaptioner:
             model_path,
             local_files_only=True,
         )
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is None:
+            raise ValueError("image-text processor must expose a tokenizer")
+        # Decoder-only generation must pad variable-length batches on the
+        # left.  Right padding makes captions depend on the physical batch
+        # assembled by the scheduler even with greedy decoding.
+        tokenizer.padding_side = "left"
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_path,
             local_files_only=True,

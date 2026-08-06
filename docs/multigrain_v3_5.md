@@ -160,3 +160,10 @@ Ray-free 回归覆盖：
 平均 58.446 pages/RPC，与历史 V3.3 full run 完全一致。输出 368/368，无
 missing/extra；详细配置、4/48/368 分级 gate 与 correctness 结果见
 `docs/experiments/multigrain_v3_5/2026-08-06_mineru_regression.md`。
+
+Video 回归覆盖 Kinetics-400 的 32,790 clips / 50.56GB：全量 OpenCV 路径处理
+1,034,374 sampled frames，V3/V3.5 output digest exact，V3.5 wall 快 `1.38%`。
+另有 256-video 四卡 SmolVLM caption 和 Whisper+ViT sibling-relation paired gates，结构
+与确定性摘要 exact，V3.5 wall 分别慢 `1.39%/1.60%`，均在 `±5%` 带内。模型文本漂移
+与 lineage 错配使用不同 gate；完整记录见
+`docs/experiments/multigrain_v3_5/2026-08-06_video_kinetics50.md`。

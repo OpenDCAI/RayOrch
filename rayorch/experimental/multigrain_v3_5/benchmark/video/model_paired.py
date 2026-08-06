@@ -77,7 +77,7 @@ def _caption_trial(
         raise ValueError(
             "caption normalized mismatch rate "
             f"{difference['normalized_mismatch_rate']:.6f} exceeds "
-            f"{maximum_normalized_mismatch:.6f}"
+            f"{maximum_normalized_mismatch:.6f}: {difference}"
         )
     return {
         "order": order,
@@ -89,6 +89,74 @@ def _caption_trial(
     }
 
 
+def multimodal_difference_summary(
+    baseline: list[Any],
+    candidate: list[Any],
+) -> dict[str, Any]:
+    """Separate lineage/merge errors from deterministic model text drift."""
+
+    if len(baseline) != len(candidate):
+        return {
+            "outputs_exact": False,
+            "structure_exact": False,
+            "reason": "video count",
+            "baseline_videos": len(baseline),
+            "candidate_videos": len(candidate),
+        }
+
+    def normalize(text: Any) -> str:
+        return " ".join(str(text).casefold().split()).strip(" .,!?:;")
+
+    structure_mismatch_videos = 0
+    frame_digest_mismatch_videos = 0
+    transcript_mismatch_videos = 0
+    normalized_transcript_mismatch_videos = 0
+    first_difference = None
+    for video_index, (left, right) in enumerate(zip(baseline, candidate)):
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            structure_mismatch_videos += 1
+        elif (
+            left.get("audio_chunks") != right.get("audio_chunks")
+            or left.get("frames") != right.get("frames")
+        ):
+            structure_mismatch_videos += 1
+        if (
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and left.get("frame_digest") != right.get("frame_digest")
+        ):
+            frame_digest_mismatch_videos += 1
+        left_text = left.get("transcript") if isinstance(left, dict) else None
+        right_text = right.get("transcript") if isinstance(right, dict) else None
+        if left_text != right_text:
+            transcript_mismatch_videos += 1
+            if normalize(left_text) != normalize(right_text):
+                normalized_transcript_mismatch_videos += 1
+        if left != right and first_difference is None:
+            first_difference = {
+                "video_index": video_index,
+                "baseline": left,
+                "candidate": right,
+            }
+
+    videos = len(baseline)
+    return {
+        "outputs_exact": baseline == candidate,
+        "structure_exact": structure_mismatch_videos == 0,
+        "structure_mismatch_videos": structure_mismatch_videos,
+        "frame_digests_exact": frame_digest_mismatch_videos == 0,
+        "frame_digest_mismatch_videos": frame_digest_mismatch_videos,
+        "transcript_mismatch_videos": transcript_mismatch_videos,
+        "normalized_transcript_mismatch_videos": (
+            normalized_transcript_mismatch_videos
+        ),
+        "normalized_transcript_mismatch_rate": (
+            normalized_transcript_mismatch_videos / videos if videos else 0.0
+        ),
+        "first_difference": first_difference,
+    }
+
+
 def _multimodal_trial(
     paths: list[str],
     options: dict[str, Any],
@@ -96,6 +164,7 @@ def _multimodal_trial(
     arena_size: int,
     max_in_flight: int,
     order: str,
+    maximum_normalized_mismatch: float = 0.02,
 ) -> dict[str, Any]:
     sequence = ("v3", "v35") if order == "v3_first" else ("v35", "v3")
     outputs: dict[str, list[Any]] = {}
@@ -122,15 +191,27 @@ def _multimodal_trial(
             outputs[engine] = list(cast(Iterable[Any], result.outputs))
             rpcs[engine] = result.rpc_count
         walls[engine] = time.perf_counter() - started
-    if outputs["v3"] != outputs["v35"]:
-        raise ValueError("multimodal V3 and V3.5 outputs differ")
+    difference = multimodal_difference_summary(outputs["v3"], outputs["v35"])
+    if not difference.get("structure_exact"):
+        raise ValueError(f"multimodal structure differs: {difference}")
+    if not difference.get("frame_digests_exact"):
+        raise ValueError(f"multimodal frame digests differ: {difference}")
+    if (
+        difference["normalized_transcript_mismatch_rate"]
+        > maximum_normalized_mismatch
+    ):
+        raise ValueError(
+            "multimodal normalized transcript mismatch rate "
+            f"{difference['normalized_transcript_mismatch_rate']:.6f} exceeds "
+            f"{maximum_normalized_mismatch:.6f}: {difference}"
+        )
     return {
         "order": order,
         "v3_wall_s": walls["v3"],
         "v35_wall_s": walls["v35"],
         "v3_rpc_count": rpcs["v3"],
         "v35_rpc_count": rpcs["v35"],
-        "outputs_exact": True,
+        "correctness": difference,
     }
 
 
@@ -187,6 +268,9 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
                     arena_size=args.arena_size,
                     max_in_flight=args.max_in_flight,
                     order=order,
+                    maximum_normalized_mismatch=(
+                        args.maximum_normalized_mismatch
+                    ),
                 )
             trials.append(trial)
     finally:

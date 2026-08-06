@@ -1,8 +1,7 @@
 # Multigrain v3.5 真实 workload 迁移与性能验证
 
-日期：2026-08-06；状态：MinerU full gate 已有结果，Docling/Video authoring 已迁移，
-Docling GPU gate 待明确授权，Kinetics-400 约 50GB 数据与 manifest 已冻结，全量内容审计
-正在执行。
+日期：2026-08-06～07；状态：MinerU full gate、Video 50GB CPU full gate 与 GPU
+representative gates 已完成；Docling GPU gate 待明确授权。
 
 ## 目标与证据边界
 
@@ -87,8 +86,16 @@ shutdown 且无残留实例。
 
 Caption gate 沿用历史语义：video/frame/source-index 必须 exact，但 greedy generation 会因
 batch padding/GEMM shape 有少量 token 漂移，因此单独报告 raw/normalized mismatch，默认
-normalized 上限为 `2%`，不错误要求文本 byte exact。Whisper+ViT smoke 的最终结构化摘要
-仍要求 exact。
+normalized 上限为 `2%`，不错误要求文本 byte exact。真实 Kinetics 256-video gate 进一步
+发现共享 caption UDF 的 decoder-only right-padding bug：修为 left padding 后 normalized
+mismatch 从 `4.00%` 降至两轮 `0.098%/0.195%`，V3/V3.5 中位 wall 为
+`85.485/86.670s`（v3.5 慢 `1.39%`）。
+
+Whisper+ViT gate 将结构、frame digest 和 transcript 分开判定；文本阈值不能放宽血缘或
+确定性帧摘要。Kinetics 256-video 两轮正式输出全部 exact，V3/V3.5 中位 wall 为
+`39.071/39.695s`（v3.5 慢 `1.60%`）。一次额外诊断 run 有 `0.3906%` normalized
+Whisper drift，但 audio chunk/frame count 与 frame digest 全部 exact，符合模型 batch-shape
+漂移而非 entity 错配。完整数据、badcase 和产物见 `2026-08-06_video_kinetics50.md`。
 
 Feature gate 对 OpenCV backend 要求完整输出 exact。ResNet/ViT 的 video/frame/source-index
 与 edge density 必须 exact，仅 top-k digest 允许显式上限，默认 `0.01%`；这对应历史 ViT
@@ -175,5 +182,7 @@ v3.5 的编译器化不是为了这几个 benchmark 临时加 special case。三
 - observation-only 物理诊断，不反向污染语义。
 
 这些结构在 authoring 中都只由 `RayModule + F.expand/F.reduce` 表达，没有 `driven_by`、
-手写 entity key 或跨层查表飞线。性能优势仍必须由未完成的 Docling/Video paired runs 证明；
-在真实数据 gate 完成前，只能说设计行为符合预期，不能宣称普遍加速。
+手写 entity key 或跨层查表飞线。现有证据支持“没有框架级性能回退”：MinerU、CPU
+50GB full、SmolVLM 与 Whisper+ViT 都处于既定 `±5%` 带；CPU full 本轮快 `1.38%`，两个
+GPU representative gate 分别慢 `1.39%/1.60%`。因此不能宣称 v3.5 对所有 workload
+普遍加速，但可以确认新设计在已覆盖单层、嵌套和 sibling 关系上保持语义与性能。

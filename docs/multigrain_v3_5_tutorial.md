@@ -1164,6 +1164,9 @@ pyright \
 当前 MinerU 368-PDF 回归配置和结果见
 [`experiments/multigrain_v3_5/2026-08-06_mineru_regression.md`](experiments/multigrain_v3_5/2026-08-06_mineru_regression.md)。
 
+Video 的 50GB full gate、SmolVLM caption 与 Whisper+ViT 双 sibling relation 结果见
+[`experiments/multigrain_v3_5/2026-08-06_video_kinetics50.md`](experiments/multigrain_v3_5/2026-08-06_video_kinetics50.md)。
+
 性能修改不能只看 unit test；至少应比较 correctness、wall time、RPC 数、平均 batch、
 driver RSS 和 actor 数。
 

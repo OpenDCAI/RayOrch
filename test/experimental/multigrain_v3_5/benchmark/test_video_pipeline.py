@@ -459,5 +459,97 @@ def test_multimodal_model_pair_requires_exact_root_merge(monkeypatch):
         order="v35_first",
     )
 
-    assert result["outputs_exact"]
+    assert result["correctness"]["outputs_exact"]
     assert result["v3_rpc_count"] == result["v35_rpc_count"] == 7
+
+
+def test_multimodal_difference_separates_lineage_frames_and_text():
+    baseline = [
+        {
+            "audio_chunks": 2,
+            "transcript": "Action.",
+            "frames": 4,
+            "frame_digest": "same",
+        },
+        {
+            "audio_chunks": 1,
+            "transcript": "left",
+            "frames": 3,
+            "frame_digest": "old",
+        },
+    ]
+    candidate = [
+        {
+            "audio_chunks": 2,
+            "transcript": "action",
+            "frames": 4,
+            "frame_digest": "same",
+        },
+        {
+            "audio_chunks": 2,
+            "transcript": "right",
+            "frames": 3,
+            "frame_digest": "new",
+        },
+    ]
+
+    difference = model_paired.multimodal_difference_summary(
+        baseline,
+        candidate,
+    )
+
+    assert not difference["outputs_exact"]
+    assert not difference["structure_exact"]
+    assert difference["structure_mismatch_videos"] == 1
+    assert not difference["frame_digests_exact"]
+    assert difference["frame_digest_mismatch_videos"] == 1
+    assert difference["transcript_mismatch_videos"] == 2
+    assert difference["normalized_transcript_mismatch_videos"] == 1
+    assert difference["first_difference"]["video_index"] == 0
+
+
+def test_multimodal_pair_allows_only_bounded_normalized_text_drift(
+    monkeypatch,
+):
+    old_outputs = [
+        {
+            "audio_chunks": 1,
+            "transcript": "left",
+            "frames": 2,
+            "frame_digest": "same",
+        }
+    ]
+    new_outputs = [
+        {
+            "audio_chunks": 1,
+            "transcript": "right",
+            "frames": 2,
+            "frame_digest": "same",
+        }
+    ]
+    old = SimpleNamespace(get=lambda: tuple(old_outputs), metrics={"rpc_count": 3})
+    new = SimpleNamespace(outputs=new_outputs, rpc_count=3)
+    monkeypatch.setattr(model_paired, "run_multimodal_v3", lambda *a, **k: old)
+    monkeypatch.setattr(model_paired, "run_multimodal_v35", lambda *a, **k: new)
+
+    with pytest.raises(ValueError, match="normalized transcript mismatch rate"):
+        model_paired._multimodal_trial(
+            ["video.mp4"],
+            {},
+            arena_size=1,
+            max_in_flight=1,
+            order="v3_first",
+            maximum_normalized_mismatch=0.02,
+        )
+
+    result = model_paired._multimodal_trial(
+        ["video.mp4"],
+        {},
+        arena_size=1,
+        max_in_flight=1,
+        order="v3_first",
+        maximum_normalized_mismatch=1.0,
+    )
+    assert not result["correctness"]["outputs_exact"]
+    assert result["correctness"]["structure_exact"]
+    assert result["correctness"]["frame_digests_exact"]
