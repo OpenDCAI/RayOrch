@@ -1,9 +1,9 @@
 """Multigrain v3.5 的纯事件驱动运行时。"""
 
+from .dispatch import DispatchSelection, GrainSnapshot
 from .engine import ArenaEngine, CommitError
 from .state import (
     EntityOrigin,
-    GrainRecord,
     GroupBinding,
     GroupShape,
     ItemRecord,
@@ -15,8 +15,9 @@ from .state import (
 __all__ = [
     "ArenaEngine",
     "CommitError",
+    "DispatchSelection",
     "EntityOrigin",
-    "GrainRecord",
+    "GrainSnapshot",
     "GroupBinding",
     "GroupShape",
     "ItemRecord",

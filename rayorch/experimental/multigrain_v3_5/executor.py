@@ -13,16 +13,19 @@ from typing import Any, Iterable, cast
 
 from .api import Pipeline
 from .materialize import materialize_tree
-from .model import CallRef, GrainRef
-from .plan import CompiledProgram
+from .model import CallRef, ExecutionError
+from .plan import CompiledProgram, PoolSpec
 from .protocol import (
     BlockRef,
+    DispatchFailure,
+    DispatchFailureKind,
     InputLayout,
     InvocationPlan,
     OutputLayout,
     RowBinding,
 )
-from .runtime import ArenaEngine
+from .recovery import RecoveryAction
+from .runtime import ArenaEngine, DispatchSelection
 from .worker import Worker, WorkerObservation
 
 
@@ -169,19 +172,11 @@ class _Dispatch:
 
     arena_index: int
     actor: _ActorSlot
-    grains: tuple[GrainRef, ...]
-    max_retries: int
+    selection: DispatchSelection
 
 
 class Executor:
     """Call-only actor pools 与多 Arena overlap 的参考执行器。"""
-
-    _INTERNAL_OPTIONS = {
-        "batch_size",
-        "batch_scope",
-        "replicas",
-        "max_retries",
-    }
 
     def __init__(
         self,
@@ -310,12 +305,15 @@ class Executor:
             lease = pending.pop(result_ref)
             arena = active[lease.arena_index].arena
             try:
-                reports = self.ray.get(result_ref)
+                result = self.ray.get(result_ref)
             except Exception as error:  # Ray 对用户异常和 actor 异常统一在 get 抛出
-                self._handle_failure(arena, lease, error)
+                self._handle_infrastructure_failure(arena, lease, error)
             else:
-                for report in reports:
-                    arena.commit_report(report)
+                if isinstance(result, DispatchFailure):
+                    self._handle_dispatch_failure(arena, lease, result)
+                else:
+                    for report in result:
+                        arena.commit_report(report)
             finally:
                 lease.actor.busy = False
 
@@ -439,27 +437,25 @@ class Executor:
             for actor in actors:
                 if actor.busy:
                     continue
-                candidate = next(
-                    (
-                        slot
-                        for _, slot in sorted(active.items())
-                        if call in slot.arena.ready_calls()
-                    ),
-                    None,
-                )
-                if candidate is None:
+                candidates = [
+                    (priority, index, slot)
+                    for index, slot in active.items()
+                    if (priority := slot.arena.dispatch_priority(call)) is not None
+                ]
+                if not candidates:
                     break
-                options = self._pool_options(call)
+                _, _, candidate = min(candidates, key=lambda item: item[:2])
+                pool = self._pool(call)
                 # 参考调度器采用即时、work-conserving 聚批：只要 actor
                 # 空闲就发送当前可见 Grain，不伪装支持定时等待窗口。
-                grains = candidate.arena.reserve_batch(
+                selection = candidate.arena.reserve_dispatch(
                     call,
-                    max_size=int(options.get("batch_size", 1)),
-                    parent_bound=options.get("batch_scope", "elastic")
-                    == "parent_bound",
+                    max_size=pool.batch_size,
+                    parent_bound=pool.batch_scope == "parent_bound",
                 )
                 invocations = tuple(
-                    candidate.arena.invocation_plan(grain) for grain in grains
+                    candidate.arena.invocation_plan(grain)
+                    for grain in selection.grains
                 )
                 layouts = self.plan.output_layouts_by_call[call]
                 result_ref = actor.handle.execute.remote(invocations, layouts)
@@ -467,53 +463,108 @@ class Executor:
                 pending[result_ref] = _Dispatch(
                     candidate.index,
                     actor,
-                    grains,
-                    int(options.get("max_retries", 1)),
+                    selection,
                 )
                 metrics = self.metrics[call]
                 metrics.rpcs += 1
-                metrics.grains += len(grains)
-                metrics.batch_sizes.append(len(grains))
+                metrics.grains += len(selection.grains)
+                metrics.batch_sizes.append(len(selection.grains))
 
-    def _handle_failure(
+    def _handle_dispatch_failure(
+        self,
+        arena: ArenaEngine,
+        lease: _Dispatch,
+        failure: DispatchFailure,
+    ) -> None:
+        """Map one typed Worker failure to an exhaustive recovery action."""
+
+        if failure.kind is DispatchFailureKind.CONTRACT_ERROR:
+            raise self._execution_error(arena, lease, failure)
+        if failure.kind is not DispatchFailureKind.UDF_ERROR:
+            raise AssertionError(
+                f"unsupported DispatchFailureKind: {failure.kind!r}"
+            )
+        policy = self._pool(lease.actor.call).recovery
+        action = policy.decide_udf(
+            completed_retries=lease.selection.udf_retries,
+            grain_count=len(lease.selection.grains),
+        )
+        if action is RecoveryAction.ABORT:
+            raise self._execution_error(arena, lease, failure)
+        self.metrics[lease.actor.call].retries += arena.apply_udf_recovery(
+            lease.selection,
+            action,
+            failure,
+        )
+
+    def _handle_infrastructure_failure(
         self,
         arena: ArenaEngine,
         lease: _Dispatch,
         error: Exception,
     ) -> None:
-        """局部 retry 或封闭失败 Grain；不回滚无关 branch/Arena。"""
+        """Replace an untrusted actor and retry without data-failure fiction."""
 
-        metrics = self.metrics[lease.actor.call]
-        for grain in lease.grains:
-            if arena.infra_failures(grain) < lease.max_retries:
-                arena.retry(grain)
-                metrics.retries += 1
-            else:
-                arena.commit_failure(grain, repr(error))
+        policy = self._pool(lease.actor.call).recovery
+        accepted = arena.retry_infrastructure_dispatch(
+            lease.selection,
+            policy,
+        )
+        if not accepted:
+            raise self._execution_error(arena, lease, error) from error
+        self._replace_actor(lease.actor)
+        self.metrics[lease.actor.call].retries += len(lease.selection.grains)
 
-        # actor crash 后原 handle 不可复用；普通 UDF 异常则保留持久实例。
-        if isinstance(error, self.ray.exceptions.RayActorError):
-            replacement = self._create_actor(lease.actor.call)
-            lease.actor.handle = replacement
+    def _replace_actor(self, actor: _ActorSlot) -> None:
+        """Discard one untrusted handle and install a fresh actor instance."""
+
+        try:
+            self.ray.kill(actor.handle, no_restart=True)
+        except Exception:
+            pass
+        actor.handle = self._create_actor(actor.call)
+
+    def _execution_error(
+        self,
+        arena: ArenaEngine,
+        lease: _Dispatch,
+        failure: DispatchFailure | Exception,
+    ) -> ExecutionError:
+        """Join wire details with Call and generation context owned by driver."""
+
+        call = lease.actor.call
+        target = self.plan.call(call).kernel.target
+        name = getattr(
+            target,
+            "__qualname__",
+            getattr(target, "__name__", repr(target)),
+        )
+        grains = ", ".join(
+            f"{grain!r}@generation={arena.grain_snapshot(grain).generation}"
+            for grain in lease.selection.grains
+        )
+        if isinstance(failure, DispatchFailure):
+            detail = (
+                f"{failure.kind.name}: {failure.error_type}: {failure.message}\n"
+                f"worker traceback:\n{failure.traceback}"
+            )
+        else:
+            detail = f"INFRA_FAILURE: {type(failure).__name__}: {failure}"
+        return ExecutionError(
+            f"Call {call.value} ({name}) dispatch failed for [{grains}]\n{detail}"
+        )
 
     def _create_pool(self, call: CallRef) -> list[_ActorSlot]:
         """只为 Call 创建 pool；Port 结构关系没有对应入口。"""
 
-        replicas = int(self._pool_options(call).get("replicas", 1))
-        if replicas <= 0:
-            raise ValueError("replicas must be positive")
+        replicas = self._pool(call).replicas
         return [_ActorSlot(call, self._create_actor(call)) for _ in range(replicas)]
 
     def _create_actor(self, call: CallRef) -> Any:
         """创建或替换一个持久 actor，并记录 startup。"""
 
         spec = self.plan.call(call)
-        options = self._pool_options(call)
-        actor_options = {
-            key: value
-            for key, value in options.items()
-            if key not in self._INTERNAL_OPTIONS
-        }
+        actor_options = dict(self._pool(call).ray_options)
         actor_class = self._actor_class.options(**actor_options)
         handle = actor_class.remote(
             spec.kernel.target,
@@ -524,13 +575,10 @@ class Executor:
         self.metrics[call].actor_starts += 1
         return handle
 
-    def _pool_options(self, call: CallRef) -> dict[str, Any]:
-        """读取一个 Call 的冻结物理配置。"""
+    def _pool(self, call: CallRef) -> PoolSpec:
+        """Return the one typed physical execution contract for a Call."""
 
-        pool = self.plan.pools[
-            self.plan.call_to_pool[call]
-        ]
-        return dict(pool.options)
+        return self.plan.pool(call)
 
     @classmethod
     def _merge_outputs(cls, outputs: list[object]) -> object:

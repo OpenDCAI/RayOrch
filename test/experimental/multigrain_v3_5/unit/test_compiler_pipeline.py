@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import fields
+from pathlib import Path
 from typing import get_args
 
 import pytest
@@ -28,9 +29,17 @@ from rayorch.experimental.multigrain_v3_5.model import (
     CallRef,
     CompileError,
     DomainRef,
+    EntityRef,
+    ItemRef,
     PortRef,
 )
+from rayorch.experimental.multigrain_v3_5.plan import (
+    BroadcastEffect,
+    FilterEffect,
+    GroupEffect,
+)
 from rayorch.experimental.multigrain_v3_5.runtime import engine
+from rayorch.experimental.multigrain_v3_5.runtime.state import ShapeKey
 from rayorch.experimental.multigrain_v3_5.semantics import (
     PrimitiveKind,
     describe_origin,
@@ -79,6 +88,44 @@ def test_arena_module_has_no_logical_origin_interpreter():
     assert ".origin" not in source
 
 
+def test_arena_has_one_closed_fact_propagation_entry():
+    source = inspect.getsource(engine.ArenaEngine)
+
+    assert set(get_args(engine._FactEvent)) == {ItemRef, ShapeKey, EntityRef}
+    assert source.count("self._facts.append(") == 3
+    assert "_receipts" not in source
+    assert "_shape_terminal" not in source
+    assert "groups_by_child_domain" not in source
+    assert "broadcasts_by_target_domain" not in source
+
+
+def test_dispatch_state_is_the_only_grain_execution_state_writer():
+    package = Path(mg.__file__).parent
+    sources = {
+        path.relative_to(package): path.read_text()
+        for path in package.rglob("*.py")
+    }
+    mutation_tokens = (
+        "record.phase = grain_transition",
+        "record.generation +=",
+        "record.infra_failures +=",
+    )
+    writers = {
+        path
+        for path, source in sources.items()
+        if any(token in source for token in mutation_tokens)
+    }
+    transition_users = {
+        path for path, source in sources.items() if "grain_transition(" in source
+    }
+
+    assert writers == {Path("runtime/dispatch.py")}
+    assert transition_users == {
+        Path("runtime/dispatch.py"),
+        Path("transitions.py"),
+    }
+
+
 def test_compiler_only_decodes_concrete_origins_through_semantic_descriptor():
     source = inspect.getsource(compiler)
     for origin_type in get_args(PortOrigin):
@@ -104,8 +151,12 @@ def test_chained_filter_control_is_a_fixed_point_analysis():
     assert {bools, membership, selected_bools}.issubset(
         compiled.facts.control_ports
     )
-    assert compiled.runtime.filter_rules[selected_bools].copy_source_control
-    assert not compiled.runtime.filter_rules[result].copy_source_control
+    selected_effect = compiled.runtime.structural_effects[selected_bools]
+    result_effect = compiled.runtime.structural_effects[result]
+    assert isinstance(selected_effect, FilterEffect)
+    assert isinstance(result_effect, FilterEffect)
+    assert selected_effect.copy_source_control
+    assert not result_effect.copy_source_control
 
 
 def test_group_valued_mask_is_rejected_by_control_semantics():
@@ -166,9 +217,15 @@ def test_unoptimized_path_and_broadcast_chain_rewrite_are_explainable():
     inner, outer = broadcasts
     root_mask = optimized.logical.source_ports[1]
 
-    assert baseline.runtime.broadcast_rules[outer].source_port == inner
-    assert optimized.runtime.broadcast_rules[outer].source_port == root_mask
-    assert optimized.runtime.broadcast_rules[inner].source_port == root_mask
+    baseline_outer = baseline.runtime.structural_effects[outer]
+    optimized_outer = optimized.runtime.structural_effects[outer]
+    optimized_inner = optimized.runtime.structural_effects[inner]
+    assert isinstance(baseline_outer, BroadcastEffect)
+    assert isinstance(optimized_outer, BroadcastEffect)
+    assert isinstance(optimized_inner, BroadcastEffect)
+    assert baseline_outer.source_port == inner
+    assert optimized_outer.source_port == root_mask
+    assert optimized_inner.source_port == root_mask
     assert len(optimized.explain.rewrites) == 1
     assert optimized.explain.rewrites[0].kind == "collapse-broadcast-chain"
     assert "rewrite collapse-broadcast-chain" in optimized.explain_text()
@@ -201,8 +258,94 @@ def test_runtime_plan_has_one_lowering_for_every_structural_port():
                 for rule in rules
             )
         elif kind is PrimitiveKind.FILTER:
-            assert port in compiled.runtime.filter_rules
+            effect = compiled.runtime.structural_effects[port]
+            assert isinstance(effect, FilterEffect)
+            for source in (effect.source_port, effect.mask_port):
+                assert any(
+                    indexed is effect
+                    for indexed in compiled.runtime.effects_by_item_port[source]
+                )
         elif kind is PrimitiveKind.GROUP:
-            assert port in compiled.runtime.group_rules
+            effect = compiled.runtime.structural_effects[port]
+            assert isinstance(effect, GroupEffect)
+            for source in (effect.value_port, effect.members_port):
+                assert any(
+                    indexed is effect
+                    for indexed in compiled.runtime.effects_by_item_port[source]
+                )
+            assert any(
+                indexed is effect
+                for indexed in compiled.runtime.effects_by_shape_domain[
+                    effect.child_domain
+                ]
+            )
         elif kind is PrimitiveKind.BROADCAST:
-            assert port in compiled.runtime.broadcast_rules
+            effect = compiled.runtime.structural_effects[port]
+            assert isinstance(effect, BroadcastEffect)
+            assert any(
+                indexed is effect
+                for indexed in compiled.runtime.effects_by_item_port[
+                    effect.source_port
+                ]
+            )
+            assert any(
+                indexed is effect
+                for indexed in compiled.runtime.effects_by_entity_domain[
+                    effect.target_domain
+                ]
+            )
+
+
+def test_pool_options_compile_to_one_typed_physical_contract():
+    recovery = mg.RecoveryPolicy.isolate_tail(infra_retries=2)
+
+    class Configured(mg.Pipeline):
+        def __init__(self) -> None:
+            self.call = mg.RayModule(U).ray_options(
+                replicas=3,
+                batch_size=7,
+                batch_scope="parent_bound",
+                recovery=recovery,
+                num_cpus=0.25,
+            )
+
+        def forward(self, values):
+            return self.call(values)
+
+    optimized = Configured().compile(optimize=True)
+    baseline = Configured().compile(optimize=False)
+    call = next(iter(optimized.logical.calls))
+    pool = optimized.runtime.pool(call)
+
+    assert optimized.runtime.pools_by_call == baseline.runtime.pools_by_call
+    assert set(optimized.runtime.pools_by_call) == {call}
+    assert pool.replicas == 3
+    assert pool.batch_size == 7
+    assert pool.batch_scope == "parent_bound"
+    assert pool.recovery is recovery
+    assert pool.ray_options == (("num_cpus", 0.25),)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"max_retries": 1}, "max_retries is ambiguous"),
+        ({"recovery": "retry"}, "RecoveryPolicy"),
+        ({"replicas": True}, "replicas"),
+        ({"batch_size": 1.5}, "batch_size"),
+        ({"batch_scope": "global"}, "batch_scope"),
+    ],
+)
+def test_compiler_rejects_untyped_or_ambiguous_physical_options(
+    options,
+    message,
+):
+    class Invalid(mg.Pipeline):
+        def __init__(self) -> None:
+            self.call = mg.RayModule(U).ray_options(**options)
+
+        def forward(self, values):
+            return self.call(values)
+
+    with pytest.raises(CompileError, match=message):
+        Invalid().compile()

@@ -80,10 +80,10 @@ class KernelSpec:
 
 @dataclass(frozen=True, slots=True)
 class InputSpec:
-    name: str
+    """一个位置或关键字逻辑参数绑定的值部分。"""
+
     port: PortRef
     mode: InputMode = InputMode.REQUIRED
-    keyword: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,11 +91,23 @@ class CallSpec:
     ref: CallRef
     kernel: KernelSpec
     execution_domain: DomainRef
-    inputs: tuple[InputSpec, ...]
+    args: tuple[InputSpec, ...] = ()
+    kwargs: tuple[tuple[str, InputSpec], ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.inputs:
+        if not self.ordered_inputs:
             raise ValueError("CallSpec requires at least one input")
+        names = tuple(name for name, _ in self.kwargs)
+        if any(not name for name in names):
+            raise ValueError("CallSpec keyword input names must be non-empty")
+        if len(set(names)) != len(names):
+            raise ValueError("CallSpec keyword input names must be unique")
+
+    @property
+    def ordered_inputs(self) -> tuple[InputSpec, ...]:
+        """按 Python 调用顺序返回 compiler/runtime 使用的 dense inputs。"""
+
+        return self.args + tuple(input_ for _, input_ in self.kwargs)
 
 
 @dataclass(frozen=True, slots=True)

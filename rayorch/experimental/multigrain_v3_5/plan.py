@@ -6,8 +6,9 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping, TypeAlias
 
-from .model import CallRef, DomainRef, PoolRef, PortRef
+from .model import CallRef, DomainRef, PortRef
 from .protocol import InputLayout, OutputLayout
+from .recovery import DEFAULT_RECOVERY_POLICY, RecoveryPolicy
 
 if TYPE_CHECKING:
     from .analysis import DerivedFacts
@@ -15,27 +16,39 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True)
-class CallInputRoute:
+class CallInputEffect:
     call: CallRef
     input_index: int
 
 
 @dataclass(frozen=True, slots=True)
-class FilterRoute:
-    port: PortRef
+class FilterEffect:
+    target_port: PortRef
+    source_port: PortRef
+    mask_port: PortRef
+    copy_source_control: bool
 
 
 @dataclass(frozen=True, slots=True)
-class GroupRoute:
-    port: PortRef
+class GroupEffect:
+    target_port: PortRef
+    value_port: PortRef
+    members_port: PortRef
+    child_domain: DomainRef
+    value_depth: int
 
 
 @dataclass(frozen=True, slots=True)
-class BroadcastRoute:
-    port: PortRef
+class BroadcastEffect:
+    target_port: PortRef
+    source_port: PortRef
+    source_domain: DomainRef
+    target_domain: DomainRef
+    copy_source_control: bool
 
 
-RuntimeRoute: TypeAlias = CallInputRoute | FilterRoute | GroupRoute | BroadcastRoute
+StructuralEffect: TypeAlias = FilterEffect | GroupEffect | BroadcastEffect
+ItemEffect: TypeAlias = CallInputEffect | StructuralEffect
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,33 +59,27 @@ class ExpansionRule:
 
 
 @dataclass(frozen=True, slots=True)
-class FilterRule:
-    source_port: PortRef
-    mask_port: PortRef
-    copy_source_control: bool
-
-
-@dataclass(frozen=True, slots=True)
-class GroupRule:
-    value_port: PortRef
-    members_port: PortRef
-    child_domain: DomainRef
-    value_depth: int
-
-
-@dataclass(frozen=True, slots=True)
-class BroadcastRule:
-    source_port: PortRef
-    source_domain: DomainRef
-    target_domain: DomainRef
-    copy_source_control: bool
-
-
-@dataclass(frozen=True, slots=True)
 class PoolSpec:
-    ref: PoolRef
-    call: CallRef
-    options: tuple[tuple[str, Any], ...] = ()
+    """一个 Call 唯一的强类型 actor-pool 执行合同。"""
+
+    replicas: int = 1
+    batch_size: int = 1
+    batch_scope: str = "elastic"
+    recovery: RecoveryPolicy = DEFAULT_RECOVERY_POLICY
+    ray_options: tuple[tuple[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.replicas) is not int or self.replicas <= 0:
+            raise ValueError("replicas must be a positive integer")
+        if type(self.batch_size) is not int or self.batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        if not isinstance(self.batch_scope, str) or self.batch_scope not in {
+            "elastic",
+            "parent_bound",
+        }:
+            raise ValueError("batch_scope must be 'elastic' or 'parent_bound'")
+        if not isinstance(self.recovery, RecoveryPolicy):
+            raise TypeError("recovery must be a RecoveryPolicy")
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,7 +139,7 @@ class RuntimePlan:
     port_domains: Mapping[PortRef, DomainRef] = field(repr=False)
     source_ports: tuple[PortRef, ...] = ()
     output_tree: object = ()
-    routes_by_port: Mapping[PortRef, tuple[RuntimeRoute, ...]] = field(
+    effects_by_item_port: Mapping[PortRef, tuple[ItemEffect, ...]] = field(
         repr=False, default_factory=dict
     )
     outputs_by_call: Mapping[CallRef, tuple[PortRef, ...]] = field(
@@ -145,19 +152,20 @@ class RuntimePlan:
         repr=False, default_factory=dict
     )
     control_ports: frozenset[PortRef] = frozenset()
-    filter_rules: Mapping[PortRef, FilterRule] = field(repr=False, default_factory=dict)
-    group_rules: Mapping[PortRef, GroupRule] = field(repr=False, default_factory=dict)
-    broadcast_rules: Mapping[PortRef, BroadcastRule] = field(
+    structural_effects: Mapping[PortRef, StructuralEffect] = field(
         repr=False, default_factory=dict
     )
-    groups_by_child_domain: Mapping[DomainRef, tuple[PortRef, ...]] = field(
+    effects_by_shape_domain: Mapping[DomainRef, tuple[GroupEffect, ...]] = field(
         repr=False, default_factory=dict
     )
-    broadcasts_by_target_domain: Mapping[DomainRef, tuple[PortRef, ...]] = field(
+    effects_by_entity_domain: Mapping[
+        DomainRef, tuple[BroadcastEffect, ...]
+    ] = field(
         repr=False, default_factory=dict
     )
-    pools: Mapping[PoolRef, PoolSpec] = field(repr=False, default_factory=dict)
-    call_to_pool: Mapping[CallRef, PoolRef] = field(repr=False, default_factory=dict)
+    pools_by_call: Mapping[CallRef, PoolSpec] = field(
+        repr=False, default_factory=dict
+    )
     output_layouts_by_call: Mapping[CallRef, tuple[OutputLayout, ...]] = field(
         repr=False, default_factory=dict
     )
@@ -173,6 +181,11 @@ class RuntimePlan:
 
     def port_domain(self, ref: PortRef) -> DomainRef:
         return self.port_domains[ref]
+
+    def pool(self, call: CallRef) -> PoolSpec:
+        """返回一个 Call 唯一的物理 actor-pool 合同。"""
+
+        return self.pools_by_call[call]
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,20 +204,18 @@ def freeze_mapping(values: Mapping[Any, Any]) -> Mapping[Any, Any]:
 
 
 __all__ = [
-    "BroadcastRoute",
-    "BroadcastRule",
-    "CallInputRoute",
+    "BroadcastEffect",
+    "CallInputEffect",
     "CanonicalRewrite",
     "CompiledProgram",
     "ExpansionRule",
     "ExplainPlan",
-    "FilterRoute",
-    "FilterRule",
-    "GroupRoute",
-    "GroupRule",
+    "FilterEffect",
+    "GroupEffect",
+    "ItemEffect",
     "PoolSpec",
     "PortExplanation",
     "RuntimePlan",
-    "RuntimeRoute",
+    "StructuralEffect",
     "freeze_mapping",
 ]

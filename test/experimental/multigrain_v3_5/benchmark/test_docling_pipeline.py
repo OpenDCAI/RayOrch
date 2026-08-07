@@ -72,7 +72,7 @@ def test_docling_v35_is_exactly_document_page_table_job_graph(
         ReduceDoclingPage,
         ReduceDoclingDocument,
     ]
-    assert len(compiled.runtime.pools) == 8
+    assert len(compiled.runtime.pools_by_call) == 8
     assert sum(
         isinstance(spec.origin, ExpandOrigin)
         for spec in compiled.logical.ports.values()
@@ -100,17 +100,15 @@ def test_docling_v35_only_batch_scope_changes_cross_parent_pools():
     assert elastic.logical.calls == parent.logical.calls
     changed = []
     for left, right in zip(
-        elastic.runtime.pools.values(),
-        parent.runtime.pools.values(),
+        elastic.runtime.pools_by_call.values(),
+        parent.runtime.pools_by_call.values(),
     ):
-        left_options = dict(left.options)
-        right_options = dict(right.options)
-        if left_options != right_options:
-            changed.append((left_options, right_options))
+        if left != right:
+            changed.append((left, right))
 
     assert len(changed) == 5
-    assert all(left["batch_scope"] == "elastic" for left, _ in changed)
-    assert all(right["batch_scope"] == "parent_bound" for _, right in changed)
+    assert all(left.batch_scope == "elastic" for left, _ in changed)
+    assert all(right.batch_scope == "parent_bound" for _, right in changed)
 
 
 @pytest.mark.parametrize(
@@ -120,7 +118,7 @@ def test_docling_v35_only_batch_scope_changes_cross_parent_pools():
         ({"ocr_batch_mode": "unknown"}, "ocr_batch_mode"),
         ({"table_batch_mode": "unknown"}, "table_batch_mode"),
         ({"table_batch_max_jobs": 0}, "table_batch_max_jobs"),
-        ({"max_retries": -1}, "max_retries"),
+        ({"infra_retries": -1}, "infra_retries"),
     ],
 )
 def test_docling_v35_rejects_unsupported_or_invalid_options(option, message):

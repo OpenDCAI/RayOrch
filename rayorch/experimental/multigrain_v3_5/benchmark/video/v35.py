@@ -14,7 +14,7 @@ from ....multigrain_v3.benchmark.video.v3 import (
     SummarizeVideos,
     TransformFrames,
 )
-from ... import F, Executor, Pipeline, Port, RayModule
+from ... import F, Executor, Pipeline, Port, RayModule, RecoveryPolicy
 from ...executor import RunResult
 
 
@@ -36,7 +36,7 @@ class VideoV35Pipeline(Pipeline):
         model_path: str | None = None,
         transform_num_gpus: float = 0.0,
         model_repeats: int = 1,
-        max_retries: int = 1,
+        infra_retries: int = 1,
     ) -> None:
         if stride <= 0:
             raise ValueError("stride must be positive")
@@ -54,8 +54,9 @@ class VideoV35Pipeline(Pipeline):
             raise ValueError("model_repeats must be positive")
         if transform_num_gpus < 0:
             raise ValueError("transform_num_gpus must be non-negative")
-        if max_retries < 0:
-            raise ValueError("max_retries must be non-negative")
+        if infra_retries < 0:
+            raise ValueError("infra_retries must be non-negative")
+        recovery = RecoveryPolicy.abort(infra_retries=infra_retries)
 
         self.decode = (
             RayModule(DecodeFrames)
@@ -64,7 +65,7 @@ class VideoV35Pipeline(Pipeline):
                 replicas=decode_replicas,
                 batch_size=1,
                 num_cpus=1,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.transform = (
@@ -81,14 +82,14 @@ class VideoV35Pipeline(Pipeline):
                 batch_scope=batch_scope,
                 num_cpus=max(1, torch_num_threads),
                 num_gpus=transform_num_gpus,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.summary = RayModule(SummarizeVideos).ray_options(
             replicas=reduce_replicas,
             batch_size=4,
             num_cpus=1,
-            max_retries=max_retries,
+            recovery=recovery,
         )
 
     def forward(self, videos: Port) -> Port:  # pyright: ignore[reportIncompatibleMethodOverride]

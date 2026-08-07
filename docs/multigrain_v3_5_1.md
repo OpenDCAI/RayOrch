@@ -44,7 +44,7 @@ Grain 的 `WAITING` 由 pending input slots 表示，不存入 `GrainPhase`：
 ```text
 WAITING → READY → IN_FLIGHT → SEALED
     └───────────────────────→ SEALED
-               IN_FLIGHT → READY  (infra retry, generation + 1)
+               IN_FLIGHT → READY  (recovery, generation + 1)
 ```
 
 Shape 必须独立存在，因为“尚无 child”可能是未决、成功展开为空、drop 或失败。
@@ -106,7 +106,13 @@ members `PRESENT` 的 child 入组、`DROPPED` 的 child 排除；members
   发布和 binding，不重新发明状态优先级。
 - 对称 Call 使用交换归约；Filter source、Reduce members 等不对称只能由明确的
   primitive role 引入，不能由输入顺序或默认 slot 引入。
-- Item、Shape publication 是单调且幂等的；冲突 publication 必须失败。
+- Item、Shape、Entity publication 是单调且幂等的；冲突 publication 必须失败。
+- `_FactEvent = ItemRef | ShapeKey | EntityRef` 只是一组事实身份通知：三个唯一
+  publication 入口写 canonical tables 后进入同一 FIFO，`advance()` 是唯一传播入口；
+  Event 不复制 outcome、binding、children 或 lineage。
+- 每个 Filter/Group/Broadcast Port 只 lower 成一个完整、不可变的 `XxxEffect`；
+  target catalog、Item trigger 和 Domain trigger 都引用该同一对象，不允许用
+  target-only Route 再回查第二份 Rule。
 - 每种 transition 都用笛卡尔积测试覆盖，而不只用少量端到端 happy path：Call
   覆盖 required/optional × 四种 ItemOutcome，Filter 覆盖 source × mask × bool，
   Broadcast 覆盖四种 outcome，Expand 覆盖四种上游 outcome，Reduce 覆盖 Shape
@@ -115,3 +121,32 @@ members `PRESENT` 的 child 入组、`DROPPED` 的 child 排除；members
 任何新增 primitive 或状态都必须同时回答：它创建哪种身份、消费哪些事实、产生
 什么终态、control 如何传播、是否需要 Worker，以及现有笛卡尔积中为什么无法
 表达。不能回答这些问题的 feature 不进入 v3.5.1。
+
+## 6. Failure 分类与恢复代数
+
+failure kind 与 recovery policy 是正交的两个轴：
+
+- `RecordFailure` 是已经定位到单 Grain 的业务终态，直接走正常 `commit_failure`；
+- `CONTRACT_ERROR` 表示 Worker ABI 被违反，必须 fail-fast；
+- `UDF_ERROR` 是整次 dispatch 的不透明业务异常，由 Call 上的 `RecoveryPolicy` 决策；
+- `INFRA_FAILURE` 表示 actor/RPC 不可信，只能 fresh-actor replay，耗尽后终止 run，
+  不能伪造成 Item failure。
+
+`RecoveryPolicy` 只有 `abort`、`retry_batch`、`retry_tail`、`isolate_tail` 四种
+UDF 模式和独立的 `infra_retries`。默认是 UDF abort、infra retry 一次。
+`isolate_tail` 固定为整组队尾重放一次，随后对仍失败的非 singleton 做二分；
+singleton 才发布 FAILED。因此无需 `max_depth` 或 `min_batch`，执行放大由输入
+cardinality 给出有限上界。
+
+恢复动作由 Ray-free 的 `RecoveryPolicy` 纯函数穷举；精确 Grain group、随 group
+携带的 `udf_retries` 以及 normal/immediate/tail queues 全部归 Arena 内唯一的
+`DispatchState` 所有。Engine 只负责
+Item/Shape/Entity 传播，Executor 只持有 actor capacity 和 pending ObjectRef，两者都不能
+拥有第二份 READY authority。compiler 把 authoring options 归一化为按 `CallRef`
+唯一索引的强类型 `PoolSpec`；它没有冗余的 `PoolRef` 身份或 `call_to_pool` 映射。
+旧的歧义 `max_retries` 在编译期拒绝，Ray actor options 才保留为不透明尾部配置。
+
+Logical `CallSpec` 直接保存 immutable positional inputs 与 ordered keyword inputs；
+每个输入值只包含 `PortRef + InputMode`。关键字名只存在 kwargs key 中，compiler 在
+lowering 时才生成唯一的 dense slot 顺序和 `InputLayout`，runtime 不回读或重新猜测
+Python 调用形状。

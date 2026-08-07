@@ -12,21 +12,39 @@ from rayorch.experimental.multigrain_v3_5.logical import ExpandOrigin
 from rayorch.experimental.multigrain_v3_5.materialize import materialize_tree
 from rayorch.experimental.multigrain_v3_5.model import (
     CallRef,
+    EntityRef,
     GrainPhase,
     ItemOutcome,
     ItemRef,
+    ShapeState,
 )
+from rayorch.experimental.multigrain_v3_5.plan import BroadcastEffect, GroupEffect
 from rayorch.experimental.multigrain_v3_5.protocol import (
     BlockRef,
     CallReport,
+    DispatchFailure,
+    DispatchFailureKind,
     ExpandedRows,
     InputLayout,
+    InvocationPlan,
+    OutputLayout,
     OutputReport,
     RecordFailure,
     RowBinding,
+    ScalarTake,
 )
-from rayorch.experimental.multigrain_v3_5.runtime import ArenaEngine, CommitError
-from rayorch.experimental.multigrain_v3_5.worker import Worker, WorkerObservation
+from rayorch.experimental.multigrain_v3_5.runtime import (
+    ArenaEngine,
+    CommitError,
+    EntityOrigin,
+    GroupBinding,
+    ShapeKey,
+)
+from rayorch.experimental.multigrain_v3_5.worker import (
+    Worker,
+    WorkerContractError,
+    WorkerObservation,
+)
 
 
 class MemoryStore:
@@ -60,6 +78,55 @@ def test_worker_observation_is_scalar_and_read_only():
     assert observation.pid > 0
     assert observation.rss_bytes >= 0
     assert dict(observation.audit) == {"jobs": 7, "mode": "batch"}
+
+
+def _execute_one(worker_target, store: MemoryStore) -> DispatchFailure:
+    block = store.put((1,))
+    invocation = InvocationPlan(
+        mg.GrainRef(mg.CallRef(0), mg.EntityRef(mg.DomainRef(0), 0)),
+        0,
+        (ScalarTake(RowBinding(block, 0)),),
+    )
+    result = Worker(worker_target, input_layout=InputLayout(1)).execute(
+        (invocation,),
+        (OutputLayout(mg.PortRef(0)),),
+        store,
+    )
+    assert isinstance(result, DispatchFailure)
+    return result
+
+
+def test_worker_classifies_udf_and_contract_failures_at_one_boundary():
+    class UdfError:
+        def run(self, values):
+            raise LookupError("poison batch")
+
+    class BadLength:
+        def run(self, values):
+            return []
+
+    udf_failure = _execute_one(UdfError, MemoryStore())
+    contract_failure = _execute_one(BadLength, MemoryStore())
+
+    assert udf_failure.kind is DispatchFailureKind.UDF_ERROR
+    assert udf_failure.error_type.endswith("LookupError")
+    assert "poison batch" in udf_failure.message
+    assert "raise LookupError" in udf_failure.traceback
+    assert contract_failure.kind is DispatchFailureKind.CONTRACT_ERROR
+    assert contract_failure.error_type.endswith("WorkerContractError")
+    assert "expected 1 Grain rows, got 0" in contract_failure.message
+    assert "PortRef(value=0)" in contract_failure.message
+
+
+def test_udf_raising_contract_error_name_is_still_a_udf_failure():
+    class UserCode:
+        def run(self, values):
+            raise WorkerContractError("a user exception, not an ABI violation")
+
+    failure = _execute_one(UserCode, MemoryStore())
+
+    assert failure.kind is DispatchFailureKind.UDF_ERROR
+    assert "not an ABI violation" in failure.message
 
 
 def test_executor_submits_all_worker_observations_before_waiting():
@@ -138,8 +205,11 @@ def run_sync(pipeline: mg.Pipeline, *columns, optimize: bool = True):
     while arena.ready_count:
         turns += 1
         assert turns < 100
-        call = arena.ready_calls()[0]
-        grains = arena.reserve_batch(call, max_size=64)
+        call = next(
+            call for call in plan.calls
+            if arena.dispatch_priority(call) is not None
+        )
+        grains = arena.reserve_dispatch(call, max_size=64).grains
         invocations = tuple(arena.invocation_plan(grain) for grain in grains)
         reports = workers[call].execute(
             invocations,
@@ -244,6 +314,15 @@ def test_keyword_only_input_preserves_default_without_identity_driver():
 
     assert outputs == [10, -1, 30]
     assert not hasattr(spec, "driving_input")
+    assert len(spec.args) == 1
+    assert tuple(name for name, _ in spec.kwargs) == ("masks",)
+    assert spec.ordered_inputs == (
+        *spec.args,
+        *(input_ for _, input_ in spec.kwargs),
+    )
+    assert not hasattr(spec, "inputs")
+    assert all(not hasattr(input_, "name") for input_ in spec.ordered_inputs)
+    assert all(not hasattr(input_, "keyword") for input_ in spec.ordered_inputs)
     assert compiled.runtime.input_layouts_by_call[call].positional_count == 1
     assert compiled.runtime.input_layouts_by_call[call].keyword_names == ("masks",)
 
@@ -261,9 +340,11 @@ def test_reordered_keyword_inputs_keep_python_binding_semantics():
             return self.call(right=right, left=left)
 
     outputs, compiled, _arena = run_sync(Reordered(), [10, 20], [3, 5])
-    call = next(iter(compiled.logical.calls))
+    call, spec = next(iter(compiled.logical.calls.items()))
 
     assert outputs == [7, 15]
+    assert spec.args == ()
+    assert tuple(name for name, _ in spec.kwargs) == ("right", "left")
     assert compiled.runtime.input_layouts_by_call[call].positional_count == 0
     assert compiled.runtime.input_layouts_by_call[call].keyword_names == (
         "right",
@@ -401,6 +482,124 @@ def test_broadcast_chain_optimized_and_baseline_have_exact_outcome_parity():
     assert len(optimized_compiled.explain.rewrites) == 1
 
 
+def test_broadcast_fact_order_reaches_the_same_fixed_point():
+    class BroadcastOrder(mg.Pipeline):
+        def __init__(self) -> None:
+            self.split = mg.RayModule(U)
+            self.label = mg.RayModule(U)
+
+        def forward(self, values):
+            rows = mg.F.expand(self.split(values))
+            return mg.F.broadcast(self.label(values), like=rows)
+
+    plan = BroadcastOrder().compile().runtime
+    effect = next(
+        effect
+        for effect in plan.structural_effects.values()
+        if isinstance(effect, BroadcastEffect)
+    )
+    binding = RowBinding(BlockRef("label"), 0)
+
+    def reach_fixed_point(*, source_first: bool):
+        arena = ArenaEngine(plan)
+        root = EntityRef(effect.source_domain, 0)
+        child = EntityRef(effect.target_domain, 0)
+        source = ItemRef(effect.source_port, root)
+        target = ItemRef(effect.target_port, child)
+        arena._publish_entity(root)
+        arena.advance()
+
+        if source_first:
+            arena._publish_item(source, ItemOutcome.PRESENT, binding=binding)
+            arena.advance()
+            arena._publish_entity(child, EntityOrigin(root, 0))
+            arena.advance()
+        else:
+            arena._publish_entity(child, EntityOrigin(root, 0))
+            arena.advance()
+            arena._publish_item(source, ItemOutcome.PRESENT, binding=binding)
+            arena.advance()
+
+        assert arena.item_outcome(target) is ItemOutcome.PRESENT
+        assert arena.value_binding(target) == binding
+        assert not arena._facts
+        arena._publish_item(source, ItemOutcome.PRESENT, binding=binding)
+        assert not arena._facts
+        arena._publish_entity(child, EntityOrigin(root, 0))
+        assert not arena._facts
+        return arena.item_outcome(target), arena.value_binding(target)
+
+    assert reach_fixed_point(source_first=True) == reach_fixed_point(
+        source_first=False
+    )
+
+
+def test_group_fact_order_reaches_the_same_fixed_point():
+    class GroupOrder(mg.Pipeline):
+        def __init__(self) -> None:
+            self.split = mg.RayModule(U)
+
+        def forward(self, values):
+            rows = mg.F.expand(self.split(values))
+            return mg.F.reduce(rows)
+
+    plan = GroupOrder().compile().runtime
+    effect = next(
+        effect
+        for effect in plan.structural_effects.values()
+        if isinstance(effect, GroupEffect)
+    )
+    assert effect.value_port == effect.members_port
+    binding = RowBinding(BlockRef("value"), 0)
+
+    def reach_fixed_point(*, shape_first: bool):
+        arena = ArenaEngine(plan)
+        root = EntityRef(plan.port_domain(effect.target_port), 0)
+        child = EntityRef(effect.child_domain, 0)
+        shape = ShapeKey(effect.child_domain, root)
+        value = ItemRef(effect.value_port, child)
+        target = ItemRef(effect.target_port, root)
+        arena._publish_entity(root)
+        arena._publish_entity(child, EntityOrigin(root, 0))
+        arena.advance()
+
+        if shape_first:
+            arena._publish_shape(
+                shape,
+                ShapeState.SUCCEEDED,
+                children=(child,),
+            )
+            arena.advance()
+            arena._publish_item(value, ItemOutcome.PRESENT, binding=binding)
+            arena.advance()
+        else:
+            arena._publish_item(value, ItemOutcome.PRESENT, binding=binding)
+            arena.advance()
+            arena._publish_shape(
+                shape,
+                ShapeState.SUCCEEDED,
+                children=(child,),
+            )
+            arena.advance()
+
+        assert arena.item_outcome(target) is ItemOutcome.PRESENT
+        group = arena.value_binding(target)
+        assert isinstance(group, GroupBinding)
+        assert group.flat_items == (value,)
+        assert not arena._facts
+        arena._publish_shape(
+            shape,
+            ShapeState.SUCCEEDED,
+            children=(child,),
+        )
+        assert not arena._facts
+        return arena.item_outcome(target), group
+
+    assert reach_fixed_point(shape_first=True) == reach_fixed_point(
+        shape_first=False
+    )
+
+
 class U:
     pass
 
@@ -423,20 +622,31 @@ def _start_manual():
     root = arena.admit_sources(
         {plan.source_ports[0]: (RowBinding(block, 0),)}
     )[0]
-    grain = arena.reserve_ready()
+    call = next(iter(plan.calls))
+    selection = arena.reserve_dispatch(call, max_size=1)
+    grain = selection.grains[0]
     expanded = next(
         port
         for port, spec in compiled.logical.ports.items()
         if isinstance(spec.origin, ExpandOrigin)
     )
     output = plan.outputs_by_call[grain.call][0]
-    return compiled, arena, root, grain, output, expanded
+    return compiled, arena, root, selection, output, expanded
 
 
 def test_retry_keeps_grain_identity_and_generation_fences_stale_report():
-    compiled, arena, root, grain, output, expanded = _start_manual()
-    arena.retry(grain)
-    assert arena.reserve_ready() == grain
+    compiled, arena, root, selection, output, expanded = _start_manual()
+    grain = selection.grains[0]
+    assert arena.retry_infrastructure_dispatch(
+        selection,
+        mg.RecoveryPolicy.abort(infra_retries=1),
+    )
+    selection = arena.reserve_dispatch(
+        grain.call,
+        max_size=1,
+        parent_bound=False,
+    )
+    assert selection.grains == (grain,)
     stale = CallReport(
         grain,
         0,
@@ -451,7 +661,7 @@ def test_retry_keeps_grain_identity_and_generation_fences_stale_report():
             (OutputReport(output, expansions=(ExpandedRows(expanded, ()),)),),
         )
     )
-    assert arena.state.grains[grain].phase is GrainPhase.SEALED
+    assert arena.grain_snapshot(grain).phase is GrainPhase.SEALED
     assert arena.item_outcome(ItemRef(output, root)) is ItemOutcome.PRESENT
     assert compiled.runtime is arena.plan
 
@@ -473,7 +683,8 @@ def test_aligned_expand_mismatch_has_no_partial_publication():
     root = arena.admit_sources(
         {plan.source_ports[0]: (RowBinding(source_block, 0),)}
     )[0]
-    grain = arena.reserve_ready()
+    call = next(iter(plan.calls))
+    grain = arena.reserve_dispatch(call, max_size=1).grains[0]
     left_group, right_group = plan.outputs_by_call[grain.call]
     expanded = tuple(
         port
@@ -510,7 +721,7 @@ def test_aligned_expand_mismatch_has_no_partial_publication():
             )
         )
 
-    assert arena.state.grains[grain].phase is GrainPhase.IN_FLIGHT
+    assert arena.grain_snapshot(grain).phase is GrainPhase.IN_FLIGHT
     assert arena.state.shapes == {}
     assert arena.entities(plan.port_domain(expanded[0])) == ()
     assert root in arena.entities(root.domain)

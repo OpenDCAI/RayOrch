@@ -12,7 +12,7 @@ from ....multigrain_v3.benchmark.video.multimodal_v3 import (
     WhisperChunks,
 )
 from ....multigrain_v3.benchmark.video.v3 import DecodeFrames, TransformFrames
-from ... import F, Executor, Pipeline, Port, RayModule
+from ... import F, Executor, Pipeline, Port, RayModule, RecoveryPolicy
 from ...executor import RunResult
 
 
@@ -37,7 +37,7 @@ class VideoMultimodalV35Pipeline(Pipeline):
         frame_batch_size: int = 16,
         frame_num_gpus: float = 0.5,
         reduce_replicas: int = 1,
-        max_retries: int = 1,
+        infra_retries: int = 1,
     ) -> None:
         if not whisper_model_path or not vit_model_path:
             raise ValueError("both model paths must be non-empty")
@@ -61,8 +61,9 @@ class VideoMultimodalV35Pipeline(Pipeline):
             raise ValueError("all model batch sizes must be positive")
         if min(asr_num_gpus, frame_num_gpus) < 0:
             raise ValueError("model GPU requirements must be non-negative")
-        if max_retries < 0:
-            raise ValueError("max_retries must be non-negative")
+        if infra_retries < 0:
+            raise ValueError("infra_retries must be non-negative")
+        recovery = RecoveryPolicy.abort(infra_retries=infra_retries)
 
         self.audio_decode = (
             RayModule(DecodeAudioChunks)
@@ -71,7 +72,7 @@ class VideoMultimodalV35Pipeline(Pipeline):
                 replicas=audio_decode_replicas,
                 batch_size=1,
                 num_cpus=1,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.asr = (
@@ -83,14 +84,14 @@ class VideoMultimodalV35Pipeline(Pipeline):
                 batch_scope=batch_scope,
                 num_cpus=1,
                 num_gpus=asr_num_gpus,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.audio_summary = RayModule(SummarizeAudio).ray_options(
             replicas=reduce_replicas,
             batch_size=4,
             num_cpus=1,
-            max_retries=max_retries,
+            recovery=recovery,
         )
 
         self.frame_decode = (
@@ -100,7 +101,7 @@ class VideoMultimodalV35Pipeline(Pipeline):
                 replicas=frame_decode_replicas,
                 batch_size=1,
                 num_cpus=1,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.frame_model = (
@@ -112,20 +113,20 @@ class VideoMultimodalV35Pipeline(Pipeline):
                 batch_scope=batch_scope,
                 num_cpus=1,
                 num_gpus=frame_num_gpus,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.frame_summary = RayModule(SummarizeFrames).ray_options(
             replicas=reduce_replicas,
             batch_size=4,
             num_cpus=1,
-            max_retries=max_retries,
+            recovery=recovery,
         )
         self.merge = RayModule(MergeModalities).ray_options(
             replicas=reduce_replicas,
             batch_size=8,
             num_cpus=1,
-            max_retries=max_retries,
+            recovery=recovery,
         )
 
     def forward(self, videos: Port) -> Port:  # pyright: ignore[reportIncompatibleMethodOverride]

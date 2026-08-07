@@ -7,6 +7,7 @@ from .model import (
     CompileError,
     DomainRef,
     EntityRef,
+    ExecutionError,
     GrainRef,
     InputMode,
     ItemRef,
@@ -15,6 +16,7 @@ from .model import (
 )
 from .logical import LogicalProgram
 from .plan import CompiledProgram, RuntimePlan
+from .recovery import RecoveryPolicy
 from .executor import Executor
 from .worker import WorkerObservation
 
@@ -27,6 +29,7 @@ __all__ = [
     "CompiledProgram",
     "DomainRef",
     "EntityRef",
+    "ExecutionError",
     "F",
     "GrainRef",
     "InputMode",
@@ -41,6 +44,7 @@ __all__ = [
     "WorkerObservation",
     "Executor",
     "RayModule",
+    "RecoveryPolicy",
     "function",
     "functional",
 ]

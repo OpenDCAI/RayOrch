@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any
 
 from .model import GrainRef, PortRef
@@ -105,6 +106,26 @@ class CallFailureReport:
 WorkerReport = CallReport | CallFailureReport
 
 
+class DispatchFailureKind(Enum):
+    """A whole Worker dispatch failed before per-Grain reports existed."""
+
+    UDF_ERROR = auto()
+    CONTRACT_ERROR = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchFailure:
+    """Serializable exception snapshot for one whole-dispatch failure."""
+
+    kind: DispatchFailureKind
+    error_type: str
+    message: str
+    traceback: str
+
+
+WorkerResult = tuple[WorkerReport, ...] | DispatchFailure
+
+
 @dataclass(frozen=True, slots=True)
 class InputLayout:
     """一个 Call 的稳定 positional/keyword Worker 调用布局。"""
@@ -157,6 +178,8 @@ __all__ = [
     "BlockRef",
     "CallFailureReport",
     "CallReport",
+    "DispatchFailure",
+    "DispatchFailureKind",
     "ExpandedRows",
     "GroupTake",
     "InputLayout",
@@ -169,5 +192,6 @@ __all__ = [
     "RowBinding",
     "ScalarTake",
     "WorkerReport",
+    "WorkerResult",
     "restore_group",
 ]

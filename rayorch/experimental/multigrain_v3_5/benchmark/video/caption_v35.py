@@ -9,7 +9,7 @@ from ....multigrain_v3.benchmark.video.caption_v3 import (
     SummarizeCaptionVideos,
 )
 from ....multigrain_v3.benchmark.video.v3 import DecodeFrames
-from ... import F, Executor, Pipeline, Port, RayModule
+from ... import F, Executor, Pipeline, Port, RayModule, RecoveryPolicy
 from ...executor import RunResult
 
 
@@ -28,7 +28,7 @@ class VideoCaptionV35Pipeline(Pipeline):
         decode_replicas: int = 4,
         reduce_replicas: int = 1,
         max_new_tokens: int = 12,
-        max_retries: int = 1,
+        infra_retries: int = 1,
     ) -> None:
         if not model_path:
             raise ValueError("model_path must be non-empty")
@@ -44,8 +44,9 @@ class VideoCaptionV35Pipeline(Pipeline):
             raise ValueError("caption_batch_size must be positive")
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
-        if max_retries < 0:
-            raise ValueError("max_retries must be non-negative")
+        if infra_retries < 0:
+            raise ValueError("infra_retries must be non-negative")
+        recovery = RecoveryPolicy.abort(infra_retries=infra_retries)
 
         self.decode = (
             RayModule(DecodeFrames)
@@ -54,7 +55,7 @@ class VideoCaptionV35Pipeline(Pipeline):
                 replicas=decode_replicas,
                 batch_size=1,
                 num_cpus=1,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.caption = (
@@ -69,14 +70,14 @@ class VideoCaptionV35Pipeline(Pipeline):
                 batch_scope=batch_scope,
                 num_cpus=1,
                 num_gpus=1,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.summary = RayModule(SummarizeCaptionVideos).ray_options(
             replicas=reduce_replicas,
             batch_size=4,
             num_cpus=1,
-            max_retries=max_retries,
+            recovery=recovery,
         )
 
     def forward(self, videos: Port) -> Port:  # pyright: ignore[reportIncompatibleMethodOverride]

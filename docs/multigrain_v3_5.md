@@ -38,21 +38,23 @@ flowchart LR
     L --> V["Verifier"]
     V --> D["DerivedFacts<br/>uses / outputs / shapes / control"]
     D --> C["Optional canonicalization<br/>transparent rewrites only"]
-    C --> R["RuntimePlan<br/>routes / rules / layouts / pools"]
-    R --> E["ArenaEngine<br/>Item / Grain / Shape / Lineage"]
+    C --> R["RuntimePlan<br/>effects / indexes / layouts / pools"]
+    R --> E["ArenaEngine<br/>Item / Shape / Entity propagation"]
+    E --> Q["DispatchState<br/>Grain phase / generation / queues"]
     R --> X["Executor<br/>actor capacity / RPC"]
     R --> W["Worker ABI<br/>InvocationPlan / OutputLayout"]
     E --> M["Materialization"]
 ```
 
-边界是单向的：
+权责边界是明确的；依赖方向服务于可读性，不作为需要额外适配层的形式约束：
 
 | 层 | 拥有 | 明确不拥有 |
 | --- | --- | --- |
-| `LogicalProgram` | 用户声明的 Call、Port、Domain、Origin、输出树 | consumers、control closure、pool、runtime route |
+| `LogicalProgram` | 用户声明的 Call、Port、Domain、Origin、输出树 | consumers、control closure、pool、runtime Effect |
 | `DerivedFacts` | 可重算的 uses、Call outputs、Shape reporters、control fixed point、group depth | actor handle、Arena state |
-| `RuntimePlan` | Port Domain 表、Call ABI、input/output layouts、routes、结构规则、pool、输出树 | `PortOrigin`、业务 payload、动态 Entity |
-| `ArenaEngine` | Item/Grain/Shape/Entity lineage、retry generation、唯一状态写入口 | logical Origin、actor handle、业务值解释 |
+| `RuntimePlan` | Port Domain 表、Call ABI、input/output layouts、不可变 Effects 及其触发索引、pool、输出树 | `PortOrigin`、业务 payload、动态 Entity |
+| `ArenaEngine` | Item/Shape/Entity lineage 与结构传播 | Grain 调度策略、logical Origin、actor handle、业务值解释 |
+| `DispatchState` | Grain phase/generation、normal/immediate/tail queues、精确 group recovery | Item/Shape publication、UDF policy、actor handle |
 | `Executor` | actor 生命周期、RPC、multi-Arena capacity | primitive 语义、lineage 推导 |
 | `Worker` | value-only batch UDF 与稳定 DTO | Program、Arena、Ray 调度策略 |
 
@@ -71,9 +73,9 @@ runtime view 行为，也必须显式返回 stop/pass 合同；未知联合成�
 | Source | 无 | demand 在 source admission 产生 manifest | `source-admission` |
 | CallOutput | Call + output index | demand 进入 Worker `OutputLayout` | `worker-output` |
 | Expand | group Port | output demand 反传给 group | `ExpansionRule`，由成功 report 原子提交直接输出 |
-| Group | value + members | group value 不能作为标量 mask | `GroupRule` + child-domain terminal trigger |
-| Broadcast | ancestor source | output demand 反传给 source | `BroadcastRule` + source/child-arrival routes |
-| Filter | source + mask | mask 主动 demand control；output demand 反传给 source | `FilterRule`，PRESENT 时可复制 source control |
+| Group | value + members | group value 不能作为标量 mask | 单一 `GroupEffect`，同时进入 Item 与 Shape-domain 触发索引 |
+| Broadcast | ancestor source | output demand 反传给 source | 单一 `BroadcastEffect`，同时进入 Item 与 Entity-domain 触发索引 |
+| Filter | source + mask | mask 主动 demand control；output demand 反传给 source | 单一 `FilterEffect`，同时进入 source/mask 索引；PRESENT 时可复制 source control |
 
 因此 chained filter 不再依赖某段 analysis 恰好记得 `FilterOrigin`：第二个
 Filter demand 第一个 Filter 的 output control，统一语义表再把 demand 传给其
@@ -85,10 +87,17 @@ source，直到 fixed point。
 
 - 在启动 Ray 前验证引用闭包、Domain ancestry、Call/Port 对齐和 Port DAG。
 - 对新增 primitive 强制穷尽 control 与 lowering 合同，减少横向漏项。
-- 让 Arena 的结构传播只解释物理 route/rule，不再重复逻辑模式匹配。
+- 让 Arena 的结构传播只解释完整物理 Effect，不再重复逻辑模式匹配或按 target 回查第二份规则。
+
+Arena 内部的 `_FactEvent = ItemRef | ShapeKey | EntityRef` 是封闭、私有的事实通知联合。
+三个事实各由唯一 publication 入口写入 canonical table 并进入同一 FIFO；`advance()`
+穷尽匹配事实类型并应用对应 Effect 索引。事件不携带 outcome/binding/children，因而不构成
+第二份运行时状态。
 - 生成稳定的 Worker `OutputLayout` 和 source control admission 合同。
 - 把用户写下的 positional/keyword 调用形状 lower 为稳定 `InputLayout`，Worker
   不反射 Pipeline 或 LogicalProgram。
+- Logical `CallSpec` 分别保存 immutable `args` 与 ordered `kwargs`；输入值只保存
+  `PortRef + InputMode`，关键字名不在 value 中重复。runtime 才使用 dense slots。
 - 用 `CompiledProgram.explain_text()` 说明每个逻辑 Port 的物理实现。
 - 同时编译 optimized/unoptimized 计划，做结果和 ItemOutcome 等价回归。
 
@@ -125,6 +134,8 @@ v3.5 保留了 v3–v3.4 中已经成立的部分：
 - `RayModule + F.*` 的用户书写模式。
 - Port/Domain 正交、显式 Expand/Reduce/Broadcast/Filter 关系。
 - Call-only actor pools；结构 primitive 不创建 actor、RPC 或 Grain。
+- 一个 Call 当前只有一个 `PoolSpec`，直接由 `CallRef` 索引；不存在没有独立语义的
+  `PoolRef` 或第二张 `call_to_pool` 映射。
 - 单写者、事件驱动 Arena 和细粒度 Entity/Item/Grain lineage。
 - PRESENT/DROPPED/FAILED/SUPPRESSED 的结果语义。
 - multi-output 逐 Grain 原子报告、generation fencing、局部 replay。

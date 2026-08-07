@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import traceback
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -11,6 +12,8 @@ from .protocol import (
     BlockRef,
     CallFailureReport,
     CallReport,
+    DispatchFailure,
+    DispatchFailureKind,
     ExpandedRows,
     GroupTake,
     InputLayout,
@@ -23,6 +26,7 @@ from .protocol import (
     RowBinding,
     ScalarTake,
     WorkerReport,
+    WorkerResult,
     restore_group,
 )
 
@@ -77,8 +81,24 @@ class Worker:
         invocations: tuple[InvocationPlan, ...],
         layouts: tuple[OutputLayout, ...],
         store: ValueStore,
-    ) -> tuple[WorkerReport, ...]:
+    ) -> WorkerResult:
         """执行一批 Grain，并让业务失败严格停留在对应记录。"""
+
+        try:
+            return self._execute(invocations, layouts, store)
+        except WorkerContractError as error:
+            return self._dispatch_failure(
+                DispatchFailureKind.CONTRACT_ERROR,
+                error,
+            )
+
+    def _execute(
+        self,
+        invocations: tuple[InvocationPlan, ...],
+        layouts: tuple[OutputLayout, ...],
+        store: ValueStore,
+    ) -> WorkerResult:
+        """Execute after the public boundary has installed contract capture."""
 
         if not invocations:
             return ()
@@ -86,12 +106,18 @@ class Worker:
         columns = self._input_columns(invocations, store)
         layout = self.input_layout
         if layout.input_count != len(columns):
-            raise WorkerContractError("input layout arity mismatch")
+            raise WorkerContractError(
+                "input layout expected "
+                f"{layout.input_count} columns, got {len(columns)}"
+            )
         positional = columns[: layout.positional_count]
         keyword_columns = columns[layout.positional_count :]
         keywords = dict(zip(layout.keyword_names, keyword_columns))
-        raw = getattr(self.udf, "run", self.udf)(*positional, **keywords)
-        normalized = self._normalize_outputs(raw, len(layouts), len(invocations))
+        try:
+            raw = getattr(self.udf, "run", self.udf)(*positional, **keywords)
+        except Exception as error:
+            return self._dispatch_failure(DispatchFailureKind.UDF_ERROR, error)
+        normalized = self._normalize_outputs(raw, layouts, len(invocations))
 
         # 任一输出列把某个位置标为 RecordFailure 时，该 Grain 的所有输出都
         # 不可见；这保持 multi-output Call 的逐 Grain 原子性。
@@ -119,7 +145,9 @@ class Worker:
                     layout.expanded_ports
                 )
                 if control_expansions and any(type(value) is not bool for value in flat):
-                    raise WorkerContractError("mask output must contain bool values")
+                    raise WorkerContractError(
+                        f"output {layout.port!r} control rows must contain bool values"
+                    )
                 block = store.put(flat)
                 offset = 0
                 for index, group in enumerate(groups):
@@ -147,7 +175,9 @@ class Worker:
             if requires_control and any(
                 type(value) is not bool for value in live_values
             ):
-                raise WorkerContractError("mask output must contain bool values")
+                raise WorkerContractError(
+                    f"output {layout.port!r} control rows must contain bool values"
+                )
 
             # 保留原 batch 行号，使每个成功 Grain 的 RowBinding 稳定对应 UDF
             # 返回位置；失败行虽然位于粗块中，但不会被任何 ItemRef 引用。
@@ -156,7 +186,9 @@ class Worker:
                 if failures[index] is not None:
                     continue
                 if value is MISSING:
-                    raise WorkerContractError("MISSING cannot be a UDF output")
+                    raise WorkerContractError(
+                        f"output {layout.port!r} cannot contain MISSING"
+                    )
                 reports[index][layout.port] = OutputReport(
                     layout.port,
                     scalar=RowBinding(block, index),
@@ -182,6 +214,20 @@ class Worker:
                     )
                 )
         return tuple(results)
+
+    @staticmethod
+    def _dispatch_failure(
+        kind: DispatchFailureKind,
+        error: Exception,
+    ) -> DispatchFailure:
+        """Snapshot an exception without requiring the exception to be picklable."""
+
+        return DispatchFailure(
+            kind,
+            f"{type(error).__module__}.{type(error).__qualname__}",
+            str(error),
+            traceback.format_exc(),
+        )
 
     def observe(self) -> WorkerObservation:
         """读取小型标量 audit；业务状态不会反向影响 Worker ABI。"""
@@ -240,17 +286,23 @@ class Worker:
     def _normalize_outputs(
         cls,
         raw: Any,
-        output_count: int,
+        layouts: tuple[OutputLayout, ...],
         grain_count: int,
     ) -> tuple[tuple[Any, ...], ...]:
+        output_count = len(layouts)
         ports = (raw,) if output_count == 1 else cls._sequence(raw, "multi-output")
         if len(ports) != output_count:
-            raise WorkerContractError("UDF output port count mismatch")
+            raise WorkerContractError(
+                f"UDF expected {output_count} output ports, got {len(ports)}"
+            )
         normalized = []
-        for column in ports:
-            values = cls._sequence(column, "output column")
+        for layout, column in zip(layouts, ports):
+            values = cls._sequence(column, f"output column {layout.port!r}")
             if len(values) != grain_count:
-                raise WorkerContractError("UDF output grain count mismatch")
+                raise WorkerContractError(
+                    f"output {layout.port!r} expected {grain_count} Grain rows, "
+                    f"got {len(values)}"
+                )
             normalized.append(values)
         return tuple(normalized)
 

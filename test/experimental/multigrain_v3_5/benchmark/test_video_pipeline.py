@@ -100,7 +100,7 @@ def test_single_relation_video_graph_is_expand_compute_group(
 
     assert [spec.kernel.target for spec in compiled.logical.calls.values()] == targets
     assert len(compiled.logical.domains) == 2
-    assert len(compiled.runtime.pools) == 3
+    assert len(compiled.runtime.pools_by_call) == 3
     assert sum(
         isinstance(spec.origin, ExpandOrigin)
         for spec in compiled.logical.ports.values()
@@ -145,7 +145,7 @@ def test_multimodal_video_has_two_sibling_relations_and_root_merge(optimize):
     assert merge.execution_domain == domains[0].ref
     assert all(
         compiled.logical.port(input_.port).domain == domains[0].ref
-        for input_ in merge.inputs
+        for input_ in merge.ordered_inputs
     )
 
 
@@ -157,16 +157,14 @@ def test_video_batch_scope_only_changes_heavy_compute_pool(factory):
     assert elastic.logical.calls == parent.logical.calls
     changed = []
     for left, right in zip(
-        elastic.runtime.pools.values(),
-        parent.runtime.pools.values(),
+        elastic.runtime.pools_by_call.values(),
+        parent.runtime.pools_by_call.values(),
     ):
-        left_options = dict(left.options)
-        right_options = dict(right.options)
-        if left_options != right_options:
-            changed.append((left_options, right_options))
+        if left != right:
+            changed.append((left, right))
     assert len(changed) == 1
-    assert changed[0][0]["batch_scope"] == "elastic"
-    assert changed[0][1]["batch_scope"] == "parent_bound"
+    assert changed[0][0].batch_scope == "elastic"
+    assert changed[0][1].batch_scope == "parent_bound"
 
 
 @pytest.mark.parametrize(
@@ -177,7 +175,7 @@ def test_video_batch_scope_only_changes_heavy_compute_pool(factory):
         {"batch_scope": "unknown"},
         {"transform_replicas": 0},
         {"transform_batch_size": 0},
-        {"max_retries": -1},
+        {"infra_retries": -1},
     ],
 )
 def test_feature_video_rejects_invalid_physical_options(option):

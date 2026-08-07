@@ -154,7 +154,7 @@ class Pipeline:
 
 
 class _ProgramBuilder:
-    """只负责 authoring trace；不计算 derived facts 或 runtime routes。"""
+    """只负责 authoring trace；不计算 derived facts 或 runtime Effects。"""
 
     def __init__(self, source_names: tuple[str, ...]) -> None:
         self.owner = next(_TRACE_IDS)
@@ -204,13 +204,19 @@ class _ProgramBuilder:
         if not args and not kwargs:
             raise CompileError("RayModule requires at least one Port input")
 
-        inputs: list[InputSpec] = []
+        positional_inputs: list[InputSpec] = []
         for index, value in enumerate(args):
             port, mode = self._input(value, f"arg_{index}")
-            inputs.append(InputSpec(f"arg_{index}", port.ref, mode))
+            positional_inputs.append(InputSpec(port.ref, mode))
+        keyword_inputs: list[tuple[str, InputSpec]] = []
         for name, value in kwargs.items():
             port, mode = self._input(value, name)
-            inputs.append(InputSpec(name, port.ref, mode, keyword=True))
+            keyword_inputs.append((name, InputSpec(port.ref, mode)))
+
+        inputs = (
+            *positional_inputs,
+            *(input_ for _, input_ in keyword_inputs),
+        )
 
         domains = {self.ports[item.port].domain for item in inputs}
         if len(domains) != 1:
@@ -231,7 +237,8 @@ class _ProgramBuilder:
             call,
             kernel,
             execution_domain,
-            tuple(inputs),
+            tuple(positional_inputs),
+            tuple(keyword_inputs),
         )
         self.call_options[call] = tuple(module.options.items())
 

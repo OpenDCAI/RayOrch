@@ -39,7 +39,7 @@ def test_mineru_v35_has_four_calls_and_no_structural_pools():
         PdfMetadata,
         MinerUAssembleDoc,
     ]
-    assert len(compiled.runtime.pools) == 4
+    assert len(compiled.runtime.pools_by_call) == 4
     assert len(compiled.logical.domains) == 2
     assert sum(
         isinstance(spec.origin, ExpandOrigin)
@@ -56,20 +56,16 @@ def test_mineru_parent_and_elastic_only_change_ocr_pool_option():
     parent = _pipeline("parent_bound").compile()
 
     assert elastic.logical.calls == parent.logical.calls
-    elastic_options = [
-        dict(pool.options) for pool in elastic.runtime.pools.values()
-    ]
-    parent_options = [
-        dict(pool.options) for pool in parent.runtime.pools.values()
-    ]
+    elastic_options = list(elastic.runtime.pools_by_call.values())
+    parent_options = list(parent.runtime.pools_by_call.values())
     changed = [
         (left, right)
         for left, right in zip(elastic_options, parent_options)
         if left != right
     ]
     assert len(changed) == 1
-    assert changed[0][0]["batch_scope"] == "elastic"
-    assert changed[0][1]["batch_scope"] == "parent_bound"
+    assert changed[0][0].batch_scope == "elastic"
+    assert changed[0][1].batch_scope == "parent_bound"
 
 
 def test_mineru_cli_defaults_to_four_pdf_correctness_gate():

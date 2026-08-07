@@ -14,6 +14,14 @@
 [`multigrain_v3_5_1.md`](multigrain_v3_5_1.md)，compiler 设计边界见
 [`multigrain_v3_5.md`](multigrain_v3_5.md)。
 
+建议按目标选择阅读路径：
+
+| 目标 | 阅读顺序 |
+| --- | --- |
+| 先会写 Pipeline | 1 → 2 → 3 → 4 → 5 |
+| 理解一次执行为何得到这个结果 | 6 → 7 → 8 → 9 → 10 |
+| 开始维护源码 | 11 → 12 → 13 → 14，再回查相关状态机 |
+
 ---
 
 ## 1. 先建立一个最小直觉
@@ -43,7 +51,62 @@ Arena 管理身份与状态，但不解释业务 payload。
 Executor 管理 Ray，但不重新解释 primitive 语义。
 ```
 
-### 1.1 第一个可运行 Pipeline
+### 1.1 先看完整组件协作图
+
+先不要深入类和字段。整个系统只有三段主流程：authoring/compile 建图，driver/runtime
+推进状态，actor/worker 执行业务值计算。
+
+```mermaid
+flowchart LR
+    subgraph Compile["Authoring 与编译期（Ray-free）"]
+        User["Pipeline.forward<br/>RayModule + F.*"] --> Logical["LogicalProgram<br/>Port / Domain / Origin"]
+        Logical --> Compiler["Compiler<br/>verify / analyze / canonicalize / lower"]
+        Compiler --> Plan["RuntimePlan<br/>effects / indexes / layouts / pools"]
+    end
+
+    subgraph Driver["Driver 运行期"]
+        Executor["Executor<br/>Arena 并发 / actor capacity / RPC"]
+        Arena["ArenaEngine<br/>Item / Shape / Entity 语义传播"]
+        Dispatch["DispatchState<br/>Grain phase / generation / queues"]
+        Recovery["RecoveryPolicy<br/>纯决策"]
+        Executor -->|"admit / reserve / commit"| Arena
+        Arena -->|"唯一 Grain 状态入口"| Dispatch
+        Executor -->|"failure facts"| Recovery
+        Recovery -->|"RecoveryAction"| Executor
+        Arena -->|"infra retry counts"| Recovery
+        Recovery -->|"allow / deny"| Arena
+    end
+
+    subgraph Actor["Ray actor"]
+        Worker["Worker<br/>恢复值 / batch UDF / 生成报告"]
+        Store["Block store<br/>BlockRef / RowBinding"]
+        Worker <-->|"get / put business values"| Store
+    end
+
+    Plan --> Executor
+    Plan --> Arena
+    Executor -->|"InvocationPlan + OutputLayout"| Worker
+    Worker -->|"WorkerResult"| Executor
+```
+
+读这张图时只记住五个 ownership：
+
+| 组件 | 唯一拥有的东西 | 不做什么 |
+| --- | --- | --- |
+| Compiler | 从 logical facts 生成完整 RuntimePlan | 不启动 Ray、不执行 UDF |
+| Executor | actors、ObjectRefs、Arena 并发额度 | 不解释 Filter/Reduce 等语义 |
+| ArenaEngine | Item/Shape/Entity publication 与传播 | 不执行业务 UDF、不维护第二份 ready queue |
+| DispatchState | Grain phase/generation 与 normal/immediate/tail queues | 不发布 Item/Shape、不决定业务策略 |
+| Worker | value-only batch UDF 和 Worker ABI | 不读取 Program/Arena、不创建逻辑身份 |
+
+箭头表示主要协作，不要求为了形式上的单向依赖增加适配层。真正禁止的是跨层写状态，
+或者同一个事实出现两个 authority。
+
+后文 Mermaid 使用统一约定：实线箭头表示调用或 DTO 传递，虚线返回箭头表示返回值，
+指向自身的箭头表示该组件修改自己拥有的状态；图中的“连接”不自动意味着对方可以读取
+或修改组件内部表。
+
+### 1.2 第一个可运行 Pipeline
 
 ```python
 import rayorch.experimental.multigrain_v3_5 as mg
@@ -221,8 +284,8 @@ self.module = (
     .ray_options(
         batch_size=16,
         replicas=2,
+        recovery=mg.RecoveryPolicy.isolate_tail(infra_retries=1),
         num_gpus=1,
-        max_retries=1,
     )
 )
 ```
@@ -292,6 +355,27 @@ def forward(self, values, increments):
 
 compiler 会生成 `InputLayout`。Worker 不反射 Pipeline，也不重新猜测 kwargs 顺序。
 
+Logical IR 忠实保存 Python 调用形状，而不是提前伪装成 runtime slot：
+
+```text
+CallSpec
+├── args: (InputSpec(values),)
+└── kwargs: (("increments", InputSpec(increments)),)
+```
+
+`InputSpec` 只保存 `PortRef + InputMode`；关键字名字只存在 `CallSpec.kwargs` 的 key，
+不在 value 中重复存一份。`CallSpec.ordered_inputs` 是按
+`args + kwargs.values()` 计算出的只读 dense view，不是第二份状态。lowering 再生成：
+
+```text
+slots = (values, increments)
+InputLayout(positional_count=1, keyword_names=("increments",))
+```
+
+Arena 用 dense slot 接收异步到达的 Item，Worker 根据唯一的 `InputLayout` 恢复
+`run(values, increments=...)`。因此 logical 层易读，runtime 又不需要维护位置参数和
+关键字参数两套队列。
+
 ### 3.4 Ray options 的两类含义
 
 当前参考 Executor 自己消费：
@@ -299,9 +383,13 @@ compiler 会生成 `InputLayout`。Worker 不反射 Pipeline，也不重新猜�
 - `batch_size`：每个 RPC 最多包含多少 Grain；
 - `batch_scope`：`elastic` 或 `parent_bound`；
 - `replicas`：该 Call 的持久 actor 数；
-- `max_retries`：基础设施/RPC 异常的局部重试次数。
+- `recovery`：该 Call 的强类型 `RecoveryPolicy`。
 
 其他选项，例如 `num_cpus`、`num_gpus`、`max_restarts`，传给 Ray actor options。
+compiler 会把两类选项归一化为一个按 `CallRef` 唯一索引的 `PoolSpec`；runtime
+不再反复解析 dict。`PoolSpec` 没有独立身份：当前一个 Call 只对应一个同构 actor
+pool，所以不存在冗余的 `PoolRef` 或 `CallRef -> PoolRef` 映射。
+旧的 `max_retries` 同时混淆 UDF 与基础设施失败，已在编译期明确拒绝。
 
 ---
 
@@ -597,6 +685,20 @@ producing_call/output_index/source_index
 
 compiler 其他阶段不再 `isinstance(XxxOrigin)`；runtime 完全不认识 Origin。
 
+这对组件的通信只有一个窄口：
+
+```mermaid
+flowchart LR
+    Origin["PortOrigin<br/>typed AST node"] -->|"describe_origin(origin)"| Parser["semantics.py<br/>唯一 parser"]
+    Parser --> Semantic["PrimitiveSemantics<br/>kind / inputs / roles / control"]
+    Semantic --> Verify["Verifier"]
+    Semantic --> Analyze["Analysis"]
+    Semantic --> Lower["Lowering"]
+```
+
+因此新增 primitive 时，应扩展 parser 返回的统一描述；不应让 Verify、Analyze、Lower
+分别反射具体 Origin 并各写一套 `isinstance`。
+
 ### 6.3 固定 compiler pipeline
 
 [`compile_logical()`](../rayorch/experimental/multigrain_v3_5/compiler.py) 的顺序固定：
@@ -610,6 +712,28 @@ verify LogicalProgram
 ```
 
 这不是可插拔 PassManager。v3.5.1 当前不需要插件注册表、cost model 或通用 SSA。
+
+```mermaid
+sequenceDiagram
+    participant P as Pipeline.forward
+    participant T as Trace context
+    participant S as semantics.py
+    participant C as Compiler
+    participant R as RuntimePlan
+
+    P->>T: 用 symbolic Ports 调用 RayModule / F.*
+    T-->>C: freeze LogicalProgram
+    C->>S: describe_origin（逐 Port）
+    S-->>C: PrimitiveSemantics
+    C->>C: verify logical graph
+    C->>C: analyze derived facts
+    opt optimize=True
+        C->>C: canonicalize transparent rewrites
+    end
+    C->>C: lower Effects / trigger indexes / layouts / pools-by-Call
+    C->>C: verify RuntimePlan completeness
+    C-->>R: immutable RuntimePlan + ExplainPlan
+```
 
 #### Verify
 
@@ -658,14 +782,23 @@ broadcast(broadcast(root, child), grandchild)
 lowering 把逻辑依赖变成 RuntimePlan：
 
 ```text
-CallInputRoute
-FilterRoute / FilterRule
-GroupRoute / GroupRule
-BroadcastRoute / BroadcastRule
+CallInputEffect
+FilterEffect
+GroupEffect
+BroadcastEffect
 ExpansionRule
 InputLayout / OutputLayout
 PoolSpec
 ```
+
+每个 structural Port 只产生一个冻结的完整 Effect。`structural_effects[target_port]`
+负责按目标定位；`effects_by_item_port[source_port]`、
+`effects_by_shape_domain[domain]` 和 `effects_by_entity_domain[domain]`
+只是触发索引，并且都引用同一个 Effect 对象。Arena 收到 Effect 后已拥有执行所需的
+全部 Port/Domain/control 信息，不需要先解析 target-only Route，再回查另一份 Rule。
+
+`PoolSpec` 由 `RuntimePlan.pools_by_call[CallRef]` 唯一定位，不重复保存 Call 或 Pool
+身份。只有 Call 创建 actor pool；任何结构 Port 都不会进入这张表。
 
 RuntimePlan 已经包含 Arena 需要的完整物理事实，所以 Arena 不回读 LogicalProgram。
 
@@ -692,35 +825,81 @@ explain，不要直接进 Arena 猜。
 
 ---
 
-## 7. 运行期：一个 Item publication 如何推动全图
+## 7. 运行期：一个事实 publication 如何推动全图
 
 Executor 的一次运行大致经历：
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant Executor
-    participant Arena
-    participant Worker
-    participant Store
+    participant E as Executor
+    participant A as ArenaEngine
+    participant D as DispatchState
+    participant P as RecoveryPolicy
+    participant W as Worker actor
+    participant S as Block store
 
-    User->>Executor: run(source columns)
-    Executor->>Store: put source blocks
-    Executor->>Arena: admit_sources(RowBindings)
-    Arena->>Arena: publish source Items and advance
-    Arena-->>Executor: READY Grains
-    Executor->>Arena: reserve_batch
-    Arena-->>Executor: InvocationPlans
-    Executor->>Worker: execute batch
-    Worker->>Store: get input rows / put output blocks
-    Worker-->>Executor: CallReports
-    Executor->>Arena: commit_report
-    Arena->>Arena: publish outputs and structural propagation
-    Arena-->>Executor: complete
-    Executor->>Store: materialize final values
-    Executor->>Arena: release_values
-    Executor-->>User: RunResult
+    User->>E: run(source columns)
+    E->>S: put(source column blocks)
+    S-->>E: BlockRefs
+    E->>A: admit_sources(RowBindings)
+    A->>A: publish source Items / advance
+    A->>D: inputs_ready(Grain, batch_key)
+
+    loop while Arena is incomplete
+        E->>A: dispatch_priority / reserve_dispatch
+        A->>D: reserve(Call, batch contract)
+        D-->>A: DispatchSelection
+        A-->>E: DispatchSelection
+        E->>A: invocation_plan(each Grain)
+        A-->>E: InvocationPlans
+        E->>W: execute(invocations, layouts)
+        W->>S: get input rows / put output blocks
+        W-->>E: WorkerResult
+        alt CallReport / CallFailureReport
+            E->>A: commit_report
+            A->>D: validate generation / seal Grain
+            A->>A: publish outputs / advance
+        else DispatchFailure(UDF_ERROR)
+            E->>P: decide_udf(completed retries, group size)
+            P-->>E: RecoveryAction
+            E->>A: apply_udf_recovery
+            alt retry or split
+                A->>D: requeue exact group(s)
+            else failed singleton
+                A->>A: publish FAILED semantic facts
+            end
+        else Ray actor/RPC exception
+            E->>A: retry_infrastructure_dispatch
+            A->>D: read infra failure counts
+            D-->>A: per-Grain counts
+            A->>P: allows_infrastructure_retry(counts)
+            P-->>A: allow / deny
+            opt allowed
+                A->>D: generation++ / immediate requeue
+                E->>E: replace untrusted actor
+            end
+        end
+    end
+
+    E->>A: read ordered terminal facts
+    E->>S: get final payloads
+    E->>A: release_values
+    E-->>User: RunResult
 ```
+
+组件两两通信可以压缩成下面五份合同：
+
+| 组件对 | 请求 | 返回 | 状态由谁修改 |
+| --- | --- | --- | --- |
+| Executor ↔ ArenaEngine | admission、reserve、commit、materialize | selection、InvocationPlan、完成状态 | ArenaEngine 修改语义表 |
+| ArenaEngine ↔ DispatchState | inputs ready/terminal、reserve、seal、recover | DispatchSelection、priority、校验结果 | DispatchState 独占 Grain/queue |
+| Executor ↔ Worker | `InvocationPlan + OutputLayout` | `WorkerResult` | Worker 只修改 actor 内 UDF 状态 |
+| ArenaEngine ↔ transitions | 当前事实 tuple | 纯 action/outcome | transition 不修改任何状态 |
+| Worker ↔ Block store | `RowBinding.get`、column `put` | 业务值、`BlockRef` | store 拥有 payload；Arena 只存引用 |
+
+这张表是定位代码的最快入口：先判断当前问题发生在哪一对组件之间，再检查该边界上的
+DTO 和 authority，而不是从 `Executor.run()` 一路单步进入所有模块。
 
 ### 7.1 Arena admission
 
@@ -739,21 +918,68 @@ result = executor.run(
 最多 4 个 Arena 同时活跃，但它们共享同一批持久 actors。一个 RPC 不混合多个 Arena
 的 Grain。
 
-### 7.2 publication receipt 与 advance
+```mermaid
+sequenceDiagram
+    participant E as Executor
+    participant S as Block store
+    participant A as ArenaEngine
 
-Arena 的所有 Item 都通过唯一 `_publish()` 入口进入不可变终态。每次新 publication
-会进入 receipt queue。
-
-`advance()` 根据 RuntimePlan routes 触发：
-
-```text
-CallInputRoute → 更新 PendingInvocation
-FilterRoute    → 尝试 Filter transition
-BroadcastRoute → 向目标后代 Entity 投影
-GroupRoute     → 尝试 parent Reduce
+    E->>E: slice row-aligned source columns
+    E->>S: put(tuple(values))
+    S-->>E: BlockRef
+    E->>E: build RowBinding(block, row)
+    E->>A: admit_sources(bindings, controls)
+    A->>A: create root Entities
+    A->>A: publish source Items
+    E->>A: close_admission()
 ```
 
-它持续运行到 receipt queue 为空，即达到当前局部不动点。
+这里 Executor 决定 Arena 切片和物理 block；ArenaEngine 决定 source Entity/Item 身份。
+双方都不读取 source 的业务含义。
+
+### 7.2 FactEvent queue 与 advance
+
+Arena 的 Item、Shape、Entity 分别只通过 `_publish_item()`、`_publish_shape()`、
+`_publish_entity()` 写入 canonical tables。首次 publication 把现有不可变身份放入
+同一个私有联合队列：
+
+```python
+_FactEvent = ItemRef | ShapeKey | EntityRef
+```
+
+Event 只表示“这个事实刚刚出现”，不复制 outcome、binding、children 或 lineage。
+完全相同的幂等 publication 不会再次入队。
+
+`advance()` 穷尽匹配三种事实，并使用 RuntimePlan 对应的 Effect 索引：
+
+```text
+ItemRef  → effects_by_item_port
+ShapeKey → effects_by_shape_domain
+EntityRef → effects_by_entity_domain
+```
+
+Item Effect 再封闭匹配为 `CallInputEffect | FilterEffect | GroupEffect |
+BroadcastEffect`。它持续运行到 FactEvent queue 为空，即达到当前局部不动点。
+
+```mermaid
+flowchart LR
+    Item["_publish_item"] --> Facts["FactEvent FIFO"]
+    Shape["_publish_shape"] --> Facts
+    Entity["_publish_entity"] --> Facts
+    Facts --> Advance{"advance(): match fact"}
+    Advance -->|"ItemRef"| ItemEffects["effects_by_item_port"]
+    Advance -->|"ShapeKey"| ShapeEffects["effects_by_shape_domain"]
+    Advance -->|"EntityRef"| EntityEffects["effects_by_entity_domain"]
+    ItemEffects --> Transitions["Call / Filter / Group / Broadcast"]
+    ShapeEffects --> Transitions
+    EntityEffects --> Transitions
+    Transitions --> NewFacts["new canonical facts"]
+    NewFacts -->|"first publication only"| Facts
+```
+
+RuntimePlan 只告诉 Arena “这次 publication 应用哪些完整 Effects”；纯 transition 决定结果，
+三个 typed publication 入口才拥有写事实的权限。有限 DAG、单调终态和每个事实只入队一次，
+共同保证局部固定点终止。
 
 ### 7.3 Call inputs 如何成为 Grain
 
@@ -768,6 +994,30 @@ GroupRoute     → 尝试 parent Reduce
 ```
 
 所有输入对 Entity 身份是对称的，不存在 `driven_by`。
+
+```mermaid
+sequenceDiagram
+    participant A as ArenaEngine
+    participant T as call_transition
+    participant D as DispatchState
+
+    A->>A: collect PendingInvocation slots
+    A->>T: modes + current Item outcomes
+    T-->>A: WAIT / READY / DROP_OUTPUTS / SUPPRESS_OUTPUTS
+    alt READY
+        A->>D: inputs_ready(GrainRef, batch_key)
+        D->>D: create READY Grain + normal queue entry
+    else DROP or SUPPRESS
+        A->>D: inputs_terminal(GrainRef)
+        D->>D: create SEALED Grain
+        A->>A: publish terminal output Items
+    else WAIT
+        A->>A: keep PendingInvocation only
+    end
+```
+
+`call_transition` 不知道 queue，`DispatchState` 不知道 REQUIRED/OPTIONAL，ArenaEngine 负责把
+纯语义动作接到唯一物理状态机上。
 
 ### 7.4 reserve、batch 与 InvocationPlan
 
@@ -787,6 +1037,29 @@ MissingTake
 
 Worker 只看到这些 value takes、generation 和 output layouts，看不到 Program、PortOrigin
 或 Arena tables。
+
+```mermaid
+sequenceDiagram
+    participant E as Executor
+    participant A as ArenaEngine
+    participant D as DispatchState
+    participant W as Worker
+
+    E->>A: dispatch_priority(CallRef)
+    A->>D: priority(CallRef)
+    D-->>A: immediate / normal / tail / none
+    E->>A: reserve_dispatch(CallRef, PoolSpec batching)
+    A->>D: reserve(...)
+    D-->>A: DispatchSelection(exact Grains, udf_retries)
+    loop each Grain
+        E->>A: invocation_plan(GrainRef)
+        A-->>E: InvocationPlan(generation, InputTakes)
+    end
+    E->>W: execute(invocations, output layouts)
+```
+
+`DispatchSelection` 是一次 RPC 的精确 lease。Executor 保存它以关联 ObjectRef 和失败，
+但不能自行把 Grain 放回 ready queue。
 
 ### 7.5 Worker report 与原子提交
 
@@ -809,13 +1082,33 @@ Arena 在写任何结果前先检查：
 验证完成后才一次性封闭 Grain 并发布结果。multi-output 中任一列把某个位置返回为
 `RecordFailure` 时，该 Grain 的所有输出都 `FAILED`，不会暴露半成功状态。
 
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant E as Executor
+    participant A as ArenaEngine
+    participant D as DispatchState
+
+    W-->>E: tuple[CallReport | CallFailureReport]
+    E->>A: commit_report(report)
+    A->>D: validate_in_flight(grain, generation)
+    D-->>A: valid current attempt
+    A->>A: preflight all outputs / shapes / controls
+    A->>D: seal(grain, generation)
+    A->>A: publish all terminal facts
+    A->>A: advance to local fixed point
+```
+
+preflight 失败时不会先发布半个 multi-output report；generation 校验则阻止旧 attempt 的
+迟到报告覆盖新状态。
+
 ### 7.6 完成、物化与释放
 
 一个 Arena 完成需要：
 
 ```text
 admission 已关闭
-receipt/pending/ready 均为空
+FactEvent queue/pending/ready 均为空
 所有 Grain SEALED
 所有输出 Port × 已存在 Entity 都有 Item 终态
 ```
@@ -860,7 +1153,8 @@ UNRESOLVED
 | FAILED | 直接生产者失败，或透明 view 保留该失败 |
 | SUPPRESSED | 生产者因依赖失败而未执行 |
 
-Item 终态不可改写；完全相同的 publication 可以幂等重放，冲突 publication 直接失败。
+Item/Shape/Entity 事实不可改写；完全相同的 publication 可以幂等重放，冲突 publication
+直接失败。
 
 ### 8.3 Grain
 
@@ -879,6 +1173,8 @@ infra_failures
 ```
 
 Grain 的业务结果由输出 Items 推导，不再维护重复 GrainOutcome。
+可变 GrainRecord 完全由 `DispatchState` 私有持有；Arena 与 Executor 只能读取冻结的
+`GrainSnapshot`，不能通过 `RuntimeState` 获得第二条修改路径。
 
 ### 8.4 Shape
 
@@ -910,6 +1206,27 @@ materializer 调用 store.get()。
 
 这避免 driver 为调度而反序列化图片、页面或模型输出。
 
+```mermaid
+sequenceDiagram
+    participant A as ArenaEngine
+    participant E as Executor transport
+    participant W as Worker
+    participant S as Block store
+
+    A-->>E: ScalarTake / GroupTake（只含 RowBindings）
+    E->>W: InvocationPlan
+    W->>S: get(RowBinding)
+    S-->>W: business value
+    W->>W: run batch UDF
+    W->>S: put(output column)
+    S-->>W: BlockRef
+    W-->>E: OutputReport(RowBinding, optional control)
+    E->>A: commit_report
+    A->>A: store binding/control，不 get payload
+```
+
+Executor 在这对组件之间仅做 DTO transport；它不检查业务值，也不生成 Item 身份。
+
 ### 9.2 control manifest 是受控投影
 
 Filter 必须知道 mask 是 True 还是 False，但 Arena 又不能读取业务 payload。因此 compiler
@@ -921,6 +1238,20 @@ ItemRecord.control 保存调度需要的 bool 副本
 ```
 
 这不是重复业务值，而是明确的 data plane/control plane 分离。
+
+```mermaid
+flowchart LR
+    Worker["Worker output"] --> Binding["RowBinding<br/>business data location"]
+    Worker --> Control["bool control manifest<br/>only when demanded"]
+    Binding --> Values["RuntimeState.values"]
+    Control --> Item["ItemRecord.control"]
+    Lineage["Entity / Shape / lineage"] --> Arena["Arena transitions"]
+    Item --> Arena
+    Values -. "Worker/materializer only" .-> Store["Block store payload"]
+```
+
+三者的生命周期也不同：payload 可在 materialize 后释放，control 是小型语义投影，
+lineage/terminal facts 则保留用于审计。
 
 ### 9.3 GroupBinding 与 CSR Shape
 
@@ -938,7 +1269,7 @@ GroupBinding(
 
 ---
 
-## 10. 失败、RecordFailure 与 retry
+## 10. 失败分类与恢复策略
 
 ### 10.1 业务记录失败
 
@@ -958,9 +1289,98 @@ class Parse:
 
 Worker 把对应 Grain 转成 `CallFailureReport`。其他 batch positions 仍然成功。
 
-### 10.2 RPC/actor 异常
+### 10.2 四类 failure 不共用一条恢复路径
 
-如果 Ray RPC 抛异常，Executor 根据 `max_retries`：
+| failure | 表示什么 | 恢复合同 |
+| --- | --- | --- |
+| `RecordFailure` | UDF 已定位到一个 Grain 的业务失败 | 直接提交该 Grain 为 FAILED，不重试 |
+| `CONTRACT_ERROR` | UDF 返回值违反编译后的 Worker ABI | 立即抛 `ExecutionError`，永不重试 |
+| `UDF_ERROR` | 一次不透明 UDF dispatch 抛异常 | 按该 Call 的 `RecoveryPolicy` 决策 |
+| `INFRA_FAILURE` | actor/RPC/transport 失效，结果不可信 | 换新 actor，按独立 infra budget 立即重放 |
+
+```mermaid
+flowchart TD
+    Failure{"失败在哪个边界被识别？"}
+    Failure -->|"UDF 返回 RecordFailure(position)"| Record["CallFailureReport"]
+    Failure -->|"Worker normalization/ABI"| Contract["CONTRACT_ERROR"]
+    Failure -->|"UDF 整次抛异常"| Udf["UDF_ERROR"]
+    Failure -->|"ray.get / actor / transport"| Infra["INFRA_FAILURE"]
+
+    Record --> Commit["ArenaEngine.commit_failure<br/>只影响对应 Grain"]
+    Contract --> Fast["ExecutionError<br/>fail-fast"]
+    Udf --> Policy["RecoveryPolicy.decide_udf"]
+    Policy --> Abort["ABORT"]
+    Policy --> Retry["RETRY_IMMEDIATE / RETRY_TAIL"]
+    Policy --> Split["SPLIT_TAIL"]
+    Policy --> Single["FAIL_SINGLETON"]
+    Retry --> Dispatch["DispatchState requeue exact group"]
+    Split --> Dispatch
+    Single --> Commit
+    Infra --> Budget{"infra budget remains?"}
+    Budget -->|"yes"| Replace["generation++ / fresh actor / immediate queue"]
+    Budget -->|"no"| Fast
+```
+
+Worker 只负责把异常快照为可序列化的 `DispatchFailure`。它不知道重试策略；
+Executor 只把 failure 分类交给纯 `RecoveryPolicy`；Arena 内唯一的 `DispatchState` 拥有
+READY、generation 和 recovery queues。这样不会在 Executor 或 Engine 中再藏一份
+可运行 Grain。
+
+合同错误的消息包含 Call/UDF、精确 Grain group、generation、ABI 说明和 Worker
+traceback。UDF 自己恰好抛出名为 `WorkerContractError` 的异常仍属于
+`UDF_ERROR`；分类依据异常发生的边界，而不是异常类名。
+
+### 10.3 UDF recovery policy
+
+```python
+mg.RecoveryPolicy.abort(infra_retries=1)          # 默认
+mg.RecoveryPolicy.retry_batch(attempts=2)
+mg.RecoveryPolicy.retry_tail(attempts=2)
+mg.RecoveryPolicy.isolate_tail(infra_retries=1)
+```
+
+| policy | UDF 失败后的动作 |
+| --- | --- |
+| `abort` | 立即终止本次 run |
+| `retry_batch` | 原精确 Grain group 进入 immediate queue |
+| `retry_tail` | 原精确 Grain group 进入 tail queue，让正常工作先行 |
+| `isolate_tail` | 整组 tail retry 一次；仍失败则有界二分，singleton 才提交 FAILED |
+
+`attempts` 是额外 UDF replay 次数，不是总执行次数。`isolate_tail` 没有
+`max_depth`、`min_batch` 等第二组旋钮：每次非 singleton 只二分一次，所以有限性由
+group cardinality 直接证明。immediate、normal、tail 的优先级也是 Arena 的显式
+调度状态，不是 Executor 临时拼接的列表。
+
+`isolate_tail` 的组件协作如下：
+
+```mermaid
+sequenceDiagram
+    participant E as Executor
+    participant P as RecoveryPolicy
+    participant A as ArenaEngine
+    participant D as DispatchState
+
+    E->>P: decide_udf(completed=0, grains=N)
+    P-->>E: RETRY_TAIL
+    E->>A: apply_udf_recovery(selection, RETRY_TAIL)
+    A->>D: recover_udf
+    D->>D: exact group → tail queue, udf_retries=1
+    Note over E,D: 若整组再次失败
+    E->>P: decide_udf(completed=1, grains=N)
+    alt N > 1
+        P-->>E: SPLIT_TAIL
+        E->>A: apply_udf_recovery
+        A->>D: ordered halves → tail queue
+    else N = 1
+        P-->>E: FAIL_SINGLETON
+        E->>A: apply_udf_recovery
+        A->>A: publish FAILED Item / Shape facts
+    end
+```
+
+### 10.4 RPC/actor 异常
+
+如果 Ray RPC 抛异常，Executor 根据 `RecoveryPolicy.infra_retries`：
 
 ```text
 IN_FLIGHT → READY
@@ -968,11 +1388,12 @@ generation += 1
 infra_failures += 1
 ```
 
-旧 generation 的迟到报告不能覆盖新 attempt。actor crash 时 Executor 会替换 actor；普通
-UDF 异常保留持久实例。超过重试预算后，相关 Grain 以 FAILED 封闭，不回滚无关 branch
-或 Arena。
+旧 generation 的迟到报告不能覆盖新 attempt。actor crash 时 Executor 丢弃不可信 handle，
+创建 fresh actor，并把同一精确 group 放进 immediate queue；若失败发生在 UDF recovery
+中，`DispatchSelection.udf_retries` 会随精确 group 保留。超过 infra budget 后抛
+`ExecutionError`，不会伪造一个业务 FAILED Item。
 
-### 10.3 failure propagation
+### 10.5 failure propagation
 
 普通 Call 的输入优先级是：
 
@@ -1000,33 +1421,63 @@ Filter 和 Reduce 是带角色的 gate：
 3. [`functional.py`](../rayorch/experimental/multigrain_v3_5/functional.py)：F.* 公开表面。
 4. [`semantics.py`](../rayorch/experimental/multigrain_v3_5/semantics.py)：唯一 Origin parser。
 5. [`transitions.py`](../rayorch/experimental/multigrain_v3_5/transitions.py)：动态状态代数。
-6. [`plan.py`](../rayorch/experimental/multigrain_v3_5/plan.py)：RuntimeRule/Route。
-7. [`compiler.py`](../rayorch/experimental/multigrain_v3_5/compiler.py)：固定 passes。
-8. [`runtime/state.py`](../rayorch/experimental/multigrain_v3_5/runtime/state.py)：被动 tables。
-9. [`runtime/engine.py`](../rayorch/experimental/multigrain_v3_5/runtime/engine.py)：单写者应用层。
-10. [`protocol.py`](../rayorch/experimental/multigrain_v3_5/protocol.py)：稳定 DTO/Worker ABI。
-11. [`worker.py`](../rayorch/experimental/multigrain_v3_5/worker.py)：值恢复和报告生成。
-12. [`executor.py`](../rayorch/experimental/multigrain_v3_5/executor.py)：Ray actor 与多 Arena 调度。
-13. [`materialize.py`](../rayorch/experimental/multigrain_v3_5/materialize.py)：最终输出恢复。
+6. [`recovery.py`](../rayorch/experimental/multigrain_v3_5/recovery.py)：Ray-free 纯恢复策略。
+7. [`plan.py`](../rayorch/experimental/multigrain_v3_5/plan.py)：完整不可变 Runtime Effects 与触发索引。
+8. [`compiler.py`](../rayorch/experimental/multigrain_v3_5/compiler.py)：固定 passes。
+9. [`runtime/state.py`](../rayorch/experimental/multigrain_v3_5/runtime/state.py)：被动 tables。
+10. [`runtime/dispatch.py`](../rayorch/experimental/multigrain_v3_5/runtime/dispatch.py)：唯一 Grain/queue 状态机。
+11. [`runtime/engine.py`](../rayorch/experimental/multigrain_v3_5/runtime/engine.py)：Item/Shape/Entity 传播层。
+12. [`protocol.py`](../rayorch/experimental/multigrain_v3_5/protocol.py)：稳定 DTO/Worker ABI。
+13. [`worker.py`](../rayorch/experimental/multigrain_v3_5/worker.py)：值恢复和报告生成。
+14. [`executor.py`](../rayorch/experimental/multigrain_v3_5/executor.py)：Ray actor 与多 Arena 调度。
+15. [`materialize.py`](../rayorch/experimental/multigrain_v3_5/materialize.py)：最终输出恢复。
 
-依赖方向是：
+源码层的主要 knowledge/call 关系是：
 
 ```mermaid
-flowchart TD
-    API["api / functional"] --> Logical["logical IR"]
-    Logical --> Semantics["semantic descriptors"]
-    Semantics --> Analysis["derived facts"]
-    Analysis --> Compiler["verify / canonicalize / lower"]
-    Compiler --> Plan["RuntimePlan"]
-    Plan --> Arena["ArenaEngine"]
-    Plan --> Executor["Executor"]
-    Plan --> Worker["Worker ABI"]
-    Arena --> Materialize["materialize"]
-    Executor --> Arena
-    Executor --> Worker
+flowchart LR
+    subgraph Frontend["Authoring / compiler"]
+        API["api / functional"] --> Logical["logical.py"]
+        Logical --> Semantics["semantics.py"]
+        Semantics --> Analysis["analysis.py"]
+        Analysis --> Compiler["compiler.py"]
+        Compiler --> Plan["plan.py<br/>RuntimePlan"]
+    end
+
+    subgraph Pure["Pure contracts"]
+        Transitions["transitions.py"]
+        Recovery["recovery.py"]
+        Protocol["protocol.py<br/>DTOs"]
+    end
+
+    subgraph Runtime["Driver runtime"]
+        Executor["executor.py"] -->|"Arena façade"| Arena["runtime/engine.py"]
+        Arena -->|"Grain authority"| Dispatch["runtime/dispatch.py"]
+        Executor --> Materialize["materialize.py"]
+        Materialize -->|"read terminal facts"| Arena
+    end
+
+    subgraph ActorSide["Actor / values"]
+        Worker["worker.py"]
+        Store["block store"]
+        Worker <-->|"get / put"| Store
+    end
+
+    Plan --> Executor
+    Plan --> Arena
+    Arena -->|"facts → decision"| Transitions
+    Dispatch -->|"phase transition"| Transitions
+    Executor -->|"UDF recovery"| Recovery
+    Arena -->|"infra budget"| Recovery
+    Executor --> Protocol
+    Arena --> Protocol
+    Worker --> Protocol
+    Executor <-->|"InvocationPlan / WorkerResult"| Worker
+    Materialize -->|"get payload"| Store
 ```
 
-反向箭头通常意味着边界正在泄漏。
+图表示主要调用与权责关系，而不是禁止所有反向依赖的形式规则。真正需要阻止的是跨层
+写状态、同一事实出现两个 authority，或为了依赖图好看而增加无语义适配层。
 
 ---
 
@@ -1052,12 +1503,27 @@ control demand 如何传播？
 2. 在 `api.py/functional.py` 构造新 Port/Domain 关系。
 3. 在 `semantics.describe_origin()` 增加穷尽 case，声明 InputRole/control。
 4. 在 compiler verifier 增加局部合法性 case。
-5. 在 `plan.py` 定义最小 `XxxRule/XxxRoute`。
-6. 在 lowering 中显式生成 rule/route；即使是 pass 也写出 case。
+5. 在 `plan.py` 定义一个包含执行所需全部静态信息的最小 `XxxEffect`。
+6. 在 lowering 中只构造一次 Effect，并让所有触发索引引用它；即使是 pass 也写出 case。
 7. 若有新的动态组合，在 `transitions.py` 增加纯函数。
 8. Arena 只应用 transition 和发布事实，不重复写状态优先级。
 9. 增加笛卡尔积测试、compiler boundary 测试和 explain 断言。
 10. optimized/unoptimized 必须结果等价。
+
+```mermaid
+flowchart LR
+    Author["api / functional<br/>构造 XxxOrigin"] --> Parser["semantics.describe_origin<br/>统一角色描述"]
+    Parser --> Verify["verify local legality"]
+    Parser --> Facts["analyze derived facts"]
+    Facts --> Lower["lower one immutable XxxEffect"]
+    Lower --> Plan["verify RuntimePlan"]
+    Plan --> Transition["pure transition<br/>若有新动态组合"]
+    Transition --> Engine["Arena applies decision<br/>and publishes facts"]
+    Engine --> Tests["Cartesian + compiler + integration"]
+```
+
+如果一项修改需要绕过这条链直接让 Executor/Worker 读取 Origin，通常说明缺少静态 Effect、
+DTO 或纯 transition，而不是需要一条快捷飞线。
 
 ### 12.2 修改状态语义
 
@@ -1110,7 +1576,7 @@ Ray actor boundary integration test
 - 任一输入 Port 不得成为 Grain/Entity 隐式 driver；
 - 只有 Expand 创建 child Entity；
 - F.* 结构 primitive 不得偷偷创建 actor/RPC/Grain；
-- Item 和 Shape 只能通过唯一 publication 入口进入终态；
+- Item、Shape、Entity 只能通过各自唯一 publication 入口进入 canonical tables；
 - Arena 不读取业务 payload；
 - Executor 不重新实现 Filter/Reduce 等 primitive 语义；
 - Worker 不读取 Program/Arena，不生成逻辑身份；
@@ -1128,8 +1594,9 @@ pytest -q \
   test/experimental/multigrain_v3_5/benchmark/test_mineru_pipeline.py
 ```
 
-这里覆盖 compiler 边界、control fixed point、状态笛卡尔积、nested group、retry fencing、
-aligned atomicity 和 MinerU Pipeline 静态结构。
+这里覆盖 compiler 边界、control fixed point、状态笛卡尔积、nested group、recovery
+policy reducer、Arena recovery queues、retry fencing、aligned atomicity 和 MinerU
+Pipeline 静态结构。
 
 ### 13.2 真实 Ray integration
 
@@ -1137,8 +1604,9 @@ aligned atomicity 和 MinerU Pipeline 静态结构。
 pytest -q test/experimental/multigrain_v3_5/integration/test_executor.py
 ```
 
-覆盖持久 actor、多 Arena、keyword ABI、actor crash replacement、RecordFailure 和
-multi-output 原子性。某些 Ray 版本若误判 uv runtime environment，可临时设置：
+覆盖持久 actor、多 Arena、keyword ABI、actor crash replacement、infra exhaustion、
+RecordFailure、UDF immediate/tail retry、poison isolation、合同 fail-fast 和 multi-output
+原子性。某些 Ray 版本若误判 uv runtime environment，可临时设置：
 
 ```bash
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
@@ -1157,7 +1625,7 @@ pyright \
   rayorch/experimental/multigrain_v3_5/runtime
 ```
 
-新增 `PortOrigin`、`InputRole` 或 route 联合成员后，`assert_never` 应帮助暴露未处理 case。
+新增 `PortOrigin`、`InputRole` 或 Effect 联合成员后，`assert_never` 应帮助暴露未处理 case。
 
 ### 13.4 真实性能证据
 
@@ -1201,13 +1669,13 @@ driver RSS 和 actor 数。
 ```python
 arena.progress_summary()
 arena.state.pending
-arena.state.grains
+arena.grain_snapshots()
 arena.state.shapes
 ```
 
 常见原因是：
 
-- 某个依赖 Port 没有 route；
+- 某个依赖 Port 没有进入 Effect 触发索引；
 - Shape 已终态但 Group 的 member/value Item 没发布；
 - Worker report layout 不完整；
 - 新 primitive 在 lowering 中被遗漏而不是显式 pass；
@@ -1222,7 +1690,7 @@ CommitError 通常不是普通业务失败，而是合同冲突：
 - scalar/expanded report 与 plan 不一致；
 - aligned cardinality 不一致；
 - control demand 不一致；
-- Item/Shape 被发布成不同终态。
+- Item/Shape/Entity 被冲突发布。
 
 先检查 WorkerReport 和 RuntimePlan，不要尝试覆盖已有状态。
 
@@ -1246,7 +1714,7 @@ materializer 不会把它们静默转换为 `None`，因为三者含义不同。
 2. compiler 把 typed PortOrigin AST 验证、分析并 lower 成不含 Origin 的 RuntimePlan。
 3. Entity 定义 occurrence，Item 定义 Port 上的终态，Grain 定义 Call 的执行，Shape 定义
    Expand children。
-4. Arena 是唯一状态写者，纯 transitions 决定结果；Executor 管 Ray，Worker 只管值。
+4. ArenaEngine 独占语义表，DispatchState 独占 Grain/queues；Executor 管 Ray，Worker 只管值。
 5. 身份、业务值、control、物理 batching 和 failure propagation 相互分离，因此可以独立
    优化而不改变逻辑语义。
 

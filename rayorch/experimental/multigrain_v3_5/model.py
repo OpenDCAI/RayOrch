@@ -13,6 +13,10 @@ class CompileError(ValueError):
     """符号 Program 违反了 v3.5 编译期不变量。"""
 
 
+class ExecutionError(RuntimeError):
+    """一次 Call dispatch 无法按照编译后的执行合同继续。"""
+
+
 @dataclass(frozen=True, slots=True, order=True)
 class CallRef:
     """静态 Program 中一个计算调用点的紧凑身份。"""
@@ -44,17 +48,6 @@ class DomainRef:
     def __post_init__(self) -> None:
         if self.value < 0:
             raise ValueError("DomainRef must be non-negative")
-
-
-@dataclass(frozen=True, slots=True, order=True)
-class PoolRef:
-    """RuntimePlan 中一个物理 Worker 池的身份。"""
-
-    value: int
-
-    def __post_init__(self) -> None:
-        if self.value < 0:
-            raise ValueError("PoolRef must be non-negative")
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -136,13 +129,13 @@ __all__ = [
     "CompileError",
     "DomainRef",
     "EntityRef",
+    "ExecutionError",
     "GrainPhase",
     "GrainRef",
     "InputMode",
     "ItemOutcome",
     "ItemRef",
     "MISSING",
-    "PoolRef",
     "PortRef",
     "ShapeState",
 ]

@@ -28,7 +28,7 @@ from ....multigrain_v3.benchmark.document_docling.tableformer_v1_batch import (
 from ....multigrain_v3.benchmark.document_docling.tableformer_v2_batch import (
     DoclingTableFormerV2BatchCore,
 )
-from ... import F, Executor, Pipeline, Port, RayModule
+from ... import F, Executor, Pipeline, Port, RayModule, RecoveryPolicy
 from ...executor import RunResult
 
 
@@ -74,7 +74,7 @@ class DoclingTableJobV35Pipeline(Pipeline):
         postprocess_replicas: int | None = None,
         table_prepare_replicas: int | None = None,
         page_reduce_replicas: int | None = None,
-        max_retries: int = 1,
+        infra_retries: int = 1,
     ) -> None:
         """Freeze only execution options that v3.5 actually implements."""
 
@@ -92,8 +92,9 @@ class DoclingTableJobV35Pipeline(Pipeline):
             raise ValueError("unsupported table_batch_mode")
         if table_batch_max_jobs <= 0:
             raise ValueError("table_batch_max_jobs must be positive")
-        if max_retries < 0:
-            raise ValueError("max_retries must be non-negative")
+        if infra_retries < 0:
+            raise ValueError("infra_retries must be non-negative")
+        recovery = RecoveryPolicy.abort(infra_retries=infra_retries)
 
         counts = (
             layout_replicas,
@@ -141,7 +142,7 @@ class DoclingTableJobV35Pipeline(Pipeline):
                 replicas=parse_replicas,
                 batch_size=parse_batch_size,
                 num_cpus=1,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.layout = (
@@ -153,7 +154,7 @@ class DoclingTableJobV35Pipeline(Pipeline):
                 batch_scope=batch_scope,
                 num_cpus=actor_num_cpus,
                 num_gpus=layout_num_gpus,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.ocr = (
@@ -169,7 +170,7 @@ class DoclingTableJobV35Pipeline(Pipeline):
                 batch_size=ocr_batch_size,
                 batch_scope=batch_scope,
                 num_cpus=actor_num_cpus,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.postprocess = RayModule(DoclingPostprocessPages).ray_options(
@@ -177,14 +178,14 @@ class DoclingTableJobV35Pipeline(Pipeline):
             batch_size=table_batch_size,
             batch_scope=batch_scope,
             num_cpus=actor_num_cpus,
-            max_retries=max_retries,
+            recovery=recovery,
         )
         self.table_prepare = RayModule(self.table_job_stage).ray_options(
             replicas=table_prepare_replicas,
             batch_size=table_batch_size,
             batch_scope=batch_scope,
             num_cpus=actor_num_cpus,
-            max_retries=max_retries,
+            recovery=recovery,
         )
         self.table_core = (
             RayModule(self.table_core_stage)
@@ -200,20 +201,20 @@ class DoclingTableJobV35Pipeline(Pipeline):
                 batch_scope=batch_scope,
                 num_cpus=actor_num_cpus,
                 num_gpus=table_num_gpus,
-                max_retries=max_retries,
+                recovery=recovery,
             )
         )
         self.page_assemble = RayModule(ReduceDoclingPage).ray_options(
             replicas=page_reduce_replicas,
             batch_size=table_batch_size,
             num_cpus=1,
-            max_retries=max_retries,
+            recovery=recovery,
         )
         self.document_assemble = RayModule(ReduceDoclingDocument).ray_options(
             replicas=reduce_replicas,
             batch_size=2,
             num_cpus=1,
-            max_retries=max_retries,
+            recovery=recovery,
         )
 
     def forward(self, documents: Port) -> Port:  # pyright: ignore[reportIncompatibleMethodOverride]

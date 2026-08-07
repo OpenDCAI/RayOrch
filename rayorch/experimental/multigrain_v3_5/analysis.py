@@ -50,7 +50,7 @@ def analyze(logical: LogicalProgram) -> DerivedFacts:
     shape_reporters: dict[DomainRef, list[PortRef]] = {}
 
     for call, spec in logical.calls.items():
-        for index, input_ in enumerate(spec.inputs):
+        for index, input_ in enumerate(spec.ordered_inputs):
             consumers.setdefault(input_.port, []).append(CallUse(call, index))
 
     for port, semantic in semantics.items():

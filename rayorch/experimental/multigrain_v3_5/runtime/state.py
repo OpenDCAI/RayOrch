@@ -8,7 +8,6 @@ from typing import TypeAlias
 from ..model import (
     DomainRef,
     EntityRef,
-    GrainPhase,
     GrainRef,
     ItemOutcome,
     ItemRef,
@@ -50,15 +49,6 @@ class ItemRecord:
     outcome: ItemOutcome
     cause: object | None = None
     control: bool | None = None
-
-
-@dataclass(slots=True)
-class GrainRecord:
-    """Grain 的执行阶段与 retry generation；身份由 table key 提供。"""
-
-    phase: GrainPhase
-    generation: int = 0
-    infra_failures: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,9 +147,8 @@ class PendingInvocation:
 
 @dataclass(slots=True)
 class RuntimeState:
-    """ArenaEngine 独占写入的全部被动语义表。"""
+    """Arena runtime 独占写入的全部被动语义表。"""
 
-    grains: dict[GrainRef, GrainRecord] = field(default_factory=dict)
     items: dict[ItemRef, ItemRecord] = field(default_factory=dict)
     shapes: dict[ShapeKey, ShapeRecord] = field(default_factory=dict)
     entity_lineage: dict[EntityRef, EntityOrigin] = field(default_factory=dict)
@@ -170,7 +159,6 @@ class RuntimeState:
 __all__ = [
     "CommitError",
     "EntityOrigin",
-    "GrainRecord",
     "GroupBinding",
     "GroupShape",
     "ItemRecord",

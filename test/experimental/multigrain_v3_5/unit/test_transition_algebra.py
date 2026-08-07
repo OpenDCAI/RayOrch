@@ -28,11 +28,8 @@ from rayorch.experimental.multigrain_v3_5.transitions import (
     item_transition,
     shape_transition,
 )
-from rayorch.experimental.multigrain_v3_5.runtime.state import (
-    EntityOrigin,
-    GrainRecord,
-    ShapeRecord,
-)
+from rayorch.experimental.multigrain_v3_5.runtime.dispatch import GrainRecord
+from rayorch.experimental.multigrain_v3_5.runtime.state import EntityOrigin, ShapeRecord
 
 
 TERMINAL_OR_PENDING = (None, *ItemOutcome)

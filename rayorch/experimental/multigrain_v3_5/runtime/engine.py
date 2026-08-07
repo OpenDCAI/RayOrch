@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, TypeAlias, assert_never
 
 from ..model import (
     CallRef,
     DomainRef,
     EntityRef,
-    GrainPhase,
     GrainRef,
     InputMode,
     ItemOutcome,
@@ -21,23 +20,22 @@ from ..model import (
 from ..transitions import (
     CallAction,
     FilterCause,
-    GrainEvent,
     GroupCause,
     InvalidTransition,
     broadcast_transition,
     call_transition,
     expansion_shape_transition,
     filter_transition,
-    grain_transition,
     group_transition,
     item_transition,
     shape_transition,
 )
 from ..plan import (
-    BroadcastRoute,
-    CallInputRoute,
-    FilterRoute,
-    GroupRoute,
+    BroadcastEffect,
+    CallInputEffect,
+    FilterEffect,
+    GroupEffect,
+    ItemEffect,
     RuntimePlan,
 )
 from ..protocol import (
@@ -51,10 +49,11 @@ from ..protocol import (
     ScalarTake,
     WorkerReport,
 )
+from ..recovery import RecoveryAction, RecoveryPolicy
+from .dispatch import DispatchSelection, DispatchState, GrainSnapshot
 from .state import (
     CommitError,
     EntityOrigin,
-    GrainRecord,
     GroupBinding,
     GroupShape,
     ItemRecord,
@@ -75,6 +74,9 @@ class _ExpansionCommit:
     controls: tuple[bool, ...] | None
 
 
+_FactEvent: TypeAlias = ItemRef | ShapeKey | EntityRef
+
+
 class ArenaEngine:
     """拥有一个 source microbatch 的全部语义事实与唯一写入口。"""
 
@@ -84,16 +86,18 @@ class ArenaEngine:
     ) -> None:
         self.plan = plan
         self.state = RuntimeState()
-        self._receipts: deque[ItemRef] = deque()
-        self._ready: deque[GrainRef] = deque()
-        self._entities_by_domain: dict[DomainRef, list[EntityRef]] = defaultdict(list)
+        self._dispatch = DispatchState()
+        self._facts: deque[_FactEvent] = deque()
+        self._entities_by_domain: dict[
+            DomainRef, dict[EntityRef, None]
+        ] = defaultdict(dict)
         self._admission_closed = False
 
     @property
     def ready_count(self) -> int:
         """返回当前可被执行器预留的 Grain 数。"""
 
-        return len(self._ready)
+        return self._dispatch.ready_count
 
     @property
     def entity_count(self) -> int:
@@ -113,49 +117,44 @@ class ArenaEngine:
 
         return len(self.state.shapes)
 
-    def ready_calls(self) -> tuple[CallRef, ...]:
-        """按 ready queue 首次出现顺序返回可调度 Call。"""
+    @property
+    def grain_count(self) -> int:
+        """返回 DispatchState 独占的 Grain 总数。"""
 
-        seen: set[CallRef] = set()
-        calls = []
-        for grain in self._ready:
-            if grain.call not in seen and self.state.grains[grain].phase is GrainPhase.READY:
-                seen.add(grain.call)
-                calls.append(grain.call)
-        return tuple(calls)
+        return self._dispatch.grain_count
 
-    def reserve_batch(
+    def grain_snapshot(self, grain: GrainRef) -> GrainSnapshot:
+        """返回一个 Grain 的不可变物理状态副本。"""
+
+        return self._dispatch.snapshot(grain)
+
+    def grain_snapshots(self) -> Mapping[GrainRef, GrainSnapshot]:
+        """返回当前全部 Grain 的不可变 point-in-time snapshot。"""
+
+        return self._dispatch.snapshots()
+
+    def dispatch_priority(self, call: CallRef) -> int | None:
+        """Return immediate/normal/tail priority for one Call, if runnable."""
+
+        return self._dispatch.priority(call)
+
+    def reserve_dispatch(
         self,
         call: CallRef,
         *,
         max_size: int,
         parent_bound: bool = False,
-    ) -> tuple[GrainRef, ...]:
-        """预留 READY Grains；parent_bound 只改变 packing，不改变身份。"""
+    ) -> DispatchSelection:
+        """Reserve immediate recovery, normal work, then deferred recovery."""
 
-        if max_size <= 0:
-            raise ValueError("max_size must be positive")
-        selected: list[GrainRef] = []
-        remaining: deque[GrainRef] = deque()
-        parent: EntityRef | None = None
-        while self._ready:
-            grain = self._ready.popleft()
-            record = self.state.grains[grain]
-            if record.phase is not GrainPhase.READY:
-                continue
-            if grain.call != call or len(selected) >= max_size:
-                remaining.append(grain)
-                continue
-            candidate_parent = self._batch_parent(grain.entity)
-            if parent_bound and parent is not None and candidate_parent != parent:
-                remaining.append(grain)
-                continue
-            if parent is None:
-                parent = candidate_parent
-            record.phase = grain_transition(record.phase, GrainEvent.RESERVE)
-            selected.append(grain)
-        self._ready = remaining
-        return tuple(selected)
+        selection = self._dispatch.reserve(
+            call,
+            max_size=max_size,
+            parent_bound=parent_bound,
+        )
+        if selection is None:
+            raise LookupError(f"no READY dispatch for {call!r}")
+        return selection
 
     def close_admission(self) -> None:
         """声明本 Arena 不再接纳 source，允许完整性判定成立。"""
@@ -167,9 +166,13 @@ class ArenaEngine:
 
         if not self._admission_closed:
             return False
-        if self._receipts or self.state.pending or self._ready:
+        if (
+            self._facts
+            or self.state.pending
+            or not self._dispatch.is_idle
+        ):
             return False
-        if any(record.phase is not GrainPhase.SEALED for record in self.state.grains.values()):
+        if not self._dispatch.all_sealed:
             return False
         for port in self._output_ports(self.plan.output_tree):
             for entity in self._entities_by_domain.get(self.plan.port_domain(port), ()):
@@ -198,10 +201,9 @@ class ArenaEngine:
     def invocation_plan(self, grain: GrainRef) -> InvocationPlan:
         """把 Arena 语义事实投影为 Worker 可消费的纯物理输入计划。"""
 
-        record = self.state.grains[grain]
         call = self.plan.call(grain.call)
         takes = []
-        for input_spec in call.inputs:
+        for input_spec in call.ordered_inputs:
             item = ItemRef(input_spec.port, grain.entity)
             receipt = self.state.items[item]
             if (
@@ -226,7 +228,11 @@ class ArenaEngine:
                 )
                 continue
             raise CommitError(f"unsupported ValueBinding: {binding!r}")
-        return InvocationPlan(grain, record.generation, tuple(takes))
+        return InvocationPlan(
+            grain,
+            self._dispatch.generation(grain),
+            tuple(takes),
+        )
 
     def ordered_items(self, port: PortRef) -> tuple[ItemRef, ...]:
         """按 source/ordinal coordinate 返回一个 Port 的全部 Item。"""
@@ -276,17 +282,13 @@ class ArenaEngine:
         self.state.values.clear()
         return released
 
-    def infra_failures(self, grain: GrainRef) -> int:
-        """返回 Grain 已发生的基础设施失败次数。"""
-
-        return self.state.grains[grain].infra_failures
-
     def progress_summary(self) -> str:
         """返回不含业务 payload 的死锁诊断摘要。"""
 
         return (
             f"pending={len(self.state.pending)}, "
-            f"grains={len(self.state.grains)}, "
+            f"ready={self.ready_count}, "
+            f"grains={self.grain_count}, "
             f"shapes={len(self.state.shapes)}"
         )
 
@@ -319,10 +321,11 @@ class ArenaEngine:
             raise CommitError("sources have already been admitted")
 
         entities = tuple(EntityRef(root_domain, index) for index in range(count))
-        self._entities_by_domain[root_domain].extend(entities)
+        for entity in entities:
+            self._publish_entity(entity)
         for source, rows in bindings.items():
             for entity, row in zip(entities, rows):
-                self._publish(
+                self._publish_item(
                     ItemRef(source, entity),
                     ItemOutcome.PRESENT,
                     binding=row,
@@ -332,34 +335,45 @@ class ArenaEngine:
         return entities
 
     def advance(self) -> None:
-        """消费 publication receipts，直到结构传播达到局部不动点。"""
+        """消费封闭 FactEvent 联合，直到结构传播达到局部不动点。"""
 
-        while self._receipts:
-            item = self._receipts.popleft()
-            for route in self.plan.routes_by_port.get(item.port, ()):
-                if isinstance(route, CallInputRoute):
-                    self._accept_call_input(route, item)
-                elif isinstance(route, FilterRoute):
-                    self._try_filter(route.port, item.entity)
-                elif isinstance(route, BroadcastRoute):
-                    self._propagate_broadcast_source(route.port, item)
-                elif isinstance(route, GroupRoute):
-                    parent = self._parent_of(item.entity)
-                    if parent is not None:
-                        self._try_group(route.port, parent)
-                else:  # pragma: no cover - RuntimePlan verifier 封闭路由类型
-                    raise CommitError(f"unsupported RuntimeRoute: {route!r}")
+        while self._facts:
+            fact = self._facts.popleft()
+            match fact:
+                case ItemRef():
+                    for effect in self.plan.effects_by_item_port.get(
+                        fact.port, ()
+                    ):
+                        self._apply_item_effect(effect, fact)
+                case ShapeKey():
+                    for effect in self.plan.effects_by_shape_domain.get(
+                        fact.child_domain, ()
+                    ):
+                        self._try_group(effect, fact.parent_entity)
+                case EntityRef():
+                    for effect in self.plan.effects_by_entity_domain.get(
+                        fact.domain, ()
+                    ):
+                        self._try_broadcast_to_entity(effect, fact)
+                case _:
+                    assert_never(fact)
 
-    def reserve_ready(self) -> GrainRef:
-        """预留一个 READY Grain，并记录当前 generation 的 attempt。"""
+    def _apply_item_effect(self, effect: ItemEffect, item: ItemRef) -> None:
+        """穷尽解释一个由 Item publication 触发的完整编译期 Effect。"""
 
-        while self._ready:
-            grain = self._ready.popleft()
-            record = self.state.grains[grain]
-            if record.phase is GrainPhase.READY:
-                record.phase = grain_transition(record.phase, GrainEvent.RESERVE)
-                return grain
-        raise LookupError("no READY Grain")
+        match effect:
+            case CallInputEffect():
+                self._accept_call_input(effect, item)
+            case FilterEffect():
+                self._try_filter(effect, item.entity)
+            case BroadcastEffect():
+                self._try_broadcast_from_source(effect, item)
+            case GroupEffect():
+                parent = self._parent_of(item.entity)
+                if parent is not None:
+                    self._try_group(effect, parent)
+            case _:
+                assert_never(effect)
 
     def commit_report(self, report: WorkerReport) -> None:
         """按报告类型进入唯一的成功/失败语义提交路径。"""
@@ -377,11 +391,7 @@ class ArenaEngine:
         """校验并发布一个成功 Grain 的全部输出、Shape 与 child Entities。"""
 
         grain = report.grain
-        record = self.state.grains.get(grain)
-        if record is None or record.phase is not GrainPhase.IN_FLIGHT:
-            raise CommitError("success report requires one IN_FLIGHT Grain")
-        if report.generation != record.generation:
-            raise CommitError("stale generation")
+        self._dispatch.validate_in_flight(grain, report.generation)
 
         expected_outputs = self.plan.outputs_by_call[grain.call]
         by_port = {output.port: output for output in report.outputs}
@@ -455,7 +465,7 @@ class ArenaEngine:
                 raise CommitError("Shape has already been published")
         # 至此所有 report/shape/cardinality 均已验证；后续 publication
         # 对状态机而言是一个不可分割的逻辑 turn。
-        record.phase = grain_transition(record.phase, GrainEvent.REPORT)
+        self._dispatch.seal(grain, report.generation)
 
         commits_by_shape: dict[ShapeKey, list[_ExpansionCommit]] = defaultdict(list)
         for commit in expansion_commits:
@@ -471,14 +481,14 @@ class ArenaEngine:
                 for child, row, control in zip(children, commit.rows, controls):
                     item = ItemRef(commit.child_port, child)
                     leaves.append(item)
-                    self._publish(
+                    self._publish_item(
                         item,
                         ItemOutcome.PRESENT,
                         binding=row,
                         control=control,
                     )
                 parent_item = ItemRef(commit.source_port, grain.entity)
-                self._publish(
+                self._publish_item(
                     parent_item,
                     ItemOutcome.PRESENT,
                     binding=GroupBinding(
@@ -491,7 +501,7 @@ class ArenaEngine:
         for item, output in scalar_commits:
             if item.port in expanded_sources:
                 continue
-            self._publish(
+            self._publish_item(
                 item,
                 ItemOutcome.PRESENT,
                 binding=output.scalar,
@@ -508,16 +518,16 @@ class ArenaEngine:
     ) -> None:
         """发布计算失败；fan-out 前失败以 unknown cardinality 封闭 Shape。"""
 
-        record = self.state.grains.get(grain)
-        if record is None or record.phase is not GrainPhase.IN_FLIGHT:
-            raise CommitError("failure requires one IN_FLIGHT Grain")
-        if generation is not None and generation != record.generation:
-            raise CommitError("stale generation")
+        self._dispatch.validate_in_flight(grain, generation)
 
         outputs = self.plan.outputs_by_call[grain.call]
-        record.phase = grain_transition(record.phase, GrainEvent.REPORT)
+        self._dispatch.seal(grain, generation)
         for output in outputs:
-            self._publish(ItemRef(output, grain.entity), ItemOutcome.FAILED, cause=cause)
+            self._publish_item(
+                ItemRef(output, grain.entity),
+                ItemOutcome.FAILED,
+                cause=cause,
+            )
             for expansion in self.plan.expansions_by_source.get(output, ()):
                 shape = ShapeKey(expansion.child_domain, grain.entity)
                 if shape not in self.state.shapes:
@@ -528,18 +538,43 @@ class ArenaEngine:
                     )
         self.advance()
 
-    def retry(self, grain: GrainRef) -> None:
-        """保留 Grain 身份并提升 generation，以 fence 隔离旧报告。"""
+    def apply_udf_recovery(
+        self,
+        selection: DispatchSelection,
+        action: RecoveryAction,
+        cause: object,
+    ) -> int:
+        """Apply one policy action at the physical/semantic ownership boundary."""
 
-        record = self.state.grains[grain]
-        if record.phase is not GrainPhase.IN_FLIGHT:
-            raise CommitError("only an IN_FLIGHT Grain can be retried")
-        record.generation += 1
-        record.infra_failures += 1
-        record.phase = grain_transition(record.phase, GrainEvent.RETRY)
-        self._ready.append(grain)
+        match action:
+            case RecoveryAction.FAIL_SINGLETON:
+                if len(selection.grains) != 1:
+                    raise CommitError("FAIL_SINGLETON requires one Grain")
+                self.commit_failure(selection.grains[0], cause)
+                return 0
+            case (
+                RecoveryAction.RETRY_IMMEDIATE
+                | RecoveryAction.RETRY_TAIL
+                | RecoveryAction.SPLIT_TAIL
+            ):
+                return self._dispatch.recover_udf(selection, action)
+            case RecoveryAction.ABORT:
+                raise CommitError("ABORT is terminal and cannot mutate an Arena")
 
-    def _publish(
+    def retry_infrastructure_dispatch(
+        self,
+        selection: DispatchSelection,
+        policy: RecoveryPolicy,
+    ) -> bool:
+        """Pure-policy preflight followed by one atomic physical requeue."""
+
+        failures = self._dispatch.infrastructure_failures(selection)
+        if not policy.allows_infrastructure_retry(failures):
+            return False
+        self._dispatch.recover_infrastructure(selection)
+        return True
+
+    def _publish_item(
         self,
         item: ItemRef,
         outcome: ItemOutcome,
@@ -571,7 +606,7 @@ class ArenaEngine:
         self.state.items[item] = record
         if binding is not None:
             self.state.values[item] = binding
-        self._receipts.append(item)
+        self._facts.append(item)
 
     def _publish_shape(
         self,
@@ -581,7 +616,7 @@ class ArenaEngine:
         children: tuple[EntityRef, ...] | None = None,
         cause: object | None = None,
     ) -> None:
-        """单调发布一个 Shape 终态，并触发所有 parent-domain Group。"""
+        """单调发布一个 Shape 终态，并入队唯一的事实传播入口。"""
 
         record = ShapeRecord(state, children, cause)
         existing = self.state.shapes.get(shape)
@@ -594,23 +629,23 @@ class ArenaEngine:
                 raise CommitError(f"conflicting Shape publication: {shape}")
             return
         self.state.shapes[shape] = record
-        self._shape_terminal(shape)
+        self._facts.append(shape)
 
-    def _accept_call_input(self, edge: CallInputRoute, item: ItemRef) -> None:
-        call = self.plan.call(edge.call)
+    def _accept_call_input(self, effect: CallInputEffect, item: ItemRef) -> None:
+        call = self.plan.call(effect.call)
         if item.entity.domain != call.execution_domain:
             raise CommitError("Call input receipt has the wrong Domain")
-        grain = GrainRef(edge.call, item.entity)
-        if grain in self.state.grains:
+        grain = GrainRef(effect.call, item.entity)
+        if self._dispatch.contains(grain):
             return
         pending = self.state.pending.setdefault(
             grain,
-            PendingInvocation([None] * len(call.inputs)),
+            PendingInvocation([None] * len(call.ordered_inputs)),
         )
-        current = pending.slots[edge.input_index]
+        current = pending.slots[effect.input_index]
         if current is not None and current != item:
             raise CommitError("Call input slot received conflicting Items")
-        pending.slots[edge.input_index] = item
+        pending.slots[effect.input_index] = item
         if self._classify_call(grain, tuple(pending.slots)):
             del self.state.pending[grain]
 
@@ -627,25 +662,20 @@ class ArenaEngine:
             for item in inputs
         )
         decision = call_transition(
-            tuple(input_.mode for input_ in call.inputs),
+            tuple(input_.mode for input_ in call.ordered_inputs),
             outcomes,
         )
         if decision.action is CallAction.WAIT:
             return False
         if decision.action is CallAction.READY:
-            self.state.grains[grain] = GrainRecord(
-                grain_transition(None, GrainEvent.INPUTS_READY)
-            )
-            self._ready.append(grain)
+            self._dispatch.inputs_ready(grain, self._batch_parent(grain.entity))
             return True
 
         assert decision.decisive_input is not None
         decisive_item = inputs[decision.decisive_input]
         assert decisive_item is not None
         receipt = self.state.items[decisive_item]
-        self.state.grains[grain] = GrainRecord(
-            grain_transition(None, GrainEvent.INPUTS_TERMINAL)
-        )
+        self._dispatch.inputs_terminal(grain)
         output = (
             ItemOutcome.DROPPED
             if decision.action is CallAction.DROP_OUTPUTS
@@ -667,7 +697,11 @@ class ArenaEngine:
         outputs = self.plan.outputs_by_call[grain.call]
         shapes: list[ShapeKey] = []
         for output in outputs:
-            self._publish(ItemRef(output, grain.entity), outcome, cause=cause)
+            self._publish_item(
+                ItemRef(output, grain.entity),
+                outcome,
+                cause=cause,
+            )
             for expansion in self.plan.expansions_by_source.get(output, ()):
                 shape = ShapeKey(expansion.child_domain, grain.entity)
                 if shape not in shapes:
@@ -678,13 +712,12 @@ class ArenaEngine:
         for shape in shapes:
             self._publish_shape(shape, state, cause=cause)
 
-    def _try_filter(self, target_port: PortRef, entity: EntityRef) -> None:
-        target = ItemRef(target_port, entity)
+    def _try_filter(self, effect: FilterEffect, entity: EntityRef) -> None:
+        target = ItemRef(effect.target_port, entity)
         if target in self.state.items:
             return
-        rule = self.plan.filter_rules[target_port]
-        source = ItemRef(rule.source_port, entity)
-        mask = ItemRef(rule.mask_port, entity)
+        source = ItemRef(effect.source_port, entity)
+        mask = ItemRef(effect.mask_port, entity)
         source_record = self.state.items.get(source)
         mask_record = self.state.items.get(mask)
         try:
@@ -700,13 +733,13 @@ class ArenaEngine:
         if decision.outcome is ItemOutcome.PRESENT:
             assert source_record is not None
             control = None
-            if rule.copy_source_control:
+            if effect.copy_source_control:
                 control = source_record.control
                 if control is None:
                     raise CommitError(
                         "filtered control Port requires a source control manifest"
                     )
-            self._publish(
+            self._publish_item(
                 target,
                 ItemOutcome.PRESENT,
                 binding=self.state.values[source],
@@ -717,24 +750,27 @@ class ArenaEngine:
         cause_item = source if decision.cause is FilterCause.SOURCE else mask
         cause_record = self.state.items.get(cause_item)
         cause = None if cause_record is None else cause_record.cause
-        self._publish(
+        self._publish_item(
             target,
             decision.outcome,
             cause=cause_item if cause is None else cause,
         )
 
-    def _try_group(self, target_port: PortRef, parent: EntityRef) -> None:
-        target = ItemRef(target_port, parent)
+    def _try_group(self, effect: GroupEffect, parent: EntityRef) -> None:
+        target = ItemRef(effect.target_port, parent)
         if target in self.state.items:
             return
-        rule = self.plan.group_rules[target_port]
-        shape_key = ShapeKey(rule.child_domain, parent)
+        shape_key = ShapeKey(effect.child_domain, parent)
         shape = self.state.shapes.get(shape_key)
         if shape is None:
             return
         children = () if shape.children is None else shape.children
-        member_items = tuple(ItemRef(rule.members_port, child) for child in children)
-        value_items = tuple(ItemRef(rule.value_port, child) for child in children)
+        member_items = tuple(
+            ItemRef(effect.members_port, child) for child in children
+        )
+        value_items = tuple(
+            ItemRef(effect.value_port, child) for child in children
+        )
         decision = group_transition(
             shape.state,
             tuple(
@@ -756,7 +792,7 @@ class ArenaEngine:
             elif decision.cause is GroupCause.VALUE:
                 assert decision.cause_index is not None
                 cause = value_items[decision.cause_index]
-            self._publish(target, decision.outcome, cause=cause)
+            self._publish_item(target, decision.outcome, cause=cause)
             return
 
         # members 决定资格，value 仅为纯状态机选出的 survivors 提供 payload。
@@ -765,7 +801,7 @@ class ArenaEngine:
         bindings = tuple(self.state.values[item] for item in survivor_items)
         # 一层 reduce 收集 RowBinding；多层 reduce 则拼接子 GroupShape，
         # 最终仍保持一个规范 CSR shape 和一份扁平叶子引用。
-        value_depth = rule.value_depth
+        value_depth = effect.value_depth
         if not bindings and value_depth > 0:
             group_shape = GroupShape.nest((), child_depth=value_depth)
             flat_items = ()
@@ -774,7 +810,7 @@ class ArenaEngine:
             flat_items = survivor_items
         elif all(isinstance(value, GroupBinding) for value in bindings):
             groups = tuple(value for value in bindings if isinstance(value, GroupBinding))
-            depth = groups[0].shape.depth if groups else rule.value_depth
+            depth = groups[0].shape.depth if groups else effect.value_depth
             group_shape = GroupShape.nest(
                 tuple(group.shape for group in groups),
                 child_depth=depth,
@@ -785,31 +821,36 @@ class ArenaEngine:
         else:
             raise CommitError("group values mix scalar and grouped realizations")
 
-        self._publish(
+        self._publish_item(
             target,
             ItemOutcome.PRESENT,
             binding=GroupBinding(group_shape, flat_items),
         )
 
-    def _propagate_broadcast_source(
+    def _try_broadcast_from_source(
         self,
-        target_port: PortRef,
+        effect: BroadcastEffect,
         source_item: ItemRef,
     ) -> None:
-        target_domain = self.plan.broadcast_rules[target_port].target_domain
-        for entity in self._entities_by_domain.get(target_domain, ()):
-            if self._ancestor_entity(entity, source_item.entity.domain) == source_item.entity:
-                self._publish_broadcast(target_port, entity)
+        for entity in self._entities_by_domain.get(effect.target_domain, ()):
+            if (
+                self._ancestor_entity(entity, effect.source_domain)
+                == source_item.entity
+            ):
+                self._try_broadcast_to_entity(effect, entity)
 
-    def _publish_broadcast(self, target_port: PortRef, entity: EntityRef) -> None:
-        target = ItemRef(target_port, entity)
+    def _try_broadcast_to_entity(
+        self,
+        effect: BroadcastEffect,
+        entity: EntityRef,
+    ) -> None:
+        target = ItemRef(effect.target_port, entity)
         if target in self.state.items:
             return
-        rule = self.plan.broadcast_rules[target_port]
-        ancestor = self._ancestor_entity(entity, rule.source_domain)
+        ancestor = self._ancestor_entity(entity, effect.source_domain)
         if ancestor is None:
             raise CommitError("broadcast target has no source-domain ancestor")
-        source = ItemRef(rule.source_port, ancestor)
+        source = ItemRef(effect.source_port, ancestor)
         if source not in self.state.items:
             return
         record = self.state.items[source]
@@ -818,12 +859,12 @@ class ArenaEngine:
             if record.outcome is ItemOutcome.PRESENT
             else None
         )
-        self._publish(
+        self._publish_item(
             target,
             broadcast_transition(record.outcome),
             binding=binding,
             cause=record.cause,
-            control=record.control if rule.copy_source_control else None,
+            control=record.control if effect.copy_source_control else None,
         )
 
     def _create_children(
@@ -836,21 +877,30 @@ class ArenaEngine:
             for ordinal in range(count)
         )
         for ordinal, child in enumerate(children):
-            self.state.entity_lineage[child] = EntityOrigin(
-                shape.parent_entity,
-                ordinal,
+            self._publish_entity(
+                child,
+                EntityOrigin(shape.parent_entity, ordinal),
             )
-            self._entities_by_domain[shape.child_domain].append(child)
-            for broadcast in self.plan.broadcasts_by_target_domain.get(
-                shape.child_domain,
-                (),
-            ):
-                self._publish_broadcast(broadcast, child)
         return children
 
-    def _shape_terminal(self, shape: ShapeKey) -> None:
-        for group_port in self.plan.groups_by_child_domain.get(shape.child_domain, ()):
-            self._try_group(group_port, shape.parent_entity)
+    def _publish_entity(
+        self,
+        entity: EntityRef,
+        origin: EntityOrigin | None = None,
+    ) -> None:
+        """单调发布 Entity 事实；root 无 origin，child 显式记录 lineage。"""
+
+        entities = self._entities_by_domain[entity.domain]
+        if entity in entities:
+            if self.state.entity_lineage.get(entity) != origin:
+                raise CommitError(f"conflicting Entity publication: {entity}")
+            return
+        if entity in self.state.entity_lineage:
+            raise CommitError(f"conflicting Entity publication: {entity}")
+        if origin is not None:
+            self.state.entity_lineage[entity] = origin
+        entities[entity] = None
+        self._facts.append(entity)
 
     def _parent_of(self, entity: EntityRef) -> EntityRef | None:
         origin = self.state.entity_lineage.get(entity)

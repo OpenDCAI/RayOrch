@@ -131,7 +131,7 @@ class CrashPipeline(mg.Pipeline):
             .ray_options(
                 batch_size=4,
                 replicas=1,
-                max_retries=1,
+                recovery=mg.RecoveryPolicy.abort(infra_retries=1),
                 num_cpus=0,
                 max_restarts=0,
             )
@@ -152,7 +152,7 @@ def test_actor_crash_replaces_actor_and_replays_same_grains(tmp_path):
     assert metrics.retries == 4
     assert metrics.rpcs == 2
     assert {
-        grain.generation for grain in result.arenas[0].state.grains.values()
+        grain.generation for grain in result.arenas[0].grain_snapshots().values()
     } == {1}
 
 
@@ -235,3 +235,198 @@ def test_record_failure_makes_all_outputs_of_one_grain_failed():
 
     assert left == [10, ItemOutcome.FAILED, 30]
     assert right == [100, ItemOutcome.FAILED, 300]
+
+
+class FailFirstDispatch:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, values):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("transient UDF failure")
+        return [(value, self.calls) for value in values]
+
+
+class RetryPipeline(mg.Pipeline):
+    def __init__(self, recovery: mg.RecoveryPolicy) -> None:
+        self.call = mg.RayModule(FailFirstDispatch).ray_options(
+            batch_size=2,
+            replicas=1,
+            recovery=recovery,
+            num_cpus=0,
+        )
+
+    def forward(self, values):
+        return self.call(values)
+
+
+@pytest.mark.parametrize(
+    ("recovery", "expected"),
+    [
+        (
+            mg.RecoveryPolicy.retry_batch(),
+            [(0, 2), (1, 2), (2, 3), (3, 3)],
+        ),
+        (
+            mg.RecoveryPolicy.retry_tail(),
+            [(0, 3), (1, 3), (2, 2), (3, 2)],
+        ),
+    ],
+)
+def test_udf_retry_policy_controls_immediate_or_tail_order(recovery, expected):
+    with Executor(RetryPipeline(recovery)) as executor:
+        result = executor.run(range(4))
+
+    metrics = next(iter(result.calls.values()))
+    assert result.outputs == expected
+    assert metrics.rpcs == 3
+    assert metrics.retries == 2
+    assert metrics.actor_starts == 1
+    assert {
+        grain.generation for grain in result.arenas[0].grain_snapshots().values()
+    } == {0, 1}
+
+
+class PoisonValue:
+    def run(self, values):
+        if 2 in values:
+            raise ValueError("poison value 2")
+        return [value * 10 for value in values]
+
+
+class IsolationPipeline(mg.Pipeline):
+    def __init__(self) -> None:
+        self.call = mg.RayModule(PoisonValue).ray_options(
+            batch_size=4,
+            recovery=mg.RecoveryPolicy.isolate_tail(),
+            num_cpus=0,
+        )
+
+    def forward(self, values):
+        return self.call(values)
+
+
+def test_isolate_tail_commits_only_the_poison_singleton_as_failed():
+    with Executor(IsolationPipeline()) as executor:
+        result = executor.run(range(4))
+
+    metrics = next(iter(result.calls.values()))
+    assert result.outputs == [0, 10, ItemOutcome.FAILED, 30]
+    assert metrics.rpcs == 6
+    assert metrics.retries == 10
+    records = result.arenas[0].grain_snapshots()
+    assert [record.generation for record in records.values()] == [2, 2, 3, 3]
+    assert all(record.infra_failures == 0 for record in records.values())
+
+
+class AlwaysUdfError:
+    def run(self, values):
+        raise ArithmeticError("deterministic UDF error")
+
+
+class AbortPipeline(mg.Pipeline):
+    def __init__(self) -> None:
+        self.call = mg.RayModule(AlwaysUdfError).ray_options(
+            batch_size=4,
+            num_cpus=0,
+        )
+
+    def forward(self, values):
+        return self.call(values)
+
+
+def test_default_udf_policy_aborts_with_complete_dispatch_context():
+    with pytest.raises(mg.ExecutionError) as captured:
+        with Executor(AbortPipeline()) as executor:
+            executor.run(range(4))
+
+    message = str(captured.value)
+    assert "AlwaysUdfError" in message
+    assert "UDF_ERROR" in message
+    assert "ArithmeticError" in message
+    assert "deterministic UDF error" in message
+    assert "generation=0" in message
+
+
+class WrongCardinality:
+    def __init__(self, marker: str) -> None:
+        self.marker = Path(marker)
+
+    def run(self, values):
+        calls = int(self.marker.read_text()) if self.marker.exists() else 0
+        self.marker.write_text(str(calls + 1), encoding="utf-8")
+        return []
+
+
+class ContractPipeline(mg.Pipeline):
+    def __init__(self, marker: str) -> None:
+        self.call = (
+            mg.RayModule(WrongCardinality)
+            .pre_init(marker)
+            .ray_options(
+                batch_size=4,
+                recovery=mg.RecoveryPolicy.isolate_tail(),
+                num_cpus=0,
+            )
+        )
+
+    def forward(self, values):
+        return self.call(values)
+
+
+def test_worker_contract_error_is_readable_and_never_retried(tmp_path):
+    marker = tmp_path / "v35-contract-calls"
+    with pytest.raises(mg.ExecutionError) as captured:
+        with Executor(ContractPipeline(str(marker))) as executor:
+            executor.run(range(4))
+
+    message = str(captured.value)
+    assert marker.read_text(encoding="utf-8") == "1"
+    assert "WrongCardinality" in message
+    assert "CONTRACT_ERROR" in message
+    assert "expected 4 Grain rows, got 0" in message
+    assert "PortRef" in message
+    assert "GrainRef" in message
+    assert "generation=0" in message
+    assert "worker traceback" in message
+
+
+class AlwaysCrash:
+    def __init__(self, marker: str) -> None:
+        self.marker = Path(marker)
+
+    def run(self, values):
+        crashes = int(self.marker.read_text()) if self.marker.exists() else 0
+        self.marker.write_text(str(crashes + 1), encoding="utf-8")
+        os._exit(19)
+
+
+class ExhaustedInfrastructurePipeline(mg.Pipeline):
+    def __init__(self, marker: str) -> None:
+        self.call = (
+            mg.RayModule(AlwaysCrash)
+            .pre_init(marker)
+            .ray_options(
+                batch_size=4,
+                recovery=mg.RecoveryPolicy.abort(infra_retries=1),
+                num_cpus=0,
+                max_restarts=0,
+            )
+        )
+
+    def forward(self, values):
+        return self.call(values)
+
+
+def test_exhausted_infrastructure_budget_aborts_without_data_failure(tmp_path):
+    marker = tmp_path / "v35-always-crash"
+    with pytest.raises(mg.ExecutionError) as captured:
+        with Executor(ExhaustedInfrastructurePipeline(str(marker))) as executor:
+            executor.run(range(4))
+
+    message = str(captured.value)
+    assert marker.read_text(encoding="utf-8") == "2"
+    assert "AlwaysCrash" in message
+    assert "INFRA_FAILURE" in message
+    assert "generation=1" in message
