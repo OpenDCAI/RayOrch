@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import rayorch.experimental.multigrain_v3_5 as mg
-from rayorch.experimental.multigrain_v3_5.executor import Executor
+from rayorch.experimental.multigrain_v3_5.executor import Executor, _RayWorkerActor
 from rayorch.experimental.multigrain_v3_5.model import ItemOutcome
 from rayorch.experimental.multigrain_v3_5.protocol import RecordFailure
 
@@ -63,6 +63,27 @@ def test_persistent_actor_is_shared_by_multiple_arenas():
     observations = next(iter(result.workers.values()))
     assert len(observations) == 1
     assert observations[0].calls == result.calls[next(iter(result.calls))].rpcs
+
+
+def test_actor_class_is_wrapped_once_per_executor(monkeypatch):
+    import ray
+
+    wraps = 0
+    original_remote = ray.remote
+
+    def tracking_remote(*args, **kwargs):
+        nonlocal wraps
+        if args and args[0] is _RayWorkerActor:
+            wraps += 1
+        return original_remote(*args, **kwargs)
+
+    monkeypatch.setattr(ray, "remote", tracking_remote)
+    pipeline = IdentityPipeline()
+    pipeline.identity = pipeline.identity.ray_options(replicas=3)
+    with Executor(pipeline):
+        pass
+
+    assert wraps == 1
 
 
 class KeywordOnlyAdd:

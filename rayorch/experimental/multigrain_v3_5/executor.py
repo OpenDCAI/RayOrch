@@ -205,6 +205,7 @@ class Executor:
                 init_kwargs["address"] = address
             ray.init(**init_kwargs)
 
+        self._actor_class = ray.remote(_RayWorkerActor)
         self.store = _RayBlockStore(ray)
         self.metrics = {call: CallMetrics() for call in self.plan.calls}
         self._actors: dict[CallRef, list[_ActorSlot]] = {}
@@ -513,7 +514,7 @@ class Executor:
             for key, value in options.items()
             if key not in self._INTERNAL_OPTIONS
         }
-        actor_class = self.ray.remote(_RayWorkerActor).options(**actor_options)
+        actor_class = self._actor_class.options(**actor_options)
         handle = actor_class.remote(
             spec.kernel.target,
             spec.kernel.init_args,
