@@ -10,21 +10,20 @@ from typing import Any, Protocol
 from .model import MISSING
 from .protocol import (
     BlockRef,
-    CallFailureReport,
-    CallReport,
+    GrainFailureReport,
+    GrainReport,
     DispatchFailure,
     DispatchFailureKind,
     ExpandedRows,
-    GroupTake,
-    InputLayout,
-    InputTake,
-    InvocationPlan,
-    MissingTake,
-    OutputLayout,
+    GroupInput,
+    CallInputLayout,
+    GrainInput,
+    GrainPlan,
+    MissingInput,
+    CallOutputLayout,
     OutputReport,
     RecordFailure,
     RowBinding,
-    ScalarTake,
     WorkerReport,
     WorkerResult,
     restore_group,
@@ -36,17 +35,17 @@ class WorkerContractError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class WorkerObservation:
+class WorkerSnapshot:
     """一次只读 Worker 快照；不参与执行语义或调度决策。"""
 
-    calls: int
+    lifetime_calls: int
     pid: int
     rss_bytes: int
     audit: tuple[tuple[str, int | float | str], ...] = ()
     error: str | None = None
 
 
-class ValueStore(Protocol):
+class BlockStore(Protocol):
     """Worker 所需的最小块存储接口。"""
 
     def get(self, binding: RowBinding) -> Any:
@@ -69,7 +68,7 @@ class Worker:
         init_args: tuple[Any, ...] = (),
         init_kwargs: tuple[tuple[str, Any], ...] = (),
         *,
-        input_layout: InputLayout,
+        input_layout: CallInputLayout,
     ) -> None:
         kwargs = dict(init_kwargs)
         self.udf = target(*init_args, **kwargs) if isinstance(target, type) else target
@@ -78,14 +77,14 @@ class Worker:
 
     def execute(
         self,
-        invocations: tuple[InvocationPlan, ...],
-        layouts: tuple[OutputLayout, ...],
-        store: ValueStore,
+        grain_plans: tuple[GrainPlan, ...],
+        layouts: tuple[CallOutputLayout, ...],
+        store: BlockStore,
     ) -> WorkerResult:
         """执行一批 Grain，并让业务失败严格停留在对应记录。"""
 
         try:
-            return self._execute(invocations, layouts, store)
+            return self._execute(grain_plans, layouts, store)
         except WorkerContractError as error:
             return self._dispatch_failure(
                 DispatchFailureKind.CONTRACT_ERROR,
@@ -94,16 +93,16 @@ class Worker:
 
     def _execute(
         self,
-        invocations: tuple[InvocationPlan, ...],
-        layouts: tuple[OutputLayout, ...],
-        store: ValueStore,
+        grain_plans: tuple[GrainPlan, ...],
+        layouts: tuple[CallOutputLayout, ...],
+        store: BlockStore,
     ) -> WorkerResult:
         """Execute after the public boundary has installed contract capture."""
 
-        if not invocations:
+        if not grain_plans:
             return ()
         self.calls += 1
-        columns = self._input_columns(invocations, store)
+        columns = self._input_columns(grain_plans, store)
         layout = self.input_layout
         if layout.input_count != len(columns):
             raise WorkerContractError(
@@ -117,17 +116,17 @@ class Worker:
             raw = getattr(self.udf, "run", self.udf)(*positional, **keywords)
         except Exception as error:
             return self._dispatch_failure(DispatchFailureKind.UDF_ERROR, error)
-        normalized = self._normalize_outputs(raw, layouts, len(invocations))
+        normalized = self._normalize_outputs(raw, layouts, len(grain_plans))
 
         # 任一输出列把某个位置标为 RecordFailure 时，该 Grain 的所有输出都
         # 不可见；这保持 multi-output Call 的逐 Grain 原子性。
-        failures: list[RecordFailure | None] = [None] * len(invocations)
+        failures: list[RecordFailure | None] = [None] * len(grain_plans)
         for values in normalized:
             for index, value in enumerate(values):
                 if isinstance(value, RecordFailure) and failures[index] is None:
                     failures[index] = value
 
-        reports = [dict() for _ in invocations]
+        reports = [dict() for _ in grain_plans]
         for layout, values in zip(layouts, normalized):
             live_values = tuple(
                 value for index, value in enumerate(values)
@@ -196,20 +195,20 @@ class Worker:
                 )
 
         results: list[WorkerReport] = []
-        for invocation, report, failure in zip(invocations, reports, failures):
+        for grain_plan, report, failure in zip(grain_plans, reports, failures):
             if failure is not None:
                 results.append(
-                    CallFailureReport(
-                        invocation.grain,
-                        invocation.generation,
+                    GrainFailureReport(
+                        grain_plan.grain,
+                        grain_plan.generation,
                         failure.cause,
                     )
                 )
             else:
                 results.append(
-                    CallReport(
-                        invocation.grain,
-                        invocation.generation,
+                    GrainReport(
+                        grain_plan.grain,
+                        grain_plan.generation,
                         tuple(report[layout.port] for layout in layouts),
                     )
                 )
@@ -229,7 +228,7 @@ class Worker:
             traceback.format_exc(),
         )
 
-    def observe(self) -> WorkerObservation:
+    def observe(self) -> WorkerSnapshot:
         """读取小型标量 audit；业务状态不会反向影响 Worker ABI。"""
 
         audit: dict[str, int | float | str] = {}
@@ -248,8 +247,8 @@ class Worker:
                 for key, item in value.items()
                 if isinstance(item, (int, float, str))
             )
-        return WorkerObservation(
-            calls=self.calls,
+        return WorkerSnapshot(
+            lifetime_calls=self.calls,
             pid=os.getpid(),
             rss_bytes=_rss_bytes(),
             audit=tuple(sorted(audit.items())),
@@ -258,35 +257,42 @@ class Worker:
     @classmethod
     def _input_columns(
         cls,
-        invocations: tuple[InvocationPlan, ...],
-        store: ValueStore,
+        grain_plans: tuple[GrainPlan, ...],
+        store: BlockStore,
     ) -> tuple[list[Any], ...]:
-        width = len(invocations[0].inputs)
-        if any(len(invocation.inputs) != width for invocation in invocations):
-            raise WorkerContractError("invocation input arity changed inside batch")
+        width = len(grain_plans[0].inputs)
+        if any(len(plan.inputs) != width for plan in grain_plans):
+            raise WorkerContractError("Grain input arity changed inside batch")
         columns: list[list[Any]] = [[] for _ in range(width)]
-        for invocation in invocations:
-            for index, take in enumerate(invocation.inputs):
-                if isinstance(take, MissingTake):
+        for grain_plan in grain_plans:
+            for index, grain_input in enumerate(grain_plan.inputs):
+                if isinstance(grain_input, MissingInput):
                     columns[index].append(MISSING)
-                elif isinstance(take, ScalarTake):
-                    columns[index].append(store.get(take.binding))
-                elif isinstance(take, GroupTake):
-                    leaves = [store.get(binding) for binding in take.bindings]
+                elif isinstance(grain_input, RowBinding):
+                    columns[index].append(store.get(grain_input))
+                elif isinstance(grain_input, GroupInput):
+                    leaves = [
+                        store.get(binding) for binding in grain_input.bindings
+                    ]
                     try:
-                        group = restore_group(leaves, take.offsets_by_level)
+                        group = restore_group(
+                            leaves,
+                            grain_input.offsets_by_level,
+                        )
                     except ValueError as error:
                         raise WorkerContractError(str(error)) from error
                     columns[index].append(group)
                 else:  # pragma: no cover - 封闭联合类型的防御分支
-                    raise WorkerContractError(f"unsupported InputTake: {take!r}")
+                    raise WorkerContractError(
+                        f"unsupported GrainInput: {grain_input!r}"
+                    )
         return tuple(columns)
 
     @classmethod
     def _normalize_outputs(
         cls,
         raw: Any,
-        layouts: tuple[OutputLayout, ...],
+        layouts: tuple[CallOutputLayout, ...],
         grain_count: int,
     ) -> tuple[tuple[Any, ...], ...]:
         output_count = len(layouts)
@@ -326,7 +332,7 @@ def _rss_bytes() -> int:
 
 __all__ = [
     "Worker",
-    "WorkerObservation",
-    "ValueStore",
+    "WorkerSnapshot",
+    "BlockStore",
     "WorkerContractError",
 ]

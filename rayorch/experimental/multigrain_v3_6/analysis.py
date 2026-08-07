@@ -26,20 +26,20 @@ LogicalUse: TypeAlias = CallUse | PrimitiveUse
 
 
 @dataclass(frozen=True, slots=True)
-class DerivedFacts:
+class ProgramAnalysis:
     """可丢弃、可重算的 compiler analysis 结果。"""
 
     semantics_by_port: Mapping[PortRef, PrimitiveSemantics] = field(repr=False)
     consumers_by_port: Mapping[PortRef, tuple[LogicalUse, ...]] = field(repr=False)
     outputs_by_call: Mapping[CallRef, tuple[PortRef, ...]] = field(repr=False)
-    shape_reporters_by_domain: Mapping[DomainRef, tuple[PortRef, ...]] = field(
+    expansion_sources_by_domain: Mapping[DomainRef, tuple[PortRef, ...]] = field(
         repr=False
     )
     control_ports: frozenset[PortRef] = frozenset()
     group_depth_by_port: Mapping[PortRef, int] = field(repr=False, default_factory=dict)
 
 
-def analyze(logical: LogicalProgram) -> DerivedFacts:
+def analyze(logical: LogicalProgram) -> ProgramAnalysis:
     """一次性计算所有 derived facts，control demand 走统一语义表。"""
 
     semantics = {
@@ -47,7 +47,7 @@ def analyze(logical: LogicalProgram) -> DerivedFacts:
     }
     consumers: dict[PortRef, list[LogicalUse]] = {}
     outputs_by_call: dict[CallRef, list[tuple[int, PortRef]]] = {}
-    shape_reporters: dict[DomainRef, list[PortRef]] = {}
+    expansion_sources: dict[DomainRef, list[PortRef]] = {}
 
     for call, spec in logical.calls.items():
         for index, input_ in enumerate(spec.ordered_inputs):
@@ -66,7 +66,7 @@ def analyze(logical: LogicalProgram) -> DerivedFacts:
             )
         if semantic.kind is PrimitiveKind.EXPAND:
             group = semantic.inputs[0].port
-            shape_reporters.setdefault(logical.port(port).domain, []).append(group)
+            expansion_sources.setdefault(logical.port(port).domain, []).append(group)
 
     control_ports = {
         demanded
@@ -95,7 +95,7 @@ def analyze(logical: LogicalProgram) -> DerivedFacts:
         if port in visiting:
             raise CompileError("logical Port dependency cycle")
         semantic = semantics[port]
-        if semantic.kind is not PrimitiveKind.GROUP:
+        if semantic.kind is not PrimitiveKind.REDUCE:
             depths[port] = 0
             return 0
         visiting.add(port)
@@ -109,7 +109,7 @@ def analyze(logical: LogicalProgram) -> DerivedFacts:
 
     from .logical import freeze_mapping
 
-    return DerivedFacts(
+    return ProgramAnalysis(
         semantics_by_port=freeze_mapping(semantics),
         consumers_by_port=freeze_mapping(
             {port: tuple(uses) for port, uses in consumers.items()}
@@ -120,10 +120,10 @@ def analyze(logical: LogicalProgram) -> DerivedFacts:
                 for call, outputs in outputs_by_call.items()
             }
         ),
-        shape_reporters_by_domain=freeze_mapping(
+        expansion_sources_by_domain=freeze_mapping(
             {
                 domain: tuple(dict.fromkeys(reporters))
-                for domain, reporters in shape_reporters.items()
+                for domain, reporters in expansion_sources.items()
             }
         ),
         control_ports=frozenset(control_ports),
@@ -133,7 +133,7 @@ def analyze(logical: LogicalProgram) -> DerivedFacts:
 
 __all__ = [
     "CallUse",
-    "DerivedFacts",
+    "ProgramAnalysis",
     "LogicalUse",
     "PrimitiveUse",
     "analyze",

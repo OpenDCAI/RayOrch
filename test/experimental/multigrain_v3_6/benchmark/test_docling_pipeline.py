@@ -34,7 +34,7 @@ from rayorch.experimental.multigrain_v3_6.benchmark.document_docling import pair
 from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_compare import (
     CoreMatrixConfig,
 )
-from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin, GroupOrigin
+from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin, ReduceOrigin
 
 
 @pytest.mark.parametrize(
@@ -62,7 +62,7 @@ def test_docling_v36_is_exactly_document_page_table_job_graph(
 ):
     compiled = pipeline_type().compile(optimize=optimize)
 
-    assert [spec.kernel.target for spec in compiled.logical.calls.values()] == [
+    assert [spec.udf.target for spec in compiled.logical.calls.values()] == [
         ExpandDoclingPages,
         DoclingLayoutPages,
         DoclingOcrPages,
@@ -72,13 +72,13 @@ def test_docling_v36_is_exactly_document_page_table_job_graph(
         ReduceDoclingPage,
         ReduceDoclingDocument,
     ]
-    assert len(compiled.runtime.pools_by_call) == 8
+    assert len(compiled.plan.actor_pools_by_call) == 8
     assert sum(
         isinstance(spec.origin, ExpandOrigin)
         for spec in compiled.logical.ports.values()
     ) == 2
     assert sum(
-        isinstance(spec.origin, GroupOrigin)
+        isinstance(spec.origin, ReduceOrigin)
         for spec in compiled.logical.ports.values()
     ) == 2
 
@@ -100,8 +100,8 @@ def test_docling_v36_only_batch_scope_changes_cross_parent_pools():
     assert elastic.logical.calls == parent.logical.calls
     changed = []
     for left, right in zip(
-        elastic.runtime.pools_by_call.values(),
-        parent.runtime.pools_by_call.values(),
+        elastic.plan.actor_pools_by_call.values(),
+        parent.plan.actor_pools_by_call.values(),
     ):
         if left != right:
             changed.append((left, right))
@@ -204,8 +204,8 @@ def test_docling_paired_cli_defaults_to_promoted_full_gate_configuration():
 
     assert args.limit == 4
     assert args.table_batch_mode == "v1_batch"
-    assert args.arena_size == 24
-    assert args.max_in_flight == 4
+    assert args.microbatch_size == 24
+    assert args.max_active_microbatches == 4
     assert (
         args.parse_replicas,
         args.layout_replicas,

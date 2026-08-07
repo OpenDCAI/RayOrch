@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from .model import GrainPhase, InputMode, ItemOutcome, ShapeState
+from .model import GrainPhase, InputMode, ItemOutcome, ExpansionOutcome
 
 
 class InvalidTransition(ValueError):
@@ -57,16 +57,16 @@ def item_transition(
     )
 
 
-def shape_transition(
-    current: ShapeState | None,
-    publication: ShapeState,
-) -> ShapeState:
-    """Shape 与 Item 一样，只接受一次终态 publication。"""
+def expansion_transition(
+    current: ExpansionOutcome | None,
+    publication: ExpansionOutcome,
+) -> ExpansionOutcome:
+    """Expansion 与 Item 一样，只接受一次终态 publication。"""
 
     if current is None or current is publication:
         return publication
     raise InvalidTransition(
-        f"conflicting Shape transition: {current.name} -> {publication.name}"
+        f"conflicting Expansion transition: {current.name} -> {publication.name}"
     )
 
 
@@ -144,55 +144,55 @@ def broadcast_transition(source: ItemOutcome) -> ItemOutcome:
     return source
 
 
-def expansion_shape_transition(output: ItemOutcome) -> ShapeState:
-    """把 Call output outcome 映射为 Expand Shape 终态。"""
+def expansion_outcome_from_item(output: ItemOutcome) -> ExpansionOutcome:
+    """把 Call output outcome 映射为 Expansion 终态。"""
 
     if output is ItemOutcome.PRESENT:
-        return ShapeState.SUCCEEDED
+        return ExpansionOutcome.SUCCEEDED
     if output is ItemOutcome.DROPPED:
-        return ShapeState.DROPPED
-    return ShapeState.FAILED
+        return ExpansionOutcome.DROPPED
+    return ExpansionOutcome.FAILED
 
 
-class GroupCause(Enum):
+class ReduceCause(Enum):
     SHAPE = auto()
     MEMBER = auto()
     VALUE = auto()
 
 
 @dataclass(frozen=True, slots=True)
-class GroupTransition:
+class ReduceTransition:
     outcome: ItemOutcome | None
     survivors: tuple[int, ...] = ()
-    cause: GroupCause | None = None
+    cause: ReduceCause | None = None
     cause_index: int | None = None
 
 
-def group_transition(
-    shape: ShapeState | None,
+def reduce_transition(
+    expansion: ExpansionOutcome | None,
     members: tuple[ItemOutcome | None, ...],
     values: tuple[ItemOutcome | None, ...],
-) -> GroupTransition:
-    """按 Shape→members→survivor values 的显式 gate 归约 Reduce。"""
+) -> ReduceTransition:
+    """按 Expansion→members→survivor values 的显式 gate 归约 Reduce。"""
 
     if len(members) != len(values):
         raise InvalidTransition("Group members/values must be aligned")
-    if shape is None:
-        return GroupTransition(None)
-    if shape is ShapeState.DROPPED:
-        return GroupTransition(ItemOutcome.DROPPED, cause=GroupCause.SHAPE)
-    if shape is ShapeState.FAILED:
-        return GroupTransition(ItemOutcome.SUPPRESSED, cause=GroupCause.SHAPE)
+    if expansion is None:
+        return ReduceTransition(None)
+    if expansion is ExpansionOutcome.DROPPED:
+        return ReduceTransition(ItemOutcome.DROPPED, cause=ReduceCause.SHAPE)
+    if expansion is ExpansionOutcome.FAILED:
+        return ReduceTransition(ItemOutcome.SUPPRESSED, cause=ReduceCause.SHAPE)
 
     for index, outcome in enumerate(members):
         if outcome in {ItemOutcome.FAILED, ItemOutcome.SUPPRESSED}:
-            return GroupTransition(
+            return ReduceTransition(
                 ItemOutcome.SUPPRESSED,
-                cause=GroupCause.MEMBER,
+                cause=ReduceCause.MEMBER,
                 cause_index=index,
             )
     if any(outcome is None for outcome in members):
-        return GroupTransition(None)
+        return ReduceTransition(None)
 
     survivors = tuple(
         index
@@ -202,14 +202,14 @@ def group_transition(
     for index in survivors:
         outcome = values[index]
         if outcome is None:
-            return GroupTransition(None)
+            return ReduceTransition(None)
         if outcome is not ItemOutcome.PRESENT:
-            return GroupTransition(
+            return ReduceTransition(
                 ItemOutcome.SUPPRESSED,
-                cause=GroupCause.VALUE,
+                cause=ReduceCause.VALUE,
                 cause_index=index,
             )
-    return GroupTransition(ItemOutcome.PRESENT, survivors)
+    return ReduceTransition(ItemOutcome.PRESENT, survivors)
 
 
 __all__ = [
@@ -218,15 +218,15 @@ __all__ = [
     "FilterCause",
     "FilterTransition",
     "GrainEvent",
-    "GroupCause",
-    "GroupTransition",
+    "ReduceCause",
+    "ReduceTransition",
     "InvalidTransition",
     "broadcast_transition",
     "call_transition",
-    "expansion_shape_transition",
+    "expansion_outcome_from_item",
     "filter_transition",
     "grain_transition",
-    "group_transition",
+    "reduce_transition",
     "item_transition",
-    "shape_transition",
+    "expansion_transition",
 ]

@@ -1,27 +1,11 @@
 """Multigrain v3.6 的纯事件驱动运行时。"""
 
-from .dispatch import DispatchSelection, GrainSnapshot
-from .engine import ArenaEngine, CommitError
-from .state import (
-    EntityOrigin,
-    GroupBinding,
-    GroupShape,
-    ItemRecord,
-    RuntimeState,
-    ShapeKey,
-    ShapeRecord,
-)
+from .dispatch import DispatchBatch, GrainSnapshot
+from .engine import CommitError, MicrobatchEngine
 
 __all__ = [
-    "ArenaEngine",
+    "MicrobatchEngine",
     "CommitError",
-    "DispatchSelection",
-    "EntityOrigin",
+    "DispatchBatch",
     "GrainSnapshot",
-    "GroupBinding",
-    "GroupShape",
-    "ItemRecord",
-    "RuntimeState",
-    "ShapeKey",
-    "ShapeRecord",
 ]

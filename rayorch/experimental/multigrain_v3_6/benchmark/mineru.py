@@ -13,7 +13,7 @@ import os
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, cast
 
 from ...multigrain_v3.benchmark.mineru import (
     DEFAULT_FLASH_REPO,
@@ -25,7 +25,7 @@ from ...multigrain_v3.benchmark.mineru import (
     ResourceSampler,
     _runtime_env,
 )
-from .. import F, Executor, Pipeline, RayModule
+from .. import F, Executor, Pipeline, Port, RayModule
 
 
 V3_GOLDEN_MEASURED_S = 587.781
@@ -93,12 +93,15 @@ class MinerUV36Pipeline(Pipeline):
             )
         )
 
-    def forward(self, pdfs):
+    def forward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self,
+        pdfs: Port,
+    ):
         """以 Port 关系声明 1:M、跨 parent page compute 和 ordered M:1。"""
 
-        pages = F.expand(self.render(pdfs))
-        contents = self.ocr(pages)
-        stems = self.metadata(pdfs)
+        pages = F.expand(cast(Port, self.render(pdfs)))
+        contents = cast(Port, self.ocr(pages))
+        stems = cast(Port, self.metadata(pdfs))
         content_groups, ordered_page_groups = F.reduce_aligned(
             contents,
             pages,
@@ -110,7 +113,7 @@ class MinerUV36Pipeline(Pipeline):
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     """运行一次 v3.6 MinerU gate，并写入摘要和 GPU samples。"""
 
-    import ray
+    import ray  # pyright: ignore[reportMissingImports]
 
     flash_repo = os.path.abspath(args.flash_repo)
     pdfs = sorted(glob.glob(os.path.join(flash_repo, "*.pdf")))[: args.limit]
@@ -133,7 +136,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     ocr_call = next(
         call
         for call, spec in compiled.logical.calls.items()
-        if spec.kernel.target is MinerUVlmOcrPage
+        if spec.udf.target is MinerUVlmOcrPage
     )
 
     started_ray_here = not ray.is_initialized()
@@ -160,8 +163,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             startup_s = time.perf_counter() - started
             result = executor.run(
                 pdfs,
-                arena_size=args.microbatch_size,
-                max_in_flight=args.max_inflight_arenas,
+                microbatch_size=args.microbatch_size,
+                max_active_microbatches=args.max_active_microbatches,
             )
         end_to_end = time.perf_counter() - started
     finally:
@@ -171,9 +174,12 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     if result is None:  # pragma: no cover - exception path exits in the try block
         raise RuntimeError("v3.6 MinerU run produced no result")
 
-    outputs = list(result.outputs)
+    outputs = list(cast(Iterable[dict[str, Any]], result.outputs))
     pages = sum(int(output["pages"]) for output in outputs)
-    heavy = result.calls[ocr_call]
+    heavy = next(
+        metrics for metrics in result.calls
+        if metrics.call_index == ocr_call.value
+    )
     gpu_peak = tuple(
         max((sample.memory_used[index] for sample in gpu_samples), default=0)
         for index in range(args.replicas)
@@ -188,7 +194,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "replicas": args.replicas,
         "microbatch_size": args.microbatch_size,
-        "max_inflight_arenas": args.max_inflight_arenas,
+        "max_active_microbatches": args.max_active_microbatches,
         "batch_policy": "immediate_work_conserving",
         "startup_s": round(startup_s, 3),
         "measured_wall_s": round(measured, 3),
@@ -202,7 +208,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             str(size): heavy.batch_sizes.count(size)
             for size in sorted(set(heavy.batch_sizes))
         },
-        "active_arenas_high_watermark": result.max_active_arenas,
+        "active_arenas_high_watermark": result.peak_active_microbatches,
         "actor_count": result.actor_count,
         "released_values": result.released_values,
         "driver_rss_start": driver_start,
@@ -249,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=4)
     parser.add_argument("--replicas", type=int, default=4)
     parser.add_argument("--microbatch-size", type=int, default=24)
-    parser.add_argument("--max-inflight-arenas", type=int, default=3)
+    parser.add_argument("--max-active-microbatches", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--render-replicas", type=int, default=4)

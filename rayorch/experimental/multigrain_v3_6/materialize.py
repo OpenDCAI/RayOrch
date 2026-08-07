@@ -1,7 +1,7 @@
 """Executor 的输出物化逻辑。
 
-该模块只通过 :class:`ArenaEngine` 的只读公开接口访问语义状态；执行器不读取
-Arena 内部 table，也不解释逻辑 provenance。
+该模块只通过 :class:`MicrobatchEngine` 的只读公开接口访问语义状态；执行器不读取
+内部 table，也不解释逻辑 provenance。
 """
 
 from __future__ import annotations
@@ -11,7 +11,8 @@ from typing import Any, Protocol
 from .model import ItemOutcome, ItemRef, PortRef
 from .plan import RuntimePlan
 from .protocol import RowBinding, restore_group
-from .runtime import ArenaEngine, GroupBinding
+from .runtime.engine import MicrobatchEngine
+from .runtime.state import GroupBinding
 
 
 class ReadableStore(Protocol):
@@ -25,7 +26,7 @@ class ReadableStore(Protocol):
 
 def materialize_tree(
     plan: RuntimePlan,
-    arena: ArenaEngine,
+    engine: MicrobatchEngine,
     store: ReadableStore,
     tree: object | None = None,
 ) -> object:
@@ -34,34 +35,34 @@ def materialize_tree(
     current = plan.output_tree if tree is None else tree
     if isinstance(current, PortRef):
         return [
-            _materialize_item(arena, store, item)
-            for item in arena.ordered_items(current)
+            _materialize_item(engine, store, item)
+            for item in engine.ordered_items(current)
         ]
     if isinstance(current, tuple):
         return tuple(
-            materialize_tree(plan, arena, store, child)
+            materialize_tree(plan, engine, store, child)
             for child in current
         )
     raise RuntimeError("invalid Program.output_tree")
 
 
 def _materialize_item(
-    arena: ArenaEngine,
+    engine: MicrobatchEngine,
     store: ReadableStore,
     item: ItemRef,
 ) -> Any:
     """物化单个终态 Item；非 PRESENT 结果保留其语义 outcome。"""
 
-    outcome = arena.item_outcome(item)
+    outcome = engine.item_outcome(item)
     if outcome is not ItemOutcome.PRESENT:
         return outcome
-    binding = arena.value_binding(item)
+    binding = engine.value_binding(item)
     if isinstance(binding, RowBinding):
         return store.get(binding)
     if not isinstance(binding, GroupBinding):  # pragma: no cover - 防御分支
         raise RuntimeError(f"unsupported ValueBinding: {binding!r}")
-    leaves = [store.get(row) for row in arena.group_rows(binding)]
-    return restore_group(leaves, binding.shape.offsets_by_level)
+    leaves = [store.get(row) for row in engine.group_rows(binding)]
+    return restore_group(leaves, binding.layout.offsets_by_level)
 
 
 __all__ = ["ReadableStore", "materialize_tree"]

@@ -39,8 +39,8 @@ def _caption_trial(
     paths: list[str],
     options: dict[str, Any],
     *,
-    arena_size: int,
-    max_in_flight: int,
+    microbatch_size: int,
+    max_active_microbatches: int,
     order: str,
     maximum_normalized_mismatch: float,
 ) -> dict[str, Any]:
@@ -54,8 +54,8 @@ def _caption_trial(
         if engine == "v3":
             result = run_caption_v3(
                 paths,
-                microbatch_size=arena_size,
-                max_inflight_arenas=max_in_flight,
+                microbatch_size=microbatch_size,
+                max_inflight_arenas=max_active_microbatches,
                 max_pending_per_actor=1,
                 **options,
             )
@@ -74,25 +74,26 @@ def _caption_trial(
         else:
             result = run_caption_v36(
                 paths,
-                arena_size=arena_size,
-                max_in_flight=max_in_flight,
+                microbatch_size=microbatch_size,
+                max_active_microbatches=max_active_microbatches,
                 **options,
             )
             outputs[engine] = list(cast(Iterable[Any], result.outputs))
             rpcs[engine] = result.rpc_count
             diagnostics[engine] = {
                 "runtime_elapsed_s": result.elapsed_s,
-                "max_active_arenas": result.max_active_arenas,
+                "peak_active_microbatches": result.peak_active_microbatches,
                 "released_values": result.released_values,
                 "calls": {
-                    f"call_{call.value}": {
-                        "actor_starts": metric.actor_starts,
+                    f"call_{metric.call_index}": {
+                        "udf_name": metric.udf_name,
+                        "actor_instances": metric.actor_instances,
                         "rpcs": metric.rpcs,
                         "grains": metric.grains,
                         "average_batch": metric.average_batch,
                         "retries": metric.retries,
                     }
-                    for call, metric in sorted(result.calls.items())
+                    for metric in result.calls
                 },
             }
         walls[engine] = time.perf_counter() - started
@@ -190,8 +191,8 @@ def _multimodal_trial(
     paths: list[str],
     options: dict[str, Any],
     *,
-    arena_size: int,
-    max_in_flight: int,
+    microbatch_size: int,
+    max_active_microbatches: int,
     order: str,
     maximum_normalized_mismatch: float = 0.02,
 ) -> dict[str, Any]:
@@ -205,8 +206,8 @@ def _multimodal_trial(
         if engine == "v3":
             result = run_multimodal_v3(
                 paths,
-                microbatch_size=arena_size,
-                max_inflight_arenas=max_in_flight,
+                microbatch_size=microbatch_size,
+                max_inflight_arenas=max_active_microbatches,
                 **options,
             )
             outputs[engine] = list(result.get())
@@ -224,25 +225,26 @@ def _multimodal_trial(
         else:
             result = run_multimodal_v36(
                 paths,
-                arena_size=arena_size,
-                max_in_flight=max_in_flight,
+                microbatch_size=microbatch_size,
+                max_active_microbatches=max_active_microbatches,
                 **options,
             )
             outputs[engine] = list(cast(Iterable[Any], result.outputs))
             rpcs[engine] = result.rpc_count
             diagnostics[engine] = {
                 "runtime_elapsed_s": result.elapsed_s,
-                "max_active_arenas": result.max_active_arenas,
+                "peak_active_microbatches": result.peak_active_microbatches,
                 "released_values": result.released_values,
                 "calls": {
-                    f"call_{call.value}": {
-                        "actor_starts": metric.actor_starts,
+                    f"call_{metric.call_index}": {
+                        "udf_name": metric.udf_name,
+                        "actor_instances": metric.actor_instances,
                         "rpcs": metric.rpcs,
                         "grains": metric.grains,
                         "average_batch": metric.average_batch,
                         "retries": metric.retries,
                     }
-                    for call, metric in sorted(result.calls.items())
+                    for metric in result.calls
                 },
             }
         walls[engine] = time.perf_counter() - started
@@ -313,8 +315,8 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
                 trial = _caption_trial(
                     paths,
                     options,
-                    arena_size=args.arena_size,
-                    max_in_flight=args.max_in_flight,
+                    microbatch_size=args.microbatch_size,
+                    max_active_microbatches=args.max_active_microbatches,
                     order=order,
                     maximum_normalized_mismatch=args.maximum_normalized_mismatch,
                 )
@@ -322,8 +324,8 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
                 trial = _multimodal_trial(
                     paths,
                     options,
-                    arena_size=args.arena_size,
-                    max_in_flight=args.max_in_flight,
+                    microbatch_size=args.microbatch_size,
+                    max_active_microbatches=args.max_active_microbatches,
                     order=order,
                     maximum_normalized_mismatch=(
                         args.maximum_normalized_mismatch
@@ -372,8 +374,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output")
     parser.add_argument("--limit", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=1)
-    parser.add_argument("--arena-size", type=int, default=4)
-    parser.add_argument("--max-in-flight", type=int, default=2)
+    parser.add_argument("--microbatch-size", type=int, default=4)
+    parser.add_argument("--max-active-microbatches", type=int, default=2)
     parser.add_argument("--num-cpus", type=int, default=16)
     parser.add_argument("--num-gpus", type=float, default=4)
     parser.add_argument(

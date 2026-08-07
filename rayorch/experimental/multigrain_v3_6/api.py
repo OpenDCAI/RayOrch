@@ -16,9 +16,9 @@ from .logical import (
     DomainSpec,
     ExpandOrigin,
     FilterOrigin,
-    GroupOrigin,
-    InputSpec,
-    KernelSpec,
+    ReduceOrigin,
+    CallInputSpec,
+    UdfSpec,
     LogicalProgram,
     PortOrigin,
     PortSpec,
@@ -38,7 +38,7 @@ class Port:
 
 
 @dataclass(frozen=True, slots=True)
-class OptionalPort:
+class OptionalInput:
     """仅改变 Call 输入策略的 Port 包装；不创建新 Port。"""
 
     port: Port
@@ -204,14 +204,14 @@ class _ProgramBuilder:
         if not args and not kwargs:
             raise CompileError("RayModule requires at least one Port input")
 
-        positional_inputs: list[InputSpec] = []
+        positional_inputs: list[CallInputSpec] = []
         for index, value in enumerate(args):
             port, mode = self._input(value, f"arg_{index}")
-            positional_inputs.append(InputSpec(port.ref, mode))
-        keyword_inputs: list[tuple[str, InputSpec]] = []
+            positional_inputs.append(CallInputSpec(port.ref, mode))
+        keyword_inputs: list[tuple[str, CallInputSpec]] = []
         for name, value in kwargs.items():
             port, mode = self._input(value, name)
-            keyword_inputs.append((name, InputSpec(port.ref, mode)))
+            keyword_inputs.append((name, CallInputSpec(port.ref, mode)))
 
         inputs = (
             *positional_inputs,
@@ -228,14 +228,14 @@ class _ProgramBuilder:
 
         call = CallRef(self.next_call)
         self.next_call += 1
-        kernel = KernelSpec(
+        udf = UdfSpec(
             module.udf,
             module.init_args,
             tuple(module.init_kwargs.items()),
         )
         self.calls[call] = CallSpec(
             call,
-            kernel,
+            udf,
             execution_domain,
             tuple(positional_inputs),
             tuple(keyword_inputs),
@@ -253,7 +253,7 @@ class _ProgramBuilder:
         return public[0] if len(public) == 1 else public
 
     def expand(self, ports: tuple[Port, ...]) -> tuple[Port, ...]:
-        """创建 child Domain；aligned 输入共享同一 Shape。"""
+        """创建 child Domain；aligned 输入共享同一 Expansion。"""
 
         specs = self._ports(ports, "expand")
         if len({spec.domain for spec in specs}) != 1:
@@ -338,7 +338,7 @@ class _ProgramBuilder:
         outputs = tuple(
             self._new_port(
                 domain.parent,
-                GroupOrigin(port.ref, member_port.ref),
+                ReduceOrigin(port.ref, member_port.ref),
             )
             for port in ports
         )
@@ -423,7 +423,7 @@ class _ProgramBuilder:
         return tuple(self.spec(port, label) for port in ports)
 
     def _input(self, value: Any, name: str) -> tuple[Port, InputMode]:
-        if isinstance(value, OptionalPort):
+        if isinstance(value, OptionalInput):
             self.spec(value.port, f"input {name}")
             return value.port, InputMode.OPTIONAL
         if isinstance(value, Port):
@@ -450,7 +450,7 @@ def active_builder() -> _ProgramBuilder:
 
 
 __all__ = [
-    "OptionalPort",
+    "OptionalInput",
     "Pipeline",
     "Port",
     "RayModule",

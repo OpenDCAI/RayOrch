@@ -146,8 +146,8 @@ class VideoMultimodalV36Pipeline(Pipeline):
 def run_multimodal_v36(
     paths: list[str],
     *,
-    arena_size: int = 4,
-    max_in_flight: int = 2,
+    microbatch_size: int = 4,
+    max_active_microbatches: int = 2,
     **pipeline_options: Any,
 ) -> RunResult:
     """Run the dual-relation v3.6 multimodal pipeline."""
@@ -155,8 +155,8 @@ def run_multimodal_v36(
     with Executor(VideoMultimodalV36Pipeline(**pipeline_options)) as executor:
         return executor.run(
             paths,
-            arena_size=arena_size,
-            max_in_flight=max_in_flight,
+            microbatch_size=microbatch_size,
+            max_active_microbatches=max_active_microbatches,
         )
 
 

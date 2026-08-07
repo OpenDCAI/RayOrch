@@ -1,4 +1,4 @@
-"""Arena-owned physical dispatch and Grain lifecycle state machine."""
+"""Microbatch-owned physical dispatch and Grain lifecycle state machine."""
 
 from __future__ import annotations
 
@@ -32,19 +32,19 @@ class GrainSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class DispatchSelection:
-    """One exact normal or recovery group reserved by an Arena."""
+class DispatchBatch:
+    """One exact normal or recovery group reserved by a microbatch."""
 
     grains: tuple[GrainRef, ...]
     udf_retries: int = 0
 
     def __post_init__(self) -> None:
         if not self.grains:
-            raise ValueError("DispatchSelection requires a non-empty Grain group")
+            raise ValueError("DispatchBatch requires a non-empty Grain group")
         if type(self.udf_retries) is not int or self.udf_retries < 0:
             raise ValueError("udf_retries must be a non-negative integer")
         if any(grain.call != self.grains[0].call for grain in self.grains):
-            raise ValueError("one DispatchSelection cannot mix Calls")
+            raise ValueError("one DispatchBatch cannot mix Calls")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,8 +61,8 @@ class DispatchState:
     def __init__(self) -> None:
         self._records: dict[GrainRef, GrainRecord] = {}
         self._normal: deque[_ReadyEntry] = deque()
-        self._immediate: deque[DispatchSelection] = deque()
-        self._tail: deque[DispatchSelection] = deque()
+        self._immediate: deque[DispatchBatch] = deque()
+        self._tail: deque[DispatchBatch] = deque()
 
     @property
     def ready_count(self) -> int:
@@ -154,7 +154,7 @@ class DispatchState:
         *,
         max_size: int,
         parent_bound: bool,
-    ) -> DispatchSelection | None:
+    ) -> DispatchBatch | None:
         """Reserve immediate recovery, normal work, then deferred recovery."""
 
         selection = self._reserve_recovery(self._immediate, call)
@@ -166,7 +166,7 @@ class DispatchState:
             parent_bound=parent_bound,
         )
         if grains:
-            return DispatchSelection(grains)
+            return DispatchBatch(grains)
         selection = self._reserve_recovery(self._tail, call)
         if selection is not None:
             return selection
@@ -205,9 +205,9 @@ class DispatchState:
 
     def _reserve_recovery(
         self,
-        queue: deque[DispatchSelection],
+        queue: deque[DispatchBatch],
         call: CallRef,
-    ) -> DispatchSelection | None:
+    ) -> DispatchBatch | None:
         for index, selection in enumerate(queue):
             if selection.grains[0].call == call:
                 self._reserve_exact(selection.grains)
@@ -238,7 +238,7 @@ class DispatchState:
 
     def recover_udf(
         self,
-        selection: DispatchSelection,
+        selection: DispatchBatch,
         action: RecoveryAction,
     ) -> int:
         """Apply one non-terminal UDF recovery decision; return retried Grains."""
@@ -252,7 +252,7 @@ class DispatchState:
                     if action is RecoveryAction.RETRY_IMMEDIATE
                     else self._tail
                 )
-                queue.append(DispatchSelection(grains, selection.udf_retries + 1))
+                queue.append(DispatchBatch(grains, selection.udf_retries + 1))
             case RecoveryAction.SPLIT_TAIL:
                 if selection.udf_retries == 0 or len(grains) <= 1:
                     raise CommitError("split requires one failed recovery group")
@@ -260,7 +260,7 @@ class DispatchState:
                 midpoint = len(grains) // 2
                 for group in (grains[:midpoint], grains[midpoint:]):
                     self._tail.append(
-                        DispatchSelection(group, selection.udf_retries)
+                        DispatchBatch(group, selection.udf_retries)
                     )
             case RecoveryAction.ABORT | RecoveryAction.FAIL_SINGLETON:
                 raise CommitError(
@@ -270,7 +270,7 @@ class DispatchState:
 
     def recover_infrastructure(
         self,
-        selection: DispatchSelection,
+        selection: DispatchBatch,
     ) -> int:
         """Requeue an already-approved exact group and return its Grain count."""
 
@@ -281,7 +281,7 @@ class DispatchState:
 
     def infrastructure_failures(
         self,
-        selection: DispatchSelection,
+        selection: DispatchBatch,
     ) -> tuple[int, ...]:
         """Read the sole physical infra-attempt counters for policy reduction."""
 
@@ -342,4 +342,4 @@ class DispatchState:
             raise CommitError(f"unknown Grain: {grain!r}") from error
 
 
-__all__ = ["DispatchSelection", "DispatchState", "GrainSnapshot"]
+__all__ = ["DispatchBatch", "DispatchState", "GrainSnapshot"]

@@ -1,4 +1,4 @@
-"""Failure-policy reducer and Arena-owned recovery queue regression."""
+"""Failure-policy reducer and microbatch-owned recovery queue regression."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from rayorch.experimental.multigrain_v3_6.recovery import (
     UdfRecoveryMode,
 )
 from rayorch.experimental.multigrain_v3_6.runtime.dispatch import (
-    DispatchSelection,
+    DispatchBatch,
     DispatchState,
 )
 
@@ -66,7 +66,7 @@ def test_recovery_records_reject_states_outside_the_closed_algebra():
             grain_count=0,
         )
     with pytest.raises(ValueError, match="non-negative integer"):
-        DispatchSelection(_grains(1), -1)
+        DispatchBatch(_grains(1), -1)
 
 
 def test_retry_policies_have_finite_exact_attempt_budgets():

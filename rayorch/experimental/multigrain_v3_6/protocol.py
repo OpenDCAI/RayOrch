@@ -47,7 +47,7 @@ class OutputReport:
 
 
 @dataclass(frozen=True, slots=True)
-class CallReport:
+class GrainReport:
     """Worker 对单个 Grain 的原子完成报告。"""
 
     grain: GrainRef
@@ -56,14 +56,7 @@ class CallReport:
 
 
 @dataclass(frozen=True, slots=True)
-class ScalarTake:
-    """从一个粗粒度块读取一行标量。"""
-
-    binding: RowBinding
-
-
-@dataclass(frozen=True, slots=True)
-class GroupTake:
+class GroupInput:
     """读取若干行，并按 CSR offsets 重建有序嵌套 group。"""
 
     bindings: tuple[RowBinding, ...]
@@ -71,20 +64,20 @@ class GroupTake:
 
 
 @dataclass(frozen=True, slots=True)
-class MissingTake:
+class MissingInput:
     """Optional+DROPPED 输入；Worker 中重建为唯一 MISSING 哨兵。"""
 
 
-InputTake = ScalarTake | GroupTake | MissingTake
+GrainInput = RowBinding | GroupInput | MissingInput
 
 
 @dataclass(frozen=True, slots=True)
-class InvocationPlan:
+class GrainPlan:
     """一个 Grain 的 generation 与纯物理输入选择计划。"""
 
     grain: GrainRef
     generation: int
-    inputs: tuple[InputTake, ...]
+    inputs: tuple[GrainInput, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +88,7 @@ class RecordFailure:
 
 
 @dataclass(frozen=True, slots=True)
-class CallFailureReport:
+class GrainFailureReport:
     """Worker 对单个 Grain 的 generation-fenced 失败报告。"""
 
     grain: GrainRef
@@ -103,7 +96,7 @@ class CallFailureReport:
     cause: Any
 
 
-WorkerReport = CallReport | CallFailureReport
+WorkerReport = GrainReport | GrainFailureReport
 
 
 class DispatchFailureKind(Enum):
@@ -127,7 +120,7 @@ WorkerResult = tuple[WorkerReport, ...] | DispatchFailure
 
 
 @dataclass(frozen=True, slots=True)
-class InputLayout:
+class CallInputLayout:
     """一个 Call 的稳定 positional/keyword Worker 调用布局。"""
 
     positional_count: int
@@ -149,7 +142,7 @@ class InputLayout:
 
 
 @dataclass(frozen=True, slots=True)
-class OutputLayout:
+class CallOutputLayout:
     """编译器生成的输出布局及 control manifest 需求。"""
 
     port: PortRef
@@ -170,27 +163,26 @@ def restore_group(
             for index in range(len(offsets) - 1)
         ]
     if len(nodes) != 1:
-        raise ValueError("GroupShape does not have one root")
+        raise ValueError("GroupLayout does not have one root")
     return nodes[0]
 
 
 __all__ = [
     "BlockRef",
-    "CallFailureReport",
-    "CallReport",
+    "GrainFailureReport",
+    "GrainReport",
     "DispatchFailure",
     "DispatchFailureKind",
     "ExpandedRows",
-    "GroupTake",
-    "InputLayout",
-    "InputTake",
-    "InvocationPlan",
-    "MissingTake",
-    "OutputLayout",
+    "GroupInput",
+    "CallInputLayout",
+    "GrainInput",
+    "GrainPlan",
+    "MissingInput",
+    "CallOutputLayout",
     "OutputReport",
     "RecordFailure",
     "RowBinding",
-    "ScalarTake",
     "WorkerReport",
     "WorkerResult",
     "restore_group",

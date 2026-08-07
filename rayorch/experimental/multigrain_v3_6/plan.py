@@ -1,4 +1,4 @@
-"""Compiler 产出的完整 RuntimePlan 与 logical→physical explain。"""
+"""Compiler 产出的完整 RuntimePlan 与 logical→physical explanation。"""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping, TypeAlias
 
 from .model import CallRef, DomainRef, PortRef
-from .protocol import InputLayout, OutputLayout
+from .protocol import CallInputLayout, CallOutputLayout
 from .recovery import DEFAULT_RECOVERY_POLICY, RecoveryPolicy
 
 if TYPE_CHECKING:
-    from .analysis import DerivedFacts
+    from .analysis import ProgramAnalysis
     from .logical import CallSpec, DomainSpec, LogicalProgram
 
 
@@ -30,7 +30,7 @@ class FilterEffect:
 
 
 @dataclass(frozen=True, slots=True)
-class GroupEffect:
+class ReduceEffect:
     target_port: PortRef
     value_port: PortRef
     members_port: PortRef
@@ -47,19 +47,19 @@ class BroadcastEffect:
     copy_source_control: bool
 
 
-StructuralEffect: TypeAlias = FilterEffect | GroupEffect | BroadcastEffect
+StructuralEffect: TypeAlias = FilterEffect | ReduceEffect | BroadcastEffect
 ItemEffect: TypeAlias = CallInputEffect | StructuralEffect
 
 
 @dataclass(frozen=True, slots=True)
-class ExpansionRule:
+class ExpandEffect:
     port: PortRef
     child_domain: DomainRef
     control_required: bool
 
 
 @dataclass(frozen=True, slots=True)
-class PoolSpec:
+class ActorPoolSpec:
     """一个 Call 唯一的强类型 actor-pool 执行合同。"""
 
     replicas: int = 1
@@ -102,7 +102,7 @@ class PortExplanation:
 
 
 @dataclass(frozen=True, slots=True)
-class ExplainPlan:
+class ProgramExplanation:
     optimized: bool
     ports: Mapping[PortRef, PortExplanation] = field(repr=False)
     rewrites: tuple[CanonicalRewrite, ...] = ()
@@ -129,7 +129,7 @@ class ExplainPlan:
 
 @dataclass(frozen=True, slots=True)
 class RuntimePlan:
-    """Arena、Executor、Worker 调度所需的全部静态事实。
+    """MicrobatchEngine、Executor、Worker 所需的全部静态执行接线。
 
     RuntimePlan 不含 PortOrigin，运行时无需导入或解释逻辑 provenance。
     """
@@ -139,37 +139,37 @@ class RuntimePlan:
     port_domains: Mapping[PortRef, DomainRef] = field(repr=False)
     source_ports: tuple[PortRef, ...] = ()
     output_tree: object = ()
-    effects_by_item_port: Mapping[PortRef, tuple[ItemEffect, ...]] = field(
+    item_effects_by_source: Mapping[PortRef, tuple[ItemEffect, ...]] = field(
         repr=False, default_factory=dict
     )
     outputs_by_call: Mapping[CallRef, tuple[PortRef, ...]] = field(
         repr=False, default_factory=dict
     )
-    expansions_by_source: Mapping[PortRef, tuple[ExpansionRule, ...]] = field(
+    expand_effects_by_source: Mapping[PortRef, tuple[ExpandEffect, ...]] = field(
         repr=False, default_factory=dict
     )
-    shape_reporters_by_domain: Mapping[DomainRef, tuple[PortRef, ...]] = field(
+    expansion_sources_by_domain: Mapping[DomainRef, tuple[PortRef, ...]] = field(
         repr=False, default_factory=dict
     )
     control_ports: frozenset[PortRef] = frozenset()
-    structural_effects: Mapping[PortRef, StructuralEffect] = field(
+    structural_effects_by_target: Mapping[PortRef, StructuralEffect] = field(
         repr=False, default_factory=dict
     )
-    effects_by_shape_domain: Mapping[DomainRef, tuple[GroupEffect, ...]] = field(
+    reduce_effects_by_child_domain: Mapping[DomainRef, tuple[ReduceEffect, ...]] = field(
         repr=False, default_factory=dict
     )
-    effects_by_entity_domain: Mapping[
+    broadcast_effects_by_target_domain: Mapping[
         DomainRef, tuple[BroadcastEffect, ...]
     ] = field(
         repr=False, default_factory=dict
     )
-    pools_by_call: Mapping[CallRef, PoolSpec] = field(
+    actor_pools_by_call: Mapping[CallRef, ActorPoolSpec] = field(
         repr=False, default_factory=dict
     )
-    output_layouts_by_call: Mapping[CallRef, tuple[OutputLayout, ...]] = field(
+    output_layouts_by_call: Mapping[CallRef, tuple[CallOutputLayout, ...]] = field(
         repr=False, default_factory=dict
     )
-    input_layouts_by_call: Mapping[CallRef, InputLayout] = field(
+    input_layouts_by_call: Mapping[CallRef, CallInputLayout] = field(
         repr=False, default_factory=dict
     )
 
@@ -182,21 +182,21 @@ class RuntimePlan:
     def port_domain(self, ref: PortRef) -> DomainRef:
         return self.port_domains[ref]
 
-    def pool(self, call: CallRef) -> PoolSpec:
+    def pool(self, call: CallRef) -> ActorPoolSpec:
         """返回一个 Call 唯一的物理 actor-pool 合同。"""
 
-        return self.pools_by_call[call]
+        return self.actor_pools_by_call[call]
 
 
 @dataclass(frozen=True, slots=True)
 class CompiledProgram:
     logical: LogicalProgram
-    facts: DerivedFacts
-    runtime: RuntimePlan
-    explain: ExplainPlan
+    analysis: ProgramAnalysis
+    plan: RuntimePlan
+    explanation: ProgramExplanation
 
     def explain_text(self) -> str:
-        return self.explain.format()
+        return self.explanation.format()
 
 
 def freeze_mapping(values: Mapping[Any, Any]) -> Mapping[Any, Any]:
@@ -208,12 +208,12 @@ __all__ = [
     "CallInputEffect",
     "CanonicalRewrite",
     "CompiledProgram",
-    "ExpansionRule",
-    "ExplainPlan",
+    "ExpandEffect",
+    "ProgramExplanation",
     "FilterEffect",
-    "GroupEffect",
+    "ReduceEffect",
     "ItemEffect",
-    "PoolSpec",
+    "ActorPoolSpec",
     "PortExplanation",
     "RuntimePlan",
     "StructuralEffect",

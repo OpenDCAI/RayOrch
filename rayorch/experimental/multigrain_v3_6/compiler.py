@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, assert_never, cast
 
-from .analysis import CallUse, DerivedFacts, PrimitiveUse, analyze
+from .analysis import CallUse, ProgramAnalysis, PrimitiveUse, analyze
 from .logical import CallSpec, LogicalProgram
 from .model import CallRef, CompileError, DomainRef, PortRef
 from .plan import (
@@ -17,18 +17,18 @@ from .plan import (
     CallInputEffect,
     CanonicalRewrite,
     CompiledProgram,
-    ExpansionRule,
-    ExplainPlan,
+    ExpandEffect,
+    ProgramExplanation,
     FilterEffect,
-    GroupEffect,
+    ReduceEffect,
     ItemEffect,
-    PoolSpec,
+    ActorPoolSpec,
     PortExplanation,
     RuntimePlan,
     StructuralEffect,
     freeze_mapping,
 )
-from .protocol import InputLayout, OutputLayout
+from .protocol import CallInputLayout, CallOutputLayout
 from .recovery import DEFAULT_RECOVERY_POLICY
 from .semantics import InputRole, PrimitiveKind, PrimitiveSemantics
 
@@ -49,11 +49,11 @@ def compile_logical(
     """编译一个已经冻结的逻辑图。"""
 
     verify_logical(logical)
-    facts = analyze(logical)
-    canonical = _canonicalize(logical, facts, enabled=optimize)
-    runtime, explain = _lower(logical, facts, canonical, call_options)
-    verify_runtime_plan(logical, facts, runtime)
-    return CompiledProgram(logical, facts, runtime, explain)
+    analysis = analyze(logical)
+    canonical = _canonicalize(logical, analysis, enabled=optimize)
+    plan, explanation = _lower(logical, analysis, canonical, call_options)
+    verify_runtime_plan(logical, analysis, plan)
+    return CompiledProgram(logical, analysis, plan, explanation)
 
 
 def verify_logical(logical: LogicalProgram) -> None:
@@ -133,7 +133,7 @@ def verify_logical(logical: LogicalProgram) -> None:
                     raise CompileError("Expand source must be a Call output")
                 if logical.domain(spec.domain).parent != logical.port(group).domain:
                     raise CompileError("Expand target Domain must be one level below source")
-            case PrimitiveKind.GROUP:
+            case PrimitiveKind.REDUCE:
                 value, members = (item.port for item in semantic.inputs)
                 child = logical.port(value).domain
                 if logical.port(members).domain != child:
@@ -221,7 +221,7 @@ def _verify_acyclic(
 
 def _canonicalize(
     logical: LogicalProgram,
-    facts: DerivedFacts,
+    analysis: ProgramAnalysis,
     *,
     enabled: bool,
 ) -> _CanonicalForm:
@@ -235,7 +235,7 @@ def _canonicalize(
         known = direct.get(port)
         if known is not None:
             return known
-        semantic = facts.semantics_by_port[port]
+        semantic = analysis.semantics_by_port[port]
         if semantic.kind is not PrimitiveKind.BROADCAST:
             direct[port] = port
             return port
@@ -260,7 +260,7 @@ def _canonicalize(
             )
         return effective
 
-    for port, semantic in facts.semantics_by_port.items():
+    for port, semantic in analysis.semantics_by_port.items():
         if semantic.kind is PrimitiveKind.BROADCAST:
             resolve(port)
 
@@ -269,56 +269,56 @@ def _canonicalize(
 
 def _lower(
     logical: LogicalProgram,
-    facts: DerivedFacts,
+    analysis: ProgramAnalysis,
     canonical: _CanonicalForm,
     call_options: Mapping[CallRef, tuple[tuple[str, object], ...]],
-) -> tuple[RuntimePlan, ExplainPlan]:
-    effects_by_item_port: dict[PortRef, list[ItemEffect]] = {}
-    expansions: dict[PortRef, list[ExpansionRule]] = {}
-    structural_effects: dict[PortRef, StructuralEffect] = {}
-    groups_by_domain: dict[DomainRef, list[GroupEffect]] = {}
+) -> tuple[RuntimePlan, ProgramExplanation]:
+    item_effects_by_source: dict[PortRef, list[ItemEffect]] = {}
+    expansions: dict[PortRef, list[ExpandEffect]] = {}
+    structural_effects_by_target: dict[PortRef, StructuralEffect] = {}
+    reductions_by_domain: dict[DomainRef, list[ReduceEffect]] = {}
     broadcasts_by_domain: dict[DomainRef, list[BroadcastEffect]] = {}
 
     def add_item_effect(source: PortRef, effect: ItemEffect) -> None:
-        bucket = effects_by_item_port.setdefault(source, [])
+        bucket = item_effects_by_source.setdefault(source, [])
         if effect not in bucket:
             bucket.append(effect)
 
     # 先构造每个 structural Port 唯一的不可变 Effect。后续各触发索引只持有
     # 这些对象本身，不再用 target-only Route 回查第二份 Rule。
-    for port, semantic in facts.semantics_by_port.items():
+    for port, semantic in analysis.semantics_by_port.items():
         match semantic.kind:
             case PrimitiveKind.SOURCE | PrimitiveKind.CALL_OUTPUT:
                 pass
             case PrimitiveKind.EXPAND:
                 source = semantic.inputs[0].port
                 expansions.setdefault(source, []).append(
-                    ExpansionRule(
+                    ExpandEffect(
                         port,
                         logical.port(port).domain,
-                        port in facts.control_ports,
+                        port in analysis.control_ports,
                     )
                 )
             case PrimitiveKind.FILTER:
                 source, mask = (item.port for item in semantic.inputs)
-                structural_effects[port] = FilterEffect(
+                structural_effects_by_target[port] = FilterEffect(
                     port,
                     source,
                     mask,
-                    port in facts.control_ports,
+                    port in analysis.control_ports,
                 )
-            case PrimitiveKind.GROUP:
+            case PrimitiveKind.REDUCE:
                 value, members = (item.port for item in semantic.inputs)
                 child_domain = logical.port(value).domain
-                effect = GroupEffect(
+                effect = ReduceEffect(
                     port,
                     value,
                     members,
                     child_domain,
-                    facts.group_depth_by_port[value],
+                    analysis.group_depth_by_port[value],
                 )
-                structural_effects[port] = effect
-                groups_by_domain.setdefault(child_domain, []).append(effect)
+                structural_effects_by_target[port] = effect
+                reductions_by_domain.setdefault(child_domain, []).append(effect)
             case PrimitiveKind.BROADCAST:
                 immediate = semantic.inputs[0].port
                 source = canonical.broadcast_sources.get(port, immediate)
@@ -327,9 +327,9 @@ def _lower(
                     source,
                     logical.port(source).domain,
                     logical.port(port).domain,
-                    port in facts.control_ports,
+                    port in analysis.control_ports,
                 )
-                structural_effects[port] = effect
+                structural_effects_by_target[port] = effect
                 broadcasts_by_domain.setdefault(effect.target_domain, []).append(
                     effect
                 )
@@ -338,7 +338,7 @@ def _lower(
 
     # LogicalUse 是 analysis 的统一反向索引。lowering 必须显式消费每个
     # dependency role；即使 Expand/Broadcast 在这里是 pass，也不能靠遗漏实现。
-    for source, uses in facts.consumers_by_port.items():
+    for source, uses in analysis.consumers_by_port.items():
         for use in uses:
             if isinstance(use, CallUse):
                 add_item_effect(source, CallInputEffect(use.call, use.input_index))
@@ -350,35 +350,35 @@ def _lower(
                     # Expand 由 Worker expanded layout 与 commit_success 直达，
                     # 不创建 Item publication effect。
                     pass
-                case InputRole.GROUP_VALUE | InputRole.GROUP_MEMBERS:
-                    effect = structural_effects.get(use.port)
-                    if not isinstance(effect, GroupEffect):  # pragma: no cover
-                        raise CompileError("Group use has no matching GroupEffect")
+                case InputRole.REDUCE_VALUE | InputRole.REDUCE_MEMBERS:
+                    effect = structural_effects_by_target.get(use.port)
+                    if not isinstance(effect, ReduceEffect):  # pragma: no cover
+                        raise CompileError("Reduce use has no matching ReduceEffect")
                     add_item_effect(source, effect)
                 case InputRole.BROADCAST_SOURCE:
                     # canonicalization 可能改写 source；在下面按最终 source 建索引。
                     pass
                 case InputRole.FILTER_SOURCE | InputRole.FILTER_MASK:
-                    effect = structural_effects.get(use.port)
+                    effect = structural_effects_by_target.get(use.port)
                     if not isinstance(effect, FilterEffect):  # pragma: no cover
                         raise CompileError("Filter use has no matching FilterEffect")
                     add_item_effect(source, effect)
                 case _:
                     assert_never(use.role)
 
-    for effect in structural_effects.values():
+    for effect in structural_effects_by_target.values():
         if isinstance(effect, BroadcastEffect):
             add_item_effect(effect.source_port, effect)
 
-    pools_by_call = {}
+    actor_pools_by_call = {}
     for call in logical.calls:
-        pools_by_call[call] = _compile_pool_spec(
+        actor_pools_by_call[call] = _compile_pool_spec(
             call_options.get(call, ()),
         )
 
     layouts = {}
     input_layouts = {}
-    for call, outputs in facts.outputs_by_call.items():
+    for call, outputs in analysis.outputs_by_call.items():
         spec = logical.call(call)
         input_layouts[call] = _compile_input_layout(spec)
         call_layouts = []
@@ -387,12 +387,12 @@ def _lower(
             demanded = frozenset(
                 port
                 for port in (output, *expanded)
-                if port in facts.control_ports
+                if port in analysis.control_ports
             )
-            call_layouts.append(OutputLayout(output, expanded, demanded))
+            call_layouts.append(CallOutputLayout(output, expanded, demanded))
         layouts[call] = tuple(call_layouts)
 
-    runtime = RuntimePlan(
+    plan = RuntimePlan(
         calls=logical.calls,
         domains=logical.domains,
         port_domains=freeze_mapping(
@@ -400,26 +400,29 @@ def _lower(
         ),
         source_ports=logical.source_ports,
         output_tree=logical.output_tree,
-        effects_by_item_port=freeze_mapping(
-            {port: tuple(items) for port, items in effects_by_item_port.items()}
+        item_effects_by_source=freeze_mapping(
+            {port: tuple(items) for port, items in item_effects_by_source.items()}
         ),
-        outputs_by_call=facts.outputs_by_call,
-        expansions_by_source=freeze_mapping(
+        outputs_by_call=analysis.outputs_by_call,
+        expand_effects_by_source=freeze_mapping(
             {port: tuple(items) for port, items in expansions.items()}
         ),
-        shape_reporters_by_domain=facts.shape_reporters_by_domain,
-        control_ports=facts.control_ports,
-        structural_effects=freeze_mapping(structural_effects),
-        effects_by_shape_domain=freeze_mapping(
-            {domain: tuple(effects) for domain, effects in groups_by_domain.items()}
+        expansion_sources_by_domain=analysis.expansion_sources_by_domain,
+        control_ports=analysis.control_ports,
+        structural_effects_by_target=freeze_mapping(structural_effects_by_target),
+        reduce_effects_by_child_domain=freeze_mapping(
+            {
+                domain: tuple(effects)
+                for domain, effects in reductions_by_domain.items()
+            }
         ),
-        effects_by_entity_domain=freeze_mapping(
+        broadcast_effects_by_target_domain=freeze_mapping(
             {
                 domain: tuple(effects)
                 for domain, effects in broadcasts_by_domain.items()
             }
         ),
-        pools_by_call=freeze_mapping(pools_by_call),
+        actor_pools_by_call=freeze_mapping(actor_pools_by_call),
         output_layouts_by_call=freeze_mapping(layouts),
         input_layouts_by_call=freeze_mapping(input_layouts),
     )
@@ -428,28 +431,28 @@ def _lower(
     for rewrite in canonical.rewrites:
         rewrites_by_port.setdefault(rewrite.port, []).append(rewrite)
     explanations = {}
-    for port, semantic in facts.semantics_by_port.items():
-        rule = _physical_rule(port, semantic.kind, runtime)
+    for port, semantic in analysis.semantics_by_port.items():
+        rule = _physical_rule(port, semantic.kind, plan)
         explanations[port] = PortExplanation(
             port,
             semantic.kind.name.lower(),
             logical.port(port).domain,
             tuple(input_.port for input_ in semantic.inputs),
             rule,
-            port in facts.control_ports,
+            port in analysis.control_ports,
             tuple(rewrites_by_port.get(port, ())),
         )
-    explain = ExplainPlan(
+    explanation = ProgramExplanation(
         canonical.optimized,
         freeze_mapping(explanations),
         canonical.rewrites,
     )
-    return runtime, explain
+    return plan, explanation
 
 
 def _compile_pool_spec(
     options: tuple[tuple[str, object], ...],
-) -> PoolSpec:
+) -> ActorPoolSpec:
     """Normalize authoring options into one typed physical Call contract."""
 
     raw = dict(options)
@@ -461,7 +464,7 @@ def _compile_pool_spec(
         )
 
     try:
-        return PoolSpec(
+        return ActorPoolSpec(
             replicas=cast(Any, raw.pop("replicas", 1)),
             batch_size=cast(Any, raw.pop("batch_size", 1)),
             batch_scope=cast(Any, raw.pop("batch_scope", "elastic")),
@@ -472,10 +475,10 @@ def _compile_pool_spec(
         raise CompileError(str(error)) from error
 
 
-def _compile_input_layout(spec: CallSpec) -> InputLayout:
-    """Lower one logical args/kwargs shape into the sole Worker ABI layout."""
+def _compile_input_layout(spec: CallSpec) -> CallInputLayout:
+    """Lower one logical args/kwargs arrangement into the sole Worker ABI layout."""
 
-    return InputLayout(
+    return CallInputLayout(
         len(spec.args),
         tuple(name for name, _ in spec.kwargs),
     )
@@ -483,31 +486,31 @@ def _compile_input_layout(spec: CallSpec) -> InputLayout:
 
 def verify_runtime_plan(
     logical: LogicalProgram,
-    facts: DerivedFacts,
-    runtime: RuntimePlan,
+    analysis: ProgramAnalysis,
+    plan: RuntimePlan,
 ) -> None:
     """保证 lowering 没有漏掉任何 logical primitive 或 Call ABI。"""
 
-    if set(runtime.calls) != set(logical.calls):
+    if set(plan.calls) != set(logical.calls):
         raise CompileError("RuntimePlan Call set is incomplete")
-    if set(runtime.port_domains) != set(logical.ports):
+    if set(plan.port_domains) != set(logical.ports):
         raise CompileError("RuntimePlan Port domain table is incomplete")
-    if set(runtime.outputs_by_call) != set(logical.calls):
+    if set(plan.outputs_by_call) != set(logical.calls):
         raise CompileError("RuntimePlan Call output table is incomplete")
-    if set(runtime.pools_by_call) != set(logical.calls):
+    if set(plan.actor_pools_by_call) != set(logical.calls):
         raise CompileError("RuntimePlan requires exactly one pool per Call")
-    if set(runtime.output_layouts_by_call) != set(logical.calls):
+    if set(plan.output_layouts_by_call) != set(logical.calls):
         raise CompileError("RuntimePlan Worker layouts are incomplete")
-    if set(runtime.input_layouts_by_call) != set(logical.calls):
+    if set(plan.input_layouts_by_call) != set(logical.calls):
         raise CompileError("RuntimePlan Worker input layouts are incomplete")
 
     expected_structural = {
         port
-        for port, semantic in facts.semantics_by_port.items()
+        for port, semantic in analysis.semantics_by_port.items()
         if semantic.kind
-        in {PrimitiveKind.FILTER, PrimitiveKind.GROUP, PrimitiveKind.BROADCAST}
+        in {PrimitiveKind.FILTER, PrimitiveKind.REDUCE, PrimitiveKind.BROADCAST}
     }
-    if set(runtime.structural_effects) != expected_structural:
+    if set(plan.structural_effects_by_target) != expected_structural:
         raise CompileError("RuntimePlan structural Effect catalog is incomplete")
 
     def indexed_by_item(port: PortRef, effect: ItemEffect) -> bool:
@@ -515,10 +518,10 @@ def verify_runtime_plan(
         # Effect, not an equal clone that could evolve into a second truth.
         return any(
             indexed is effect
-            for indexed in runtime.effects_by_item_port.get(port, ())
+            for indexed in plan.item_effects_by_source.get(port, ())
         )
 
-    for port, semantic in facts.semantics_by_port.items():
+    for port, semantic in analysis.semantics_by_port.items():
         match semantic.kind:
             case PrimitiveKind.SOURCE | PrimitiveKind.CALL_OUTPUT:
                 pass
@@ -526,41 +529,41 @@ def verify_runtime_plan(
                 source = semantic.inputs[0].port
                 if not any(
                     rule.port == port
-                    for rule in runtime.expansions_by_source.get(source, ())
+                    for rule in plan.expand_effects_by_source.get(source, ())
                 ):
                     raise CompileError("RuntimePlan omitted an Expand rule")
             case PrimitiveKind.FILTER:
-                effect = runtime.structural_effects[port]
+                effect = plan.structural_effects_by_target[port]
                 if not isinstance(effect, FilterEffect):
                     raise CompileError("RuntimePlan has the wrong Filter Effect")
                 if not indexed_by_item(effect.source_port, effect):
                     raise CompileError("RuntimePlan omitted a Filter source index")
                 if not indexed_by_item(effect.mask_port, effect):
                     raise CompileError("RuntimePlan omitted a Filter mask index")
-            case PrimitiveKind.GROUP:
-                effect = runtime.structural_effects[port]
-                if not isinstance(effect, GroupEffect):
-                    raise CompileError("RuntimePlan has the wrong Group Effect")
+            case PrimitiveKind.REDUCE:
+                effect = plan.structural_effects_by_target[port]
+                if not isinstance(effect, ReduceEffect):
+                    raise CompileError("RuntimePlan has the wrong Reduce Effect")
                 if not indexed_by_item(effect.value_port, effect):
-                    raise CompileError("RuntimePlan omitted a Group value index")
+                    raise CompileError("RuntimePlan omitted a Reduce value index")
                 if not indexed_by_item(effect.members_port, effect):
-                    raise CompileError("RuntimePlan omitted a Group members index")
+                    raise CompileError("RuntimePlan omitted a Reduce members index")
                 if not any(
                     indexed is effect
-                    for indexed in runtime.effects_by_shape_domain.get(
+                    for indexed in plan.reduce_effects_by_child_domain.get(
                         effect.child_domain, ()
                     )
                 ):
-                    raise CompileError("RuntimePlan omitted a Group domain index")
+                    raise CompileError("RuntimePlan omitted a Reduce domain index")
             case PrimitiveKind.BROADCAST:
-                effect = runtime.structural_effects[port]
+                effect = plan.structural_effects_by_target[port]
                 if not isinstance(effect, BroadcastEffect):
                     raise CompileError("RuntimePlan has the wrong Broadcast Effect")
                 if not indexed_by_item(effect.source_port, effect):
                     raise CompileError("RuntimePlan omitted a Broadcast source index")
                 if not any(
                     indexed is effect
-                    for indexed in runtime.effects_by_entity_domain.get(
+                    for indexed in plan.broadcast_effects_by_target_domain.get(
                         effect.target_domain, ()
                     )
                 ):
@@ -569,16 +572,16 @@ def verify_runtime_plan(
                 assert_never(semantic.kind)
 
     for call, spec in logical.calls.items():
-        if runtime.input_layouts_by_call[call] != _compile_input_layout(spec):
+        if plan.input_layouts_by_call[call] != _compile_input_layout(spec):
             raise CompileError("RuntimePlan Worker input layout does not match CallSpec")
         for index, input_ in enumerate(spec.ordered_inputs):
-            if CallInputEffect(call, index) not in runtime.effects_by_item_port.get(
+            if CallInputEffect(call, index) not in plan.item_effects_by_source.get(
                 input_.port, ()
             ):
                 raise CompileError("RuntimePlan omitted a Call input Effect")
 
 
-def _physical_rule(port: PortRef, kind: PrimitiveKind, runtime: RuntimePlan) -> str:
+def _physical_rule(port: PortRef, kind: PrimitiveKind, plan: RuntimePlan) -> str:
     match kind:
         case PrimitiveKind.SOURCE:
             return "source-admission"
@@ -587,15 +590,15 @@ def _physical_rule(port: PortRef, kind: PrimitiveKind, runtime: RuntimePlan) -> 
         case PrimitiveKind.EXPAND:
             return "expanded-output-layout"
         case PrimitiveKind.FILTER:
-            return "arena-filter"
-        case PrimitiveKind.GROUP:
-            return "arena-group"
+            return "filter-effect"
+        case PrimitiveKind.REDUCE:
+            return "reduce-effect"
         case PrimitiveKind.BROADCAST:
-            effect = runtime.structural_effects[port]
+            effect = plan.structural_effects_by_target[port]
             if not isinstance(effect, BroadcastEffect):  # pragma: no cover
                 raise CompileError("Broadcast Port has no BroadcastEffect")
             source = effect.source_port
-            return f"arena-broadcast(p{source.value})"
+            return f"broadcast-effect(p{source.value})"
         case _:
             assert_never(kind)
 

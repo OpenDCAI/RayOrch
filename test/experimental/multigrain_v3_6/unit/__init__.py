@@ -1,1 +1,1 @@
-"""Ray-free compiler and Arena tests."""
+"""Ray-free compiler and microbatch-engine tests."""

@@ -102,8 +102,8 @@ class VideoV36Pipeline(Pipeline):
 def run_v36(
     paths: list[str],
     *,
-    arena_size: int = 2,
-    max_in_flight: int = 2,
+    microbatch_size: int = 2,
+    max_active_microbatches: int = 2,
     **pipeline_options: Any,
 ) -> RunResult:
     """Run the v3.6 feature pipeline on an initialized or local Ray runtime."""
@@ -111,8 +111,8 @@ def run_v36(
     with Executor(VideoV36Pipeline(**pipeline_options)) as executor:
         return executor.run(
             paths,
-            arena_size=arena_size,
-            max_in_flight=max_in_flight,
+            microbatch_size=microbatch_size,
+            max_active_microbatches=max_active_microbatches,
         )
 
 

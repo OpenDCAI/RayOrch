@@ -17,7 +17,7 @@ from rayorch.experimental.multigrain_v3_6.logical import (
     DomainSpec,
     ExpandOrigin,
     FilterOrigin,
-    GroupOrigin,
+    ReduceOrigin,
     LogicalProgram,
     PortOrigin,
     PortSpec,
@@ -36,10 +36,10 @@ from rayorch.experimental.multigrain_v3_6.model import (
 from rayorch.experimental.multigrain_v3_6.plan import (
     BroadcastEffect,
     FilterEffect,
-    GroupEffect,
+    ReduceEffect,
 )
 from rayorch.experimental.multigrain_v3_6.runtime import engine
-from rayorch.experimental.multigrain_v3_6.runtime.state import ShapeKey
+from rayorch.experimental.multigrain_v3_6.runtime.state import ExpansionRef
 from rayorch.experimental.multigrain_v3_6.semantics import (
     PrimitiveKind,
     describe_origin,
@@ -48,6 +48,25 @@ from rayorch.experimental.multigrain_v3_6.semantics import (
 
 class U:
     pass
+
+
+def test_root_public_api_is_deliberately_small():
+    assert set(mg.__all__) == {
+        "CompileError",
+        "CompiledProgram",
+        "Executor",
+        "ExecutionError",
+        "F",
+        "ItemOutcome",
+        "MISSING",
+        "Pipeline",
+        "Port",
+        "RayModule",
+        "RecordFailure",
+        "RecoveryPolicy",
+        "RunResult",
+        "function",
+    }
 
 
 def test_logical_program_contains_only_declared_logical_facts():
@@ -66,7 +85,7 @@ def test_every_origin_has_one_explicit_semantic_descriptor():
         SourceOrigin(0, "source"),
         CallOutputOrigin(CallRef(0), 0),
         ExpandOrigin(p0),
-        GroupOrigin(p0, p1),
+        ReduceOrigin(p0, p1),
         BroadcastOrigin(p0),
         FilterOrigin(p0, p1),
     )
@@ -76,11 +95,11 @@ def test_every_origin_has_one_explicit_semantic_descriptor():
     )
     assert describe_origin(FilterOrigin(p0, p1)).control_demands == (p1,)
     assert describe_origin(FilterOrigin(p0, p1)).control_predecessors == (p0,)
-    assert describe_origin(GroupOrigin(p0, p1)).rejects_control
+    assert describe_origin(ReduceOrigin(p0, p1)).rejects_control
     assert describe_origin(SourceOrigin(0, "source")).source_index == 0
 
 
-def test_arena_module_has_no_logical_origin_interpreter():
+def test_engine_module_has_no_logical_origin_interpreter():
     source = inspect.getsource(engine)
     assert "PortOrigin" not in source
     assert "FilterOrigin" not in source
@@ -88,10 +107,10 @@ def test_arena_module_has_no_logical_origin_interpreter():
     assert ".origin" not in source
 
 
-def test_arena_has_one_closed_fact_propagation_entry():
-    source = inspect.getsource(engine.ArenaEngine)
+def test_engine_has_one_closed_fact_propagation_entry():
+    source = inspect.getsource(engine.MicrobatchEngine)
 
-    assert set(get_args(engine._FactEvent)) == {ItemRef, ShapeKey, EntityRef}
+    assert set(get_args(engine._FactEvent)) == {ItemRef, ExpansionRef, EntityRef}
     assert source.count("self._facts.append(") == 3
     assert "_receipts" not in source
     assert "_shape_terminal" not in source
@@ -147,12 +166,12 @@ def test_chained_filter_control_is_a_fixed_point_analysis():
     )
     selected_bools, result = filters
 
-    assert values not in compiled.facts.control_ports
+    assert values not in compiled.analysis.control_ports
     assert {bools, membership, selected_bools}.issubset(
-        compiled.facts.control_ports
+        compiled.analysis.control_ports
     )
-    selected_effect = compiled.runtime.structural_effects[selected_bools]
-    result_effect = compiled.runtime.structural_effects[result]
+    selected_effect = compiled.plan.structural_effects_by_target[selected_bools]
+    result_effect = compiled.plan.structural_effects_by_target[result]
     assert isinstance(selected_effect, FilterEffect)
     assert isinstance(result_effect, FilterEffect)
     assert selected_effect.copy_source_control
@@ -217,17 +236,17 @@ def test_unoptimized_path_and_broadcast_chain_rewrite_are_explainable():
     inner, outer = broadcasts
     root_mask = optimized.logical.source_ports[1]
 
-    baseline_outer = baseline.runtime.structural_effects[outer]
-    optimized_outer = optimized.runtime.structural_effects[outer]
-    optimized_inner = optimized.runtime.structural_effects[inner]
+    baseline_outer = baseline.plan.structural_effects_by_target[outer]
+    optimized_outer = optimized.plan.structural_effects_by_target[outer]
+    optimized_inner = optimized.plan.structural_effects_by_target[inner]
     assert isinstance(baseline_outer, BroadcastEffect)
     assert isinstance(optimized_outer, BroadcastEffect)
     assert isinstance(optimized_inner, BroadcastEffect)
     assert baseline_outer.source_port == inner
     assert optimized_outer.source_port == root_mask
     assert optimized_inner.source_port == root_mask
-    assert len(optimized.explain.rewrites) == 1
-    assert optimized.explain.rewrites[0].kind == "collapse-broadcast-chain"
+    assert len(optimized.explanation.rewrites) == 1
+    assert optimized.explanation.rewrites[0].kind == "collapse-broadcast-chain"
     assert "rewrite collapse-broadcast-chain" in optimized.explain_text()
     assert baseline.explain_text().startswith("RuntimePlan[unoptimized]")
 
@@ -254,43 +273,43 @@ def test_runtime_plan_has_one_lowering_for_every_structural_port():
         if kind is PrimitiveKind.EXPAND:
             assert any(
                 rule.port == port
-                for rules in compiled.runtime.expansions_by_source.values()
+                for rules in compiled.plan.expand_effects_by_source.values()
                 for rule in rules
             )
         elif kind is PrimitiveKind.FILTER:
-            effect = compiled.runtime.structural_effects[port]
+            effect = compiled.plan.structural_effects_by_target[port]
             assert isinstance(effect, FilterEffect)
             for source in (effect.source_port, effect.mask_port):
                 assert any(
                     indexed is effect
-                    for indexed in compiled.runtime.effects_by_item_port[source]
+                    for indexed in compiled.plan.item_effects_by_source[source]
                 )
-        elif kind is PrimitiveKind.GROUP:
-            effect = compiled.runtime.structural_effects[port]
-            assert isinstance(effect, GroupEffect)
+        elif kind is PrimitiveKind.REDUCE:
+            effect = compiled.plan.structural_effects_by_target[port]
+            assert isinstance(effect, ReduceEffect)
             for source in (effect.value_port, effect.members_port):
                 assert any(
                     indexed is effect
-                    for indexed in compiled.runtime.effects_by_item_port[source]
+                    for indexed in compiled.plan.item_effects_by_source[source]
                 )
             assert any(
                 indexed is effect
-                for indexed in compiled.runtime.effects_by_shape_domain[
+                for indexed in compiled.plan.reduce_effects_by_child_domain[
                     effect.child_domain
                 ]
             )
         elif kind is PrimitiveKind.BROADCAST:
-            effect = compiled.runtime.structural_effects[port]
+            effect = compiled.plan.structural_effects_by_target[port]
             assert isinstance(effect, BroadcastEffect)
             assert any(
                 indexed is effect
-                for indexed in compiled.runtime.effects_by_item_port[
+                for indexed in compiled.plan.item_effects_by_source[
                     effect.source_port
                 ]
             )
             assert any(
                 indexed is effect
-                for indexed in compiled.runtime.effects_by_entity_domain[
+                for indexed in compiled.plan.broadcast_effects_by_target_domain[
                     effect.target_domain
                 ]
             )
@@ -315,10 +334,10 @@ def test_pool_options_compile_to_one_typed_physical_contract():
     optimized = Configured().compile(optimize=True)
     baseline = Configured().compile(optimize=False)
     call = next(iter(optimized.logical.calls))
-    pool = optimized.runtime.pool(call)
+    pool = optimized.plan.pool(call)
 
-    assert optimized.runtime.pools_by_call == baseline.runtime.pools_by_call
-    assert set(optimized.runtime.pools_by_call) == {call}
+    assert optimized.plan.actor_pools_by_call == baseline.plan.actor_pools_by_call
+    assert set(optimized.plan.actor_pools_by_call) == {call}
     assert pool.replicas == 3
     assert pool.batch_size == 7
     assert pool.batch_scope == "parent_bound"

@@ -54,7 +54,7 @@ class DomainRef:
 class EntityRef:
     """一个 Domain 中的一次逻辑 occurrence。
 
-    第一版中 ``value`` 仅在 Arena 内有效；Domain 本身属于身份的一部分，
+    ``value`` 仅在一个 MicrobatchEngine 内有效；Domain 本身属于身份的一部分，
     因此无关坐标不会仅因整数相同而意外对齐。
     """
 
@@ -106,8 +106,8 @@ class GrainPhase(Enum):
     SEALED = auto()
 
 
-class ShapeState(Enum):
-    """一次 fan-out Shape 的终态及其 cardinality 可知性。"""
+class ExpansionOutcome(Enum):
+    """一次 fan-out Expansion 的终态及其 cardinality 可知性。"""
 
     SUCCEEDED = auto()
     DROPPED = auto()
@@ -137,5 +137,5 @@ __all__ = [
     "ItemRef",
     "MISSING",
     "PortRef",
-    "ShapeState",
+    "ExpansionOutcome",
 ]

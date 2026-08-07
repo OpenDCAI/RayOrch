@@ -1,8 +1,8 @@
 # MultiGrain v3.6：静态语义编译边界
 
-首次发布前的动态状态机收敛合同见
-[`multigrain_v3_6_1.md`](multigrain_v3_6_1.md)。v3.6.1 删除输入 driver，
-并以可穷举 transition algebra 统一 F.*、Grain、Item 与 Shape 的运行时语义。
+动态状态机收敛合同见
+[`multigrain_v3_6_design.md`](multigrain_v3_6_design.md)。v3.6 删除输入 driver，
+并以可穷举 transition algebra 统一 F.*、Grain、Item 与 Expansion 的运行时语义。
 第一次阅读或准备维护源码时，建议从
 [`multigrain_v3_6_tutorial.md`](multigrain_v3_6_tutorial.md) 开始。
 
@@ -26,7 +26,7 @@ trace
 
 - 每种 primitive 必须声明逻辑依赖、control demand/transfer 和 lowering。
 - `LogicalProgram` 不再混入反向索引、control closure 或物理 actor 配置。
-- Arena 只执行完整 `RuntimePlan`，不导入或读取 `PortOrigin`。
+- `MicrobatchEngine` 只执行完整 `RuntimePlan`，不导入或读取 `PortOrigin`。
 - 优化关闭后仍走同一 verifier、analysis、lowering，形成 correctness baseline。
 - `explain` 能逐 Port 追踪 logical→physical 映射和 canonical rewrite。
 
@@ -36,13 +36,13 @@ trace
 flowchart LR
     A["RayModule + F.* authoring"] --> L["LogicalProgram<br/>Call / Port / Domain / Origin"]
     L --> V["Verifier"]
-    V --> D["DerivedFacts<br/>uses / outputs / shapes / control"]
+    V --> D["ProgramAnalysis<br/>uses / outputs / expansions / control"]
     D --> C["Optional canonicalization<br/>transparent rewrites only"]
     C --> R["RuntimePlan<br/>effects / indexes / layouts / pools"]
-    R --> E["ArenaEngine<br/>Item / Shape / Entity propagation"]
+    R --> E["MicrobatchEngine<br/>Item / Expansion / Entity propagation"]
     E --> Q["DispatchState<br/>Grain phase / generation / queues"]
     R --> X["Executor<br/>actor capacity / RPC"]
-    R --> W["Worker ABI<br/>InvocationPlan / OutputLayout"]
+    R --> W["Worker ABI<br/>GrainPlan / CallOutputLayout"]
     E --> M["Materialization"]
 ```
 
@@ -51,14 +51,14 @@ flowchart LR
 | 层 | 拥有 | 明确不拥有 |
 | --- | --- | --- |
 | `LogicalProgram` | 用户声明的 Call、Port、Domain、Origin、输出树 | consumers、control closure、pool、runtime Effect |
-| `DerivedFacts` | 可重算的 uses、Call outputs、Shape reporters、control fixed point、group depth | actor handle、Arena state |
+| `ProgramAnalysis` | 可重算的 uses、Call outputs、Expansion sources、control fixed point、group depth | actor handle、runtime state |
 | `RuntimePlan` | Port Domain 表、Call ABI、input/output layouts、不可变 Effects 及其触发索引、pool、输出树 | `PortOrigin`、业务 payload、动态 Entity |
-| `ArenaEngine` | Item/Shape/Entity lineage 与结构传播 | Grain 调度策略、logical Origin、actor handle、业务值解释 |
-| `DispatchState` | Grain phase/generation、normal/immediate/tail queues、精确 group recovery | Item/Shape publication、UDF policy、actor handle |
-| `Executor` | actor 生命周期、RPC、multi-Arena capacity | primitive 语义、lineage 推导 |
-| `Worker` | value-only batch UDF 与稳定 DTO | Program、Arena、Ray 调度策略 |
+| `MicrobatchEngine` | Item/Expansion/Entity lineage 与结构传播 | Grain 调度策略、logical Origin、actor handle、业务值解释 |
+| `DispatchState` | Grain phase/generation、normal/immediate/tail queues、精确 batch recovery | Item/Expansion publication、UDF policy、actor handle |
+| `Executor` | actor 生命周期、RPC、multi-microbatch capacity | primitive 语义、lineage 推导 |
+| `Worker` | value-only batch UDF 与稳定 DTO | Program、runtime tables、Ray 调度策略 |
 
-`RuntimePlan` 会复制运行时真正需要的静态事实。Arena 不通过
+`RuntimePlan` 会复制运行时真正需要的静态事实。`MicrobatchEngine` 不通过
 `CompiledProgram.logical` 回读任何 provenance，也不在构造时重新扫描 Origins
 建立私有索引。
 
@@ -71,9 +71,9 @@ runtime view 行为，也必须显式返回 stop/pass 合同；未知联合成�
 | Primitive | 逻辑输入 | control 语义 | Runtime lowering |
 | --- | --- | --- | --- |
 | Source | 无 | demand 在 source admission 产生 manifest | `source-admission` |
-| CallOutput | Call + output index | demand 进入 Worker `OutputLayout` | `worker-output` |
-| Expand | group Port | output demand 反传给 group | `ExpansionRule`，由成功 report 原子提交直接输出 |
-| Group | value + members | group value 不能作为标量 mask | 单一 `GroupEffect`，同时进入 Item 与 Shape-domain 触发索引 |
+| CallOutput | Call + output index | demand 进入 Worker `CallOutputLayout` | `worker-output` |
+| Expand | group Port | output demand 反传给 group | `ExpandEffect`，由成功 report 原子提交直接输出 |
+| Reduce | value + members | group value 不能作为标量 mask | 单一 `ReduceEffect`，同时进入 Item 与 Expansion-domain 触发索引 |
 | Broadcast | ancestor source | output demand 反传给 source | 单一 `BroadcastEffect`，同时进入 Item 与 Entity-domain 触发索引 |
 | Filter | source + mask | mask 主动 demand control；output demand 反传给 source | 单一 `FilterEffect`，同时进入 source/mask 索引；PRESENT 时可复制 source control |
 
@@ -87,14 +87,14 @@ source，直到 fixed point。
 
 - 在启动 Ray 前验证引用闭包、Domain ancestry、Call/Port 对齐和 Port DAG。
 - 对新增 primitive 强制穷尽 control 与 lowering 合同，减少横向漏项。
-- 让 Arena 的结构传播只解释完整物理 Effect，不再重复逻辑模式匹配或按 target 回查第二份规则。
+- 让 `MicrobatchEngine` 的结构传播只解释完整物理 Effect，不再重复逻辑模式匹配或按 target 回查第二份规则。
 
-Arena 内部的 `_FactEvent = ItemRef | ShapeKey | EntityRef` 是封闭、私有的事实通知联合。
+MicrobatchEngine 内部的 `_FactEvent = ItemRef | ExpansionRef | EntityRef` 是封闭、私有的事实通知联合。
 三个事实各由唯一 publication 入口写入 canonical table 并进入同一 FIFO；`advance()`
 穷尽匹配事实类型并应用对应 Effect 索引。事件不携带 outcome/binding/children，因而不构成
 第二份运行时状态。
-- 生成稳定的 Worker `OutputLayout` 和 source control admission 合同。
-- 把用户写下的 positional/keyword 调用形状 lower 为稳定 `InputLayout`，Worker
+- 生成稳定的 Worker `CallOutputLayout` 和 source control admission 合同。
+- 把用户写下的 positional/keyword 调用形状 lower 为稳定 `CallInputLayout`，Worker
   不反射 Pipeline 或 LogicalProgram。
 - Logical `CallSpec` 分别保存 immutable `args` 与 ordered `kwargs`；输入值只保存
   `PortRef + InputMode`，关键字名不在 value 中重复。runtime 才使用 dense slots。
@@ -118,7 +118,7 @@ v3.6 不声称静态编译能够：
 
 - 预测运行时 Expand cardinality，或消除 workload 真实存在的 N×M。
 - 理解任意 Python UDF 的纯度、副作用、代价或内存峰值。
-- 代替 Arena 的局部 failure propagation、retry generation 和 stale fencing。
+- 代替 `MicrobatchEngine` 的局部 failure propagation、retry generation 和 stale fencing。
 - 自动把一般 Reduce 变成 streaming aggregation。
 - 通过融合结构 view 获得 actor/RPC 收益；Filter 本来就没有 actor 或 RPC。
 - 保证任意 workload 的性能；物理优化仍需 profile 与端到端证据。
@@ -134,27 +134,43 @@ v3.6 保留了 v3–v3.4 中已经成立的部分：
 - `RayModule + F.*` 的用户书写模式。
 - Port/Domain 正交、显式 Expand/Reduce/Broadcast/Filter 关系。
 - Call-only actor pools；结构 primitive 不创建 actor、RPC 或 Grain。
-- 一个 Call 当前只有一个 `PoolSpec`，直接由 `CallRef` 索引；不存在没有独立语义的
+- 一个 Call 当前只有一个 `ActorPoolSpec`，直接由 `CallRef` 索引；不存在没有独立语义的
   `PoolRef` 或第二张 `call_to_pool` 映射。
-- 单写者、事件驱动 Arena 和细粒度 Entity/Item/Grain lineage。
+- 单写者、事件驱动 `MicrobatchEngine` 和细粒度 Entity/Item/Grain lineage。
 - PRESENT/DROPPED/FAILED/SUPPRESSED 的结果语义。
 - multi-output 逐 Grain 原子报告、generation fencing、局部 replay。
-- 多 Arena 共享持久 actor capacity，Worker 使用 value-only DTO。
+- 多 microbatch 共享持久 actor capacity，Worker 使用 value-only DTO。
 - 单一真实 Ray Executor 与统一 `BlockRef`。
 
 同时不把 v3.4 的结构 hard limits 带入新版本。有限且可物化 workload 的容量先
-由 admission、backpressure 与 Arena 生命周期管理；若 profile 证明元数据成本
+由 admission、backpressure 与 microbatch 生命周期管理；若 profile 证明元数据成本
 成为瓶颈，再优化物理表示，而不降低细粒度 lineage 语义。v3.6 也删除了未参与
-判定的 `ShapeState.OPEN`、reporter bookkeeping 和 `active_attempt` 字段。
+判定的 `ExpansionOutcome.OPEN`、reporter bookkeeping 和 `active_attempt` 字段。
 
-## 7. 验证口径
+## 7. 公开用户路径
+
+根包只公开日常使用所需的对象：
+
+```text
+Pipeline / Port / RayModule / F.* / function
+Executor / RunResult / CompiledProgram
+ItemOutcome / RecordFailure / MISSING
+RecoveryPolicy / CompileError / ExecutionError
+```
+
+七种 Ref、RuntimeState、DispatchState、Effect 和 Worker DTO 仍是完整实现的一部分，
+但属于维护者路径，不通过根包制造额外用户心智负担。`RunResult` 只返回 frozen
+`CallMetrics` 与 `MicrobatchMetrics`；它不泄露可变 Engine、RuntimeState 或 Ref-keyed
+内部字典。
+
+## 8. 验证口径
 
 Ray-free 回归覆盖：
 
 - primitive 语义表的完整集合；
 - `LogicalProgram` 与 derived facts 字段隔离；
 - keyword-only、反序 kwargs 与默认参数跳过；
-- Arena 源码不含 Origin interpreter；
+- `MicrobatchEngine` 源码不含 Origin interpreter；
 - chained filter control fixed point；
 - group-valued mask 拒绝；
 - nested empty Expand/Reduce；
@@ -162,19 +178,11 @@ Ray-free 回归覆盖：
 - generation fencing；
 - aligned Expand mismatch 无局部发布。
 
-真实 Ray 回归覆盖持久 actor、多 Arena、actor crash replacement、同 Grain replay、
-逐记录业务失败和 multi-output 原子失败。
+当前源码门禁为 107 个 Ray-free tests、14 个真实 Ray integration tests，以及核心
+pyright 0 error。真实 Ray 覆盖空输入、重复 run 的 run-local/lifetime 指标、持久
+actor、多 microbatch、同步构造失败清理、actor crash replacement、同 Grain replay、
+逐记录业务失败、合同错误 fail-fast 和 multi-output 原子失败。
 
-真实 4×H20 MinerU 回归覆盖 368 PDFs / 7,072 pages、动态 PDF→Page fan-out、
-跨 parent elastic batching 与 ordered Reduce。V3.6 measured wall 为 602.760s，
-相对 V3 golden 587.781s 慢 2.55%，落在既定 ±5% gate 内；OCR 为 121 RPC、
-平均 58.446 pages/RPC，与历史 V3.3 full run 完全一致。输出 368/368，无
-missing/extra；详细配置、4/48/368 分级 gate 与 correctness 结果见
-`docs/experiments/multigrain_v3_6/2026-08-06_mineru_regression.md`。
-
-Video 回归覆盖 Kinetics-400 的 32,790 clips / 50.56GB：全量 OpenCV 路径处理
-1,034,374 sampled frames，V3/V3.6 output digest exact，V3.6 wall 快 `1.38%`。
-另有 256-video 四卡 SmolVLM caption 和 Whisper+ViT sibling-relation paired gates，结构
-与确定性摘要 exact，V3.6 wall 分别慢 `1.39%/1.60%`，均在 `±5%` 带内。模型文本漂移
-与 lineage 错配使用不同 gate；完整记录见
-`docs/experiments/multigrain_v3_6/2026-08-06_video_kinetics50.md`。
+MinerU 368 PDF、Docling 与视频 workload 的 V3.6 数据必须由本实现重新运行后写入
+`docs/experiments/multigrain_v3_6/`。在这些结果产生前，不沿用 V3.5 数字，也不宣称
+V3.6 已通过性能门禁。

@@ -15,7 +15,7 @@ from .logical import (
     CallOutputOrigin,
     ExpandOrigin,
     FilterOrigin,
-    GroupOrigin,
+    ReduceOrigin,
     PortOrigin,
     SourceOrigin,
 )
@@ -26,15 +26,15 @@ class PrimitiveKind(Enum):
     SOURCE = auto()
     CALL_OUTPUT = auto()
     EXPAND = auto()
-    GROUP = auto()
+    REDUCE = auto()
     BROADCAST = auto()
     FILTER = auto()
 
 
 class InputRole(Enum):
     EXPAND_GROUP = auto()
-    GROUP_VALUE = auto()
-    GROUP_MEMBERS = auto()
+    REDUCE_VALUE = auto()
+    REDUCE_MEMBERS = auto()
     BROADCAST_SOURCE = auto()
     FILTER_SOURCE = auto()
     FILTER_MASK = auto()
@@ -81,12 +81,12 @@ def describe_origin(origin: PortOrigin) -> PrimitiveSemantics:
                 (PrimitiveInput(group, InputRole.EXPAND_GROUP),),
                 control_predecessors=(group,),
             )
-        case GroupOrigin(value_port=value, members_port=members):
+        case ReduceOrigin(value_port=value, members_port=members):
             return PrimitiveSemantics(
-                PrimitiveKind.GROUP,
+                PrimitiveKind.REDUCE,
                 (
-                    PrimitiveInput(value, InputRole.GROUP_VALUE),
-                    PrimitiveInput(members, InputRole.GROUP_MEMBERS),
+                    PrimitiveInput(value, InputRole.REDUCE_VALUE),
+                    PrimitiveInput(members, InputRole.REDUCE_MEMBERS),
                 ),
                 rejects_control=True,
             )

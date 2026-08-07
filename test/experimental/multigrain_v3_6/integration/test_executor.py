@@ -48,21 +48,37 @@ class IdentityPipeline(mg.Pipeline):
         return self.identity(values)
 
 
-def test_persistent_actor_is_shared_by_multiple_arenas():
+def test_persistent_actor_is_shared_by_multiple_microbatches():
     with Executor(IdentityPipeline()) as executor:
-        result = executor.run(range(15), arena_size=4, max_in_flight=3)
+        result = executor.run(range(15), microbatch_size=4, max_active_microbatches=3)
 
     assert [value for value, _ in result.outputs] == list(range(15))
     assert len({identity for _, identity in result.outputs}) == 1
     assert result.actor_count == 1
-    assert result.max_active_arenas == 3
-    assert len(result.arenas) == 4
-    assert all(arena.is_complete() for arena in result.arenas)
-    assert all(not arena.state.values for arena in result.arenas)
+    assert result.peak_active_microbatches == 3
+    assert len(result.microbatches) == 4
+    assert all(microbatch.grain_count > 0 for microbatch in result.microbatches)
+    assert result.released_values > 0
     assert executor.store._cache == {}
-    observations = next(iter(result.workers.values()))
-    assert len(observations) == 1
-    assert observations[0].calls == result.calls[next(iter(result.calls))].rpcs
+    metrics = result.calls[0]
+    assert len(metrics.worker_snapshots) == 1
+    assert metrics.worker_snapshots[0].lifetime_calls == metrics.rpcs
+
+
+def test_empty_input_and_repeated_runs_keep_metrics_scopes_explicit():
+    with Executor(IdentityPipeline()) as executor:
+        empty = executor.run([])
+        first = executor.run([1, 2])
+        second = executor.run([3])
+
+    assert empty.outputs == []
+    assert empty.microbatches[0].entity_count == 0
+    assert empty.calls[0].rpcs == 0
+    assert first.outputs[0][0] == 1
+    assert second.outputs[0][0] == 3
+    assert first.calls[0].rpcs == 1
+    assert second.calls[0].rpcs == 1
+    assert second.calls[0].worker_snapshots[0].lifetime_calls == 2
 
 
 def test_actor_class_is_wrapped_once_per_executor(monkeypatch):
@@ -84,6 +100,38 @@ def test_actor_class_is_wrapped_once_per_executor(monkeypatch):
         pass
 
     assert wraps == 1
+
+
+def test_synchronous_actor_construction_failure_cleans_partial_pool(monkeypatch):
+    import ray
+
+    created = []
+    killed = []
+
+    class ActorClass:
+        def options(self, **options):
+            return self
+
+        def remote(self, *args):
+            if created:
+                raise RuntimeError("second actor construction failed")
+            handle = object()
+            created.append(handle)
+            return handle
+
+    monkeypatch.setattr(ray, "remote", lambda target: ActorClass())
+    monkeypatch.setattr(
+        ray,
+        "kill",
+        lambda handle, *, no_restart: killed.append(handle),
+    )
+    pipeline = IdentityPipeline()
+    pipeline.identity = pipeline.identity.ray_options(replicas=2)
+
+    with pytest.raises(RuntimeError, match="second actor construction failed"):
+        Executor(pipeline)
+
+    assert killed == created
 
 
 class KeywordOnlyAdd:
@@ -144,16 +192,13 @@ class CrashPipeline(mg.Pipeline):
 def test_actor_crash_replaces_actor_and_replays_same_grains(tmp_path):
     marker = tmp_path / "v36-crash-once"
     with Executor(CrashPipeline(str(marker))) as executor:
-        result = executor.run(range(4), arena_size=4)
+        result = executor.run(range(4), microbatch_size=4)
 
-    metrics = next(iter(result.calls.values()))
+    metrics = result.calls[0]
     assert result.outputs == [0, 2, 4, 6]
-    assert metrics.actor_starts == 2
+    assert metrics.actor_instances == 2
     assert metrics.retries == 4
     assert metrics.rpcs == 2
-    assert {
-        grain.generation for grain in result.arenas[0].grain_snapshots().values()
-    } == {1}
 
 
 class Render:
@@ -199,12 +244,12 @@ def test_record_failure_suppresses_only_its_parent():
     assert result.outputs[0] == (0, [(0, 0), (0, 1), (0, 2)])
     assert result.outputs[1] is ItemOutcome.SUPPRESSED
     assert result.outputs[2] == (2, [(2, 0), (2, 1), (2, 2)])
-    transform_call = next(
-        call
-        for call, spec in result.arenas[0].plan.calls.items()
-        if spec.kernel.target is FailOneLeaf
+    transform = next(
+        metrics
+        for metrics in result.calls
+        if metrics.udf_name.endswith("FailOneLeaf")
     )
-    assert result.calls[transform_call].grains == 9
+    assert transform.grains == 9
 
 
 class MultiOutputFail:
@@ -278,14 +323,11 @@ def test_udf_retry_policy_controls_immediate_or_tail_order(recovery, expected):
     with Executor(RetryPipeline(recovery)) as executor:
         result = executor.run(range(4))
 
-    metrics = next(iter(result.calls.values()))
+    metrics = result.calls[0]
     assert result.outputs == expected
     assert metrics.rpcs == 3
     assert metrics.retries == 2
-    assert metrics.actor_starts == 1
-    assert {
-        grain.generation for grain in result.arenas[0].grain_snapshots().values()
-    } == {0, 1}
+    assert metrics.actor_instances == 1
 
 
 class PoisonValue:
@@ -311,13 +353,11 @@ def test_isolate_tail_commits_only_the_poison_singleton_as_failed():
     with Executor(IsolationPipeline()) as executor:
         result = executor.run(range(4))
 
-    metrics = next(iter(result.calls.values()))
+    metrics = result.calls[0]
     assert result.outputs == [0, 10, ItemOutcome.FAILED, 30]
     assert metrics.rpcs == 6
     assert metrics.retries == 10
-    records = result.arenas[0].grain_snapshots()
-    assert [record.generation for record in records.values()] == [2, 2, 3, 3]
-    assert all(record.infra_failures == 0 for record in records.values())
+    assert result.microbatches[0].grain_count == 4
 
 
 class AlwaysUdfError:

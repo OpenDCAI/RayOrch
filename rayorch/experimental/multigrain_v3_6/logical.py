@@ -1,4 +1,4 @@
-"""v3.6 的纯逻辑 IR。
+"""v3.6 的不可变轻量逻辑程序。
 
 本模块只描述用户声明的 Call、Port、Domain 与 provenance。反向索引、control
 demand、物理路由和 actor pool 都不属于 LogicalProgram。
@@ -31,7 +31,7 @@ class ExpandOrigin:
 
 
 @dataclass(frozen=True, slots=True)
-class GroupOrigin:
+class ReduceOrigin:
     value_port: PortRef
     members_port: PortRef
 
@@ -51,7 +51,7 @@ PortOrigin: TypeAlias = (
     SourceOrigin
     | CallOutputOrigin
     | ExpandOrigin
-    | GroupOrigin
+    | ReduceOrigin
     | BroadcastOrigin
     | FilterOrigin
 )
@@ -72,14 +72,14 @@ class DomainSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class KernelSpec:
+class UdfSpec:
     target: Any
     init_args: tuple[Any, ...] = ()
     init_kwargs: tuple[tuple[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
-class InputSpec:
+class CallInputSpec:
     """一个位置或关键字逻辑参数绑定的值部分。"""
 
     port: PortRef
@@ -89,10 +89,10 @@ class InputSpec:
 @dataclass(frozen=True, slots=True)
 class CallSpec:
     ref: CallRef
-    kernel: KernelSpec
+    udf: UdfSpec
     execution_domain: DomainRef
-    args: tuple[InputSpec, ...] = ()
-    kwargs: tuple[tuple[str, InputSpec], ...] = ()
+    args: tuple[CallInputSpec, ...] = ()
+    kwargs: tuple[tuple[str, CallInputSpec], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.ordered_inputs:
@@ -104,7 +104,7 @@ class CallSpec:
             raise ValueError("CallSpec keyword input names must be unique")
 
     @property
-    def ordered_inputs(self) -> tuple[InputSpec, ...]:
+    def ordered_inputs(self) -> tuple[CallInputSpec, ...]:
         """按 Python 调用顺序返回 compiler/runtime 使用的 dense inputs。"""
 
         return self.args + tuple(input_ for _, input_ in self.kwargs)
@@ -143,12 +143,12 @@ __all__ = [
     "DomainSpec",
     "ExpandOrigin",
     "FilterOrigin",
-    "GroupOrigin",
-    "InputSpec",
-    "KernelSpec",
+    "CallInputSpec",
     "LogicalProgram",
     "PortOrigin",
     "PortSpec",
+    "ReduceOrigin",
     "SourceOrigin",
+    "UdfSpec",
     "freeze_mapping",
 ]

@@ -2,7 +2,7 @@
 
 The business UDFs are imported unchanged from the V3 benchmark.  This module
 only replaces V3 ``Expand/Map/Reduce`` authoring and its executor with
-``RayModule + F.*``, the v3.6 compiler, RuntimePlan, Arena and Executor.
+``RayModule + F.*``, the v3.6 compiler, RuntimePlan, MicrobatchEngine and Executor.
 """
 
 from __future__ import annotations
@@ -267,8 +267,8 @@ class DoclingTableFormerV2BatchV36Pipeline(DoclingTableJobV36Pipeline):
 def run_v36(
     paths: list[str],
     *,
-    arena_size: int = 24,
-    max_in_flight: int = 4,
+    microbatch_size: int = 24,
+    max_active_microbatches: int = 4,
     **pipeline_options: Any,
 ) -> RunResult:
     """Run Docling on an already initialized Ray runtime or a local default."""
@@ -283,8 +283,8 @@ def run_v36(
     with Executor(pipeline_type(**pipeline_options)) as executor:
         return executor.run(
             paths,
-            arena_size=arena_size,
-            max_in_flight=max_in_flight,
+            microbatch_size=microbatch_size,
+            max_active_microbatches=max_active_microbatches,
         )
 
 

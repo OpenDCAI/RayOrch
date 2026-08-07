@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .api import OptionalPort, Port, active_builder
+from .api import OptionalInput, Port, active_builder
 from .model import CompileError
 
 
@@ -45,12 +45,12 @@ def filter(port: Port, mask: Port) -> Port:
     return active_builder().filter(port, mask)
 
 
-def optional(port: Port) -> OptionalPort:
+def optional(port: Port) -> OptionalInput:
     """把 Port 标为 Call 的 optional 输入；不创建结构节点。"""
 
     if not isinstance(port, Port):
         raise CompileError("optional requires a Port")
-    return OptionalPort(port)
+    return OptionalInput(port)
 
 
 __all__ = [

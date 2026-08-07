@@ -32,26 +32,27 @@ from rayorch.experimental.multigrain_v3_6.benchmark.video import audit
 from rayorch.experimental.multigrain_v3_6.benchmark.video import paired
 from rayorch.experimental.multigrain_v3_6.benchmark.video import kinetics50
 from rayorch.experimental.multigrain_v3_6.benchmark.video import model_paired
-from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin, GroupOrigin
-from rayorch.experimental.multigrain_v3_6.model import CallRef
+from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin, ReduceOrigin
 
 
 def _fake_v36_result(outputs, *, rpc_count: int, grains: int):
     metric = SimpleNamespace(
-        actor_starts=1,
+        call_index=0,
+        udf_name="FakeVideoUdf",
+        actor_instances=1,
         rpcs=rpc_count,
         grains=grains,
         average_batch=grains / rpc_count,
-        batch_sizes=[grains],
+        batch_sizes=(grains,),
         retries=0,
+        worker_snapshots=(),
     )
     return SimpleNamespace(
         outputs=outputs,
         rpc_count=rpc_count,
-        calls={CallRef(0): metric},
-        workers={},
+        calls=(metric,),
         elapsed_s=0.1,
-        max_active_arenas=1,
+        peak_active_microbatches=1,
         released_values=grains,
     )
 
@@ -98,15 +99,15 @@ def test_single_relation_video_graph_is_expand_compute_group(
 ):
     compiled = pipeline.compile(optimize=optimize)
 
-    assert [spec.kernel.target for spec in compiled.logical.calls.values()] == targets
+    assert [spec.udf.target for spec in compiled.logical.calls.values()] == targets
     assert len(compiled.logical.domains) == 2
-    assert len(compiled.runtime.pools_by_call) == 3
+    assert len(compiled.plan.actor_pools_by_call) == 3
     assert sum(
         isinstance(spec.origin, ExpandOrigin)
         for spec in compiled.logical.ports.values()
     ) == 1
     assert sum(
-        isinstance(spec.origin, GroupOrigin)
+        isinstance(spec.origin, ReduceOrigin)
         for spec in compiled.logical.ports.values()
     ) == 1
 
@@ -118,7 +119,7 @@ def test_multimodal_video_has_two_sibling_relations_and_root_merge(optimize):
         vit_model_path="vit",
     ).compile(optimize=optimize)
 
-    assert [spec.kernel.target for spec in compiled.logical.calls.values()] == [
+    assert [spec.udf.target for spec in compiled.logical.calls.values()] == [
         DecodeAudioChunks,
         WhisperChunks,
         SummarizeAudio,
@@ -137,7 +138,7 @@ def test_multimodal_video_has_two_sibling_relations_and_root_merge(optimize):
         for spec in compiled.logical.ports.values()
     ) == 2
     assert sum(
-        isinstance(spec.origin, GroupOrigin)
+        isinstance(spec.origin, ReduceOrigin)
         for spec in compiled.logical.ports.values()
     ) == 2
 
@@ -157,8 +158,8 @@ def test_video_batch_scope_only_changes_heavy_compute_pool(factory):
     assert elastic.logical.calls == parent.logical.calls
     changed = []
     for left, right in zip(
-        elastic.runtime.pools_by_call.values(),
-        parent.runtime.pools_by_call.values(),
+        elastic.plan.actor_pools_by_call.values(),
+        parent.plan.actor_pools_by_call.values(),
     ):
         if left != right:
             changed.append((left, right))
@@ -213,7 +214,7 @@ def test_paired_trial_materializes_v3_and_requires_exact_output(monkeypatch):
     def fake_v36(paths, **options):
         calls.append("v36")
         assert paths == ["video.mp4"]
-        assert options["arena_size"] == 2
+        assert options["microbatch_size"] == 2
         return _fake_v36_result(list(expected), rpc_count=3, grains=4)
 
     monkeypatch.setattr(paired, "run_v3", fake_v3)
@@ -221,8 +222,8 @@ def test_paired_trial_materializes_v3_and_requires_exact_output(monkeypatch):
     result = paired._run_trial(
         ["video.mp4"],
         {},
-        arena_size=2,
-        max_in_flight=1,
+        microbatch_size=2,
+        max_active_microbatches=1,
         order="v36_first",
     )
 
@@ -247,8 +248,8 @@ def test_paired_trial_reports_first_business_output_difference(monkeypatch):
         paired._run_trial(
             ["video.mp4"],
             {},
-            arena_size=1,
-            max_in_flight=1,
+            microbatch_size=1,
+            max_active_microbatches=1,
             order="v3_first",
         )
 
@@ -283,8 +284,8 @@ def test_paired_model_output_allows_only_bounded_digest_drift(monkeypatch):
     result = paired._run_trial(
         ["video.mp4"],
         {},
-        arena_size=1,
-        max_in_flight=1,
+        microbatch_size=1,
+        max_active_microbatches=1,
         order="v3_first",
         maximum_digest_mismatch=0.5,
     )
@@ -299,8 +300,8 @@ def test_paired_cli_defaults_to_manifest_preserving_full_run():
 
     assert args.limit == 0
     assert args.repeats == 1
-    assert args.arena_size == 24
-    assert args.max_in_flight == 4
+    assert args.microbatch_size == 24
+    assert args.max_active_microbatches == 4
 
 
 def test_kinetics50_plan_is_frozen_unique_and_plan_only_by_default(tmp_path):
@@ -431,8 +432,8 @@ def test_caption_model_pair_allows_bounded_text_drift_but_exact_structure(
     result = model_paired._caption_trial(
         ["video.mp4"],
         {},
-        arena_size=1,
-        max_in_flight=1,
+        microbatch_size=1,
+        max_active_microbatches=1,
         order="v3_first",
         maximum_normalized_mismatch=0.02,
     )
@@ -452,8 +453,8 @@ def test_multimodal_model_pair_requires_exact_root_merge(monkeypatch):
     result = model_paired._multimodal_trial(
         ["video.mp4"],
         {},
-        arena_size=1,
-        max_in_flight=1,
+        microbatch_size=1,
+        max_active_microbatches=1,
         order="v36_first",
     )
 
@@ -534,8 +535,8 @@ def test_multimodal_pair_allows_only_bounded_normalized_text_drift(
         model_paired._multimodal_trial(
             ["video.mp4"],
             {},
-            arena_size=1,
-            max_in_flight=1,
+            microbatch_size=1,
+            max_active_microbatches=1,
             order="v3_first",
             maximum_normalized_mismatch=0.02,
         )
@@ -543,8 +544,8 @@ def test_multimodal_pair_allows_only_bounded_normalized_text_drift(
     result = model_paired._multimodal_trial(
         ["video.mp4"],
         {},
-        arena_size=1,
-        max_in_flight=1,
+        microbatch_size=1,
+        max_active_microbatches=1,
         order="v3_first",
         maximum_normalized_mismatch=1.0,
     )

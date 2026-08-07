@@ -1,6 +1,6 @@
 # Multigrain V3.6 命名与架构宪法
 
-> 状态：已批准，V3.6 实现和审查必须遵守本文。
+> 状态：已批准并落地；真实性能门禁仍在执行。
 >
 > 目标：一份语义只使用一个词；名称直接表达所在层级；普通用户不需要理解执行器内部对象。
 
@@ -444,6 +444,7 @@ expanded Port 的行集合、一个输出 Port 的报告、Worker 报告联合�
 |---|---|
 | `ShapeKey` | `ExpansionRef` |
 | `ShapeRecord` | `ExpansionRecord` |
+| `ShapeRecord.state` | `ExpansionRecord.outcome` |
 | `EntityOrigin` | `EntityParent` |
 | `GroupShape` | `GroupLayout` |
 | `GroupBinding.shape` | `GroupBinding.layout` |
@@ -525,10 +526,10 @@ Policy 只做纯决策；DispatchState 执行物理 phase/queue 变化；Microba
 - Worker 合同错误使用 `expected/actual`、`input/output port`、`grain/generation`；
 - `ProgramExplanation` 中原语名与 `F.*` 一致，使用 `reduce` 而不是 `group`。
 
-## 10. 现有源码契合性审计（breaking change 前）
+## 10. 实现后源码契合性审计
 
-总体结论：现有实现的职责分层已经契合本宪法，breaking change 主要是收口与统一
-词汇，不需要重写编译器或状态机架构。
+总体结论：V3.6 已按本宪法完成 breaking 收口；编译器和状态机架构沿用 V3.5 已验证
+的职责分层，没有为改名重写语义算法。
 
 已经契合：
 
@@ -543,15 +544,16 @@ Policy 只做纯决策；DispatchState 执行物理 phase/queue 变化；Microba
 - materialize 只调用 Engine 的只读查询，不读取 RuntimeState table；
 - Worker 只接收 protocol DTO，不持有 RuntimePlan 或 RuntimeState。
 
-需要在 breaking change 中收口：
+已经完成的收口：
 
-- Engine 当前公开 `state` 属性，应改为 `_state`；
-- `runtime.__init__` 当前 re-export RuntimeState 和记录类型，应移除聚合导出；
-- RunResult 当前保存 live Engine，应替换为 MicrobatchMetrics；
-- integration tests 和教程当前通过 `result.arenas`、`arena.state` 读取内部对象，应迁移到
-  Metrics、Snapshot、Executor.plan 或所属状态机单元测试；
-- 根包当前暴露 Ref、LogicalProgram、RuntimePlan 和 Worker 类型，应缩减到用户任务 API；
-- 旧的 Shape/Group/Invocation/Arena 词汇按本文映射统一替换。
+- Engine 的权威表只存在于私有 `_state`；
+- `runtime.__init__` 不再聚合导出 RuntimeState 和记录类型；
+- RunResult 只保存 frozen `CallMetrics` 与 `MicrobatchMetrics`，不保存 live Engine；
+- integration tests 和教程不再通过公开结果读取 Engine/RuntimeState；
+- 根包只暴露第 2.1 节的用户任务 API；
+- 标量 Grain 输入直接使用 `RowBinding`，不存在零语义 `ScalarTake` wrapper；
+- `ExpansionRecord.outcome`、`WorkerSnapshot.lifetime_calls` 和
+  `CallMetrics.actor_instances` 已统一消除歧义词。
 
 下列结构不构成飞线，不应为了“绝对分层”重复实现：
 
@@ -591,6 +593,7 @@ ScalarTake GroupTake MissingTake InputTake InputLayout OutputLayout ExplainPlan
 - `RuntimeState / DispatchState`：拥有可变表或状态机；
 - 本文迁移映射中的旧名称；
 - V3/V3.1/V3.2/V3.3/V3.4/V3.5 历史实现与历史文档，不做跨版本机械替换。
+- paired benchmark 为调用历史 V3 API 而保留的参数名，只允许出现在 V3 arm 的适配边。
 
 ## 12. 宪法修改规则
 

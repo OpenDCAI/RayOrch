@@ -1,50 +1,31 @@
-"""以 Port/Domain 为核心抽象的实验性 Multigrain v3.6。"""
+"""Multigrain v3.6 的精简公开编程接口。"""
 
-from . import functional
-from .api import OptionalPort, Pipeline, Port, RayModule, function
+from . import functional as F
+from .api import Pipeline, Port, RayModule, function
+from .executor import Executor, RunResult
 from .model import (
-    CallRef,
     CompileError,
-    DomainRef,
-    EntityRef,
     ExecutionError,
-    GrainRef,
-    InputMode,
-    ItemRef,
+    ItemOutcome,
     MISSING,
-    PortRef,
 )
-from .logical import LogicalProgram
-from .plan import CompiledProgram, RuntimePlan
+from .plan import CompiledProgram
+from .protocol import RecordFailure
 from .recovery import RecoveryPolicy
-from .executor import Executor
-from .worker import WorkerObservation
-
-# 文档与论文伪代码统一使用 F.expand/F.reduce；它只是 functional 模块别名。
-F = functional
 
 __all__ = [
-    "CallRef",
     "CompileError",
     "CompiledProgram",
-    "DomainRef",
-    "EntityRef",
+    "Executor",
     "ExecutionError",
     "F",
-    "GrainRef",
-    "InputMode",
-    "ItemRef",
-    "LogicalProgram",
+    "ItemOutcome",
     "MISSING",
-    "OptionalPort",
     "Pipeline",
     "Port",
-    "PortRef",
-    "RuntimePlan",
-    "WorkerObservation",
-    "Executor",
     "RayModule",
+    "RecordFailure",
     "RecoveryPolicy",
+    "RunResult",
     "function",
-    "functional",
 ]

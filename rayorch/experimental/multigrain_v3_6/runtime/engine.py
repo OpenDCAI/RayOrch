@@ -1,4 +1,4 @@
-"""Multigrain v3.6 的单写者、事件驱动 Arena 语义状态机。"""
+"""Multigrain v3.6 的单写者、事件驱动 microbatch 语义状态机。"""
 
 from __future__ import annotations
 
@@ -15,58 +15,57 @@ from ..model import (
     ItemOutcome,
     ItemRef,
     PortRef,
-    ShapeState,
+    ExpansionOutcome,
 )
 from ..transitions import (
     CallAction,
     FilterCause,
-    GroupCause,
+    ReduceCause,
     InvalidTransition,
     broadcast_transition,
     call_transition,
-    expansion_shape_transition,
+    expansion_outcome_from_item,
     filter_transition,
-    group_transition,
+    reduce_transition,
     item_transition,
-    shape_transition,
+    expansion_transition,
 )
 from ..plan import (
     BroadcastEffect,
     CallInputEffect,
     FilterEffect,
-    GroupEffect,
+    ReduceEffect,
     ItemEffect,
     RuntimePlan,
 )
 from ..protocol import (
-    CallFailureReport,
-    CallReport,
-    GroupTake,
-    InvocationPlan,
-    MissingTake,
+    GrainFailureReport,
+    GrainReport,
+    GroupInput,
+    GrainPlan,
+    MissingInput,
     OutputReport,
     RowBinding,
-    ScalarTake,
     WorkerReport,
 )
 from ..recovery import RecoveryAction, RecoveryPolicy
-from .dispatch import DispatchSelection, DispatchState, GrainSnapshot
+from .dispatch import DispatchBatch, DispatchState, GrainSnapshot
 from .state import (
     CommitError,
-    EntityOrigin,
+    EntityParent,
     GroupBinding,
-    GroupShape,
+    GroupLayout,
     ItemRecord,
-    PendingInvocation,
+    PendingGrain,
     RuntimeState,
-    ShapeKey,
-    ShapeRecord,
+    ExpansionRef,
+    ExpansionRecord,
     ValueBinding,
 )
 
 
 @dataclass(frozen=True, slots=True)
-class _ExpansionCommit:
+class _ExpandedOutputCommit:
     source_port: PortRef
     child_port: PortRef
     child_domain: DomainRef
@@ -74,10 +73,10 @@ class _ExpansionCommit:
     controls: tuple[bool, ...] | None
 
 
-_FactEvent: TypeAlias = ItemRef | ShapeKey | EntityRef
+_FactEvent: TypeAlias = ItemRef | ExpansionRef | EntityRef
 
 
-class ArenaEngine:
+class MicrobatchEngine:
     """拥有一个 source microbatch 的全部语义事实与唯一写入口。"""
 
     def __init__(
@@ -85,7 +84,7 @@ class ArenaEngine:
         plan: RuntimePlan,
     ) -> None:
         self.plan = plan
-        self.state = RuntimeState()
+        self._state = RuntimeState()
         self._dispatch = DispatchState()
         self._facts: deque[_FactEvent] = deque()
         self._entities_by_domain: dict[
@@ -101,21 +100,21 @@ class ArenaEngine:
 
     @property
     def entity_count(self) -> int:
-        """返回 Arena 已创建的 Entity 总数，供审计与 benchmark 使用。"""
+        """返回本 microbatch 已创建的 Entity 总数。"""
 
         return sum(len(entities) for entities in self._entities_by_domain.values())
 
     @property
     def item_count(self) -> int:
-        """返回 Arena 已终态化的 Item 总数。"""
+        """返回本 microbatch 已终态化的 Item 总数。"""
 
-        return len(self.state.items)
+        return len(self._state.items)
 
     @property
-    def shape_count(self) -> int:
-        """返回 Arena 已创建的 fan-out Shape 总数。"""
+    def expansion_count(self) -> int:
+        """返回本 microbatch 已终态化的 Expansion 总数。"""
 
-        return len(self.state.shapes)
+        return len(self._state.expansions)
 
     @property
     def grain_count(self) -> int:
@@ -144,31 +143,31 @@ class ArenaEngine:
         *,
         max_size: int,
         parent_bound: bool = False,
-    ) -> DispatchSelection:
+    ) -> DispatchBatch:
         """Reserve immediate recovery, normal work, then deferred recovery."""
 
-        selection = self._dispatch.reserve(
+        batch = self._dispatch.reserve(
             call,
             max_size=max_size,
             parent_bound=parent_bound,
         )
-        if selection is None:
+        if batch is None:
             raise LookupError(f"no READY dispatch for {call!r}")
-        return selection
+        return batch
 
     def close_admission(self) -> None:
-        """声明本 Arena 不再接纳 source，允许完整性判定成立。"""
+        """声明本 microbatch 不再接纳 source。"""
 
         self._admission_closed = True
 
     def is_complete(self) -> bool:
-        """按完整合同审计 Arena，而非仅检查 ready queue。"""
+        """按完整合同审计 microbatch，而非仅检查 ready queue。"""
 
         if not self._admission_closed:
             return False
         if (
             self._facts
-            or self.state.pending
+            or self._state.pending_grains
             or not self._dispatch.is_idle
         ):
             return False
@@ -176,7 +175,7 @@ class ArenaEngine:
             return False
         for port in self._output_ports(self.plan.output_tree):
             for entity in self._entities_by_domain.get(self.plan.port_domain(port), ()):
-                if ItemRef(port, entity) not in self.state.items:
+                if ItemRef(port, entity) not in self._state.items:
                     return False
         return True
 
@@ -198,40 +197,40 @@ class ArenaEngine:
 
         return tuple(self._entities_by_domain.get(domain, ()))
 
-    def invocation_plan(self, grain: GrainRef) -> InvocationPlan:
-        """把 Arena 语义事实投影为 Worker 可消费的纯物理输入计划。"""
+    def grain_plan(self, grain: GrainRef) -> GrainPlan:
+        """把语义事实投影为 Worker 可消费的纯物理输入计划。"""
 
         call = self.plan.call(grain.call)
-        takes = []
+        inputs = []
         for input_spec in call.ordered_inputs:
             item = ItemRef(input_spec.port, grain.entity)
-            receipt = self.state.items[item]
+            receipt = self._state.items[item]
             if (
                 input_spec.mode is InputMode.OPTIONAL
                 and receipt.outcome is ItemOutcome.DROPPED
             ):
-                takes.append(MissingTake())
+                inputs.append(MissingInput())
                 continue
-            binding = self.state.values[item]
+            binding = self._state.values[item]
             if isinstance(binding, RowBinding):
-                takes.append(ScalarTake(binding))
+                inputs.append(binding)
                 continue
             if isinstance(binding, GroupBinding):
-                rows = tuple(self.state.values[leaf] for leaf in binding.flat_items)
+                rows = tuple(self._state.values[leaf] for leaf in binding.flat_items)
                 if not all(isinstance(row, RowBinding) for row in rows):
                     raise CommitError("canonical group leaves must resolve to rows")
-                takes.append(
-                    GroupTake(
+                inputs.append(
+                    GroupInput(
                         tuple(row for row in rows if isinstance(row, RowBinding)),
-                        binding.shape.offsets_by_level,
+                        binding.layout.offsets_by_level,
                     )
                 )
                 continue
             raise CommitError(f"unsupported ValueBinding: {binding!r}")
-        return InvocationPlan(
+        return GrainPlan(
             grain,
             self._dispatch.generation(grain),
-            tuple(takes),
+            tuple(inputs),
         )
 
     def ordered_items(self, port: PortRef) -> tuple[ItemRef, ...]:
@@ -247,17 +246,17 @@ class ArenaEngine:
     def item_outcome(self, item: ItemRef) -> ItemOutcome:
         """读取已经终态化 Item 的 outcome。"""
 
-        return self.state.items[item].outcome
+        return self._state.items[item].outcome
 
     def value_binding(self, item: ItemRef) -> ValueBinding:
         """读取 PRESENT Item 的物理 binding；调用方不得据此改变语义状态。"""
 
-        return self.state.values[item]
+        return self._state.values[item]
 
     def group_rows(self, binding: GroupBinding) -> tuple[RowBinding, ...]:
         """把 canonical group 叶子解析为行引用，不读取业务 payload。"""
 
-        rows = tuple(self.state.values[leaf] for leaf in binding.flat_items)
+        rows = tuple(self._state.values[leaf] for leaf in binding.flat_items)
         if not all(isinstance(row, RowBinding) for row in rows):
             raise CommitError("canonical group leaves must resolve to rows")
         return tuple(row for row in rows if isinstance(row, RowBinding))
@@ -267,29 +266,29 @@ class ArenaEngine:
 
         path = []
         cursor = entity
-        while cursor in self.state.entity_lineage:
-            origin = self.state.entity_lineage[cursor]
+        while cursor in self._state.entity_lineage:
+            origin = self._state.entity_lineage[cursor]
             path.append(origin.ordinal)
             cursor = origin.parent_entity
         return (cursor.value, *reversed(path))
 
     def release_values(self) -> int:
-        """完成后释放物理 bindings，同时保留 Item/Shape/Grain 语义事实。"""
+        """完成后释放物理 bindings，同时保留语义计数与 Grain 状态。"""
 
         if not self.is_complete():
-            raise CommitError("cannot release values before Arena completion")
-        released = len(self.state.values)
-        self.state.values.clear()
+            raise CommitError("cannot release values before microbatch completion")
+        released = len(self._state.values)
+        self._state.values.clear()
         return released
 
     def progress_summary(self) -> str:
         """返回不含业务 payload 的死锁诊断摘要。"""
 
         return (
-            f"pending={len(self.state.pending)}, "
+            f"pending={len(self._state.pending_grains)}, "
             f"ready={self.ready_count}, "
             f"grains={self.grain_count}, "
-            f"shapes={len(self.state.shapes)}"
+            f"shapes={len(self._state.expansions)}"
         )
 
     def admit_sources(
@@ -341,17 +340,17 @@ class ArenaEngine:
             fact = self._facts.popleft()
             match fact:
                 case ItemRef():
-                    for effect in self.plan.effects_by_item_port.get(
+                    for effect in self.plan.item_effects_by_source.get(
                         fact.port, ()
                     ):
                         self._apply_item_effect(effect, fact)
-                case ShapeKey():
-                    for effect in self.plan.effects_by_shape_domain.get(
+                case ExpansionRef():
+                    for effect in self.plan.reduce_effects_by_child_domain.get(
                         fact.child_domain, ()
                     ):
-                        self._try_group(effect, fact.parent_entity)
+                        self._try_reduce(effect, fact.parent_entity)
                 case EntityRef():
-                    for effect in self.plan.effects_by_entity_domain.get(
+                    for effect in self.plan.broadcast_effects_by_target_domain.get(
                         fact.domain, ()
                     ):
                         self._try_broadcast_to_entity(effect, fact)
@@ -368,17 +367,17 @@ class ArenaEngine:
                 self._try_filter(effect, item.entity)
             case BroadcastEffect():
                 self._try_broadcast_from_source(effect, item)
-            case GroupEffect():
+            case ReduceEffect():
                 parent = self._parent_of(item.entity)
                 if parent is not None:
-                    self._try_group(effect, parent)
+                    self._try_reduce(effect, parent)
             case _:
                 assert_never(effect)
 
     def commit_report(self, report: WorkerReport) -> None:
         """按报告类型进入唯一的成功/失败语义提交路径。"""
 
-        if isinstance(report, CallFailureReport):
+        if isinstance(report, GrainFailureReport):
             self.commit_failure(
                 report.grain,
                 report.cause,
@@ -387,8 +386,8 @@ class ArenaEngine:
         else:
             self.commit_success(report)
 
-    def commit_success(self, report: CallReport) -> None:
-        """校验并发布一个成功 Grain 的全部输出、Shape 与 child Entities。"""
+    def commit_success(self, report: GrainReport) -> None:
+        """校验并发布一个成功 Grain 的全部输出、Expansion 与 child Entities。"""
 
         grain = report.grain
         self._dispatch.validate_in_flight(grain, report.generation)
@@ -399,13 +398,13 @@ class ArenaEngine:
             raise CommitError("report outputs must exactly match Call outputs")
 
         scalar_commits: list[tuple[ItemRef, OutputReport]] = []
-        expansion_commits: list[_ExpansionCommit] = []
-        counts_by_shape: dict[ShapeKey, list[int]] = defaultdict(list)
-        reporters_by_shape: dict[ShapeKey, set[PortRef]] = defaultdict(set)
+        expansion_commits: list[_ExpandedOutputCommit] = []
+        counts_by_expansion: dict[ExpansionRef, list[int]] = defaultdict(list)
+        reporters_by_expansion: dict[ExpansionRef, set[PortRef]] = defaultdict(set)
 
         for output_port in expected_outputs:
             output = by_port[output_port]
-            expansion_rules = self.plan.expansions_by_source.get(output_port, ())
+            expansion_rules = self.plan.expand_effects_by_source.get(output_port, ())
             expanded_ports = tuple(rule.port for rule in expansion_rules)
             rules_by_port = {rule.port: rule for rule in expansion_rules}
             expanded_by_port = {item.port: item for item in output.expansions}
@@ -442,11 +441,11 @@ class ArenaEngine:
                     if any(type(value) is not bool for value in controls):
                         raise CommitError("expanded control manifest must contain bool")
                 child_domain = rule.child_domain
-                shape = ShapeKey(child_domain, grain.entity)
-                counts_by_shape[shape].append(len(rows))
-                reporters_by_shape[shape].add(output_port)
+                expansion = ExpansionRef(child_domain, grain.entity)
+                counts_by_expansion[expansion].append(len(rows))
+                reporters_by_expansion[expansion].add(output_port)
                 expansion_commits.append(
-                    _ExpansionCommit(
+                    _ExpandedOutputCommit(
                         output_port,
                         child_port,
                         child_domain,
@@ -455,26 +454,36 @@ class ArenaEngine:
                     )
                 )
 
-        for shape, counts in counts_by_shape.items():
+        for expansion, counts in counts_by_expansion.items():
             if len(set(counts)) != 1:
                 raise CommitError("aligned expansion cardinality mismatch")
-            expected = set(self.plan.shape_reporters_by_domain[shape.child_domain])
-            if reporters_by_shape[shape] != expected:
+            expected = set(
+                self.plan.expansion_sources_by_domain[expansion.child_domain]
+            )
+            if reporters_by_expansion[expansion] != expected:
                 raise CommitError("aligned expansion reporters are incomplete")
-            if shape in self.state.shapes:
-                raise CommitError("Shape has already been published")
-        # 至此所有 report/shape/cardinality 均已验证；后续 publication
+            if expansion in self._state.expansions:
+                raise CommitError("Expansion has already been published")
+        # 至此所有 report/expansion/cardinality 均已验证；后续 publication
         # 对状态机而言是一个不可分割的逻辑 turn。
         self._dispatch.seal(grain, report.generation)
 
-        commits_by_shape: dict[ShapeKey, list[_ExpansionCommit]] = defaultdict(list)
+        commits_by_expansion: dict[
+            ExpansionRef, list[_ExpandedOutputCommit]
+        ] = defaultdict(list)
         for commit in expansion_commits:
-            commits_by_shape[ShapeKey(commit.child_domain, grain.entity)].append(commit)
+            commits_by_expansion[
+                ExpansionRef(commit.child_domain, grain.entity)
+            ].append(commit)
 
-        for shape, commits in commits_by_shape.items():
+        for expansion, commits in commits_by_expansion.items():
             count = len(commits[0].rows)
-            children = self._create_children(shape, count)
-            self._publish_shape(shape, ShapeState.SUCCEEDED, children=children)
+            children = self._create_children(expansion, count)
+            self._publish_expansion(
+                expansion,
+                ExpansionOutcome.SUCCEEDED,
+                children=children,
+            )
             for commit in commits:
                 leaves = []
                 controls = commit.controls or (None,) * len(commit.rows)
@@ -492,7 +501,7 @@ class ArenaEngine:
                     parent_item,
                     ItemOutcome.PRESENT,
                     binding=GroupBinding(
-                        GroupShape.one_level(count),
+                        GroupLayout.one_level(count),
                         tuple(leaves),
                     ),
                 )
@@ -516,7 +525,7 @@ class ArenaEngine:
         *,
         generation: int | None = None,
     ) -> None:
-        """发布计算失败；fan-out 前失败以 unknown cardinality 封闭 Shape。"""
+        """发布计算失败；fan-out 前失败以 unknown cardinality 封闭 Expansion。"""
 
         self._dispatch.validate_in_flight(grain, generation)
 
@@ -528,19 +537,19 @@ class ArenaEngine:
                 ItemOutcome.FAILED,
                 cause=cause,
             )
-            for expansion in self.plan.expansions_by_source.get(output, ()):
-                shape = ShapeKey(expansion.child_domain, grain.entity)
-                if shape not in self.state.shapes:
-                    self._publish_shape(
-                        shape,
-                        ShapeState.FAILED,
+            for expansion in self.plan.expand_effects_by_source.get(output, ()):
+                expansion_ref = ExpansionRef(expansion.child_domain, grain.entity)
+                if expansion_ref not in self._state.expansions:
+                    self._publish_expansion(
+                        expansion_ref,
+                        ExpansionOutcome.FAILED,
                         cause=cause,
                     )
         self.advance()
 
     def apply_udf_recovery(
         self,
-        selection: DispatchSelection,
+        selection: DispatchBatch,
         action: RecoveryAction,
         cause: object,
     ) -> int:
@@ -559,11 +568,11 @@ class ArenaEngine:
             ):
                 return self._dispatch.recover_udf(selection, action)
             case RecoveryAction.ABORT:
-                raise CommitError("ABORT is terminal and cannot mutate an Arena")
+                raise CommitError("ABORT is terminal and cannot mutate a microbatch")
 
     def retry_infrastructure_dispatch(
         self,
-        selection: DispatchSelection,
+        selection: DispatchBatch,
         policy: RecoveryPolicy,
     ) -> bool:
         """Pure-policy preflight followed by one atomic physical requeue."""
@@ -583,14 +592,14 @@ class ArenaEngine:
         cause: object | None = None,
         control: bool | None = None,
     ) -> None:
-        existing = self.state.items.get(item)
+        existing = self._state.items.get(item)
         record = ItemRecord(outcome, cause, control)
         if existing is not None:
             try:
                 item_transition(existing.outcome, outcome)
             except InvalidTransition as error:
                 raise CommitError(str(error)) from error
-            existing_binding = self.state.values.get(item)
+            existing_binding = self._state.values.get(item)
             if existing != record or existing_binding != binding:
                 raise CommitError(f"conflicting Item publication: {item}")
             return
@@ -603,33 +612,38 @@ class ArenaEngine:
                 raise CommitError("control manifest requires PRESENT Item")
             if type(control) is not bool:
                 raise CommitError("control manifest must be bool")
-        self.state.items[item] = record
+        self._state.items[item] = record
         if binding is not None:
-            self.state.values[item] = binding
+            self._state.values[item] = binding
         self._facts.append(item)
 
-    def _publish_shape(
+    def _publish_expansion(
         self,
-        shape: ShapeKey,
-        state: ShapeState,
+        expansion: ExpansionRef,
+        outcome: ExpansionOutcome,
         *,
         children: tuple[EntityRef, ...] | None = None,
         cause: object | None = None,
     ) -> None:
-        """单调发布一个 Shape 终态，并入队唯一的事实传播入口。"""
+        """单调发布一个 Expansion 终态，并入队唯一的事实传播入口。"""
 
-        record = ShapeRecord(state, children, cause)
-        existing = self.state.shapes.get(shape)
+        record = ExpansionRecord(outcome, children, cause)
+        existing = self._state.expansions.get(expansion)
         try:
-            shape_transition(None if existing is None else existing.state, state)
+            expansion_transition(
+                None if existing is None else existing.outcome,
+                outcome,
+            )
         except InvalidTransition as error:
             raise CommitError(str(error)) from error
         if existing is not None:
             if existing != record:
-                raise CommitError(f"conflicting Shape publication: {shape}")
+                raise CommitError(
+                    f"conflicting Expansion publication: {expansion}"
+                )
             return
-        self.state.shapes[shape] = record
-        self._facts.append(shape)
+        self._state.expansions[expansion] = record
+        self._facts.append(expansion)
 
     def _accept_call_input(self, effect: CallInputEffect, item: ItemRef) -> None:
         call = self.plan.call(effect.call)
@@ -638,16 +652,16 @@ class ArenaEngine:
         grain = GrainRef(effect.call, item.entity)
         if self._dispatch.contains(grain):
             return
-        pending = self.state.pending.setdefault(
+        pending = self._state.pending_grains.setdefault(
             grain,
-            PendingInvocation([None] * len(call.ordered_inputs)),
+            PendingGrain([None] * len(call.ordered_inputs)),
         )
         current = pending.slots[effect.input_index]
         if current is not None and current != item:
             raise CommitError("Call input slot received conflicting Items")
         pending.slots[effect.input_index] = item
         if self._classify_call(grain, tuple(pending.slots)):
-            del self.state.pending[grain]
+            del self._state.pending_grains[grain]
 
     def _classify_call(
         self,
@@ -658,7 +672,7 @@ class ArenaEngine:
 
         call = self.plan.call(grain.call)
         outcomes = tuple(
-            None if item is None else self.state.items[item].outcome
+            None if item is None else self._state.items[item].outcome
             for item in inputs
         )
         decision = call_transition(
@@ -674,7 +688,7 @@ class ArenaEngine:
         assert decision.decisive_input is not None
         decisive_item = inputs[decision.decisive_input]
         assert decisive_item is not None
-        receipt = self.state.items[decisive_item]
+        receipt = self._state.items[decisive_item]
         self._dispatch.inputs_terminal(grain)
         output = (
             ItemOutcome.DROPPED
@@ -695,31 +709,31 @@ class ArenaEngine:
         cause: object | None,
     ) -> None:
         outputs = self.plan.outputs_by_call[grain.call]
-        shapes: list[ShapeKey] = []
+        expansions: list[ExpansionRef] = []
         for output in outputs:
             self._publish_item(
                 ItemRef(output, grain.entity),
                 outcome,
                 cause=cause,
             )
-            for expansion in self.plan.expansions_by_source.get(output, ()):
-                shape = ShapeKey(expansion.child_domain, grain.entity)
-                if shape not in shapes:
-                    shapes.append(shape)
-        state = expansion_shape_transition(outcome)
-        if state is ShapeState.SUCCEEDED:
+            for expansion in self.plan.expand_effects_by_source.get(output, ()):
+                expansion_ref = ExpansionRef(expansion.child_domain, grain.entity)
+                if expansion_ref not in expansions:
+                    expansions.append(expansion_ref)
+        expansion_outcome = expansion_outcome_from_item(outcome)
+        if expansion_outcome is ExpansionOutcome.SUCCEEDED:
             raise CommitError("PRESENT expansion requires a successful Worker report")
-        for shape in shapes:
-            self._publish_shape(shape, state, cause=cause)
+        for expansion in expansions:
+            self._publish_expansion(expansion, expansion_outcome, cause=cause)
 
     def _try_filter(self, effect: FilterEffect, entity: EntityRef) -> None:
         target = ItemRef(effect.target_port, entity)
-        if target in self.state.items:
+        if target in self._state.items:
             return
         source = ItemRef(effect.source_port, entity)
         mask = ItemRef(effect.mask_port, entity)
-        source_record = self.state.items.get(source)
-        mask_record = self.state.items.get(mask)
+        source_record = self._state.items.get(source)
+        mask_record = self._state.items.get(mask)
         try:
             decision = filter_transition(
                 None if source_record is None else source_record.outcome,
@@ -742,13 +756,13 @@ class ArenaEngine:
             self._publish_item(
                 target,
                 ItemOutcome.PRESENT,
-                binding=self.state.values[source],
+                binding=self._state.values[source],
                 control=control,
             )
             return
 
         cause_item = source if decision.cause is FilterCause.SOURCE else mask
-        cause_record = self.state.items.get(cause_item)
+        cause_record = self._state.items.get(cause_item)
         cause = None if cause_record is None else cause_record.cause
         self._publish_item(
             target,
@@ -756,40 +770,42 @@ class ArenaEngine:
             cause=cause_item if cause is None else cause,
         )
 
-    def _try_group(self, effect: GroupEffect, parent: EntityRef) -> None:
+    def _try_reduce(self, effect: ReduceEffect, parent: EntityRef) -> None:
         target = ItemRef(effect.target_port, parent)
-        if target in self.state.items:
+        if target in self._state.items:
             return
-        shape_key = ShapeKey(effect.child_domain, parent)
-        shape = self.state.shapes.get(shape_key)
-        if shape is None:
+        expansion_ref = ExpansionRef(effect.child_domain, parent)
+        expansion = self._state.expansions.get(expansion_ref)
+        if expansion is None:
             return
-        children = () if shape.children is None else shape.children
+        children = () if expansion.children is None else expansion.children
         member_items = tuple(
             ItemRef(effect.members_port, child) for child in children
         )
         value_items = tuple(
             ItemRef(effect.value_port, child) for child in children
         )
-        decision = group_transition(
-            shape.state,
+        decision = reduce_transition(
+            expansion.outcome,
             tuple(
-                None if item not in self.state.items else self.state.items[item].outcome
+                None if item not in self._state.items else self._state.items[item].outcome
                 for item in member_items
             ),
             tuple(
-                None if item not in self.state.items else self.state.items[item].outcome
+                None if item not in self._state.items else self._state.items[item].outcome
                 for item in value_items
             ),
         )
         if decision.outcome is None:
             return
         if decision.outcome is not ItemOutcome.PRESENT:
-            cause: object = shape_key if shape.cause is None else shape.cause
-            if decision.cause is GroupCause.MEMBER:
+            cause: object = (
+                expansion_ref if expansion.cause is None else expansion.cause
+            )
+            if decision.cause is ReduceCause.MEMBER:
                 assert decision.cause_index is not None
                 cause = member_items[decision.cause_index]
-            elif decision.cause is GroupCause.VALUE:
+            elif decision.cause is ReduceCause.VALUE:
                 assert decision.cause_index is not None
                 cause = value_items[decision.cause_index]
             self._publish_item(target, decision.outcome, cause=cause)
@@ -798,21 +814,21 @@ class ArenaEngine:
         # members 决定资格，value 仅为纯状态机选出的 survivors 提供 payload。
         survivor_items = tuple(value_items[index] for index in decision.survivors)
 
-        bindings = tuple(self.state.values[item] for item in survivor_items)
-        # 一层 reduce 收集 RowBinding；多层 reduce 则拼接子 GroupShape，
-        # 最终仍保持一个规范 CSR shape 和一份扁平叶子引用。
+        bindings = tuple(self._state.values[item] for item in survivor_items)
+        # 一层 reduce 收集 RowBinding；多层 reduce 则拼接子 GroupLayout，
+        # 最终仍保持一个规范 CSR layout 和一份扁平叶子引用。
         value_depth = effect.value_depth
         if not bindings and value_depth > 0:
-            group_shape = GroupShape.nest((), child_depth=value_depth)
+            group_shape = GroupLayout.nest((), child_depth=value_depth)
             flat_items = ()
         elif not bindings or all(isinstance(value, RowBinding) for value in bindings):
-            group_shape = GroupShape.one_level(len(bindings))
+            group_shape = GroupLayout.one_level(len(bindings))
             flat_items = survivor_items
         elif all(isinstance(value, GroupBinding) for value in bindings):
             groups = tuple(value for value in bindings if isinstance(value, GroupBinding))
-            depth = groups[0].shape.depth if groups else effect.value_depth
-            group_shape = GroupShape.nest(
-                tuple(group.shape for group in groups),
+            depth = groups[0].layout.depth if groups else effect.value_depth
+            group_shape = GroupLayout.nest(
+                tuple(group.layout for group in groups),
                 child_depth=depth,
             )
             flat_items = tuple(
@@ -845,17 +861,17 @@ class ArenaEngine:
         entity: EntityRef,
     ) -> None:
         target = ItemRef(effect.target_port, entity)
-        if target in self.state.items:
+        if target in self._state.items:
             return
         ancestor = self._ancestor_entity(entity, effect.source_domain)
         if ancestor is None:
             raise CommitError("broadcast target has no source-domain ancestor")
         source = ItemRef(effect.source_port, ancestor)
-        if source not in self.state.items:
+        if source not in self._state.items:
             return
-        record = self.state.items[source]
+        record = self._state.items[source]
         binding = (
-            self.state.values[source]
+            self._state.values[source]
             if record.outcome is ItemOutcome.PRESENT
             else None
         )
@@ -869,41 +885,44 @@ class ArenaEngine:
 
     def _create_children(
         self,
-        shape: ShapeKey,
+        expansion: ExpansionRef,
         count: int,
     ) -> tuple[EntityRef, ...]:
         children = tuple(
-            EntityRef(shape.child_domain, self._pair(shape.parent_entity.value, ordinal))
+            EntityRef(
+                expansion.child_domain,
+                self._pair(expansion.parent_entity.value, ordinal),
+            )
             for ordinal in range(count)
         )
         for ordinal, child in enumerate(children):
             self._publish_entity(
                 child,
-                EntityOrigin(shape.parent_entity, ordinal),
+                EntityParent(expansion.parent_entity, ordinal),
             )
         return children
 
     def _publish_entity(
         self,
         entity: EntityRef,
-        origin: EntityOrigin | None = None,
+        origin: EntityParent | None = None,
     ) -> None:
         """单调发布 Entity 事实；root 无 origin，child 显式记录 lineage。"""
 
         entities = self._entities_by_domain[entity.domain]
         if entity in entities:
-            if self.state.entity_lineage.get(entity) != origin:
+            if self._state.entity_lineage.get(entity) != origin:
                 raise CommitError(f"conflicting Entity publication: {entity}")
             return
-        if entity in self.state.entity_lineage:
+        if entity in self._state.entity_lineage:
             raise CommitError(f"conflicting Entity publication: {entity}")
         if origin is not None:
-            self.state.entity_lineage[entity] = origin
+            self._state.entity_lineage[entity] = origin
         entities[entity] = None
         self._facts.append(entity)
 
     def _parent_of(self, entity: EntityRef) -> EntityRef | None:
-        origin = self.state.entity_lineage.get(entity)
+        origin = self._state.entity_lineage.get(entity)
         return None if origin is None else origin.parent_entity
 
     def _ancestor_entity(
@@ -913,7 +932,7 @@ class ArenaEngine:
     ) -> EntityRef | None:
         cursor = entity
         while cursor.domain != domain:
-            origin = self.state.entity_lineage.get(cursor)
+            origin = self._state.entity_lineage.get(cursor)
             if origin is None:
                 return None
             cursor = origin.parent_entity
@@ -927,4 +946,4 @@ class ArenaEngine:
         return total * (total + 1) // 2 + right
 
 
-__all__ = ["ArenaEngine", "CommitError"]
+__all__ = ["MicrobatchEngine", "CommitError"]

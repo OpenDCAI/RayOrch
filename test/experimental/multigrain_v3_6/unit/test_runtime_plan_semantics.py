@@ -1,4 +1,4 @@
-"""完整 RuntimePlan 驱动的 Ray-free Arena/Worker 语义回归。"""
+"""完整 RuntimePlan 驱动的 Ray-free microbatch/Worker 语义回归。"""
 
 from __future__ import annotations
 
@@ -12,38 +12,39 @@ from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin
 from rayorch.experimental.multigrain_v3_6.materialize import materialize_tree
 from rayorch.experimental.multigrain_v3_6.model import (
     CallRef,
+    DomainRef,
     EntityRef,
     GrainPhase,
+    GrainRef,
     ItemOutcome,
     ItemRef,
-    ShapeState,
+    PortRef,
+    ExpansionOutcome,
 )
-from rayorch.experimental.multigrain_v3_6.plan import BroadcastEffect, GroupEffect
+from rayorch.experimental.multigrain_v3_6.plan import BroadcastEffect, ReduceEffect
 from rayorch.experimental.multigrain_v3_6.protocol import (
     BlockRef,
-    CallReport,
+    GrainReport,
     DispatchFailure,
     DispatchFailureKind,
     ExpandedRows,
-    InputLayout,
-    InvocationPlan,
-    OutputLayout,
+    CallInputLayout,
+    GrainPlan,
+    CallOutputLayout,
     OutputReport,
     RecordFailure,
     RowBinding,
-    ScalarTake,
 )
-from rayorch.experimental.multigrain_v3_6.runtime import (
-    ArenaEngine,
-    CommitError,
-    EntityOrigin,
+from rayorch.experimental.multigrain_v3_6.runtime import CommitError, MicrobatchEngine
+from rayorch.experimental.multigrain_v3_6.runtime.state import (
+    EntityParent,
     GroupBinding,
-    ShapeKey,
+    ExpansionRef,
 )
 from rayorch.experimental.multigrain_v3_6.worker import (
     Worker,
     WorkerContractError,
-    WorkerObservation,
+    WorkerSnapshot,
 )
 
 
@@ -71,10 +72,10 @@ def test_worker_observation_is_scalar_and_read_only():
                 "ignored": object(),
             }
 
-    worker = Worker(Audited, input_layout=InputLayout(1))
+    worker = Worker(Audited, input_layout=CallInputLayout(1))
     observation = worker.observe()
 
-    assert observation.calls == 0
+    assert observation.lifetime_calls == 0
     assert observation.pid > 0
     assert observation.rss_bytes >= 0
     assert dict(observation.audit) == {"jobs": 7, "mode": "batch"}
@@ -82,14 +83,14 @@ def test_worker_observation_is_scalar_and_read_only():
 
 def _execute_one(worker_target, store: MemoryStore) -> DispatchFailure:
     block = store.put((1,))
-    invocation = InvocationPlan(
-        mg.GrainRef(mg.CallRef(0), mg.EntityRef(mg.DomainRef(0), 0)),
+    grain_plan = GrainPlan(
+        GrainRef(CallRef(0), EntityRef(DomainRef(0), 0)),
         0,
-        (ScalarTake(RowBinding(block, 0)),),
+        (RowBinding(block, 0),),
     )
-    result = Worker(worker_target, input_layout=InputLayout(1)).execute(
-        (invocation,),
-        (OutputLayout(mg.PortRef(0)),),
+    result = Worker(worker_target, input_layout=CallInputLayout(1)).execute(
+        (grain_plan,),
+        (CallOutputLayout(PortRef(0)),),
         store,
     )
     assert isinstance(result, DispatchFailure)
@@ -133,8 +134,8 @@ def test_executor_submits_all_worker_observations_before_waiting():
     events = []
     first_ref, second_ref = object(), object()
     expected = {
-        first_ref: WorkerObservation(calls=2, pid=1, rss_bytes=10),
-        second_ref: WorkerObservation(calls=3, pid=2, rss_bytes=20),
+        first_ref: WorkerSnapshot(lifetime_calls=2, pid=1, rss_bytes=10),
+        second_ref: WorkerSnapshot(lifetime_calls=3, pid=2, rss_bytes=20),
     }
 
     def endpoint(name, reference):
@@ -176,9 +177,38 @@ def test_executor_submits_all_worker_observations_before_waiting():
     )
 
 
+@pytest.mark.parametrize(("owns_ray", "expected_shutdowns"), [(False, 0), (True, 1)])
+def test_executor_close_respects_ray_runtime_ownership(
+    owns_ray,
+    expected_shutdowns,
+):
+    shutdowns = []
+
+    class FakeRay:
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def shutdown():
+            shutdowns.append(True)
+
+    executor = object.__new__(Executor)
+    executor.ray = FakeRay()
+    executor._owns_ray = owns_ray
+    executor._closed = False
+    executor._actors = {}
+    executor.store = SimpleNamespace(clear_cache=lambda: None)
+
+    executor.close()
+    executor.close()
+
+    assert len(shutdowns) == expected_shutdowns
+
+
 def run_sync(pipeline: mg.Pipeline, *columns, optimize: bool = True):
     compiled = pipeline.compile(optimize=optimize)
-    plan = compiled.runtime
+    plan = compiled.plan
     store = MemoryStore()
     bindings = {}
     controls = {}
@@ -189,37 +219,37 @@ def run_sync(pipeline: mg.Pipeline, *columns, optimize: bool = True):
         if port in plan.control_ports:
             controls[port] = values
 
-    arena = ArenaEngine(plan)
-    arena.admit_sources(bindings, controls=controls)
-    arena.close_admission()
+    engine = MicrobatchEngine(plan)
+    engine.admit_sources(bindings, controls=controls)
+    engine.close_admission()
     workers = {
         call: Worker(
-            spec.kernel.target,
-            spec.kernel.init_args,
-            spec.kernel.init_kwargs,
+            spec.udf.target,
+            spec.udf.init_args,
+            spec.udf.init_kwargs,
             input_layout=plan.input_layouts_by_call[call],
         )
         for call, spec in plan.calls.items()
     }
     turns = 0
-    while arena.ready_count:
+    while engine.ready_count:
         turns += 1
         assert turns < 100
         call = next(
             call for call in plan.calls
-            if arena.dispatch_priority(call) is not None
+            if engine.dispatch_priority(call) is not None
         )
-        grains = arena.reserve_dispatch(call, max_size=64).grains
-        invocations = tuple(arena.invocation_plan(grain) for grain in grains)
+        grains = engine.reserve_dispatch(call, max_size=64).grains
+        grain_plans = tuple(engine.grain_plan(grain) for grain in grains)
         reports = workers[call].execute(
-            invocations,
+            grain_plans,
             plan.output_layouts_by_call[call],
             store,
         )
         for report in reports:
-            arena.commit_report(report)
-    assert arena.is_complete()
-    return materialize_tree(plan, arena, store), compiled, arena
+            engine.commit_report(report)
+    assert engine.is_complete()
+    return materialize_tree(plan, engine, store), compiled, engine
 
 
 def test_tutorial_document_pipeline_example():
@@ -323,8 +353,8 @@ def test_keyword_only_input_preserves_default_without_identity_driver():
     assert not hasattr(spec, "inputs")
     assert all(not hasattr(input_, "name") for input_ in spec.ordered_inputs)
     assert all(not hasattr(input_, "keyword") for input_ in spec.ordered_inputs)
-    assert compiled.runtime.input_layouts_by_call[call].positional_count == 1
-    assert compiled.runtime.input_layouts_by_call[call].keyword_names == ("masks",)
+    assert compiled.plan.input_layouts_by_call[call].positional_count == 1
+    assert compiled.plan.input_layouts_by_call[call].keyword_names == ("masks",)
 
 
 def test_reordered_keyword_inputs_keep_python_binding_semantics():
@@ -345,8 +375,8 @@ def test_reordered_keyword_inputs_keep_python_binding_semantics():
     assert outputs == [7, 15]
     assert spec.args == ()
     assert tuple(name for name, _ in spec.kwargs) == ("right", "left")
-    assert compiled.runtime.input_layouts_by_call[call].positional_count == 0
-    assert compiled.runtime.input_layouts_by_call[call].keyword_names == (
+    assert compiled.plan.input_layouts_by_call[call].positional_count == 0
+    assert compiled.plan.input_layouts_by_call[call].keyword_names == (
         "right",
         "left",
     )
@@ -478,8 +508,8 @@ def test_broadcast_chain_optimized_and_baseline_have_exact_outcome_parity():
     assert optimized == baseline
     assert optimized[:4] == [10, 11, 20, 21]
     assert optimized[4:] == [ItemOutcome.DROPPED] * 4
-    assert baseline_compiled.explain.rewrites == ()
-    assert len(optimized_compiled.explain.rewrites) == 1
+    assert baseline_compiled.explanation.rewrites == ()
+    assert len(optimized_compiled.explanation.rewrites) == 1
 
 
 def test_broadcast_fact_order_reaches_the_same_fixed_point():
@@ -492,42 +522,42 @@ def test_broadcast_fact_order_reaches_the_same_fixed_point():
             rows = mg.F.expand(self.split(values))
             return mg.F.broadcast(self.label(values), like=rows)
 
-    plan = BroadcastOrder().compile().runtime
+    plan = BroadcastOrder().compile().plan
     effect = next(
         effect
-        for effect in plan.structural_effects.values()
+        for effect in plan.structural_effects_by_target.values()
         if isinstance(effect, BroadcastEffect)
     )
     binding = RowBinding(BlockRef("label"), 0)
 
     def reach_fixed_point(*, source_first: bool):
-        arena = ArenaEngine(plan)
+        engine = MicrobatchEngine(plan)
         root = EntityRef(effect.source_domain, 0)
         child = EntityRef(effect.target_domain, 0)
         source = ItemRef(effect.source_port, root)
         target = ItemRef(effect.target_port, child)
-        arena._publish_entity(root)
-        arena.advance()
+        engine._publish_entity(root)
+        engine.advance()
 
         if source_first:
-            arena._publish_item(source, ItemOutcome.PRESENT, binding=binding)
-            arena.advance()
-            arena._publish_entity(child, EntityOrigin(root, 0))
-            arena.advance()
+            engine._publish_item(source, ItemOutcome.PRESENT, binding=binding)
+            engine.advance()
+            engine._publish_entity(child, EntityParent(root, 0))
+            engine.advance()
         else:
-            arena._publish_entity(child, EntityOrigin(root, 0))
-            arena.advance()
-            arena._publish_item(source, ItemOutcome.PRESENT, binding=binding)
-            arena.advance()
+            engine._publish_entity(child, EntityParent(root, 0))
+            engine.advance()
+            engine._publish_item(source, ItemOutcome.PRESENT, binding=binding)
+            engine.advance()
 
-        assert arena.item_outcome(target) is ItemOutcome.PRESENT
-        assert arena.value_binding(target) == binding
-        assert not arena._facts
-        arena._publish_item(source, ItemOutcome.PRESENT, binding=binding)
-        assert not arena._facts
-        arena._publish_entity(child, EntityOrigin(root, 0))
-        assert not arena._facts
-        return arena.item_outcome(target), arena.value_binding(target)
+        assert engine.item_outcome(target) is ItemOutcome.PRESENT
+        assert engine.value_binding(target) == binding
+        assert not engine._facts
+        engine._publish_item(source, ItemOutcome.PRESENT, binding=binding)
+        assert not engine._facts
+        engine._publish_entity(child, EntityParent(root, 0))
+        assert not engine._facts
+        return engine.item_outcome(target), engine.value_binding(target)
 
     assert reach_fixed_point(source_first=True) == reach_fixed_point(
         source_first=False
@@ -543,57 +573,57 @@ def test_group_fact_order_reaches_the_same_fixed_point():
             rows = mg.F.expand(self.split(values))
             return mg.F.reduce(rows)
 
-    plan = GroupOrder().compile().runtime
+    plan = GroupOrder().compile().plan
     effect = next(
         effect
-        for effect in plan.structural_effects.values()
-        if isinstance(effect, GroupEffect)
+        for effect in plan.structural_effects_by_target.values()
+        if isinstance(effect, ReduceEffect)
     )
     assert effect.value_port == effect.members_port
     binding = RowBinding(BlockRef("value"), 0)
 
     def reach_fixed_point(*, shape_first: bool):
-        arena = ArenaEngine(plan)
+        engine = MicrobatchEngine(plan)
         root = EntityRef(plan.port_domain(effect.target_port), 0)
         child = EntityRef(effect.child_domain, 0)
-        shape = ShapeKey(effect.child_domain, root)
+        expansion = ExpansionRef(effect.child_domain, root)
         value = ItemRef(effect.value_port, child)
         target = ItemRef(effect.target_port, root)
-        arena._publish_entity(root)
-        arena._publish_entity(child, EntityOrigin(root, 0))
-        arena.advance()
+        engine._publish_entity(root)
+        engine._publish_entity(child, EntityParent(root, 0))
+        engine.advance()
 
         if shape_first:
-            arena._publish_shape(
-                shape,
-                ShapeState.SUCCEEDED,
+            engine._publish_expansion(
+                expansion,
+                ExpansionOutcome.SUCCEEDED,
                 children=(child,),
             )
-            arena.advance()
-            arena._publish_item(value, ItemOutcome.PRESENT, binding=binding)
-            arena.advance()
+            engine.advance()
+            engine._publish_item(value, ItemOutcome.PRESENT, binding=binding)
+            engine.advance()
         else:
-            arena._publish_item(value, ItemOutcome.PRESENT, binding=binding)
-            arena.advance()
-            arena._publish_shape(
-                shape,
-                ShapeState.SUCCEEDED,
+            engine._publish_item(value, ItemOutcome.PRESENT, binding=binding)
+            engine.advance()
+            engine._publish_expansion(
+                expansion,
+                ExpansionOutcome.SUCCEEDED,
                 children=(child,),
             )
-            arena.advance()
+            engine.advance()
 
-        assert arena.item_outcome(target) is ItemOutcome.PRESENT
-        group = arena.value_binding(target)
+        assert engine.item_outcome(target) is ItemOutcome.PRESENT
+        group = engine.value_binding(target)
         assert isinstance(group, GroupBinding)
         assert group.flat_items == (value,)
-        assert not arena._facts
-        arena._publish_shape(
-            shape,
-            ShapeState.SUCCEEDED,
+        assert not engine._facts
+        engine._publish_expansion(
+            expansion,
+            ExpansionOutcome.SUCCEEDED,
             children=(child,),
         )
-        assert not arena._facts
-        return arena.item_outcome(target), group
+        assert not engine._facts
+        return engine.item_outcome(target), group
 
     assert reach_fixed_point(shape_first=True) == reach_fixed_point(
         shape_first=False
@@ -615,15 +645,15 @@ class ExpandReduce(mg.Pipeline):
 
 def _start_manual():
     compiled = ExpandReduce().compile()
-    plan = compiled.runtime
+    plan = compiled.plan
     store = MemoryStore()
     block = store.put(("root",))
-    arena = ArenaEngine(plan)
-    root = arena.admit_sources(
+    engine = MicrobatchEngine(plan)
+    root = engine.admit_sources(
         {plan.source_ports[0]: (RowBinding(block, 0),)}
     )[0]
     call = next(iter(plan.calls))
-    selection = arena.reserve_dispatch(call, max_size=1)
+    selection = engine.reserve_dispatch(call, max_size=1)
     grain = selection.grains[0]
     expanded = next(
         port
@@ -631,39 +661,39 @@ def _start_manual():
         if isinstance(spec.origin, ExpandOrigin)
     )
     output = plan.outputs_by_call[grain.call][0]
-    return compiled, arena, root, selection, output, expanded
+    return compiled, engine, root, selection, output, expanded
 
 
 def test_retry_keeps_grain_identity_and_generation_fences_stale_report():
-    compiled, arena, root, selection, output, expanded = _start_manual()
+    compiled, engine, root, selection, output, expanded = _start_manual()
     grain = selection.grains[0]
-    assert arena.retry_infrastructure_dispatch(
+    assert engine.retry_infrastructure_dispatch(
         selection,
         mg.RecoveryPolicy.abort(infra_retries=1),
     )
-    selection = arena.reserve_dispatch(
+    selection = engine.reserve_dispatch(
         grain.call,
         max_size=1,
         parent_bound=False,
     )
     assert selection.grains == (grain,)
-    stale = CallReport(
+    stale = GrainReport(
         grain,
         0,
         (OutputReport(output, expansions=(ExpandedRows(expanded, ()),)),),
     )
     with pytest.raises(CommitError, match="stale generation"):
-        arena.commit_success(stale)
-    arena.commit_success(
-        CallReport(
+        engine.commit_success(stale)
+    engine.commit_success(
+        GrainReport(
             grain,
             1,
             (OutputReport(output, expansions=(ExpandedRows(expanded, ()),)),),
         )
     )
-    assert arena.grain_snapshot(grain).phase is GrainPhase.SEALED
-    assert arena.item_outcome(ItemRef(output, root)) is ItemOutcome.PRESENT
-    assert compiled.runtime is arena.plan
+    assert engine.grain_snapshot(grain).phase is GrainPhase.SEALED
+    assert engine.item_outcome(ItemRef(output, root)) is ItemOutcome.PRESENT
+    assert compiled.plan is engine.plan
 
 
 def test_aligned_expand_mismatch_has_no_partial_publication():
@@ -676,15 +706,15 @@ def test_aligned_expand_mismatch_has_no_partial_publication():
             return mg.F.expand_aligned(left_group, right_group)
 
     compiled = Aligned().compile()
-    plan = compiled.runtime
+    plan = compiled.plan
     store = MemoryStore()
     source_block = store.put(("root",))
-    arena = ArenaEngine(plan)
-    root = arena.admit_sources(
+    engine = MicrobatchEngine(plan)
+    root = engine.admit_sources(
         {plan.source_ports[0]: (RowBinding(source_block, 0),)}
     )[0]
     call = next(iter(plan.calls))
-    grain = arena.reserve_dispatch(call, max_size=1).grains[0]
+    grain = engine.reserve_dispatch(call, max_size=1).grains[0]
     left_group, right_group = plan.outputs_by_call[grain.call]
     expanded = tuple(
         port
@@ -694,8 +724,8 @@ def test_aligned_expand_mismatch_has_no_partial_publication():
     rows = store.put((1, 2, 3))
 
     with pytest.raises(CommitError, match="cardinality mismatch"):
-        arena.commit_success(
-            CallReport(
+        engine.commit_success(
+            GrainReport(
                 grain,
                 0,
                 (
@@ -721,7 +751,7 @@ def test_aligned_expand_mismatch_has_no_partial_publication():
             )
         )
 
-    assert arena.grain_snapshot(grain).phase is GrainPhase.IN_FLIGHT
-    assert arena.state.shapes == {}
-    assert arena.entities(plan.port_domain(expanded[0])) == ()
-    assert root in arena.entities(root.domain)
+    assert engine.grain_snapshot(grain).phase is GrainPhase.IN_FLIGHT
+    assert engine.expansion_count == 0
+    assert engine.entities(plan.port_domain(expanded[0])) == ()
+    assert root in engine.entities(root.domain)

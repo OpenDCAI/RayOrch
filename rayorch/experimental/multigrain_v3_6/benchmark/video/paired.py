@@ -83,8 +83,8 @@ def _run_trial(
     paths: list[str],
     pipeline_options: dict[str, Any],
     *,
-    arena_size: int,
-    max_in_flight: int,
+    microbatch_size: int,
+    max_active_microbatches: int,
     order: str,
     maximum_digest_mismatch: float = 0.0,
 ) -> dict[str, Any]:
@@ -102,8 +102,8 @@ def _run_trial(
         if engine == "v3":
             result = run_v3(
                 paths,
-                microbatch_size=arena_size,
-                max_inflight_arenas=max_in_flight,
+                microbatch_size=microbatch_size,
+                max_inflight_arenas=max_active_microbatches,
                 **pipeline_options,
             )
             # V3 deliberately returns detached BlockSlices; get() is the public
@@ -126,22 +126,22 @@ def _run_trial(
         else:
             result = run_v36(
                 paths,
-                arena_size=arena_size,
-                max_in_flight=max_in_flight,
+                microbatch_size=microbatch_size,
+                max_active_microbatches=max_active_microbatches,
                 **pipeline_options,
             )
             outputs[engine] = list(cast(Iterable[Any], result.outputs))
             rpc_counts[engine] = result.rpc_count
-            grains = sum(metric.grains for metric in result.calls.values())
+            grains = sum(metric.grains for metric in result.calls)
             grains_per_rpc[engine] = grains / result.rpc_count if result.rpc_count else 0.0
             worker_observations = [
                 observation
-                for observations in result.workers.values()
-                for observation in observations
+                for metric in result.calls
+                for observation in metric.worker_snapshots
             ]
             diagnostics[engine] = {
                 "runtime_elapsed_s": result.elapsed_s,
-                "max_active_arenas": result.max_active_arenas,
+                "peak_active_microbatches": result.peak_active_microbatches,
                 "released_values": result.released_values,
                 "worker_observation_errors": [
                     observation.error
@@ -153,8 +153,9 @@ def _run_trial(
                     default=0,
                 ),
                 "calls": {
-                    f"call_{call.value}": {
-                        "actor_starts": metric.actor_starts,
+                    f"call_{metric.call_index}": {
+                        "udf_name": metric.udf_name,
+                        "actor_instances": metric.actor_instances,
                         "rpcs": metric.rpcs,
                         "grains": metric.grains,
                         "average_batch": metric.average_batch,
@@ -163,7 +164,7 @@ def _run_trial(
                         ),
                         "retries": metric.retries,
                     }
-                    for call, metric in sorted(result.calls.items())
+                    for metric in result.calls
                 },
             }
         walls[engine] = time.perf_counter() - started
@@ -261,8 +262,8 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
             _run_trial(
                 paths,
                 pipeline_options,
-                arena_size=args.arena_size,
-                max_in_flight=args.max_in_flight,
+                microbatch_size=args.microbatch_size,
+                max_active_microbatches=args.max_active_microbatches,
                 order="v3_first" if index % 2 == 0 else "v36_first",
                 maximum_digest_mismatch=(
                     0.0
@@ -291,8 +292,8 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
         "input_bytes": sum(entry.bytes or 0 for entry in entries),
         "input_duration_s": sum(entry.duration_s or 0.0 for entry in entries),
         "pipeline_options": pipeline_options,
-        "arena_size": args.arena_size,
-        "max_in_flight": args.max_in_flight,
+        "microbatch_size": args.microbatch_size,
+        "max_active_microbatches": args.max_active_microbatches,
         "warmup": args.warmup,
         "repeats": args.repeats,
         "timing_scope": (
@@ -369,8 +370,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0001,
         help="maximum model top-k digest mismatch rate; OpenCV always requires zero",
     )
-    parser.add_argument("--arena-size", type=int, default=24)
-    parser.add_argument("--max-in-flight", type=int, default=4)
+    parser.add_argument("--microbatch-size", type=int, default=24)
+    parser.add_argument("--max-active-microbatches", type=int, default=4)
     parser.add_argument("--num-cpus", type=int, default=32)
     parser.add_argument("--num-gpus", type=float, default=0.0)
     parser.add_argument("--object-store-gb", type=float)

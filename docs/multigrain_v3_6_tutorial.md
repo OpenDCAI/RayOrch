@@ -1,17 +1,17 @@
-# MultiGrain v3.6.1 从零理解与维护教程
+# MultiGrain v3.6 从零理解与维护教程
 
 这份教程面向第一次接触 MultiGrain、数据流编译器和细粒度 lineage 的读者。读完后，
 你应该能够：
 
 - 写出并运行一个 `RayModule + F.*` Pipeline；
-- 解释 Port、Domain、Entity、Item、Grain 和 Shape 分别是什么；
-- 沿着 compiler、Arena、Executor、Worker 追踪一条数据；
+- 解释 Port、Domain、Entity、Item、Grain 和 Expansion 分别是什么；
+- 沿着 compiler、MicrobatchEngine、Executor、Worker 追踪一条数据；
 - 判断 Filter、Expand、Reduce、Broadcast 和 Optional 如何改变状态；
 - 定位常见编译、死锁、失败传播和 Worker ABI 问题；
 - 在不引入飞线的前提下维护或增加一个 primitive。
 
-本教程描述的是首次发布前已经完成 breaking change 的 v3.6.1。动态语义的精简合同见
-[`multigrain_v3_6_1.md`](multigrain_v3_6_1.md)，compiler 设计边界见
+本教程描述的是首次发布前已经完成 breaking change 的 v3.6。动态语义的精简合同见
+[`multigrain_v3_6_design.md`](multigrain_v3_6_design.md)，compiler 设计边界见
 [`multigrain_v3_6.md`](multigrain_v3_6.md)。
 
 建议按目标选择阅读路径：
@@ -33,13 +33,15 @@ MultiGrain 做的事情可以先粗略理解为：
     ↓
 compiler 在启动 Ray 前验证并生成 RuntimePlan
     ↓
-Executor 把输入切成多个 Arena，并让它们共享持久 Ray actors
+Executor 把输入切成多个 microbatch，每个 microbatch 拥有一个 MicrobatchEngine，
+并让它们共享持久 Ray actors
     ↓
-Arena 为每个逻辑 Entity 维护 Item、Grain、Shape 等细粒度事实
+MicrobatchEngine 为每个逻辑 Entity 维护 Item、Expansion 等语义事实，
+其 DispatchState 维护 Grain 生命周期
     ↓
 Worker 只读取值、批量执行 UDF，并返回结构化报告
     ↓
-Arena 提交报告、传播结构状态，最后按 lineage 顺序物化输出
+MicrobatchEngine 提交报告、传播结构状态，最后按 lineage 顺序物化输出
 ```
 
 最重要的边界是：
@@ -47,7 +49,7 @@ Arena 提交报告、传播结构状态，最后按 lineage 顺序物化输出
 ```text
 RayModule 执行业务计算。
 F.* 声明数据的结构关系。
-Arena 管理身份与状态，但不解释业务 payload。
+MicrobatchEngine 管理身份与状态，但不解释业务 payload。
 Executor 管理 Ray，但不重新解释 primitive 语义。
 ```
 
@@ -65,16 +67,16 @@ flowchart LR
     end
 
     subgraph Driver["Driver 运行期"]
-        Executor["Executor<br/>Arena 并发 / actor capacity / RPC"]
-        Arena["ArenaEngine<br/>Item / Shape / Entity 语义传播"]
+        Executor["Executor<br/>microbatch 并发 / actor capacity / RPC"]
+        MicrobatchEngine["MicrobatchEngine<br/>Item / Expansion / Entity 语义传播"]
         Dispatch["DispatchState<br/>Grain phase / generation / queues"]
         Recovery["RecoveryPolicy<br/>纯决策"]
-        Executor -->|"admit / reserve / commit"| Arena
-        Arena -->|"唯一 Grain 状态入口"| Dispatch
+        Executor -->|"admit / reserve / commit"| MicrobatchEngine
+        MicrobatchEngine -->|"唯一 Grain 状态入口"| Dispatch
         Executor -->|"failure facts"| Recovery
         Recovery -->|"RecoveryAction"| Executor
-        Arena -->|"infra retry counts"| Recovery
-        Recovery -->|"allow / deny"| Arena
+        MicrobatchEngine -->|"infra retry counts"| Recovery
+        Recovery -->|"allow / deny"| MicrobatchEngine
     end
 
     subgraph Actor["Ray actor"]
@@ -84,8 +86,8 @@ flowchart LR
     end
 
     Plan --> Executor
-    Plan --> Arena
-    Executor -->|"InvocationPlan + OutputLayout"| Worker
+    Plan --> MicrobatchEngine
+    Executor -->|"GrainPlan + CallOutputLayout"| Worker
     Worker -->|"WorkerResult"| Executor
 ```
 
@@ -94,10 +96,10 @@ flowchart LR
 | 组件 | 唯一拥有的东西 | 不做什么 |
 | --- | --- | --- |
 | Compiler | 从 logical facts 生成完整 RuntimePlan | 不启动 Ray、不执行 UDF |
-| Executor | actors、ObjectRefs、Arena 并发额度 | 不解释 Filter/Reduce 等语义 |
-| ArenaEngine | Item/Shape/Entity publication 与传播 | 不执行业务 UDF、不维护第二份 ready queue |
-| DispatchState | Grain phase/generation 与 normal/immediate/tail queues | 不发布 Item/Shape、不决定业务策略 |
-| Worker | value-only batch UDF 和 Worker ABI | 不读取 Program/Arena、不创建逻辑身份 |
+| Executor | actors、ObjectRefs、microbatch 并发额度 | 不解释 Filter/Reduce 等语义 |
+| MicrobatchEngine | Item/Expansion/Entity publication 与传播 | 不执行业务 UDF、不维护第二份 ready queue |
+| DispatchState | Grain phase/generation 与 normal/immediate/tail queues | 不发布 Item/Expansion、不决定业务策略 |
+| Worker | value-only batch UDF 和 Worker ABI | 不读取 Program/MicrobatchEngine、不创建逻辑身份 |
 
 箭头表示主要协作，不要求为了形式上的单向依赖增加适配层。真正禁止的是跨层写状态，
 或者同一个事实出现两个 authority。
@@ -136,14 +138,31 @@ with mg.Executor(DoublePipeline()) as executor:
 assert result.outputs == [2, 4, 6]
 ```
 
-`Executor` 会在 Ray 尚未初始化时调用 `ray.init()`。退出 context manager 会终止本
-Executor 创建的 actors，但不会擅自关闭可能由其他任务共享的 Ray 集群；独立脚本若希望
-完全退出，可在最后显式调用 `ray.shutdown()`。
+`Executor` 会在 Ray 尚未初始化时调用 `ray.init()`。退出 context manager 总会终止本
+Executor 创建的 actors；如果 Ray 也是本 Executor 初始化的，它同时负责
+`ray.shutdown()`。如果调用方已经初始化 Ray，Executor 视其为外部资源，关闭时不会
+影响共享 runtime。
 
-这里有两个容易误解的地方：
+这里有三个容易误解的地方：
 
 1. `Pipeline.forward()` 编译时执行一次，但参数是符号 `Port`，不是真实的 `[1, 2, 3]`。
 2. `Double.run()` 运行时接收批量列，例如 `[1, 2, 3]`，返回值也必须按 batch 对齐。
+3. `RunResult` 只持有输出和不可变指标快照，不持有活的 Engine 或 RuntimeState。
+
+常用结果字段是：
+
+```python
+result.outputs
+result.elapsed_s
+result.calls          # tuple[CallMetrics, ...]
+result.microbatches   # tuple[MicrobatchMetrics, ...]
+result.rpc_count
+result.actor_count
+result.released_values
+```
+
+`CallMetrics` 用 `call_index + udf_name` 标识调用点。它的 `rpcs/grains/retries` 是本次
+`run()` 的统计；`worker_snapshots[*].lifetime_calls` 则刻意表示持久 actor 的累计值。
 
 可以在不执行 Ray 的情况下查看编译结果：
 
@@ -156,7 +175,7 @@ print(compiled.explain_text())
 
 ---
 
-## 2. 六个必须分清的概念
+## 2. 七种必须分清的身份
 
 理解整个框架的关键不是记住类名，而是分清静态位置、动态身份和执行行为。
 
@@ -168,15 +187,15 @@ print(compiled.explain_text())
 | Item | 一个 Port 对一个 Entity 的结果 | 动态 |
 | Call | 一个 RayModule 在图中的调用点 | 静态 |
 | Grain | 一个 Call 对一个 Entity 的逻辑调用 | 动态 |
-| Shape | 一个 parent Entity 的 Expand 结果 | 动态 |
+| Expansion | 一个 parent Entity 的 Expand 结果 | 动态 |
 
 它们的身份公式是：
 
 ```text
-EntityRef = DomainRef × occurrence
-ItemRef   = PortRef × EntityRef
-GrainRef  = CallRef × EntityRef
-ShapeKey  = child DomainRef × parent EntityRef
+EntityRef    = DomainRef × occurrence
+ItemRef      = PortRef × EntityRef
+GrainRef     = CallRef × EntityRef
+ExpansionRef = child DomainRef × parent EntityRef
 ```
 
 ### 2.1 Port 不是数据容器
@@ -251,7 +270,7 @@ GrainRef(score_call, page_2)
 Executor 可以把多个 Grain 打包进一个 actor RPC，但 batching 不改变 Grain 身份。
 重试时 GrainRef 也不变，只提升 generation。
 
-### 2.5 Shape 为什么不能省略
+### 2.5 Expansion 为什么不能省略
 
 没有 child Entity 可能表示四件不同的事：
 
@@ -262,7 +281,7 @@ parent Item 被 DROPPED
 上游失败，无法知道 cardinality
 ```
 
-所以 Shape 有独立终态：
+所以 Expansion 有独立终态：
 
 ```text
 SUCCEEDED(children) | DROPPED | FAILED
@@ -353,26 +372,26 @@ def forward(self, values, increments):
     return self.add(values, increments=increments)
 ```
 
-compiler 会生成 `InputLayout`。Worker 不反射 Pipeline，也不重新猜测 kwargs 顺序。
+compiler 会生成 `CallInputLayout`。Worker 不反射 Pipeline，也不重新猜测 kwargs 顺序。
 
 Logical IR 忠实保存 Python 调用形状，而不是提前伪装成 runtime slot：
 
 ```text
 CallSpec
-├── args: (InputSpec(values),)
-└── kwargs: (("increments", InputSpec(increments)),)
+├── args: (CallInputSpec(values),)
+└── kwargs: (("increments", CallInputSpec(increments)),)
 ```
 
-`InputSpec` 只保存 `PortRef + InputMode`；关键字名字只存在 `CallSpec.kwargs` 的 key，
+`CallInputSpec` 只保存 `PortRef + InputMode`；关键字名字只存在 `CallSpec.kwargs` 的 key，
 不在 value 中重复存一份。`CallSpec.ordered_inputs` 是按
 `args + kwargs.values()` 计算出的只读 dense view，不是第二份状态。lowering 再生成：
 
 ```text
 slots = (values, increments)
-InputLayout(positional_count=1, keyword_names=("increments",))
+CallInputLayout(positional_count=1, keyword_names=("increments",))
 ```
 
-Arena 用 dense slot 接收异步到达的 Item，Worker 根据唯一的 `InputLayout` 恢复
+MicrobatchEngine 用 dense slot 接收异步到达的 Item，Worker 根据唯一的 `CallInputLayout` 恢复
 `run(values, increments=...)`。因此 logical 层易读，runtime 又不需要维护位置参数和
 关键字参数两套队列。
 
@@ -386,8 +405,8 @@ Arena 用 dense slot 接收异步到达的 Item，Worker 根据唯一的 `InputL
 - `recovery`：该 Call 的强类型 `RecoveryPolicy`。
 
 其他选项，例如 `num_cpus`、`num_gpus`、`max_restarts`，传给 Ray actor options。
-compiler 会把两类选项归一化为一个按 `CallRef` 唯一索引的 `PoolSpec`；runtime
-不再反复解析 dict。`PoolSpec` 没有独立身份：当前一个 Call 只对应一个同构 actor
+compiler 会把两类选项归一化为一个按 `CallRef` 唯一索引的 `ActorPoolSpec`；runtime
+不再反复解析 dict。`ActorPoolSpec` 没有独立身份：当前一个 Call 只对应一个同构 actor
 pool，所以不存在冗余的 `PoolRef` 或 `CallRef -> PoolRef` 映射。
 旧的 `max_retries` 同时混淆 UDF 与基础设施失败，已在编译期明确拒绝。
 
@@ -523,7 +542,7 @@ selected_thresholds = mg.F.filter(thresholds, leaf_mask)
 
 ### 4.6 aligned API
 
-`expand_aligned(*ports)` 让同一个 Call 的多个 group outputs 共享 Shape：
+`expand_aligned(*ports)` 让同一个 Call 的多个 group outputs 共享 Expansion：
 
 ```python
 left_group, right_group = self.produce(values)
@@ -663,7 +682,7 @@ output_tree
 SourceOrigin
 CallOutputOrigin
 ExpandOrigin
-GroupOrigin
+ReduceOrigin
 BroadcastOrigin
 FilterOrigin
 ```
@@ -711,7 +730,7 @@ verify LogicalProgram
 → verify RuntimePlan
 ```
 
-这不是可插拔 PassManager。v3.6.1 当前不需要插件注册表、cost model 或通用 SSA。
+这不是可插拔 PassManager。v3.6 当前不需要插件注册表、cost model 或通用 SSA。
 
 ```mermaid
 sequenceDiagram
@@ -732,7 +751,7 @@ sequenceDiagram
     end
     C->>C: lower Effects / trigger indexes / layouts / pools-by-Call
     C->>C: verify RuntimePlan completeness
-    C-->>R: immutable RuntimePlan + ExplainPlan
+    C-->>R: immutable RuntimePlan + ProgramExplanation
 ```
 
 #### Verify
@@ -758,7 +777,7 @@ sequenceDiagram
 ```text
 consumers_by_port
 outputs_by_call
-shape_reporters_by_domain
+expansion_sources_by_domain
 control_ports fixed point
 group_depth_by_port
 ```
@@ -784,23 +803,23 @@ lowering 把逻辑依赖变成 RuntimePlan：
 ```text
 CallInputEffect
 FilterEffect
-GroupEffect
+ReduceEffect
 BroadcastEffect
-ExpansionRule
-InputLayout / OutputLayout
-PoolSpec
+ExpandEffect
+CallInputLayout / CallOutputLayout
+ActorPoolSpec
 ```
 
-每个 structural Port 只产生一个冻结的完整 Effect。`structural_effects[target_port]`
-负责按目标定位；`effects_by_item_port[source_port]`、
-`effects_by_shape_domain[domain]` 和 `effects_by_entity_domain[domain]`
-只是触发索引，并且都引用同一个 Effect 对象。Arena 收到 Effect 后已拥有执行所需的
+每个 structural Port 只产生一个冻结的完整 Effect。`structural_effects_by_target[target_port]`
+负责按目标定位；`item_effects_by_source[source_port]`、
+`reduce_effects_by_child_domain[domain]` 和 `broadcast_effects_by_target_domain[domain]`
+只是触发索引，并且都引用同一个 Effect 对象。MicrobatchEngine 收到 Effect 后已拥有执行所需的
 全部 Port/Domain/control 信息，不需要先解析 target-only Route，再回查另一份 Rule。
 
-`PoolSpec` 由 `RuntimePlan.pools_by_call[CallRef]` 唯一定位，不重复保存 Call 或 Pool
+`ActorPoolSpec` 由 `RuntimePlan.actor_pools_by_call[CallRef]` 唯一定位，不重复保存 Call 或 Pool
 身份。只有 Call 创建 actor pool；任何结构 Port 都不会进入这张表。
 
-RuntimePlan 已经包含 Arena 需要的完整物理事实，所以 Arena 不回读 LogicalProgram。
+RuntimePlan 已经包含 MicrobatchEngine 需要的完整物理事实，所以 MicrobatchEngine 不回读 LogicalProgram。
 
 ### 6.4 用 explain 调试编译结果
 
@@ -821,7 +840,7 @@ print(compiled.explain_text())
 ```
 
 遇到“为什么这个 mask 没有 control”或“为什么 Broadcast 指向另一个 source”时，先看
-explain，不要直接进 Arena 猜。
+explain，不要直接进 MicrobatchEngine 猜。
 
 ---
 
@@ -833,7 +852,7 @@ Executor 的一次运行大致经历：
 sequenceDiagram
     participant User
     participant E as Executor
-    participant A as ArenaEngine
+    participant A as MicrobatchEngine
     participant D as DispatchState
     participant P as RecoveryPolicy
     participant W as Worker actor
@@ -846,17 +865,17 @@ sequenceDiagram
     A->>A: publish source Items / advance
     A->>D: inputs_ready(Grain, batch_key)
 
-    loop while Arena is incomplete
+    loop while MicrobatchEngine is incomplete
         E->>A: dispatch_priority / reserve_dispatch
         A->>D: reserve(Call, batch contract)
-        D-->>A: DispatchSelection
-        A-->>E: DispatchSelection
-        E->>A: invocation_plan(each Grain)
+        D-->>A: DispatchBatch
+        A-->>E: DispatchBatch
+        E->>A: grain_plan(each Grain)
         A-->>E: InvocationPlans
-        E->>W: execute(invocations, layouts)
+        E->>W: execute(grain_plans, layouts)
         W->>S: get input rows / put output blocks
         W-->>E: WorkerResult
-        alt CallReport / CallFailureReport
+        alt GrainReport / GrainFailureReport
             E->>A: commit_report
             A->>D: validate generation / seal Grain
             A->>A: publish outputs / advance
@@ -892,37 +911,37 @@ sequenceDiagram
 
 | 组件对 | 请求 | 返回 | 状态由谁修改 |
 | --- | --- | --- | --- |
-| Executor ↔ ArenaEngine | admission、reserve、commit、materialize | selection、InvocationPlan、完成状态 | ArenaEngine 修改语义表 |
-| ArenaEngine ↔ DispatchState | inputs ready/terminal、reserve、seal、recover | DispatchSelection、priority、校验结果 | DispatchState 独占 Grain/queue |
-| Executor ↔ Worker | `InvocationPlan + OutputLayout` | `WorkerResult` | Worker 只修改 actor 内 UDF 状态 |
-| ArenaEngine ↔ transitions | 当前事实 tuple | 纯 action/outcome | transition 不修改任何状态 |
-| Worker ↔ Block store | `RowBinding.get`、column `put` | 业务值、`BlockRef` | store 拥有 payload；Arena 只存引用 |
+| Executor ↔ MicrobatchEngine | admission、reserve、commit、materialize | DispatchBatch、GrainPlan、完成状态 | MicrobatchEngine 修改语义表 |
+| MicrobatchEngine ↔ DispatchState | inputs ready/terminal、reserve、seal、recover | DispatchBatch、priority、校验结果 | DispatchState 独占 Grain/queue |
+| Executor ↔ Worker | `GrainPlan + CallOutputLayout` | `WorkerResult` | Worker 只修改 actor 内 UDF 状态 |
+| MicrobatchEngine ↔ transitions | 当前事实 tuple | 纯 action/outcome | transition 不修改任何状态 |
+| Worker ↔ Block store | `RowBinding.get`、column `put` | 业务值、`BlockRef` | store 拥有 payload；MicrobatchEngine 只存引用 |
 
 这张表是定位代码的最快入口：先判断当前问题发生在哪一对组件之间，再检查该边界上的
 DTO 和 authority，而不是从 `Executor.run()` 一路单步进入所有模块。
 
-### 7.1 Arena admission
+### 7.1 MicrobatchEngine admission
 
 `Executor.run()` 要求 source columns 数量等于 `forward` 参数数，而且所有列等长。
 
-`arena_size` 把 source rows 切成多个独立 Arena：
+`microbatch_size` 把 source rows 切成多个独立 MicrobatchEngine：
 
 ```python
 result = executor.run(
     values,
-    arena_size=32,
-    max_in_flight=4,
+    microbatch_size=32,
+    max_active_microbatches=4,
 )
 ```
 
-最多 4 个 Arena 同时活跃，但它们共享同一批持久 actors。一个 RPC 不混合多个 Arena
+最多 4 个 MicrobatchEngine 同时活跃，但它们共享同一批持久 actors。一个 RPC 不混合多个 MicrobatchEngine
 的 Grain。
 
 ```mermaid
 sequenceDiagram
     participant E as Executor
     participant S as Block store
-    participant A as ArenaEngine
+    participant A as MicrobatchEngine
 
     E->>E: slice row-aligned source columns
     E->>S: put(tuple(values))
@@ -934,17 +953,17 @@ sequenceDiagram
     E->>A: close_admission()
 ```
 
-这里 Executor 决定 Arena 切片和物理 block；ArenaEngine 决定 source Entity/Item 身份。
+这里 Executor 决定 MicrobatchEngine 切片和物理 block；MicrobatchEngine 决定 source Entity/Item 身份。
 双方都不读取 source 的业务含义。
 
 ### 7.2 FactEvent queue 与 advance
 
-Arena 的 Item、Shape、Entity 分别只通过 `_publish_item()`、`_publish_shape()`、
+MicrobatchEngine 的 Item、Expansion、Entity 分别只通过 `_publish_item()`、`_publish_expansion()`、
 `_publish_entity()` 写入 canonical tables。首次 publication 把现有不可变身份放入
 同一个私有联合队列：
 
 ```python
-_FactEvent = ItemRef | ShapeKey | EntityRef
+_FactEvent = ItemRef | ExpansionRef | EntityRef
 ```
 
 Event 只表示“这个事实刚刚出现”，不复制 outcome、binding、children 或 lineage。
@@ -953,23 +972,23 @@ Event 只表示“这个事实刚刚出现”，不复制 outcome、binding、ch
 `advance()` 穷尽匹配三种事实，并使用 RuntimePlan 对应的 Effect 索引：
 
 ```text
-ItemRef  → effects_by_item_port
-ShapeKey → effects_by_shape_domain
-EntityRef → effects_by_entity_domain
+ItemRef  → item_effects_by_source
+ExpansionRef → reduce_effects_by_child_domain
+EntityRef → broadcast_effects_by_target_domain
 ```
 
-Item Effect 再封闭匹配为 `CallInputEffect | FilterEffect | GroupEffect |
+Item Effect 再封闭匹配为 `CallInputEffect | FilterEffect | ReduceEffect |
 BroadcastEffect`。它持续运行到 FactEvent queue 为空，即达到当前局部不动点。
 
 ```mermaid
 flowchart LR
     Item["_publish_item"] --> Facts["FactEvent FIFO"]
-    Shape["_publish_shape"] --> Facts
+    Expansion["_publish_expansion"] --> Facts
     Entity["_publish_entity"] --> Facts
     Facts --> Advance{"advance(): match fact"}
-    Advance -->|"ItemRef"| ItemEffects["effects_by_item_port"]
-    Advance -->|"ShapeKey"| ShapeEffects["effects_by_shape_domain"]
-    Advance -->|"EntityRef"| EntityEffects["effects_by_entity_domain"]
+    Advance -->|"ItemRef"| ItemEffects["item_effects_by_source"]
+    Advance -->|"ExpansionRef"| ShapeEffects["reduce_effects_by_child_domain"]
+    Advance -->|"EntityRef"| EntityEffects["broadcast_effects_by_target_domain"]
     ItemEffects --> Transitions["Call / Filter / Group / Broadcast"]
     ShapeEffects --> Transitions
     EntityEffects --> Transitions
@@ -977,13 +996,13 @@ flowchart LR
     NewFacts -->|"first publication only"| Facts
 ```
 
-RuntimePlan 只告诉 Arena “这次 publication 应用哪些完整 Effects”；纯 transition 决定结果，
+RuntimePlan 只告诉 MicrobatchEngine “这次 publication 应用哪些完整 Effects”；纯 transition 决定结果，
 三个 typed publication 入口才拥有写事实的权限。有限 DAG、单调终态和每个事实只入队一次，
 共同保证局部固定点终止。
 
 ### 7.3 Call inputs 如何成为 Grain
 
-同一个 Call、同一个 Entity 的输入槽由 `PendingInvocation` 收集。动态规则由
+同一个 Call、同一个 Entity 的输入槽由 `PendingGrain` 收集。动态规则由
 [`transitions.py`](../rayorch/experimental/multigrain_v3_6/transitions.py) 唯一定义：
 
 ```text
@@ -997,11 +1016,11 @@ RuntimePlan 只告诉 Arena “这次 publication 应用哪些完整 Effects”�
 
 ```mermaid
 sequenceDiagram
-    participant A as ArenaEngine
+    participant A as MicrobatchEngine
     participant T as call_transition
     participant D as DispatchState
 
-    A->>A: collect PendingInvocation slots
+    A->>A: collect PendingGrain slots
     A->>T: modes + current Item outcomes
     T-->>A: WAIT / READY / DROP_OUTPUTS / SUPPRESS_OUTPUTS
     alt READY
@@ -1012,53 +1031,53 @@ sequenceDiagram
         D->>D: create SEALED Grain
         A->>A: publish terminal output Items
     else WAIT
-        A->>A: keep PendingInvocation only
+        A->>A: keep PendingGrain only
     end
 ```
 
-`call_transition` 不知道 queue，`DispatchState` 不知道 REQUIRED/OPTIONAL，ArenaEngine 负责把
+`call_transition` 不知道 queue，`DispatchState` 不知道 REQUIRED/OPTIONAL，MicrobatchEngine 负责把
 纯语义动作接到唯一物理状态机上。
 
-### 7.4 reserve、batch 与 InvocationPlan
+### 7.4 reserve、batch 与 GrainPlan
 
-Executor 从 Arena 预留 READY Grains：
+Executor 从 MicrobatchEngine 预留 READY Grains：
 
 ```text
 READY + RESERVE → IN_FLIGHT
 ```
 
-Arena 再把每个 Grain 投影为 Worker DTO：
+MicrobatchEngine 再把每个 Grain 投影为 Worker DTO：
 
 ```text
-ScalarTake
-GroupTake
-MissingTake
+RowBinding
+GroupInput
+MissingInput
 ```
 
 Worker 只看到这些 value takes、generation 和 output layouts，看不到 Program、PortOrigin
-或 Arena tables。
+或 MicrobatchEngine tables。
 
 ```mermaid
 sequenceDiagram
     participant E as Executor
-    participant A as ArenaEngine
+    participant A as MicrobatchEngine
     participant D as DispatchState
     participant W as Worker
 
     E->>A: dispatch_priority(CallRef)
     A->>D: priority(CallRef)
     D-->>A: immediate / normal / tail / none
-    E->>A: reserve_dispatch(CallRef, PoolSpec batching)
+    E->>A: reserve_dispatch(CallRef, ActorPoolSpec batching)
     A->>D: reserve(...)
-    D-->>A: DispatchSelection(exact Grains, udf_retries)
+    D-->>A: DispatchBatch(exact Grains, udf_retries)
     loop each Grain
-        E->>A: invocation_plan(GrainRef)
-        A-->>E: InvocationPlan(generation, InputTakes)
+        E->>A: grain_plan(GrainRef)
+        A-->>E: GrainPlan(generation, inputs)
     end
-    E->>W: execute(invocations, output layouts)
+    E->>W: execute(grain_plans, output layouts)
 ```
 
-`DispatchSelection` 是一次 RPC 的精确 lease。Executor 保存它以关联 ObjectRef 和失败，
+`DispatchBatch` 是一次 RPC 的精确 lease。Executor 保存它以关联 ObjectRef 和失败，
 但不能自行把 Grain 放回 ready queue。
 
 ### 7.5 Worker report 与原子提交
@@ -1066,11 +1085,11 @@ sequenceDiagram
 Worker 返回：
 
 ```text
-CallReport        成功，含全部 outputs
-CallFailureReport 某个 Grain 的业务失败
+GrainReport        成功，含全部 outputs
+GrainFailureReport 某个 Grain 的业务失败
 ```
 
-Arena 在写任何结果前先检查：
+MicrobatchEngine 在写任何结果前先检查：
 
 - Grain 是否 `IN_FLIGHT`；
 - generation 是否仍然有效；
@@ -1086,14 +1105,14 @@ Arena 在写任何结果前先检查：
 sequenceDiagram
     participant W as Worker
     participant E as Executor
-    participant A as ArenaEngine
+    participant A as MicrobatchEngine
     participant D as DispatchState
 
-    W-->>E: tuple[CallReport | CallFailureReport]
+    W-->>E: tuple[GrainReport | GrainFailureReport]
     E->>A: commit_report(report)
     A->>D: validate_in_flight(grain, generation)
     D-->>A: valid current attempt
-    A->>A: preflight all outputs / shapes / controls
+    A->>A: preflight all outputs / expansions / controls
     A->>D: seal(grain, generation)
     A->>A: publish all terminal facts
     A->>A: advance to local fixed point
@@ -1104,7 +1123,7 @@ preflight 失败时不会先发布半个 multi-output report；generation 校验
 
 ### 7.6 完成、物化与释放
 
-一个 Arena 完成需要：
+一个 MicrobatchEngine 完成需要：
 
 ```text
 admission 已关闭
@@ -1116,11 +1135,13 @@ FactEvent queue/pending/ready 均为空
 `materialize_tree()`：
 
 - PRESENT scalar：读取 `RowBinding`；
-- PRESENT group：按 `GroupShape` 恢复嵌套 list；
+- PRESENT group：按 `GroupLayout` 恢复嵌套 list；
 - 非 PRESENT：在结果中保留 `ItemOutcome`。
 
-最终业务值复制到用户结果后，Arena 清空 ValueTable，但保留 Item/Shape/Grain/lineage
-用于审计。
+最终业务值复制到用户结果后，MicrobatchEngine 清空 ValueTable。Executor 随即冻结
+`MicrobatchMetrics` 并释放 Engine；`RunResult` 不保留可变内部状态。需要逐 Grain 检查时，
+应在 `DispatchState` 或 `MicrobatchEngine` 的所属单元测试中使用只读 snapshot，而不是
+让公开结果承担调试后门。
 
 ---
 
@@ -1153,7 +1174,7 @@ UNRESOLVED
 | FAILED | 直接生产者失败，或透明 view 保留该失败 |
 | SUPPRESSED | 生产者因依赖失败而未执行 |
 
-Item/Shape/Entity 事实不可改写；完全相同的 publication 可以幂等重放，冲突 publication
+Item/Expansion/Entity 事实不可改写；完全相同的 publication 可以幂等重放，冲突 publication
 直接失败。
 
 ### 8.3 Grain
@@ -1173,10 +1194,10 @@ infra_failures
 ```
 
 Grain 的业务结果由输出 Items 推导，不再维护重复 GrainOutcome。
-可变 GrainRecord 完全由 `DispatchState` 私有持有；Arena 与 Executor 只能读取冻结的
+可变 GrainRecord 完全由 `DispatchState` 私有持有；MicrobatchEngine 与 Executor 只能读取冻结的
 `GrainSnapshot`，不能通过 `RuntimeState` 获得第二条修改路径。
 
-### 8.4 Shape
+### 8.4 Expansion
 
 ```text
 UNRESOLVED
@@ -1185,14 +1206,14 @@ UNRESOLVED
   └─ FAILED
 ```
 
-成功 Shape 直接拥有有序 child Entity tuple，cardinality 由 `len(children)` 派生。
-失败 Shape 不虚构 children。
+成功 Expansion 直接拥有有序 child Entity tuple，cardinality 由 `len(children)` 派生。
+失败 Expansion 不虚构 children。
 
 ---
 
 ## 9. payload、control 与 lineage 为什么分开
 
-### 9.1 Arena 不读取业务 payload
+### 9.1 MicrobatchEngine 不读取业务 payload
 
 业务值存成粗粒度 block：
 
@@ -1201,20 +1222,20 @@ BlockRef → 一个 Ray ObjectRef 或测试内存块
 RowBinding(block, row) → 块中的一行
 ```
 
-Arena 的 ValueTable 只保存 ItemRef 到 RowBinding/GroupBinding 的映射。只有 Worker 和最终
+MicrobatchEngine 的 ValueTable 只保存 ItemRef 到 RowBinding/GroupBinding 的映射。只有 Worker 和最终
 materializer 调用 store.get()。
 
 这避免 driver 为调度而反序列化图片、页面或模型输出。
 
 ```mermaid
 sequenceDiagram
-    participant A as ArenaEngine
+    participant A as MicrobatchEngine
     participant E as Executor transport
     participant W as Worker
     participant S as Block store
 
-    A-->>E: ScalarTake / GroupTake（只含 RowBindings）
-    E->>W: InvocationPlan
+    A-->>E: RowBinding / GroupInput（只含 RowBindings）
+    E->>W: GrainPlan
     W->>S: get(RowBinding)
     S-->>W: business value
     W->>W: run batch UDF
@@ -1229,7 +1250,7 @@ Executor 在这对组件之间仅做 DTO transport；它不检查业务值，也
 
 ### 9.2 control manifest 是受控投影
 
-Filter 必须知道 mask 是 True 还是 False，但 Arena 又不能读取业务 payload。因此 compiler
+Filter 必须知道 mask 是 True 还是 False，但 MicrobatchEngine 又不能读取业务 payload。因此 compiler
 计算 `control_ports`，Worker 只为被 demand 的 bool Port 返回小型 control manifest。
 
 ```text
@@ -1245,21 +1266,21 @@ flowchart LR
     Worker --> Control["bool control manifest<br/>only when demanded"]
     Binding --> Values["RuntimeState.values"]
     Control --> Item["ItemRecord.control"]
-    Lineage["Entity / Shape / lineage"] --> Arena["Arena transitions"]
-    Item --> Arena
+    Lineage["Entity / Expansion / lineage"] --> MicrobatchEngine["MicrobatchEngine transitions"]
+    Item --> MicrobatchEngine
     Values -. "Worker/materializer only" .-> Store["Block store payload"]
 ```
 
 三者的生命周期也不同：payload 可在 materialize 后释放，control 是小型语义投影，
 lineage/terminal facts 则保留用于审计。
 
-### 9.3 GroupBinding 与 CSR Shape
+### 9.3 GroupBinding 与 CSR Expansion
 
-Reduce 不把大 group payload 复制到 Arena，而是保存：
+Reduce 不把大 group payload 复制到 MicrobatchEngine，而是保存：
 
 ```text
 GroupBinding(
-    GroupShape(offsets_by_level),
+    GroupLayout(offsets_by_level),
     flat_items,
 )
 ```
@@ -1287,7 +1308,7 @@ class Parse:
         ]
 ```
 
-Worker 把对应 Grain 转成 `CallFailureReport`。其他 batch positions 仍然成功。
+Worker 把对应 Grain 转成 `GrainFailureReport`。其他 batch positions 仍然成功。
 
 ### 10.2 四类 failure 不共用一条恢复路径
 
@@ -1301,12 +1322,12 @@ Worker 把对应 Grain 转成 `CallFailureReport`。其他 batch positions 仍�
 ```mermaid
 flowchart TD
     Failure{"失败在哪个边界被识别？"}
-    Failure -->|"UDF 返回 RecordFailure(position)"| Record["CallFailureReport"]
+    Failure -->|"UDF 返回 RecordFailure(position)"| Record["GrainFailureReport"]
     Failure -->|"Worker normalization/ABI"| Contract["CONTRACT_ERROR"]
     Failure -->|"UDF 整次抛异常"| Udf["UDF_ERROR"]
     Failure -->|"ray.get / actor / transport"| Infra["INFRA_FAILURE"]
 
-    Record --> Commit["ArenaEngine.commit_failure<br/>只影响对应 Grain"]
+    Record --> Commit["MicrobatchEngine.commit_failure<br/>只影响对应 Grain"]
     Contract --> Fast["ExecutionError<br/>fail-fast"]
     Udf --> Policy["RecoveryPolicy.decide_udf"]
     Policy --> Abort["ABORT"]
@@ -1322,7 +1343,7 @@ flowchart TD
 ```
 
 Worker 只负责把异常快照为可序列化的 `DispatchFailure`。它不知道重试策略；
-Executor 只把 failure 分类交给纯 `RecoveryPolicy`；Arena 内唯一的 `DispatchState` 拥有
+Executor 只把 failure 分类交给纯 `RecoveryPolicy`；MicrobatchEngine 内唯一的 `DispatchState` 拥有
 READY、generation 和 recovery queues。这样不会在 Executor 或 Engine 中再藏一份
 可运行 Grain。
 
@@ -1348,7 +1369,7 @@ mg.RecoveryPolicy.isolate_tail(infra_retries=1)
 
 `attempts` 是额外 UDF replay 次数，不是总执行次数。`isolate_tail` 没有
 `max_depth`、`min_batch` 等第二组旋钮：每次非 singleton 只二分一次，所以有限性由
-group cardinality 直接证明。immediate、normal、tail 的优先级也是 Arena 的显式
+group cardinality 直接证明。immediate、normal、tail 的优先级也是 MicrobatchEngine 的显式
 调度状态，不是 Executor 临时拼接的列表。
 
 `isolate_tail` 的组件协作如下：
@@ -1357,12 +1378,12 @@ group cardinality 直接证明。immediate、normal、tail 的优先级也是 Ar
 sequenceDiagram
     participant E as Executor
     participant P as RecoveryPolicy
-    participant A as ArenaEngine
+    participant A as MicrobatchEngine
     participant D as DispatchState
 
     E->>P: decide_udf(completed=0, grains=N)
     P-->>E: RETRY_TAIL
-    E->>A: apply_udf_recovery(selection, RETRY_TAIL)
+    E->>A: apply_udf_recovery(batch, RETRY_TAIL)
     A->>D: recover_udf
     D->>D: exact group → tail queue, udf_retries=1
     Note over E,D: 若整组再次失败
@@ -1374,7 +1395,7 @@ sequenceDiagram
     else N = 1
         P-->>E: FAIL_SINGLETON
         E->>A: apply_udf_recovery
-        A->>A: publish FAILED Item / Shape facts
+        A->>A: publish FAILED Item / Expansion facts
     end
 ```
 
@@ -1390,7 +1411,7 @@ infra_failures += 1
 
 旧 generation 的迟到报告不能覆盖新 attempt。actor crash 时 Executor 丢弃不可信 handle，
 创建 fresh actor，并把同一精确 group 放进 immediate queue；若失败发生在 UDF recovery
-中，`DispatchSelection.udf_retries` 会随精确 group 保留。超过 infra budget 后抛
+中，`DispatchBatch.udf_retries` 会随精确 group 保留。超过 infra budget 后抛
 `ExecutionError`，不会伪造一个业务 FAILED Item。
 
 ### 10.5 failure propagation
@@ -1406,7 +1427,7 @@ FAILED/SUPPRESSED > unresolved > REQUIRED DROPPED > READY
 Filter 和 Reduce 是带角色的 gate：
 
 - Filter 先看 source，再看 mask；
-- Reduce 先看 Shape，再看 members，只读取 survivors 的 values。
+- Reduce 先看 Expansion，再看 members，只读取 survivors 的 values。
 
 这些不对称写在纯 transition 中，不允许由某个默认输入槽暗中决定。
 
@@ -1414,7 +1435,7 @@ Filter 和 Reduce 是带角色的 gate：
 
 ## 11. 源码地图与推荐阅读顺序
 
-建议按以下顺序阅读，而不是直接从 ArenaEngine 开始：
+建议按以下顺序阅读，而不是直接从 MicrobatchEngine 开始：
 
 1. [`model.py`](../rayorch/experimental/multigrain_v3_6/model.py)：核心 Ref 和终态枚举。
 2. [`logical.py`](../rayorch/experimental/multigrain_v3_6/logical.py)：typed logical IR。
@@ -1426,10 +1447,10 @@ Filter 和 Reduce 是带角色的 gate：
 8. [`compiler.py`](../rayorch/experimental/multigrain_v3_6/compiler.py)：固定 passes。
 9. [`runtime/state.py`](../rayorch/experimental/multigrain_v3_6/runtime/state.py)：被动 tables。
 10. [`runtime/dispatch.py`](../rayorch/experimental/multigrain_v3_6/runtime/dispatch.py)：唯一 Grain/queue 状态机。
-11. [`runtime/engine.py`](../rayorch/experimental/multigrain_v3_6/runtime/engine.py)：Item/Shape/Entity 传播层。
+11. [`runtime/engine.py`](../rayorch/experimental/multigrain_v3_6/runtime/engine.py)：Item/Expansion/Entity 传播层。
 12. [`protocol.py`](../rayorch/experimental/multigrain_v3_6/protocol.py)：稳定 DTO/Worker ABI。
 13. [`worker.py`](../rayorch/experimental/multigrain_v3_6/worker.py)：值恢复和报告生成。
-14. [`executor.py`](../rayorch/experimental/multigrain_v3_6/executor.py)：Ray actor 与多 Arena 调度。
+14. [`executor.py`](../rayorch/experimental/multigrain_v3_6/executor.py)：Ray actor 与多 microbatch 调度。
 15. [`materialize.py`](../rayorch/experimental/multigrain_v3_6/materialize.py)：最终输出恢复。
 
 源码层的主要 knowledge/call 关系是：
@@ -1451,10 +1472,10 @@ flowchart LR
     end
 
     subgraph Runtime["Driver runtime"]
-        Executor["executor.py"] -->|"Arena façade"| Arena["runtime/engine.py"]
-        Arena -->|"Grain authority"| Dispatch["runtime/dispatch.py"]
+        Executor["executor.py"] -->|"MicrobatchEngine façade"| MicrobatchEngine["runtime/engine.py"]
+        MicrobatchEngine -->|"Grain authority"| Dispatch["runtime/dispatch.py"]
         Executor --> Materialize["materialize.py"]
-        Materialize -->|"read terminal facts"| Arena
+        Materialize -->|"read terminal facts"| MicrobatchEngine
     end
 
     subgraph ActorSide["Actor / values"]
@@ -1464,15 +1485,15 @@ flowchart LR
     end
 
     Plan --> Executor
-    Plan --> Arena
-    Arena -->|"facts → decision"| Transitions
+    Plan --> MicrobatchEngine
+    MicrobatchEngine -->|"facts → decision"| Transitions
     Dispatch -->|"phase transition"| Transitions
     Executor -->|"UDF recovery"| Recovery
-    Arena -->|"infra budget"| Recovery
+    MicrobatchEngine -->|"infra budget"| Recovery
     Executor --> Protocol
-    Arena --> Protocol
+    MicrobatchEngine --> Protocol
     Worker --> Protocol
-    Executor <-->|"InvocationPlan / WorkerResult"| Worker
+    Executor <-->|"GrainPlan / WorkerResult"| Worker
     Materialize -->|"get payload"| Store
 ```
 
@@ -1491,7 +1512,7 @@ flowchart LR
 它创建哪种身份？
 它消费哪些 Port，角色分别是什么？
 它是否改变 Domain？
-它产生哪些 Item/Shape 终态？
+它产生哪些 Item/Expansion 终态？
 control demand 如何传播？
 它是否真的需要 Worker？
 为什么现有 primitive 无法表达？
@@ -1506,7 +1527,7 @@ control demand 如何传播？
 5. 在 `plan.py` 定义一个包含执行所需全部静态信息的最小 `XxxEffect`。
 6. 在 lowering 中只构造一次 Effect，并让所有触发索引引用它；即使是 pass 也写出 case。
 7. 若有新的动态组合，在 `transitions.py` 增加纯函数。
-8. Arena 只应用 transition 和发布事实，不重复写状态优先级。
+8. MicrobatchEngine 只应用 transition 和发布事实，不重复写状态优先级。
 9. 增加笛卡尔积测试、compiler boundary 测试和 explain 断言。
 10. optimized/unoptimized 必须结果等价。
 
@@ -1518,7 +1539,7 @@ flowchart LR
     Facts --> Lower["lower one immutable XxxEffect"]
     Lower --> Plan["verify RuntimePlan"]
     Plan --> Transition["pure transition<br/>若有新动态组合"]
-    Transition --> Engine["Arena applies decision<br/>and publishes facts"]
+    Transition --> Engine["MicrobatchEngine applies decision<br/>and publishes facts"]
     Engine --> Tests["Cartesian + compiler + integration"]
 ```
 
@@ -1527,13 +1548,13 @@ DTO 或纯 transition，而不是需要一条快捷飞线。
 
 ### 12.2 修改状态语义
 
-不要先改 Arena 的某个 `if`。正确顺序是：
+不要先改 MicrobatchEngine 的某个 `if`。正确顺序是：
 
 ```text
-更新 v3.6.1 语义合同
+更新 v3.6 语义合同
 → 修改 transitions.py
 → 修改笛卡尔积期望
-→ 让 Arena 适配 transition result
+→ 让 MicrobatchEngine 适配 transition result
 → 跑完整回归
 ```
 
@@ -1546,13 +1567,13 @@ DTO 或纯 transition，而不是需要一条快捷飞线。
 
 ```text
 protocol DTO
-compiler InputLayout/OutputLayout
-Arena invocation_plan/commit validation
+compiler CallInputLayout/CallOutputLayout
+MicrobatchEngine grain_plan/commit validation
 Worker restore/normalize/report
 Ray actor boundary integration test
 ```
 
-不要把 LogicalProgram 或 Arena 对象直接传进 Worker。
+不要把 LogicalProgram 或 MicrobatchEngine 对象直接传进 Worker。
 
 ### 12.4 增加编译优化
 
@@ -1576,10 +1597,10 @@ Ray actor boundary integration test
 - 任一输入 Port 不得成为 Grain/Entity 隐式 driver；
 - 只有 Expand 创建 child Entity；
 - F.* 结构 primitive 不得偷偷创建 actor/RPC/Grain；
-- Item、Shape、Entity 只能通过各自唯一 publication 入口进入 canonical tables；
-- Arena 不读取业务 payload；
+- Item、Expansion、Entity 只能通过各自唯一 publication 入口进入 canonical tables；
+- MicrobatchEngine 不读取业务 payload；
 - Executor 不重新实现 Filter/Reduce 等 primitive 语义；
-- Worker 不读取 Program/Arena，不生成逻辑身份；
+- Worker 不读取 Program/MicrobatchEngine，不生成逻辑身份；
 - derived index/queue 不得成为第二套语义权威表。
 
 ---
@@ -1595,7 +1616,7 @@ pytest -q \
 ```
 
 这里覆盖 compiler 边界、control fixed point、状态笛卡尔积、nested group、recovery
-policy reducer、Arena recovery queues、retry fencing、aligned atomicity 和 MinerU
+policy reducer、MicrobatchEngine recovery queues、retry fencing、aligned atomicity 和 MinerU
 Pipeline 静态结构。
 
 ### 13.2 真实 Ray integration
@@ -1604,9 +1625,10 @@ Pipeline 静态结构。
 pytest -q test/experimental/multigrain_v3_6/integration/test_executor.py
 ```
 
-覆盖持久 actor、多 Arena、keyword ABI、actor crash replacement、infra exhaustion、
-RecordFailure、UDF immediate/tail retry、poison isolation、合同 fail-fast 和 multi-output
-原子性。某些 Ray 版本若误判 uv runtime environment，可临时设置：
+覆盖空输入、重复 run 指标、持久 actor、多 microbatch、同步 actor 构造清理、keyword
+ABI、actor crash replacement、infra exhaustion、RecordFailure、UDF immediate/tail retry、
+poison isolation、合同 fail-fast 和 multi-output 原子性。某些 Ray 版本若误判 uv runtime
+environment，可临时设置：
 
 ```bash
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
@@ -1629,11 +1651,8 @@ pyright \
 
 ### 13.4 真实性能证据
 
-当前 MinerU 368-PDF 回归配置和结果见
-[`experiments/multigrain_v3_6/2026-08-06_mineru_regression.md`](experiments/multigrain_v3_6/2026-08-06_mineru_regression.md)。
-
-Video 的 50GB full gate、SmolVLM caption 与 Whisper+ViT 双 sibling relation 结果见
-[`experiments/multigrain_v3_6/2026-08-06_video_kinetics50.md`](experiments/multigrain_v3_6/2026-08-06_video_kinetics50.md)。
+MinerU 368-PDF、Docling 和视频结果必须由当前 V3.6 源码重新执行后写入
+`docs/experiments/multigrain_v3_6/`。不能复制 V3.5 数字冒充本版证据。
 
 性能修改不能只看 unit test；至少应比较 correctness、wall time、RPC 数、平均 batch、
 driver RSS 和 actor 数。
@@ -1656,27 +1675,26 @@ driver RSS 和 actor 数。
 
 按顺序检查：
 
-1. `compiled.facts.control_ports` 是否包含 mask producer；
+1. `compiled.analysis.control_ports` 是否包含 mask producer；
 2. `compiled.explain_text()` 是否显示 `control`；
 3. chained Filter 是否通过 `control_predecessors` 回传；
 4. Worker output 是否真的是逐 Grain bool；
 5. expanded bool rows 是否与 rows 等长。
 
-### 14.3 Arena deadlocked
+### 14.3 MicrobatchEngine deadlocked
 
 查看：
 
 ```python
-arena.progress_summary()
-arena.state.pending
-arena.grain_snapshots()
-arena.state.shapes
+engine.progress_summary()
+engine.grain_snapshots()
+engine.expansion_count
 ```
 
 常见原因是：
 
 - 某个依赖 Port 没有进入 Effect 触发索引；
-- Shape 已终态但 Group 的 member/value Item 没发布；
+- Expansion 已终态但 Group 的 member/value Item 没发布；
 - Worker report layout 不完整；
 - 新 primitive 在 lowering 中被遗漏而不是显式 pass；
 - output Port 对某些已存在 Entity 没有终态。
@@ -1690,7 +1708,7 @@ CommitError 通常不是普通业务失败，而是合同冲突：
 - scalar/expanded report 与 plan 不一致；
 - aligned cardinality 不一致；
 - control demand 不一致；
-- Item/Shape/Entity 被冲突发布。
+- Item/Expansion/Entity 被冲突发布。
 
 先检查 WorkerReport 和 RuntimePlan，不要尝试覆盖已有状态。
 
@@ -1712,11 +1730,11 @@ materializer 不会把它们静默转换为 `None`，因为三者含义不同。
 
 1. `Pipeline.forward()` 用符号 Port 写图，RayModule 表示计算，F.* 表示结构关系。
 2. compiler 把 typed PortOrigin AST 验证、分析并 lower 成不含 Origin 的 RuntimePlan。
-3. Entity 定义 occurrence，Item 定义 Port 上的终态，Grain 定义 Call 的执行，Shape 定义
+3. Entity 定义 occurrence，Item 定义 Port 上的终态，Grain 定义 Call 的执行，Expansion 定义
    Expand children。
-4. ArenaEngine 独占语义表，DispatchState 独占 Grain/queues；Executor 管 Ray，Worker 只管值。
+4. MicrobatchEngine 独占语义表，DispatchState 独占 Grain/queues；Executor 管 Ray，Worker 只管值。
 5. 身份、业务值、control、物理 batching 和 failure propagation 相互分离，因此可以独立
    优化而不改变逻辑语义。
 
 当你能根据一个新需求明确指出它属于这五层中的哪一层，并说明它不应该进入哪些层，
-就已经具备维护 v3.6.1 的核心能力。
+就已经具备维护 v3.6 的核心能力。

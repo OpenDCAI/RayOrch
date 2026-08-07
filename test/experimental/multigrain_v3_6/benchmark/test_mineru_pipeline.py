@@ -12,7 +12,7 @@ from rayorch.experimental.multigrain_v3_6.benchmark.mineru import (
     MinerUV36Pipeline,
     build_parser,
 )
-from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin, GroupOrigin
+from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin, ReduceOrigin
 
 
 def _pipeline(mode: str = "elastic") -> MinerUV36Pipeline:
@@ -31,7 +31,7 @@ def _pipeline(mode: str = "elastic") -> MinerUV36Pipeline:
 
 def test_mineru_v36_has_four_calls_and_no_structural_pools():
     compiled = _pipeline().compile()
-    targets = [spec.kernel.target for spec in compiled.logical.calls.values()]
+    targets = [spec.udf.target for spec in compiled.logical.calls.values()]
 
     assert targets == [
         MinerUPdfToPages,
@@ -39,14 +39,14 @@ def test_mineru_v36_has_four_calls_and_no_structural_pools():
         PdfMetadata,
         MinerUAssembleDoc,
     ]
-    assert len(compiled.runtime.pools_by_call) == 4
+    assert len(compiled.plan.actor_pools_by_call) == 4
     assert len(compiled.logical.domains) == 2
     assert sum(
         isinstance(spec.origin, ExpandOrigin)
         for spec in compiled.logical.ports.values()
     ) == 1
     assert sum(
-        isinstance(spec.origin, GroupOrigin)
+        isinstance(spec.origin, ReduceOrigin)
         for spec in compiled.logical.ports.values()
     ) == 2
 
@@ -56,8 +56,8 @@ def test_mineru_parent_and_elastic_only_change_ocr_pool_option():
     parent = _pipeline("parent_bound").compile()
 
     assert elastic.logical.calls == parent.logical.calls
-    elastic_options = list(elastic.runtime.pools_by_call.values())
-    parent_options = list(parent.runtime.pools_by_call.values())
+    elastic_options = list(elastic.plan.actor_pools_by_call.values())
+    parent_options = list(parent.plan.actor_pools_by_call.values())
     changed = [
         (left, right)
         for left, right in zip(elastic_options, parent_options)
@@ -82,6 +82,6 @@ def test_mineru_cli_defaults_to_four_pdf_correctness_gate():
 
     assert args.limit == 4
     assert args.batch_size == 64
-    assert args.max_inflight_arenas == 3
+    assert args.max_active_microbatches == 3
     assert args.num_cpus == 32
     assert args.object_store_gb == 100

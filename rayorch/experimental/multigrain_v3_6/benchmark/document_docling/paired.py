@@ -170,11 +170,9 @@ def _validate_arm_outputs(
 def _worker_summary(result: RunResult) -> dict[str, Any]:
     """Aggregate observation-only v3.6 Worker snapshots by UDF class."""
 
-    plan = result.arenas[0].plan
     summary: dict[str, Any] = {}
-    for call, observations in result.workers.items():
-        target = plan.call(call).kernel.target
-        name = getattr(target, "__name__", repr(target))
+    for metrics in result.calls:
+        observations = metrics.worker_snapshots
         audit_numeric: dict[str, float] = {}
         audit_text: dict[str, set[str]] = {}
         for observation in observations:
@@ -183,9 +181,9 @@ def _worker_summary(result: RunResult) -> dict[str, Any]:
                     audit_numeric[key] = audit_numeric.get(key, 0.0) + value
                 else:
                     audit_text.setdefault(key, set()).add(value)
-        summary[name] = {
+        summary[metrics.udf_name] = {
             "actors": len(observations),
-            "calls": sum(item.calls for item in observations),
+            "calls": sum(item.lifetime_calls for item in observations),
             "rss_peak_bytes": max(
                 (item.rss_bytes for item in observations),
                 default=0,
@@ -269,8 +267,8 @@ def _run_trial(
     v3_options: dict[str, Any],
     v36_options: dict[str, Any],
     *,
-    arena_size: int,
-    max_in_flight: int,
+    microbatch_size: int,
+    max_active_microbatches: int,
     order: str,
     minimum_jaccard: float,
     expected_tables: int | None,
@@ -305,8 +303,8 @@ def _run_trial(
             else:
                 result = run_v36(
                     paths,
-                    arena_size=arena_size,
-                    max_in_fight=max_in_flight,
+                    microbatch_size=microbatch_size,
+                    max_in_fight=max_active_microbatches,
                     **v36_options,
                 )
                 docs = tuple(
@@ -318,7 +316,7 @@ def _run_trial(
                     "rpc_count": result.rpc_count,
                     "actor_count": result.actor_count,
                     "released_values": result.released_values,
-                    "max_active_arenas": result.max_active_arenas,
+                    "peak_active_microbatches": result.peak_active_microbatches,
                     "workers": workers,
                     "audit_violations": _audit_violations(workers),
                 }
@@ -467,8 +465,8 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
         table_batch_max_jobs=args.table_batch_max_jobs,
         actor_num_cpus=args.actor_num_cpus,
         max_pending_per_actor=1,
-        microbatch_size=args.arena_size,
-        max_inflight_arenas=args.max_in_flight,
+        microbatch_size=args.microbatch_size,
+        max_inflight_arenas=args.max_active_microbatches,
     )
     v3_options, v36_options = _arm_options(
         len(manifest.paths),
@@ -495,8 +493,8 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
                 manifest,
                 v3_options,
                 v36_options,
-                arena_size=args.arena_size,
-                max_in_flight=args.max_in_flight,
+                microbatch_size=args.microbatch_size,
+                max_active_microbatches=args.max_active_microbatches,
                 order="v3_first" if index % 2 == 0 else "v36_first",
                 minimum_jaccard=args.minimum_jaccard,
                 expected_tables=args.expected_tables,
@@ -612,8 +610,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--table-batch-max-jobs", type=int, default=16)
     parser.add_argument("--actor-num-cpus", type=float, default=1.0)
-    parser.add_argument("--arena-size", type=int, default=24)
-    parser.add_argument("--max-in-flight", type=int, default=4)
+    parser.add_argument("--microbatch-size", type=int, default=24)
+    parser.add_argument("--max-active-microbatches", type=int, default=4)
     parser.add_argument("--ray-num-cpus", type=int, default=128)
     parser.add_argument("--ray-num-gpus", type=float, default=4.0)
     parser.add_argument("--object-store-gb", type=float)
