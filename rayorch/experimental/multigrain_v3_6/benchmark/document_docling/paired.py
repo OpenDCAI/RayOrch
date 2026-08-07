@@ -304,7 +304,7 @@ def _run_trial(
                 result = run_v36(
                     paths,
                     microbatch_size=microbatch_size,
-                    max_in_fight=max_active_microbatches,
+                    max_active_microbatches=max_active_microbatches,
                     **v36_options,
                 )
                 docs = tuple(

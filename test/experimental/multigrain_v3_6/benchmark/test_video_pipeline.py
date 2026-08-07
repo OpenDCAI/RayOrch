@@ -552,3 +552,12 @@ def test_multimodal_pair_allows_only_bounded_normalized_text_drift(
     assert not result["correctness"]["outputs_exact"]
     assert result["correctness"]["structure_exact"]
     assert result["correctness"]["frame_digests_exact"]
+
+
+def test_model_paired_cli_defaults_to_frozen_performance_window():
+    args = model_paired.build_parser().parse_args(
+        ["caption", "--manifest", "videos.json"]
+    )
+
+    assert args.microbatch_size == 32
+    assert args.max_active_microbatches == 4

@@ -215,6 +215,73 @@ def test_docling_paired_cli_defaults_to_promoted_full_gate_configuration():
     ) == (16, 2, 6, 2, 4)
 
 
+def test_docling_paired_forwards_v36_microbatch_controls(monkeypatch):
+    captured = {}
+
+    class V3Result:
+        metrics = {
+            "startup_time_s": 0.0,
+            "measured_wall_time_s": 1.0,
+            "end_to_end_wall_time_s": 1.0,
+            "rpc_count": 1,
+        }
+
+        def get(self):
+            return ({"pdf": "doc", "pages": 1, "tables": 0, "markdown": "ok"},)
+
+    class V36Result:
+        outputs = ({"pdf": "doc", "pages": 1, "tables": 0, "markdown": "ok"},)
+        elapsed_s = 1.0
+        rpc_count = 1
+        actor_count = 1
+        released_values = 1
+        peak_active_microbatches = 1
+        calls = ()
+
+    class Monitor:
+        available = False
+        unavailable_reason = "test"
+
+        def __init__(self, **_options):
+            pass
+
+        def start(self):
+            return self
+
+        def stop(self):
+            return ()
+
+    monkeypatch.setattr(paired, "run_v3", lambda *_args, **_kwargs: V3Result())
+
+    def run_v36(*_args, **kwargs):
+        captured.update(kwargs)
+        return V36Result()
+
+    monkeypatch.setattr(paired, "run_v36", run_v36)
+    monkeypatch.setattr(paired, "GpuMonitor", Monitor)
+
+    paired._run_trial(
+        paired.DoclingManifest(
+            paths=("doc.pdf",),
+            pdf_ids=("doc",),
+            input_bytes=1,
+            expected_pages=1,
+            manifest_sha256="test",
+        ),
+        {},
+        {},
+        microbatch_size=7,
+        max_active_microbatches=3,
+        order="v3_first",
+        minimum_jaccard=1.0,
+        expected_tables=0,
+    )
+
+    assert captured["microbatch_size"] == 7
+    assert captured["max_active_microbatches"] == 3
+    assert "max_in_fight" not in captured
+
+
 def test_docling_manifest_and_each_arm_have_independent_identity_gates(
     tmp_path,
 ):

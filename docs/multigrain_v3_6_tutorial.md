@@ -1651,11 +1651,18 @@ pyright \
 
 ### 13.4 真实性能证据
 
-MinerU 368-PDF、Docling 和视频结果必须由当前 V3.6 源码重新执行后写入
-`docs/experiments/multigrain_v3_6/`。不能复制 V3.5 数字冒充本版证据。
+当前实现已经完成 MinerU 368-PDF、Docling 48-PDF、Caption 256-video 和双 Domain
+Multimodal 256-video 的两轮交替顺序 paired trial。相对基线的平均变化依次为 -0.551%、
++1.260%、+1.990% 和 +0.492%，身份与结构合同全部通过。完整均值、样本方差、RPC/batch
+诊断和业务非确定性分析见
+[`2026-08-08_release_regression.md`](experiments/multigrain_v3_6/2026-08-08_release_regression.md)。
 
-性能修改不能只看 unit test；至少应比较 correctness、wall time、RPC 数、平均 batch、
-driver RSS 和 actor 数。
+Caption 还验证了一个重要反例：microbatch 4、active 2 会让 V3.5/V3.6 都因 admission
+window 太小而增加约 50% RPC。冻结性能窗口是 32×4，benchmark 默认值和 artifact 已显式
+固定这两个字段。维护者应把它们理解为容量/吞吐配置，而不是与性能无关的安全限制。
+
+后续性能修改仍不能只看 unit test；至少应比较 correctness、wall time、RPC 数、平均
+batch、driver RSS 和 actor 数。
 
 ---
 

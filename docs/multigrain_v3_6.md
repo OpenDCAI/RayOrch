@@ -178,11 +178,13 @@ Ray-free 回归覆盖：
 - generation fencing；
 - aligned Expand mismatch 无局部发布。
 
-当前源码门禁为 107 个 Ray-free tests、14 个真实 Ray integration tests，以及核心
+当前源码门禁为 109 个 Ray-free tests、14 个真实 Ray integration tests，以及核心
 pyright 0 error。真实 Ray 覆盖空输入、重复 run 的 run-local/lifetime 指标、持久
 actor、多 microbatch、同步构造失败清理、actor crash replacement、同 Grain replay、
 逐记录业务失败、合同错误 fail-fast 和 multi-output 原子失败。
 
-MinerU 368 PDF、Docling 与视频 workload 的 V3.6 数据必须由本实现重新运行后写入
-`docs/experiments/multigrain_v3_6/`。在这些结果产生前，不沿用 V3.5 数字，也不宣称
-V3.6 已通过性能门禁。
+真实 workload 门禁也已完成。两轮交替顺序的 paired trial 中，MinerU 368 PDF 相对
+frozen V3.5 快 0.551%，Docling 48 PDF、Video Caption 256 和 Video Multimodal 256
+相对 V3 分别慢 1.260%、1.990% 和 0.492%；身份/结构合同全部通过。完整配置、均值、
+样本方差、正确性和容量窗口反例见
+[`2026-08-08_release_regression.md`](experiments/multigrain_v3_6/2026-08-08_release_regression.md)。

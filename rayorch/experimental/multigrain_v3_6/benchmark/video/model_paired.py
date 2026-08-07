@@ -344,6 +344,8 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
         "manifest": str(Path(args.manifest).resolve()),
         "videos": len(paths),
         "options": options,
+        "microbatch_size": args.microbatch_size,
+        "max_active_microbatches": args.max_active_microbatches,
         "timing_scope": "startup_materialization_and_teardown_inclusive",
         "trials": trials,
         "v3_median_wall_s": statistics.median(old),
@@ -374,8 +376,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output")
     parser.add_argument("--limit", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=1)
-    parser.add_argument("--microbatch-size", type=int, default=4)
-    parser.add_argument("--max-active-microbatches", type=int, default=2)
+    parser.add_argument("--microbatch-size", type=int, default=32)
+    parser.add_argument("--max-active-microbatches", type=int, default=4)
     parser.add_argument("--num-cpus", type=int, default=16)
     parser.add_argument("--num-gpus", type=float, default=4)
     parser.add_argument(
