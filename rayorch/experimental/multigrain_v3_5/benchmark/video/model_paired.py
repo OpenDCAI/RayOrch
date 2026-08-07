@@ -16,6 +16,7 @@ from ....multigrain_v3.benchmark.video.caption_v3 import run_v3 as run_caption_v
 from ....multigrain_v3.benchmark.video.multimodal_v3 import (
     run_v3 as run_multimodal_v3,
 )
+from ..paired_stats import paired_timing_summary
 from .caption_v35 import run_caption_v35
 from .multimodal_v35 import run_multimodal_v35
 
@@ -47,6 +48,7 @@ def _caption_trial(
     outputs: dict[str, list[Any]] = {}
     walls: dict[str, float] = {}
     rpcs: dict[str, int] = {}
+    diagnostics: dict[str, dict[str, Any]] = {}
     for engine in sequence:
         started = time.perf_counter()
         if engine == "v3":
@@ -59,6 +61,16 @@ def _caption_trial(
             )
             outputs[engine] = list(result.get())
             rpcs[engine] = int(result.metrics["rpc_count"])
+            diagnostics[engine] = {
+                key: value
+                for key, value in result.metrics.items()
+                if key
+                in {
+                    "startup_time_s",
+                    "measured_wall_time_s",
+                    "end_to_end_wall_time_s",
+                }
+            }
         else:
             result = run_caption_v35(
                 paths,
@@ -68,6 +80,21 @@ def _caption_trial(
             )
             outputs[engine] = list(cast(Iterable[Any], result.outputs))
             rpcs[engine] = result.rpc_count
+            diagnostics[engine] = {
+                "runtime_elapsed_s": result.elapsed_s,
+                "max_active_arenas": result.max_active_arenas,
+                "released_values": result.released_values,
+                "calls": {
+                    f"call_{call.value}": {
+                        "actor_starts": metric.actor_starts,
+                        "rpcs": metric.rpcs,
+                        "grains": metric.grains,
+                        "average_batch": metric.average_batch,
+                        "retries": metric.retries,
+                    }
+                    for call, metric in sorted(result.calls.items())
+                },
+            }
         walls[engine] = time.perf_counter() - started
 
     difference = caption_difference_summary(outputs["v3"], outputs["v35"])
@@ -85,6 +112,8 @@ def _caption_trial(
         "v35_wall_s": walls["v35"],
         "v3_rpc_count": rpcs["v3"],
         "v35_rpc_count": rpcs["v35"],
+        "v3_diagnostics": diagnostics["v3"],
+        "v35_diagnostics": diagnostics["v35"],
         "correctness": difference,
     }
 
@@ -170,6 +199,7 @@ def _multimodal_trial(
     outputs: dict[str, list[Any]] = {}
     walls: dict[str, float] = {}
     rpcs: dict[str, int] = {}
+    diagnostics: dict[str, dict[str, Any]] = {}
     for engine in sequence:
         started = time.perf_counter()
         if engine == "v3":
@@ -181,6 +211,16 @@ def _multimodal_trial(
             )
             outputs[engine] = list(result.get())
             rpcs[engine] = int(result.metrics["rpc_count"])
+            diagnostics[engine] = {
+                key: value
+                for key, value in result.metrics.items()
+                if key
+                in {
+                    "startup_time_s",
+                    "measured_wall_time_s",
+                    "end_to_end_wall_time_s",
+                }
+            }
         else:
             result = run_multimodal_v35(
                 paths,
@@ -190,6 +230,21 @@ def _multimodal_trial(
             )
             outputs[engine] = list(cast(Iterable[Any], result.outputs))
             rpcs[engine] = result.rpc_count
+            diagnostics[engine] = {
+                "runtime_elapsed_s": result.elapsed_s,
+                "max_active_arenas": result.max_active_arenas,
+                "released_values": result.released_values,
+                "calls": {
+                    f"call_{call.value}": {
+                        "actor_starts": metric.actor_starts,
+                        "rpcs": metric.rpcs,
+                        "grains": metric.grains,
+                        "average_batch": metric.average_batch,
+                        "retries": metric.retries,
+                    }
+                    for call, metric in sorted(result.calls.items())
+                },
+            }
         walls[engine] = time.perf_counter() - started
     difference = multimodal_difference_summary(outputs["v3"], outputs["v35"])
     if not difference.get("structure_exact"):
@@ -211,6 +266,8 @@ def _multimodal_trial(
         "v35_wall_s": walls["v35"],
         "v3_rpc_count": rpcs["v3"],
         "v35_rpc_count": rpcs["v35"],
+        "v3_diagnostics": diagnostics["v3"],
+        "v35_diagnostics": diagnostics["v35"],
         "correctness": difference,
     }
 
@@ -291,6 +348,11 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
         "v35_median_wall_s": statistics.median(new),
         "v35_speedup_median": statistics.median(
             left / right for left, right in zip(old, new)
+        ),
+        "timing_statistics": paired_timing_summary(
+            old,
+            new,
+            (str(trial["order"]) for trial in trials),
         ),
     }
     if args.output:

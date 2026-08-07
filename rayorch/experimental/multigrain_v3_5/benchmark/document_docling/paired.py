@@ -18,6 +18,7 @@ from ....multigrain_v3.benchmark.document_docling.core_compare import (
 from ....multigrain_v3.benchmark.document_docling.core_v3 import run_v3
 from ....multigrain_v3.benchmark.document_docling.gpu_monitor import GpuMonitor
 from ...executor import RunResult
+from ..paired_stats import paired_timing_summary
 from .core_v35 import run_v35
 
 
@@ -553,6 +554,11 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
                 old / new for old, new in zip(v3_measured, v35_measured)
             ),
             "outputs_pass": True,
+            "timing_statistics": paired_timing_summary(
+                v3_outer,
+                v35_outer,
+                (str(trial["order"]) for trial in trials),
+            ),
         },
     }
     if args.output:

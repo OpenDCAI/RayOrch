@@ -426,7 +426,7 @@ def test_caption_model_pair_allows_bounded_text_drift_but_exact_structure(
         get=lambda: tuple(old_outputs),
         metrics={"rpc_count": 3},
     )
-    new = SimpleNamespace(outputs=new_outputs, rpc_count=3)
+    new = _fake_v35_result(new_outputs, rpc_count=3, grains=1)
     monkeypatch.setattr(model_paired, "run_caption_v3", lambda *a, **k: old)
     monkeypatch.setattr(model_paired, "run_caption_v35", lambda *a, **k: new)
 
@@ -447,7 +447,7 @@ def test_caption_model_pair_allows_bounded_text_drift_but_exact_structure(
 def test_multimodal_model_pair_requires_exact_root_merge(monkeypatch):
     outputs = [{"audio_chunks": 2, "transcript": "ok", "frames": 4}]
     old = SimpleNamespace(get=lambda: tuple(outputs), metrics={"rpc_count": 7})
-    new = SimpleNamespace(outputs=list(outputs), rpc_count=7)
+    new = _fake_v35_result(list(outputs), rpc_count=7, grains=1)
     monkeypatch.setattr(model_paired, "run_multimodal_v3", lambda *a, **k: old)
     monkeypatch.setattr(model_paired, "run_multimodal_v35", lambda *a, **k: new)
 
@@ -528,7 +528,7 @@ def test_multimodal_pair_allows_only_bounded_normalized_text_drift(
         }
     ]
     old = SimpleNamespace(get=lambda: tuple(old_outputs), metrics={"rpc_count": 3})
-    new = SimpleNamespace(outputs=new_outputs, rpc_count=3)
+    new = _fake_v35_result(new_outputs, rpc_count=3, grains=1)
     monkeypatch.setattr(model_paired, "run_multimodal_v3", lambda *a, **k: old)
     monkeypatch.setattr(model_paired, "run_multimodal_v35", lambda *a, **k: new)
 

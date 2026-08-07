@@ -20,6 +20,7 @@ from typing import Any, Iterable, cast
 from ....multigrain_v3.benchmark.video.data import load_video_manifest
 from ....multigrain_v3.benchmark.video.v3 import run_v3
 from ....multigrain_v3.benchmark.video.workload import prepare_resnet18_weights
+from ..paired_stats import paired_timing_summary
 from .v35 import run_v35
 
 
@@ -308,6 +309,11 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
                 old / new for old, new in zip(v3_walls, v35_walls)
             ),
             6,
+        ),
+        "timing_statistics": paired_timing_summary(
+            v3_walls,
+            v35_walls,
+            (str(trial["order"]) for trial in trials),
         ),
         "outputs_equivalent": True,
         "outputs_exact": all(
