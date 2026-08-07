@@ -1,0 +1,606 @@
+"""基于 Ray actor pools 的 v3.6 执行器与多 Arena driver。
+
+逻辑 Program、Arena 状态机和 Worker ABI 均不依赖 Ray；本模块是唯一持有
+actor handle 与 ObjectRef 的适配层。不同 Arena 共享 actor capacity，但一个 RPC
+不会静默混合多个 Arena 的 Grain，从而保持与设计文档一致的实验口径。
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterable, cast
+
+from .api import Pipeline
+from .materialize import materialize_tree
+from .model import CallRef, ExecutionError
+from .plan import CompiledProgram, PoolSpec
+from .protocol import (
+    BlockRef,
+    DispatchFailure,
+    DispatchFailureKind,
+    InputLayout,
+    InvocationPlan,
+    OutputLayout,
+    RowBinding,
+)
+from .recovery import RecoveryAction
+from .runtime import ArenaEngine, DispatchSelection
+from .worker import Worker, WorkerObservation
+
+
+class _RayBlockStore:
+    """只负责 ObjectRef 与块内行之间的物理映射，不解释业务值。"""
+
+    def __init__(self, ray_module: Any) -> None:
+        self._ray = ray_module
+        self._cache: dict[Any, tuple[Any, ...]] = {}
+
+    def clear_cache(self) -> None:
+        """清空已解引用 payload cache；BlockRef 生命周期由 Arena 持有。"""
+
+        self._cache.clear()
+
+    def put(self, values: tuple[Any, ...]) -> BlockRef:
+        """把一列批输出作为一个粗粒度块写入 object store。"""
+
+        return BlockRef(self._ray.put(tuple(values)))
+
+    def get(self, binding: RowBinding) -> Any:
+        """只在 Worker 或最终结果交付时读取一行 payload。"""
+
+        block = binding.block
+        if not isinstance(block, BlockRef):
+            raise TypeError(f"_RayBlockStore received non-Ray block: {block!r}")
+        payload = block.handle
+        # 同一粗块往往服务一个 batch 的很多 RowBinding；每批只 ray.get 一次。
+        if isinstance(payload, self._ray.ObjectRef):
+            if payload not in self._cache:
+                self._cache[payload] = self._ray.get(payload)
+            payload = self._cache[payload]
+        return payload[binding.row]
+
+
+class _RayWorkerActor:
+    """Ray 壳层：持久化一个 Worker，并复用完全相同的 Worker ABI。"""
+
+    def __init__(
+        self,
+        target: Any,
+        init_args: tuple[Any, ...],
+        init_kwargs: tuple[tuple[str, Any], ...],
+        input_layout: InputLayout,
+    ) -> None:
+        import ray  # pyright: ignore[reportMissingImports]
+
+        self._store = _RayBlockStore(ray)
+        self._worker = Worker(
+            target,
+            init_args,
+            init_kwargs,
+            input_layout=input_layout,
+        )
+
+    def ready(self) -> bool:
+        """在 UDF 构造完成后响应，用作初始 actor pool 启动屏障。"""
+
+        return True
+
+    def execute(
+        self,
+        invocations: tuple[InvocationPlan, ...],
+        layouts: tuple[OutputLayout, ...],
+    ):
+        """执行一批、一次返回；actor 不读取 Program 或 Arena。"""
+
+        self._store.clear_cache()
+        try:
+            return self._worker.execute(invocations, layouts, self._store)
+        finally:
+            # actor 不跨 RPC 持有输入 blocks；输出 blocks 由返回的 RowBinding
+            # 进入 driver/Arena 生命周期管理。
+            self._store.clear_cache()
+
+    def observe(self) -> WorkerObservation:
+        """Expose one observation-only snapshot without leaking the UDF."""
+
+        return self._worker.observe()
+
+
+@dataclass(slots=True)
+class CallMetrics:
+    """一个 Call 在所有 Arena 上共享的物理执行统计。"""
+
+    actor_starts: int = 0
+    rpcs: int = 0
+    grains: int = 0
+    retries: int = 0
+    batch_sizes: list[int] = field(default_factory=list)
+
+    @property
+    def average_batch(self) -> float:
+        """每个 RPC 的平均 Grain 数。"""
+
+        return self.grains / self.rpcs if self.rpcs else 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class RunResult:
+    """有序输出、多 Arena 审计状态和 Ray 调度指标。"""
+
+    outputs: object
+    elapsed_s: float
+    calls: dict[CallRef, CallMetrics]
+    arenas: tuple[ArenaEngine, ...]
+    max_active_arenas: int
+    released_values: int
+    workers: dict[CallRef, tuple[WorkerObservation, ...]]
+
+    @property
+    def rpc_count(self) -> int:
+        """全部 Call 的实际 actor RPC 数。"""
+
+        return sum(metrics.rpcs for metrics in self.calls.values())
+
+    @property
+    def actor_count(self) -> int:
+        """本次 ExecutionPool 实际创建的 actor 数。"""
+
+        return sum(metrics.actor_starts for metrics in self.calls.values())
+
+
+@dataclass(slots=True)
+class _ActorSlot:
+    """driver 内部的 actor capacity token。"""
+
+    call: CallRef
+    handle: Any
+    busy: bool = False
+
+
+@dataclass(slots=True)
+class _ArenaSlot:
+    """一个 source microbatch 及其唯一 Arena 状态机。"""
+
+    index: int
+    arena: ArenaEngine
+
+
+@dataclass(frozen=True, slots=True)
+class _Dispatch:
+    """pending ObjectRef 对应的 generation-fenced dispatch lease。"""
+
+    arena_index: int
+    actor: _ActorSlot
+    selection: DispatchSelection
+
+
+class Executor:
+    """Call-only actor pools 与多 Arena overlap 的参考执行器。"""
+
+    def __init__(
+        self,
+        pipeline: Pipeline | CompiledProgram,
+        *,
+        address: str | None = None,
+        ray_init_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        """编译 Pipeline、连接 Ray，并按 Call 创建持久 actor pools。"""
+
+        import ray  # pyright: ignore[reportMissingImports]
+
+        self.ray = ray
+        self.compiled = (
+            pipeline if isinstance(pipeline, CompiledProgram) else pipeline.compile()
+        )
+        self.plan = self.compiled.runtime
+        if not ray.is_initialized():
+            init_kwargs = dict(ray_init_kwargs or {})
+            if address is not None:
+                init_kwargs["address"] = address
+            ray.init(**init_kwargs)
+
+        self._actor_class = ray.remote(_RayWorkerActor)
+        self.store = _RayBlockStore(ray)
+        self.metrics = {call: CallMetrics() for call in self.plan.calls}
+        self._actors: dict[CallRef, list[_ActorSlot]] = {}
+        for call in self.plan.calls:
+            self._actors[call] = self._create_pool(call)
+        # actor handle 创建是异步的；统一 ready 屏障确保 run() 的计时
+        # 不混入 UDF/模型初始化，同时保持所有 pool 并行启动。
+        startup_refs = [
+            actor.handle.ready.remote()
+            for actors in self._actors.values()
+            for actor in actors
+        ]
+        try:
+            ray.get(startup_refs)
+        except Exception:
+            # 构造失败时对象不会交给调用方，必须在此回收已创建的 actors。
+            self.close()
+            raise
+
+    def run(
+        self,
+        *source_columns: Iterable[Any],
+        arena_size: int | None = None,
+        max_in_flight: int = 1,
+    ) -> RunResult:
+        """执行行对齐 sources，并让至多 ``max_in_flight`` 个 Arena 重叠。"""
+
+        columns = self._normalize_sources(source_columns)
+        row_count = len(columns[0])
+        if max_in_flight <= 0:
+            raise ValueError("max_in_flight must be positive")
+        if arena_size is None:
+            arena_size = max(1, row_count)
+        if arena_size <= 0:
+            raise ValueError("arena_size must be positive")
+
+        slices = [
+            tuple(column[start : start + arena_size] for column in columns)
+            for start in range(0, row_count, arena_size)
+        ]
+        if not slices:
+            slices = [tuple(() for _ in columns)]
+
+        # actor pool 跨 run 持久化，但调度指标严格按 run 隔离。已有 actor
+        # 计为本次使用一次；运行中 replacement 会由 _create_actor 继续累加。
+        self.store.clear_cache()
+        self.metrics = {
+            call: CallMetrics(actor_starts=len(self._actors[call]))
+            for call in self.plan.calls
+        }
+        all_arenas: list[ArenaEngine | None] = [None] * len(slices)
+        active: dict[int, _ArenaSlot] = {}
+        completed: dict[int, object] = {}
+        pending: dict[Any, _Dispatch] = {}
+        next_arena = 0
+        high_watermark = 0
+        released_values = 0
+        started = time.perf_counter()
+
+        while len(completed) < len(slices):
+            while next_arena < len(slices) and len(active) < max_in_flight:
+                arena = self._admit_arena(slices[next_arena])
+                active[next_arena] = _ArenaSlot(next_arena, arena)
+                all_arenas[next_arena] = arena
+                next_arena += 1
+                high_watermark = max(high_watermark, len(active))
+
+            self._dispatch_ready(active, pending)
+
+            # 只有没有 pending lease 的 Arena 才能离开 active 集合。
+            pending_arenas = {lease.arena_index for lease in pending.values()}
+            for index, slot in tuple(active.items()):
+                if index not in pending_arenas and slot.arena.is_complete():
+                    completed[index] = materialize_tree(
+                        self.plan,
+                        slot.arena,
+                        self.store,
+                    )
+                    # materialize 已把最终业务对象复制到 driver output；cache
+                    # 只用于一次粗块去重，不能把所有 Arena 的 payload 留到 run 结束。
+                    self.store.clear_cache()
+                    # 最终业务值已经复制到 driver 输出；清空 ValueTable 会释放
+                    # page-image 等 ObjectRef，但 Item/Shape/Grain 仍可完整审计。
+                    released_values += slot.arena.release_values()
+                    del active[index]
+
+            if len(completed) == len(slices):
+                break
+            if not pending and next_arena < len(slices):
+                # 当前 active Arena 已完成，但仍有尚未 admission 的 source slice；
+                # 下一 turn 会填充空出的 in-flight credit，这不是 deadlock。
+                continue
+            if not pending:
+                summaries = ", ".join(
+                    f"arena[{index}] {slot.arena.progress_summary()}"
+                    for index, slot in sorted(active.items())
+                )
+                raise RuntimeError(f"v3.6 Ray runtime deadlocked: {summaries}")
+
+            ready, _ = self.ray.wait(list(pending), num_returns=1)
+            result_ref = ready[0]
+            lease = pending.pop(result_ref)
+            arena = active[lease.arena_index].arena
+            try:
+                result = self.ray.get(result_ref)
+            except Exception as error:  # Ray 对用户异常和 actor 异常统一在 get 抛出
+                self._handle_infrastructure_failure(arena, lease, error)
+            else:
+                if isinstance(result, DispatchFailure):
+                    self._handle_dispatch_failure(arena, lease, result)
+                else:
+                    for report in result:
+                        arena.commit_report(report)
+            finally:
+                lease.actor.busy = False
+
+        elapsed_s = time.perf_counter() - started
+        arenas = tuple(arena for arena in all_arenas if arena is not None)
+        workers = self._observe_workers()
+        return RunResult(
+            self._merge_outputs([completed[index] for index in range(len(slices))]),
+            elapsed_s,
+            self.metrics,
+            arenas,
+            high_watermark,
+            released_values,
+            workers,
+        )
+
+    def close(self) -> None:
+        """显式终止本执行器创建的 actors，但不关闭共享 Ray 集群。"""
+
+        for actors in self._actors.values():
+            for actor in actors:
+                self.ray.kill(actor.handle, no_restart=True)
+        self._actors.clear()
+
+    def _observe_workers(self) -> dict[CallRef, tuple[WorkerObservation, ...]]:
+        """Best-effort physical diagnostics must not invalidate business output."""
+
+        result: dict[CallRef, list[WorkerObservation | None]] = {
+            call: [None] * len(actors)
+            for call, actors in self._actors.items()
+        }
+        pending = {}
+        for call, actors in self._actors.items():
+            for index, actor in enumerate(actors):
+                try:
+                    reference = actor.handle.observe.remote()
+                except Exception as error:
+                    result[call][index] = WorkerObservation(
+                        calls=0,
+                        pid=0,
+                        rss_bytes=0,
+                        error=repr(error),
+                    )
+                else:
+                    pending[reference] = (call, index)
+        while pending:
+            ready, _ = self.ray.wait(list(pending), num_returns=1)
+            reference = ready[0]
+            call, index = pending.pop(reference)
+            try:
+                result[call][index] = self.ray.get(reference)
+            except Exception as error:
+                result[call][index] = WorkerObservation(
+                    calls=0,
+                    pid=0,
+                    rss_bytes=0,
+                    error=repr(error),
+                )
+        if any(
+            observation is None
+            for observations in result.values()
+            for observation in observations
+        ):
+            raise AssertionError("worker observation collection lost an actor")
+        return {
+            call: cast(tuple[WorkerObservation, ...], tuple(observations))
+            for call, observations in result.items()
+        }
+
+    def __enter__(self):
+        """支持用 context manager 约束 ExecutionPool 生命周期。"""
+
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        """离开 context 时释放 actors。"""
+
+        self.close()
+
+    def _normalize_sources(
+        self,
+        source_columns: tuple[Iterable[Any], ...],
+    ) -> tuple[tuple[Any, ...], ...]:
+        """冻结 sources，并校验列数和行对齐。"""
+
+        if len(source_columns) != len(self.plan.source_ports):
+            raise ValueError("source column count does not match Pipeline.forward")
+        columns = tuple(tuple(column) for column in source_columns)
+        if len({len(column) for column in columns}) != 1:
+            raise ValueError("source columns must be row-aligned")
+        return columns
+
+    def _admit_arena(
+        self,
+        columns: tuple[tuple[Any, ...], ...],
+    ) -> ArenaEngine:
+        """把一个 source slice 原子接纳为独立 Arena。"""
+
+        arena = ArenaEngine(self.plan)
+        bindings = {}
+        controls = {}
+        for port, values in zip(self.plan.source_ports, columns):
+            block = self.store.put(values)
+            bindings[port] = tuple(
+                RowBinding(block, row) for row in range(len(values))
+            )
+            if port in self.plan.control_ports:
+                controls[port] = values
+        arena.admit_sources(bindings, controls=controls)
+        arena.close_admission()
+        return arena
+
+    def _dispatch_ready(
+        self,
+        active: dict[int, _ArenaSlot],
+        pending: dict[Any, _Dispatch],
+    ) -> None:
+        """把 READY Grain 分配给空闲 actor；每个 batch 严格属于一个 Arena。"""
+
+        for call, actors in self._actors.items():
+            for actor in actors:
+                if actor.busy:
+                    continue
+                candidates = [
+                    (priority, index, slot)
+                    for index, slot in active.items()
+                    if (priority := slot.arena.dispatch_priority(call)) is not None
+                ]
+                if not candidates:
+                    break
+                _, _, candidate = min(candidates, key=lambda item: item[:2])
+                pool = self._pool(call)
+                # 参考调度器采用即时、work-conserving 聚批：只要 actor
+                # 空闲就发送当前可见 Grain，不伪装支持定时等待窗口。
+                selection = candidate.arena.reserve_dispatch(
+                    call,
+                    max_size=pool.batch_size,
+                    parent_bound=pool.batch_scope == "parent_bound",
+                )
+                invocations = tuple(
+                    candidate.arena.invocation_plan(grain)
+                    for grain in selection.grains
+                )
+                layouts = self.plan.output_layouts_by_call[call]
+                result_ref = actor.handle.execute.remote(invocations, layouts)
+                actor.busy = True
+                pending[result_ref] = _Dispatch(
+                    candidate.index,
+                    actor,
+                    selection,
+                )
+                metrics = self.metrics[call]
+                metrics.rpcs += 1
+                metrics.grains += len(selection.grains)
+                metrics.batch_sizes.append(len(selection.grains))
+
+    def _handle_dispatch_failure(
+        self,
+        arena: ArenaEngine,
+        lease: _Dispatch,
+        failure: DispatchFailure,
+    ) -> None:
+        """Map one typed Worker failure to an exhaustive recovery action."""
+
+        if failure.kind is DispatchFailureKind.CONTRACT_ERROR:
+            raise self._execution_error(arena, lease, failure)
+        if failure.kind is not DispatchFailureKind.UDF_ERROR:
+            raise AssertionError(
+                f"unsupported DispatchFailureKind: {failure.kind!r}"
+            )
+        policy = self._pool(lease.actor.call).recovery
+        action = policy.decide_udf(
+            completed_retries=lease.selection.udf_retries,
+            grain_count=len(lease.selection.grains),
+        )
+        if action is RecoveryAction.ABORT:
+            raise self._execution_error(arena, lease, failure)
+        self.metrics[lease.actor.call].retries += arena.apply_udf_recovery(
+            lease.selection,
+            action,
+            failure,
+        )
+
+    def _handle_infrastructure_failure(
+        self,
+        arena: ArenaEngine,
+        lease: _Dispatch,
+        error: Exception,
+    ) -> None:
+        """Replace an untrusted actor and retry without data-failure fiction."""
+
+        policy = self._pool(lease.actor.call).recovery
+        accepted = arena.retry_infrastructure_dispatch(
+            lease.selection,
+            policy,
+        )
+        if not accepted:
+            raise self._execution_error(arena, lease, error) from error
+        self._replace_actor(lease.actor)
+        self.metrics[lease.actor.call].retries += len(lease.selection.grains)
+
+    def _replace_actor(self, actor: _ActorSlot) -> None:
+        """Discard one untrusted handle and install a fresh actor instance."""
+
+        try:
+            self.ray.kill(actor.handle, no_restart=True)
+        except Exception:
+            pass
+        actor.handle = self._create_actor(actor.call)
+
+    def _execution_error(
+        self,
+        arena: ArenaEngine,
+        lease: _Dispatch,
+        failure: DispatchFailure | Exception,
+    ) -> ExecutionError:
+        """Join wire details with Call and generation context owned by driver."""
+
+        call = lease.actor.call
+        target = self.plan.call(call).kernel.target
+        name = getattr(
+            target,
+            "__qualname__",
+            getattr(target, "__name__", repr(target)),
+        )
+        grains = ", ".join(
+            f"{grain!r}@generation={arena.grain_snapshot(grain).generation}"
+            for grain in lease.selection.grains
+        )
+        if isinstance(failure, DispatchFailure):
+            detail = (
+                f"{failure.kind.name}: {failure.error_type}: {failure.message}\n"
+                f"worker traceback:\n{failure.traceback}"
+            )
+        else:
+            detail = f"INFRA_FAILURE: {type(failure).__name__}: {failure}"
+        return ExecutionError(
+            f"Call {call.value} ({name}) dispatch failed for [{grains}]\n{detail}"
+        )
+
+    def _create_pool(self, call: CallRef) -> list[_ActorSlot]:
+        """只为 Call 创建 pool；Port 结构关系没有对应入口。"""
+
+        replicas = self._pool(call).replicas
+        return [_ActorSlot(call, self._create_actor(call)) for _ in range(replicas)]
+
+    def _create_actor(self, call: CallRef) -> Any:
+        """创建或替换一个持久 actor，并记录 startup。"""
+
+        spec = self.plan.call(call)
+        actor_options = dict(self._pool(call).ray_options)
+        actor_class = self._actor_class.options(**actor_options)
+        handle = actor_class.remote(
+            spec.kernel.target,
+            spec.kernel.init_args,
+            spec.kernel.init_kwargs,
+            self.plan.input_layouts_by_call[call],
+        )
+        self.metrics[call].actor_starts += 1
+        return handle
+
+    def _pool(self, call: CallRef) -> PoolSpec:
+        """Return the one typed physical execution contract for a Call."""
+
+        return self.plan.pool(call)
+
+    @classmethod
+    def _merge_outputs(cls, outputs: list[object]) -> object:
+        """按 Arena admission 顺序拼接同构输出树。"""
+
+        first = outputs[0]
+        if isinstance(first, list):
+            list_outputs = cast(list[list[object]], outputs)
+            return [item for output in list_outputs for item in output]
+        if isinstance(first, tuple):
+            tuple_outputs = cast(list[tuple[object, ...]], outputs)
+            return tuple(
+                cls._merge_outputs(
+                    [output[index] for output in tuple_outputs]
+                )
+                for index in range(len(first))
+            )
+        raise RuntimeError("invalid materialized output tree")
+
+
+__all__ = [
+    "CallMetrics",
+    "Executor",
+    "RunResult",
+]
