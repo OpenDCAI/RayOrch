@@ -1,4 +1,9 @@
-"""Multigrain v3.6 的单写者、事件驱动 microbatch 语义状态机。"""
+"""Multigrain v3.6 的单写者、事件驱动 microbatch 语义状态机。
+
+Engine 是 RuntimeState、Entity 枚举索引和事实 FIFO 的唯一写入口。纯 outcome/phase
+决策位于 transitions.py，Grain 物理队列位于 dispatch.py；本模块只把编译后的 Effect
+应用到一个 microbatch 的 canonical facts，绝不回读 Logical Origin。
+"""
 
 from __future__ import annotations
 
@@ -17,7 +22,7 @@ from ..model import (
     PortRef,
     ExpansionOutcome,
 )
-from ..transitions import (
+from .transitions import (
     CallAction,
     FilterCause,
     ReduceCause,
@@ -30,7 +35,7 @@ from ..transitions import (
     item_transition,
     expansion_transition,
 )
-from ..plan import (
+from ..program.plan import (
     BroadcastEffect,
     CallInputEffect,
     FilterEffect,
@@ -77,7 +82,11 @@ _FactEvent: TypeAlias = ItemRef | ExpansionRef | EntityRef
 
 
 class MicrobatchEngine:
-    """拥有一个 source microbatch 的全部语义事实与唯一写入口。"""
+    """拥有一个 source microbatch 的全部语义事实与唯一写入口。
+
+    阅读顺序建议是 admission/advance、Worker report commit、三个 publication
+    gateway，最后再看 Filter/Reduce/Broadcast 的 Effect interpreter。
+    """
 
     def __init__(
         self,
@@ -91,6 +100,8 @@ class MicrobatchEngine:
             DomainRef, dict[EntityRef, None]
         ] = defaultdict(dict)
         self._admission_closed = False
+
+    # ── Read-only projections for Executor and materialization ──────────
 
     @property
     def ready_count(self) -> int:
@@ -288,8 +299,10 @@ class MicrobatchEngine:
             f"pending={len(self._state.pending_grains)}, "
             f"ready={self.ready_count}, "
             f"grains={self.grain_count}, "
-            f"shapes={len(self._state.expansions)}"
+            f"expansions={len(self._state.expansions)}"
         )
+
+    # ── Source admission and the sole fact fixed-point loop ─────────────
 
     def admit_sources(
         self,
@@ -374,6 +387,8 @@ class MicrobatchEngine:
             case _:
                 assert_never(effect)
 
+    # ── Worker report preflight and commit boundary ─────────────────────
+
     def commit_report(self, report: WorkerReport) -> None:
         """按报告类型进入唯一的成功/失败语义提交路径。"""
 
@@ -392,6 +407,8 @@ class MicrobatchEngine:
         grain = report.grain
         self._dispatch.validate_in_flight(grain, report.generation)
 
+        # Phase 1: validate every per-output scalar/expanded/control contract
+        # and build publication intents without mutating canonical state.
         expected_outputs = self.plan.outputs_by_call[grain.call]
         by_port = {output.port: output for output in report.outputs}
         if len(by_port) != len(report.outputs) or set(by_port) != set(expected_outputs):
@@ -454,6 +471,8 @@ class MicrobatchEngine:
                     )
                 )
 
+        # Phase 2: aligned outputs share one Expansion, so cardinality and the
+        # complete reporter set must agree across all participating outputs.
         for expansion, counts in counts_by_expansion.items():
             if len(set(counts)) != 1:
                 raise CommitError("aligned expansion cardinality mismatch")
@@ -464,8 +483,9 @@ class MicrobatchEngine:
                 raise CommitError("aligned expansion reporters are incomplete")
             if expansion in self._state.expansions:
                 raise CommitError("Expansion has already been published")
-        # 至此所有 report/expansion/cardinality 均已验证；后续 publication
-        # 对状态机而言是一个不可分割的逻辑 turn。
+        # Mutation frontier: all report, control, Expansion and cardinality
+        # checks are complete. Everything below is one indivisible semantic
+        # turn from the state machine's perspective.
         self._dispatch.seal(grain, report.generation)
 
         commits_by_expansion: dict[
@@ -476,6 +496,8 @@ class MicrobatchEngine:
                 ExpansionRef(commit.child_domain, grain.entity)
             ].append(commit)
 
+        # Phase 3: publish Expansion -> child Entity -> child/parent Item in
+        # dependency order, then run one fact-propagation fixed point.
         for expansion, commits in commits_by_expansion.items():
             count = len(commits[0].rows)
             children = self._create_children(expansion, count)
@@ -517,6 +539,8 @@ class MicrobatchEngine:
                 control=output.control,
             )
         self.advance()
+
+    # ── Failure/recovery handoff to the sole DispatchState ──────────────
 
     def commit_failure(
         self,
@@ -583,6 +607,8 @@ class MicrobatchEngine:
         self._dispatch.recover_infrastructure(selection)
         return True
 
+    # ── Canonical Item and Expansion publication gateways ───────────────
+
     def _publish_item(
         self,
         item: ItemRef,
@@ -592,6 +618,12 @@ class MicrobatchEngine:
         cause: object | None = None,
         control: bool | None = None,
     ) -> None:
+        """Monotonically publish one Item and enqueue its identity once.
+
+        Outcome, binding, cause and control are committed together here; the
+        FIFO carries only ItemRef and therefore never becomes a second truth.
+        """
+
         existing = self._state.items.get(item)
         record = ItemRecord(outcome, cause, control)
         if existing is not None:
@@ -644,6 +676,8 @@ class MicrobatchEngine:
             return
         self._state.expansions[expansion] = record
         self._facts.append(expansion)
+
+    # ── Call input algebra and structural Effect interpreters ───────────
 
     def _accept_call_input(self, effect: CallInputEffect, item: ItemRef) -> None:
         call = self.plan.call(effect.call)
@@ -727,6 +761,8 @@ class MicrobatchEngine:
             self._publish_expansion(expansion, expansion_outcome, cause=cause)
 
     def _try_filter(self, effect: FilterEffect, entity: EntityRef) -> None:
+        """Publish Filter once both same-Entity inputs determine a terminal result."""
+
         target = ItemRef(effect.target_port, entity)
         if target in self._state.items:
             return
@@ -771,6 +807,8 @@ class MicrobatchEngine:
         )
 
     def _try_reduce(self, effect: ReduceEffect, parent: EntityRef) -> None:
+        """Restore one parent group after Expansion, membership and values settle."""
+
         target = ItemRef(effect.target_port, parent)
         if target in self._state.items:
             return
@@ -819,15 +857,15 @@ class MicrobatchEngine:
         # 最终仍保持一个规范 CSR layout 和一份扁平叶子引用。
         value_depth = effect.value_depth
         if not bindings and value_depth > 0:
-            group_shape = GroupLayout.nest((), child_depth=value_depth)
+            group_layout = GroupLayout.nest((), child_depth=value_depth)
             flat_items = ()
         elif not bindings or all(isinstance(value, RowBinding) for value in bindings):
-            group_shape = GroupLayout.one_level(len(bindings))
+            group_layout = GroupLayout.one_level(len(bindings))
             flat_items = survivor_items
         elif all(isinstance(value, GroupBinding) for value in bindings):
             groups = tuple(value for value in bindings if isinstance(value, GroupBinding))
             depth = groups[0].layout.depth if groups else effect.value_depth
-            group_shape = GroupLayout.nest(
+            group_layout = GroupLayout.nest(
                 tuple(group.layout for group in groups),
                 child_depth=depth,
             )
@@ -840,7 +878,7 @@ class MicrobatchEngine:
         self._publish_item(
             target,
             ItemOutcome.PRESENT,
-            binding=GroupBinding(group_shape, flat_items),
+            binding=GroupBinding(group_layout, flat_items),
         )
 
     def _try_broadcast_from_source(
@@ -882,6 +920,8 @@ class MicrobatchEngine:
             cause=record.cause,
             control=record.control if effect.copy_source_control else None,
         )
+
+    # ── Entity creation and lineage navigation ──────────────────────────
 
     def _create_children(
         self,

@@ -10,7 +10,7 @@ from ....multigrain_v3.benchmark.video.caption_v3 import (
 )
 from ....multigrain_v3.benchmark.video.v3 import DecodeFrames
 from ... import F, Executor, Pipeline, Port, RayModule, RecoveryPolicy
-from ...executor import RunResult
+from ... import RunResult
 
 
 class VideoCaptionV36Pipeline(Pipeline):

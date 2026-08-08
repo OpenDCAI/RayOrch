@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, TypeAlias
 
-from .model import CallRef, DomainRef, InputMode, PortRef
+from ..model import CallRef, DomainRef, InputMode, PortRef
 
 
 @dataclass(frozen=True, slots=True)

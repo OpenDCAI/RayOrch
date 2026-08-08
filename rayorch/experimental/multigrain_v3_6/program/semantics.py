@@ -19,7 +19,7 @@ from .logical import (
     PortOrigin,
     SourceOrigin,
 )
-from .model import CallRef, PortRef
+from ..model import CallRef, PortRef
 
 
 class PrimitiveKind(Enum):

@@ -13,7 +13,7 @@ from ....multigrain_v3.benchmark.video.multimodal_v3 import (
 )
 from ....multigrain_v3.benchmark.video.v3 import DecodeFrames, TransformFrames
 from ... import F, Executor, Pipeline, Port, RayModule, RecoveryPolicy
-from ...executor import RunResult
+from ... import RunResult
 
 
 class VideoMultimodalV36Pipeline(Pipeline):

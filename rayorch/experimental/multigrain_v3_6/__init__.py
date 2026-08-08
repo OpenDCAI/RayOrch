@@ -2,14 +2,15 @@
 
 from . import functional as F
 from .api import Pipeline, Port, RayModule, function
-from .executor import Executor, RunResult
+from .execution.executor import Executor
+from .execution.result import RunResult
 from .model import (
     CompileError,
     ExecutionError,
     ItemOutcome,
     MISSING,
 )
-from .plan import CompiledProgram
+from .program.plan import CompiledProgram
 from .protocol import RecordFailure
 from .recovery import RecoveryPolicy
 

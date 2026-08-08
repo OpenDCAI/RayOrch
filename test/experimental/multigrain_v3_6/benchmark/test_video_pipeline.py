@@ -32,7 +32,7 @@ from rayorch.experimental.multigrain_v3_6.benchmark.video import audit
 from rayorch.experimental.multigrain_v3_6.benchmark.video import paired
 from rayorch.experimental.multigrain_v3_6.benchmark.video import kinetics50
 from rayorch.experimental.multigrain_v3_6.benchmark.video import model_paired
-from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin, ReduceOrigin
+from rayorch.experimental.multigrain_v3_6.program.logical import ExpandOrigin, ReduceOrigin
 
 
 def _fake_v36_result(outputs, *, rpc_count: int, grains: int):

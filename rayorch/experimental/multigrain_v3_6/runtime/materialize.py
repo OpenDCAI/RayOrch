@@ -8,11 +8,11 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from .model import ItemOutcome, ItemRef, PortRef
-from .plan import RuntimePlan
-from .protocol import RowBinding, restore_group
-from .runtime.engine import MicrobatchEngine
-from .runtime.state import GroupBinding
+from ..model import ItemOutcome, ItemRef, PortRef
+from ..program.plan import RuntimePlan
+from ..protocol import RowBinding, restore_group
+from .engine import MicrobatchEngine
+from .state import GroupBinding
 
 
 class ReadableStore(Protocol):

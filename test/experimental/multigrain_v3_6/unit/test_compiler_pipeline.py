@@ -10,8 +10,13 @@ from typing import get_args
 import pytest
 
 import rayorch.experimental.multigrain_v3_6 as mg
-from rayorch.experimental.multigrain_v3_6 import compiler
-from rayorch.experimental.multigrain_v3_6.logical import (
+from rayorch.experimental.multigrain_v3_6.program import (
+    analysis,
+    compiler,
+    lowering,
+    verify,
+)
+from rayorch.experimental.multigrain_v3_6.program.logical import (
     BroadcastOrigin,
     CallOutputOrigin,
     DomainSpec,
@@ -23,8 +28,8 @@ from rayorch.experimental.multigrain_v3_6.logical import (
     PortSpec,
     SourceOrigin,
 )
-from rayorch.experimental.multigrain_v3_6.compiler import compile_logical
-from rayorch.experimental.multigrain_v3_6.logical import freeze_mapping
+from rayorch.experimental.multigrain_v3_6.program.compiler import compile_logical
+from rayorch.experimental.multigrain_v3_6.program.logical import freeze_mapping
 from rayorch.experimental.multigrain_v3_6.model import (
     CallRef,
     CompileError,
@@ -33,14 +38,14 @@ from rayorch.experimental.multigrain_v3_6.model import (
     ItemRef,
     PortRef,
 )
-from rayorch.experimental.multigrain_v3_6.plan import (
+from rayorch.experimental.multigrain_v3_6.program.plan import (
     BroadcastEffect,
     FilterEffect,
     ReduceEffect,
 )
 from rayorch.experimental.multigrain_v3_6.runtime import engine
 from rayorch.experimental.multigrain_v3_6.runtime.state import ExpansionRef
-from rayorch.experimental.multigrain_v3_6.semantics import (
+from rayorch.experimental.multigrain_v3_6.program.semantics import (
     PrimitiveKind,
     describe_origin,
 )
@@ -113,7 +118,6 @@ def test_engine_has_one_closed_fact_propagation_entry():
     assert set(get_args(engine._FactEvent)) == {ItemRef, ExpansionRef, EntityRef}
     assert source.count("self._facts.append(") == 3
     assert "_receipts" not in source
-    assert "_shape_terminal" not in source
     assert "groups_by_child_domain" not in source
     assert "broadcasts_by_target_domain" not in source
 
@@ -141,12 +145,15 @@ def test_dispatch_state_is_the_only_grain_execution_state_writer():
     assert writers == {Path("runtime/dispatch.py")}
     assert transition_users == {
         Path("runtime/dispatch.py"),
-        Path("transitions.py"),
+        Path("runtime/transitions.py"),
     }
 
 
 def test_compiler_only_decodes_concrete_origins_through_semantic_descriptor():
-    source = inspect.getsource(compiler)
+    source = "\n".join(
+        inspect.getsource(module)
+        for module in (analysis, compiler, lowering, verify)
+    )
     for origin_type in get_args(PortOrigin):
         assert origin_type.__name__ not in source
 

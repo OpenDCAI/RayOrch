@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 import rayorch.experimental.multigrain_v3_6 as mg
-from rayorch.experimental.multigrain_v3_6.executor import Executor
-from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin
-from rayorch.experimental.multigrain_v3_6.materialize import materialize_tree
+from rayorch.experimental.multigrain_v3_6.execution.executor import Executor
+from rayorch.experimental.multigrain_v3_6.program.logical import ExpandOrigin
+from rayorch.experimental.multigrain_v3_6.runtime.materialize import materialize_tree
 from rayorch.experimental.multigrain_v3_6.model import (
     CallRef,
     DomainRef,
@@ -21,7 +21,7 @@ from rayorch.experimental.multigrain_v3_6.model import (
     PortRef,
     ExpansionOutcome,
 )
-from rayorch.experimental.multigrain_v3_6.plan import BroadcastEffect, ReduceEffect
+from rayorch.experimental.multigrain_v3_6.program.plan import BroadcastEffect, ReduceEffect
 from rayorch.experimental.multigrain_v3_6.protocol import (
     BlockRef,
     GrainReport,
@@ -41,7 +41,7 @@ from rayorch.experimental.multigrain_v3_6.runtime.state import (
     GroupBinding,
     ExpansionRef,
 )
-from rayorch.experimental.multigrain_v3_6.worker import (
+from rayorch.experimental.multigrain_v3_6.execution.worker import (
     Worker,
     WorkerContractError,
     WorkerSnapshot,
@@ -582,7 +582,7 @@ def test_group_fact_order_reaches_the_same_fixed_point():
     assert effect.value_port == effect.members_port
     binding = RowBinding(BlockRef("value"), 0)
 
-    def reach_fixed_point(*, shape_first: bool):
+    def reach_fixed_point(*, expansion_first: bool):
         engine = MicrobatchEngine(plan)
         root = EntityRef(plan.port_domain(effect.target_port), 0)
         child = EntityRef(effect.child_domain, 0)
@@ -593,7 +593,7 @@ def test_group_fact_order_reaches_the_same_fixed_point():
         engine._publish_entity(child, EntityParent(root, 0))
         engine.advance()
 
-        if shape_first:
+        if expansion_first:
             engine._publish_expansion(
                 expansion,
                 ExpansionOutcome.SUCCEEDED,
@@ -625,8 +625,8 @@ def test_group_fact_order_reaches_the_same_fixed_point():
         assert not engine._facts
         return engine.item_outcome(target), group
 
-    assert reach_fixed_point(shape_first=True) == reach_fixed_point(
-        shape_first=False
+    assert reach_fixed_point(expansion_first=True) == reach_fixed_point(
+        expansion_first=False
     )
 
 
@@ -641,6 +641,14 @@ class ExpandReduce(mg.Pipeline):
     def forward(self, values):
         rows = mg.F.expand(self.render(values))
         return mg.F.reduce(rows)
+
+
+def test_progress_summary_uses_expansion_vocabulary():
+    engine = MicrobatchEngine(ExpandReduce().compile().plan)
+
+    assert engine.progress_summary() == (
+        "pending=0, ready=0, grains=0, expansions=0"
+    )
 
 
 def _start_manual():

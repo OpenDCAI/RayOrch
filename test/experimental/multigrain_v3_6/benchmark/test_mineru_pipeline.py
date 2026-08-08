@@ -12,7 +12,7 @@ from rayorch.experimental.multigrain_v3_6.benchmark.mineru import (
     MinerUV36Pipeline,
     build_parser,
 )
-from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin, ReduceOrigin
+from rayorch.experimental.multigrain_v3_6.program.logical import ExpandOrigin, ReduceOrigin
 
 
 def _pipeline(mode: str = "elastic") -> MinerUV36Pipeline:

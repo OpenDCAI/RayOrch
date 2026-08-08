@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 import rayorch.experimental.multigrain_v3_6 as mg
-from rayorch.experimental.multigrain_v3_6.executor import Executor, _RayWorkerActor
+from rayorch.experimental.multigrain_v3_6.execution.executor import Executor
+from rayorch.experimental.multigrain_v3_6.execution.ray_backend import _RayWorkerActor
 from rayorch.experimental.multigrain_v3_6.model import ItemOutcome
 from rayorch.experimental.multigrain_v3_6.protocol import RecordFailure
 

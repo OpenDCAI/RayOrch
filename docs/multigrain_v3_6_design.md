@@ -1,7 +1,11 @@
 # MultiGrain v3.6：封闭状态机与无飞线语义
 
-面向新使用者和维护者的逐步教程见
-[`multigrain_v3_6_tutorial.md`](multigrain_v3_6_tutorial.md)。
+> **文档生态位：规范性的状态机与结构语义合同。** review 新行为时按需查阅；第一次学习请走
+> [`V3.6 文档地图`](multigrain_v3_6_documentation_map.md)给出的顺序，不需要从本文开始。
+
+顺序学习路径见
+[`multigrain_v3_6_getting_started.md`](multigrain_v3_6_getting_started.md)；跨组件维护合同见
+[`multigrain_v3_6_maintainer_guide.md`](multigrain_v3_6_maintainer_guide.md)。
 
 ## 1. 目标与边界
 
@@ -41,6 +45,12 @@ flowchart LR
     TF --> RS
     TF --> DS
 ```
+
+源码目录直接反映这个边界：`program/` 只保存和编译静态 Program，
+`runtime/` 只管单个 microbatch 的动态事实，`execution/` 才持有 Ray actor、
+RPC 和 Worker。根部 `model.py` / `protocol.py` / `recovery.py` 是各层共享的
+Ray-free 合同；依赖门禁测试防止 Program 反向导入 runtime/execution，也防止
+runtime 绕过 RuntimePlan 回读 compiler internals。
 
 四类动态事实分别是：
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Mapping, TypeAlias
 
 from .logical import LogicalProgram
-from .model import CallRef, CompileError, DomainRef, PortRef
+from ..model import CallRef, CompileError, DomainRef, PortRef
 from .semantics import InputRole, PrimitiveKind, PrimitiveSemantics, describe_origin
 
 

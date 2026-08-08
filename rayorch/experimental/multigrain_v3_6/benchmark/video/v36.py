@@ -15,7 +15,7 @@ from ....multigrain_v3.benchmark.video.v3 import (
     TransformFrames,
 )
 from ... import F, Executor, Pipeline, Port, RayModule, RecoveryPolicy
-from ...executor import RunResult
+from ... import RunResult
 
 
 class VideoV36Pipeline(Pipeline):

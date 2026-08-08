@@ -99,7 +99,7 @@ class GroupLayout:
 
     @classmethod
     def nest(cls, children: tuple[GroupLayout, ...], *, child_depth: int) -> GroupLayout:
-        """把同深度 child shapes 拼成更高一级；空 group 也保留完整层数。"""
+        """把同深度 child layouts 拼成更高一级；空 group 也保留完整层数。"""
 
         if child_depth <= 0:
             raise ValueError("child_depth must be positive")

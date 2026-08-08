@@ -1,7 +1,7 @@
 """基于 Ray actor pools 的 v3.6 执行器与多 microbatch driver。
 
 逻辑 Program、MicrobatchEngine 状态机和 Worker ABI 均不依赖 Ray；本模块是唯一持有
-actor handle 与 ObjectRef 的适配层。不同 microbatch 共享 actor capacity，但一个 RPC
+actor handle 与 pending RPC ObjectRef 的 driver。不同 microbatch 共享 actor capacity，但一个 RPC
 不会静默混合多个 microbatch 的 Grain，从而保持与设计文档一致的实验口径。
 """
 
@@ -11,100 +11,23 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, cast
 
-from .api import Pipeline
-from .materialize import materialize_tree
-from .model import CallRef, ExecutionError
-from .plan import ActorPoolSpec, CompiledProgram
-from .protocol import (
-    BlockRef,
+from ..api import Pipeline
+from ..runtime.materialize import materialize_tree
+from ..model import CallRef, ExecutionError
+from ..program.plan import ActorPoolSpec, CompiledProgram
+from ..protocol import (
     DispatchFailure,
     DispatchFailureKind,
-    CallInputLayout,
-    GrainPlan,
-    CallOutputLayout,
     RowBinding,
 )
-from .recovery import RecoveryAction
-from .runtime import DispatchBatch, MicrobatchEngine
-from .worker import Worker, WorkerSnapshot
+from ..recovery import RecoveryAction
+from ..runtime import DispatchBatch, MicrobatchEngine
+from .ray_backend import _RayBlockStore, _RayWorkerActor
+from .result import CallMetrics, MicrobatchMetrics, RunResult
+from .worker import WorkerSnapshot
 
 
-class _RayBlockStore:
-    """只负责 ObjectRef 与块内行之间的物理映射，不解释业务值。"""
-
-    def __init__(self, ray_module: Any) -> None:
-        self._ray = ray_module
-        self._cache: dict[Any, tuple[Any, ...]] = {}
-
-    def clear_cache(self) -> None:
-        """清空已解引用 payload cache；BlockRef 生命周期由 microbatch 持有。"""
-
-        self._cache.clear()
-
-    def put(self, values: tuple[Any, ...]) -> BlockRef:
-        """把一列批输出作为一个粗粒度块写入 object store。"""
-
-        return BlockRef(self._ray.put(tuple(values)))
-
-    def get(self, binding: RowBinding) -> Any:
-        """只在 Worker 或最终结果交付时读取一行 payload。"""
-
-        block = binding.block
-        if not isinstance(block, BlockRef):
-            raise TypeError(f"_RayBlockStore received non-Ray block: {block!r}")
-        payload = block.handle
-        # 同一粗块往往服务一个 batch 的很多 RowBinding；每批只 ray.get 一次。
-        if isinstance(payload, self._ray.ObjectRef):
-            if payload not in self._cache:
-                self._cache[payload] = self._ray.get(payload)
-            payload = self._cache[payload]
-        return payload[binding.row]
-
-
-class _RayWorkerActor:
-    """Ray 壳层：持久化一个 Worker，并复用完全相同的 Worker ABI。"""
-
-    def __init__(
-        self,
-        target: Any,
-        init_args: tuple[Any, ...],
-        init_kwargs: tuple[tuple[str, Any], ...],
-        input_layout: CallInputLayout,
-    ) -> None:
-        import ray  # pyright: ignore[reportMissingImports]
-
-        self._store = _RayBlockStore(ray)
-        self._worker = Worker(
-            target,
-            init_args,
-            init_kwargs,
-            input_layout=input_layout,
-        )
-
-    def ready(self) -> bool:
-        """在 UDF 构造完成后响应，用作初始 actor pool 启动屏障。"""
-
-        return True
-
-    def execute(
-        self,
-        grain_plans: tuple[GrainPlan, ...],
-        layouts: tuple[CallOutputLayout, ...],
-    ):
-        """执行一批、一次返回；actor 不读取 Program 或 MicrobatchEngine。"""
-
-        self._store.clear_cache()
-        try:
-            return self._worker.execute(grain_plans, layouts, self._store)
-        finally:
-            # actor 不跨 RPC 持有输入 blocks；输出 blocks 由返回的 RowBinding
-            # 进入 driver/microbatch 生命周期管理。
-            self._store.clear_cache()
-
-    def observe(self) -> WorkerSnapshot:
-        """Expose one observation-only snapshot without leaking the UDF."""
-
-        return self._worker.observe()
+# ── Driver-local mutable counters and physical ownership records ─────────────
 
 
 @dataclass(slots=True)
@@ -116,67 +39,6 @@ class _CallCounters:
     grains: int = 0
     retries: int = 0
     batch_sizes: list[int] = field(default_factory=list)
-
-
-@dataclass(frozen=True, slots=True)
-class CallMetrics:
-    """一个 Call 的 run-local、不可变物理统计快照。"""
-
-    call_index: int
-    udf_name: str
-    actor_instances: int
-    rpcs: int
-    grains: int
-    retries: int
-    batch_sizes: tuple[int, ...]
-    worker_snapshots: tuple[WorkerSnapshot, ...]
-
-    @property
-    def average_batch(self) -> float:
-        """每个 RPC 的平均 Grain 数。"""
-
-        return self.grains / self.rpcs if self.rpcs else 0.0
-
-
-@dataclass(frozen=True, slots=True)
-class RunResult:
-    """有序输出与不泄露运行时可变对象的审计快照。"""
-
-    outputs: object
-    elapsed_s: float
-    calls: tuple[CallMetrics, ...]
-    microbatches: tuple[MicrobatchMetrics, ...]
-    peak_active_microbatches: int
-
-    @property
-    def rpc_count(self) -> int:
-        """全部 Call 的实际 actor RPC 数。"""
-
-        return sum(metrics.rpcs for metrics in self.calls)
-
-    @property
-    def actor_count(self) -> int:
-        """本轮可用及 replacement 后参与执行的 actor 实例数。"""
-
-        return sum(metrics.actor_instances for metrics in self.calls)
-
-    @property
-    def released_values(self) -> int:
-        """全部 microbatch 完成交付后释放的 ValueBinding 数。"""
-
-        return sum(metrics.released_values for metrics in self.microbatches)
-
-
-@dataclass(frozen=True, slots=True)
-class MicrobatchMetrics:
-    """一个已完成 source microbatch 的只读语义规模快照。"""
-
-    index: int
-    entity_count: int
-    item_count: int
-    expansion_count: int
-    grain_count: int
-    released_values: int
 
 
 @dataclass(slots=True)
@@ -206,7 +68,11 @@ class _DispatchLease:
 
 
 class Executor:
-    """Call-only actor pools 与多 microbatch overlap 的参考执行器。"""
+    """Call-only actor pools 与多 microbatch overlap 的参考执行器。
+
+    Executor 独占 actor capacity、pending RPC lease 和 run-local counters；
+    primitive 传播、Entity lineage 与 Grain phase 仍分别归 Engine/DispatchState。
+    """
 
     def __init__(
         self,
@@ -254,6 +120,8 @@ class Executor:
             self.close()
             raise
 
+    # ── Public run/close lifecycle ───────────────────────────────────────
+
     def run(
         self,
         *source_columns: Iterable[Any],
@@ -295,6 +163,11 @@ class Executor:
         high_watermark = 0
         started = time.perf_counter()
 
+        # Event-loop invariants:
+        # 1. active[index] uniquely owns that microbatch's Engine;
+        # 2. every pending ObjectRef maps to exactly one fenced lease;
+        # 3. a busy actor has one such lease and is released in finally;
+        # 4. materialization requires both no pending lease and Engine complete.
         while len(completed) < len(slices):
             while (
                 next_microbatch < len(slices)
@@ -401,6 +274,8 @@ class Executor:
             self.ray.shutdown()
         self._closed = True
 
+    # ── Observation and immutable result snapshots ──────────────────────
+
     def _observe_workers(self) -> dict[CallRef, tuple[WorkerSnapshot, ...]]:
         """Best-effort physical diagnostics must not invalidate business output."""
 
@@ -480,6 +355,8 @@ class Executor:
 
         self.close()
 
+    # ── Source admission and work-conserving dispatch ───────────────────
+
     def _normalize_sources(
         self,
         source_columns: tuple[Iterable[Any], ...],
@@ -556,6 +433,8 @@ class Executor:
                 counters.rpcs += 1
                 counters.grains += len(batch.grains)
                 counters.batch_sizes.append(len(batch.grains))
+
+    # ── Typed failure classification and recovery handoff ───────────────
 
     def _handle_dispatch_failure(
         self,
@@ -638,6 +517,8 @@ class Executor:
             f"Call {call.value} ({name}) dispatch failed for [{grains}]\n{detail}"
         )
 
+    # ── Actor-pool lifecycle and small pure helpers ─────────────────────
+
     def _create_pool(self, call: CallRef) -> None:
         """只为 Call 创建 pool；Port 结构关系没有对应入口。"""
 
@@ -696,8 +577,5 @@ class Executor:
 
 
 __all__ = [
-    "CallMetrics",
     "Executor",
-    "MicrobatchMetrics",
-    "RunResult",
 ]

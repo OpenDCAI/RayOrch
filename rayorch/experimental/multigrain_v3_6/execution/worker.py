@@ -7,8 +7,8 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .model import MISSING
-from .protocol import (
+from ..model import MISSING
+from ..protocol import (
     BlockRef,
     GrainFailureReport,
     GrainReport,

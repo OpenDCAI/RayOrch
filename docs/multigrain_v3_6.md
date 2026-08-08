@@ -1,10 +1,16 @@
 # MultiGrain v3.6：静态语义编译边界
 
+> **文档生态位：compiler 的设计理由与能力边界。** 本文是按问题查阅的设计说明，不是零基础
+> 教程，也不描述 Ray event loop。全部阅读路线见
+> [`V3.6 文档地图`](multigrain_v3_6_documentation_map.md)。
+
 动态状态机收敛合同见
 [`multigrain_v3_6_design.md`](multigrain_v3_6_design.md)。v3.6 删除输入 driver，
 并以可穷举 transition algebra 统一 F.*、Grain、Item 与 Expansion 的运行时语义。
-第一次阅读或准备维护源码时，建议从
-[`multigrain_v3_6_tutorial.md`](multigrain_v3_6_tutorial.md) 开始。
+第一次接触 V3.6 时，建议先读精简的
+[`multigrain_v3_6_getting_started.md`](multigrain_v3_6_getting_started.md)；准备深入维护时，
+再读 [`multigrain_v3_6_maintainer_guide.md`](multigrain_v3_6_maintainer_guide.md)，并按需进入
+[`复杂源码导读`](multigrain_v3_6_walkthrough/README.md)。
 
 ## 1. 结论
 
@@ -61,6 +67,11 @@ flowchart LR
 `RuntimePlan` 会复制运行时真正需要的静态事实。`MicrobatchEngine` 不通过
 `CompiledProgram.logical` 回读任何 provenance，也不在构造时重新扫描 Origins
 建立私有索引。
+
+源码以 `program/` 表示静态 Program 编译，`runtime/` 表示动态语义状态机，
+`execution/` 表示 Ray/Worker 物理边界。这不是简单的 static/dynamic 二分：
+`protocol.py` 和 `recovery.py` 作为跨层纯合同保留在根部，避免把 Worker ABI
+或恢复决策硬塞进某一个状态所有者。
 
 ## 3. Primitive 穷尽语义
 
@@ -177,9 +188,10 @@ Ray-free 回归覆盖：
 - optimized/unoptimized Broadcast outcome parity；
 - generation fencing；
 - aligned Expand mismatch 无局部发布。
+- `program / runtime / execution` 的 AST 依赖边界门禁。
 
-当前源码门禁为 109 个 Ray-free tests、14 个真实 Ray integration tests，以及核心
-pyright 0 error。真实 Ray 覆盖空输入、重复 run 的 run-local/lifetime 指标、持久
+已提交的 V3.6 release baseline 门禁为 111 个 Ray-free tests、14 个真实 Ray integration
+tests，以及核心 pyright 0 error。真实 Ray 覆盖空输入、重复 run 的 run-local/lifetime 指标、持久
 actor、多 microbatch、同步构造失败清理、actor crash replacement、同 Grain replay、
 逐记录业务失败、合同错误 fail-fast 和 multi-output 原子失败。
 
@@ -188,3 +200,5 @@ frozen V3.5 快 0.551%，Docling 48 PDF、Video Caption 256 和 Video Multimodal
 相对 V3 分别慢 1.260%、1.990% 和 0.492%；身份/结构合同全部通过。完整配置、均值、
 样本方差、正确性和容量窗口反例见
 [`2026-08-08_release_regression.md`](experiments/multigrain_v3_6/2026-08-08_release_regression.md)。
+后续工作树是否仍处于同一证据范围，应以新门禁为准；当前差距记录在
+[`架构审计待确认项`](todos/22-v36-architecture-audit-findings.md)。

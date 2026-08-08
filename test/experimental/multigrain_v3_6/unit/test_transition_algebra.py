@@ -13,7 +13,7 @@ from rayorch.experimental.multigrain_v3_6.model import (
     ItemOutcome,
     ExpansionOutcome,
 )
-from rayorch.experimental.multigrain_v3_6.transitions import (
+from rayorch.experimental.multigrain_v3_6.runtime.transitions import (
     CallAction,
     FilterCause,
     GrainEvent,

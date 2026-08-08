@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from .model import GrainPhase, InputMode, ItemOutcome, ExpansionOutcome
+from ..model import GrainPhase, InputMode, ItemOutcome, ExpansionOutcome
 
 
 class InvalidTransition(ValueError):

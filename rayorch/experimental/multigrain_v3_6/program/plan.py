@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping, TypeAlias
 
-from .model import CallRef, DomainRef, PortRef
-from .protocol import CallInputLayout, CallOutputLayout
-from .recovery import DEFAULT_RECOVERY_POLICY, RecoveryPolicy
+from ..model import CallRef, DomainRef, PortRef
+from ..protocol import CallInputLayout, CallOutputLayout
+from ..recovery import DEFAULT_RECOVERY_POLICY, RecoveryPolicy
 
 if TYPE_CHECKING:
     from .analysis import ProgramAnalysis
@@ -199,10 +198,6 @@ class CompiledProgram:
         return self.explanation.format()
 
 
-def freeze_mapping(values: Mapping[Any, Any]) -> Mapping[Any, Any]:
-    return MappingProxyType(dict(values))
-
-
 __all__ = [
     "BroadcastEffect",
     "CallInputEffect",
@@ -217,5 +212,4 @@ __all__ = [
     "PortExplanation",
     "RuntimePlan",
     "StructuralEffect",
-    "freeze_mapping",
 ]

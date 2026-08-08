@@ -1,5 +1,9 @@
 # MultiGrain V3.6 真实 workload 发布回归
 
+> **文档生态位：一次可复核的历史实验快照。** 本文证明下述 commit/configuration 的结果，
+> 不是对之后任意工作树的滚动担保。学习和规范文档入口见
+> [`V3.6 文档地图`](../../multigrain_v3_6_documentation_map.md)。
+
 日期：2026-08-08
 结论：通过。V3.6 在冻结配置下未发现系统性性能退化，四项 paired gate 的平均相对变化均在
 ±2% 内，结构与身份合同全部通过。

@@ -17,7 +17,7 @@ from ....multigrain_v3.benchmark.document_docling.core_compare import (
 )
 from ....multigrain_v3.benchmark.document_docling.core_v3 import run_v3
 from ....multigrain_v3.benchmark.document_docling.gpu_monitor import GpuMonitor
-from ...executor import RunResult
+from ... import RunResult
 from ..paired_stats import paired_timing_summary
 from .core_v36 import run_v36
 

@@ -8,8 +8,8 @@ import itertools
 from dataclasses import dataclass
 from typing import Any, Callable, Self, overload
 
-from .compiler import compile_logical
-from .logical import (
+from .program.compiler import compile_logical
+from .program.logical import (
     BroadcastOrigin,
     CallOutputOrigin,
     CallSpec,
@@ -26,7 +26,7 @@ from .logical import (
     freeze_mapping,
 )
 from .model import CallRef, CompileError, DomainRef, InputMode, PortRef
-from .plan import CompiledProgram
+from .program.plan import CompiledProgram
 
 
 @dataclass(frozen=True, slots=True)

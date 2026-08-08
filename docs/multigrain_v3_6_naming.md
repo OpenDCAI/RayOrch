@@ -1,8 +1,14 @@
 # Multigrain V3.6 命名与架构宪法
 
-> 状态：已批准并落地；源码、真实 Ray 与真实性能门禁均已通过。
+> **文档生态位：规范性的词汇、后缀、状态所有权和模块落点。** 本文用于命名/架构 review，
+> 不是顺序教程；全部文档关系见
+> [`V3.6 文档地图`](multigrain_v3_6_documentation_map.md)。
 >
 > 目标：一份语义只使用一个词；名称直接表达所在层级；普通用户不需要理解执行器内部对象。
+>
+> 状态：宪法已批准并落地；已提交 release baseline 通过真实 Ray 与性能门禁。当前未提交目录
+> 重组的精确证据范围见
+> [`架构审计待确认项`](todos/22-v36-architecture-audit-findings.md)。
 
 ## 0. 版本边界
 
@@ -107,8 +113,12 @@ Worker/Engine 类型不再从根包 re-export。
 | 动态 | `GrainRef` | `CallRef × EntityRef` | 哪一次逻辑计算可以被调度？ |
 | 动态 | `ExpansionRef` | `child DomainRef × parent EntityRef` | 一次 Expand 产生了哪些有序 children？ |
 
+如果公式仍然抽象，先看[入门教程 4.2 节的 PDF→Page→OCR 完整例子](multigrain_v3_6_getting_started.md#42-用一条-pdf-流水线逐个理解七种-ref)：
+它把 Port/Entity/Item 分别类比为列、行、单元格，并逐步展示 Item 如何使 Grain 就绪、
+Grain 又如何产生新的 Item。
+
 四种动态身份不得合并：它们的唯一公式、终态和触发的下游 Effect 不同。保留这些
-小型值对象是在消除隐式 driver 和跨组件飞线，而不是制造概念。
+小型值对象是在消除隐式身份所有者和跨组件飞线，而不是制造概念。
 
 ## 3. 架构层级与状态所有权
 
@@ -193,6 +203,12 @@ broadcast_transition
 回调。MicrobatchEngine 只通过 RuntimePlan 的触发索引消费事实并发布新事实。
 
 ### 3.3 唯一写入权
+
+这里的 **publish（发布）** 是状态机术语，准确含义是“让一个运行时事实正式生效”：
+先校验完整记录是否合法，再把它登记到唯一的 canonical table，并在首次登记时把其
+`Ref` 放入事实队列，供 `advance()` 继续传播。它不是网络广播、Ray Object Store
+的 `put()`，也不是向用户暴露数据。之所以不叫普通 `set`，是因为这一步不仅修改字典，
+还建立了“下游现在可以观察并消费这个事实”的状态机边界。
 
 - `MicrobatchEngine._publish_item()` 是 ItemRecord/ValueBinding 的规范发布入口；
 - `MicrobatchEngine._publish_expansion()` 是 ExpansionRecord 的规范发布入口；
@@ -352,7 +368,7 @@ microbatch 已完成，因此不重复保存恒为 true 的 `complete` 字段；
 
 `OptionalInput` 只改变一个 Call 输入的 `InputMode`，不创建 Port。
 
-### `logical.py`
+### `program/logical.py`
 
 | 当前 | 目标 |
 |---|---|
@@ -361,7 +377,7 @@ microbatch 已完成，因此不重复保存恒为 true 的 `complete` 字段；
 | `KernelSpec` | `UdfSpec` |
 | `CallSpec.kernel` | `CallSpec.udf` |
 
-### `semantics.py`
+### `program/semantics.py`
 
 | 当前 | 目标 |
 |---|---|
@@ -369,7 +385,7 @@ microbatch 已完成，因此不重复保存恒为 true 的 `complete` 字段；
 | `GROUP_VALUE` | `REDUCE_VALUE` |
 | `GROUP_MEMBERS` | `REDUCE_MEMBERS` |
 
-### `analysis.py`
+### `program/analysis.py`
 
 | 当前 | 目标 |
 |---|---|
@@ -379,7 +395,7 @@ microbatch 已完成，因此不重复保存恒为 true 的 `complete` 字段；
 `CallUse / PrimitiveUse / LogicalUse` 保留；`Use` 是标准的编译器反向边词汇。
 `group_depth_by_port` 也保留，因为它描述数据嵌套深度，不是 Reduce 原语名称。
 
-### `plan.py`
+### `program/plan.py`
 
 | 当前 | 目标 |
 |---|---|
@@ -405,7 +421,7 @@ RuntimePlan 索引按“触发源”命名：
 
 所有索引必须引用同一份 Effect 对象，不允许重新构造 equal clone。
 
-### `transitions.py`
+### `runtime/transitions.py`
 
 | 当前 | 目标 |
 |---|---|
@@ -480,7 +496,7 @@ expanded Port 的行集合、一个输出 Port 的报告、Worker 报告联合�
 _FactEvent = ItemRef | ExpansionRef | EntityRef
 ```
 
-### `executor.py`
+### `execution/executor.py`
 
 | 当前 | 目标 |
 |---|---|
@@ -499,7 +515,7 @@ _FactEvent = ItemRef | ExpansionRef | EntityRef
 `actor_instances` 表示本轮可用及 replacement 后参与统计的 actor 实例数，不再错误暗示
 所有 persistent actor 都是在本轮启动的。
 
-### `worker.py`
+### `execution/worker.py`
 
 | 当前 | 目标 |
 |---|---|

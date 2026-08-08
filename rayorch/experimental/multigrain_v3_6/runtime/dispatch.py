@@ -9,7 +9,7 @@ from typing import Mapping
 
 from ..model import CallRef, EntityRef, GrainPhase, GrainRef
 from ..recovery import RecoveryAction
-from ..transitions import GrainEvent, grain_transition
+from .transitions import GrainEvent, grain_transition
 from .state import CommitError
 
 

@@ -107,6 +107,14 @@ runtime state algebra is fixed in
 [`docs/multigrain_v3_5_1.md`](docs/multigrain_v3_5_1.md). A step-by-step
 introduction and maintainer guide is available in
 [`docs/multigrain_v3_5_tutorial.md`](docs/multigrain_v3_5_tutorial.md).
+For the breaking V3.6 architecture, first choose a reading path from the
+[`V3.6 documentation map`](docs/multigrain_v3_6_documentation_map.md). The staged
+[`docs/multigrain_v3_6_getting_started.md`](docs/multigrain_v3_6_getting_started.md)
+is the single sequential learning path; then use
+[`docs/multigrain_v3_6_maintainer_guide.md`](docs/multigrain_v3_6_maintainer_guide.md)
+for cross-component contracts and modification discipline. Detailed source walkthroughs
+start at
+[`docs/multigrain_v3_6_walkthrough/README.md`](docs/multigrain_v3_6_walkthrough/README.md).
 
 ## Minimal Example
 

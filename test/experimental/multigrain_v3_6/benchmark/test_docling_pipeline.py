@@ -34,7 +34,7 @@ from rayorch.experimental.multigrain_v3_6.benchmark.document_docling import pair
 from rayorch.experimental.multigrain_v3.benchmark.document_docling.core_compare import (
     CoreMatrixConfig,
 )
-from rayorch.experimental.multigrain_v3_6.logical import ExpandOrigin, ReduceOrigin
+from rayorch.experimental.multigrain_v3_6.program.logical import ExpandOrigin, ReduceOrigin
 
 
 @pytest.mark.parametrize(

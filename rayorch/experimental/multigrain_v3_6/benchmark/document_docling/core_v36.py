@@ -29,7 +29,7 @@ from ....multigrain_v3.benchmark.document_docling.tableformer_v2_batch import (
     DoclingTableFormerV2BatchCore,
 )
 from ... import F, Executor, Pipeline, Port, RayModule, RecoveryPolicy
-from ...executor import RunResult
+from ... import RunResult
 
 
 class DoclingTableJobV36Pipeline(Pipeline):
