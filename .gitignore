@@ -14,5 +14,17 @@ cache*
 
 test/**/*.json
 test/**/*.jpg
-
+results/**
+results/**/*.json
+results/**/*.jpg
+results/**/*.png
+results/**/*.pdf
+results/**/*.doc
+results/**/*.docx
+results/**/*.xls
+results/**/*.xlsx
+results/**/*.ppt
+results/**/*.pptx
+results/**/*.txt
 /*.json
+build/**
