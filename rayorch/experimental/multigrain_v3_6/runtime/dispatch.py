@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
@@ -60,14 +60,20 @@ class DispatchState:
 
     def __init__(self) -> None:
         self._records: dict[GrainRef, GrainRecord] = {}
-        self._normal: deque[_ReadyEntry] = deque()
+        # Normal work is selected by Call.  A single microbatch-wide deque made
+        # every reservation scan READY grains belonging to every other Call;
+        # large fan-out microbatches therefore paid O(total_ready) for each
+        # actor batch.  Per-Call FIFO queues preserve the same ordering and
+        # parent-bound packing semantics while making elastic reservation
+        # O(batch_size).
+        self._normal: dict[CallRef, deque[_ReadyEntry]] = defaultdict(deque)
         self._immediate: deque[DispatchBatch] = deque()
         self._tail: deque[DispatchBatch] = deque()
 
     @property
     def ready_count(self) -> int:
         return (
-            len(self._normal)
+            sum(len(queue) for queue in self._normal.values())
             + sum(len(selection.grains) for selection in self._immediate)
             + sum(len(selection.grains) for selection in self._tail)
         )
@@ -78,7 +84,9 @@ class DispatchState:
 
     @property
     def is_idle(self) -> bool:
-        return not (self._normal or self._immediate or self._tail)
+        return not (
+            any(self._normal.values()) or self._immediate or self._tail
+        )
 
     @property
     def all_sealed(self) -> bool:
@@ -118,7 +126,7 @@ class DispatchState:
         """Create one READY Grain and enqueue it exactly once."""
 
         self._create(grain, GrainEvent.INPUTS_READY)
-        self._normal.append(_ReadyEntry(grain, batch_key))
+        self._normal[grain.call].append(_ReadyEntry(grain, batch_key))
 
     def inputs_terminal(self, grain: GrainRef) -> None:
         """Create one dependency-terminal Grain directly as SEALED."""
@@ -139,10 +147,7 @@ class DispatchState:
 
         if any(item.grains[0].call == call for item in self._immediate):
             return 0
-        if any(
-            entry.grain.call == call and self._is_ready(entry.grain)
-            for entry in self._normal
-        ):
+        if self._normal.get(call):
             return 1
         if any(item.grains[0].call == call for item in self._tail):
             return 2
@@ -181,26 +186,47 @@ class DispatchState:
     ) -> tuple[GrainRef, ...]:
         if max_size <= 0:
             raise ValueError("max_size must be positive")
+        queue = self._normal.get(call)
+        if not queue:
+            return ()
+
         selected: list[GrainRef] = []
+        if not parent_bound:
+            while queue and len(selected) < max_size:
+                entry = queue.popleft()
+                if not self._is_ready(entry.grain):
+                    continue
+                self._reserve_exact((entry.grain,))
+                selected.append(entry.grain)
+            if not queue:
+                self._normal.pop(call, None)
+            return tuple(selected)
+
+        # parent_bound must retain the historical behavior: choose the first
+        # ready parent, collect up to max_size siblings from the whole Call
+        # queue, and preserve the relative order of every unselected entry.
         remaining: deque[_ReadyEntry] = deque()
         parent: EntityRef | None = None
-        while self._normal:
-            entry = self._normal.popleft()
+        while queue:
+            entry = queue.popleft()
             grain = entry.grain
             if not self._is_ready(grain):
                 continue
-            if grain.call != call or len(selected) >= max_size:
+            if len(selected) >= max_size:
                 remaining.append(entry)
                 continue
             candidate_parent = entry.batch_key
-            if parent_bound and parent is not None and candidate_parent != parent:
+            if parent is not None and candidate_parent != parent:
                 remaining.append(entry)
                 continue
             if parent is None:
                 parent = candidate_parent
             self._reserve_exact((grain,))
             selected.append(grain)
-        self._normal = remaining
+        if remaining:
+            self._normal[call] = remaining
+        else:
+            self._normal.pop(call, None)
         return tuple(selected)
 
     def _reserve_recovery(

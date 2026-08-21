@@ -85,6 +85,55 @@ WAITING → READY → IN_FLIGHT → SEALED
                IN_FLIGHT → READY  (recovery, generation + 1)
 ```
 
+### READY queue 分区与 driver backpressure
+
+`DispatchState` 的 normal queue 只属于一个 microbatch，但其中可能同时存在多个
+Call 的 READY Grain。旧实现把它们放在一个共享 `deque` 中；Executor 为某个 Call
+选择 actor batch 时，`priority(call)` 需要线性寻找属于该 Call 的 Grain，
+`reserve(call)` 则扫描并重建整个 deque。即使已经选满 `batch_size`，仍必须访问
+剩余 entry，才能保留其他 Call 和未选 Grain 的顺序。
+
+设当前共享队列有 `N` 个 READY entry，目标 Call 有 `n` 个，batch size 为 `B`：
+
+- 一次 `priority(call)` 最坏为 `O(N)`；
+- 一次 elastic reservation 为 `O(N)`，而不是 `O(B)`；
+- 仅排空目标 Call 的 backlog 就需要扫描
+  `n + (n - B) + (n - 2B) + ... = O(n² / B)`；
+- 若期间还有 `m` 个其他 Call entry 留在队列中，还会额外访问约
+  `ceil(n / B) × m` 次。
+
+这个成本位于单线程 driver 的串行关键路径，而不是 Ray CPU actor 中。Executor
+提交下一批 RPC 前，要在所有 active microbatches 中查询 READY work，再按 Call
+遍历空闲 actor。一个较大的 CPU Call 队列因此可以在轮到 GPU Call 之前制造
+head-of-line blocking。GPU actor 虽然仍持有 GPU resource，上一批结束后却收不到
+新的 `execute.remote()`，表现为 GPU 已分配但 utilization 下降。更多 CPU replicas
+不会并行化这段 driver-local 状态机，反而会增加一次 refill 需要服务的 actor 数。
+
+当前实现按 `CallRef` 保存独立 normal FIFO：
+
+```text
+normal: CallRef -> deque[ReadyEntry]
+```
+
+因此 `priority(call)` 对 normal work 是 `O(1)`；elastic reservation 只从目标
+deque 弹出最多 `B` 个 Grain，为 `O(B)`，排空一个 Call 总计 `O(n)`。不同 Call
+之间本来就没有可观察的 dequeue 顺序，per-Call FIFO 等价于旧共享 FIFO 在该 Call
+上的稳定投影。`parent_bound` 仍可能扫描目标 Call 队列以收集同 parent Grain，但
+不再访问其他 Call，并保持所有未选 Grain 的相对 FIFO 顺序。immediate 与 tail
+recovery queues 保持独立，优先级仍为 immediate → normal → tail。
+
+真实 `GrainRef` 的缩小 microbenchmark 包含 5,536 个 READY entry：共享 deque
+为排空各 Call 访问 3,023,296 个 entry、耗时 2.735 秒；per-Call deque 只访问
+5,536 个 entry、耗时 7.65 毫秒。该结果说明热点来自重复的嵌套 Ref hash、字典查询
+与 deque 重建，而不是一次简单的短循环。
+
+在同模型、数据和 batch 参数的 64×H20 四帧视频任务中，旧实现最佳连续 60 秒
+GPU utilization 均值为 73.20%，per-Call queue 的连续 60 秒均值为 97.73%。该
+配置下 decode 实测供给约 1,191 clips/s，而 64 个 fused teacher actors 满载只需
+约 184 clips/s，因此结果与 driver refill 而非 HDFS 吞吐成为主要瓶颈一致。这里的
+utilization 是 workload evidence，不属于运行时语义合同；正确性仍由 Call FIFO、
+`parent_bound` 和 recovery queue 测试独立保证。
+
 Expansion 必须独立存在，因为“尚无 child”可能是未决、成功展开为空、drop 或失败。
 终态为 `SUCCEEDED(children)`、`DROPPED`、`FAILED`；cardinality 只由
 `len(children)` 派生，不维护第二份数字事实。
