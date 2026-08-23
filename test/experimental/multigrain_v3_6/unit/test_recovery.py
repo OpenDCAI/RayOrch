@@ -33,6 +33,73 @@ def _grains(count: int) -> tuple[GrainRef, ...]:
     )
 
 
+def test_normal_queues_preserve_call_fifo_and_do_not_scan_other_calls():
+    dispatch = DispatchState()
+    domain = DomainRef(0)
+    first_call = CallRef(0)
+    second_call = CallRef(1)
+    first = tuple(
+        GrainRef(first_call, EntityRef(domain, ordinal))
+        for ordinal in range(2_000)
+    )
+    second = tuple(
+        GrainRef(second_call, EntityRef(domain, 2_000 + ordinal))
+        for ordinal in range(8)
+    )
+    for grain in (*first, *second):
+        dispatch.inputs_ready(grain, grain.entity)
+
+    original_is_ready = dispatch._is_ready
+    visits = 0
+
+    def counted_is_ready(grain):
+        nonlocal visits
+        visits += 1
+        return original_is_ready(grain)
+
+    dispatch._is_ready = counted_is_ready
+    selected = dispatch.reserve(
+        second_call,
+        max_size=4,
+        parent_bound=False,
+    )
+
+    assert selected is not None
+    assert selected.grains == second[:4]
+    assert visits == 4
+    assert dispatch.ready_count == 2_004
+    assert dispatch.priority(first_call) == 1
+    assert dispatch.priority(second_call) == 1
+
+
+def test_parent_bound_queue_preserves_parent_and_relative_fifo_order():
+    dispatch = DispatchState()
+    call = CallRef(0)
+    child_domain = DomainRef(1)
+    parent_domain = DomainRef(0)
+    grains = tuple(
+        GrainRef(call, EntityRef(child_domain, ordinal))
+        for ordinal in range(4)
+    )
+    parents = (
+        EntityRef(parent_domain, 0),
+        EntityRef(parent_domain, 1),
+        EntityRef(parent_domain, 0),
+        EntityRef(parent_domain, 1),
+    )
+    for grain, parent in zip(grains, parents):
+        dispatch.inputs_ready(grain, parent)
+
+    first = dispatch.reserve(call, max_size=3, parent_bound=True)
+    second = dispatch.reserve(call, max_size=3, parent_bound=True)
+
+    assert first is not None
+    assert second is not None
+    assert first.grains == (grains[0], grains[2])
+    assert second.grains == (grains[1], grains[3])
+    assert dispatch.ready_count == 0
+
+
 def test_dispatch_snapshots_do_not_leak_mutable_grain_authority():
     grain = _grains(1)[0]
     state = DispatchState()
