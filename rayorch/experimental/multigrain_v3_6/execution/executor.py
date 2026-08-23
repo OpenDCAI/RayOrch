@@ -8,8 +8,9 @@ actor handle 与 pending RPC ObjectRef 的 driver。不同 microbatch 共享 act
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Iterable, cast
+from typing import Any, cast
 
 from ..api import Pipeline
 from ..runtime.materialize import materialize_tree
@@ -124,11 +125,11 @@ class Executor:
 
     def run(
         self,
-        *source_columns: Iterable[Any],
+        *source_columns: Sequence[Any],
         microbatch_size: int | None = None,
         max_active_microbatches: int = 1,
     ) -> RunResult:
-        """执行行对齐 sources，并限制同时活跃的 source microbatch 数。"""
+        """执行行对齐的有限 Sequences，并限制同时活跃的 microbatch 数。"""
 
         if self._closed:
             raise RuntimeError("Executor is closed")
@@ -160,6 +161,7 @@ class Executor:
         completed: dict[int, object] = {}
         pending: dict[Any, _DispatchLease] = {}
         next_microbatch = 0
+        execution_started = False
         high_watermark = 0
         started = time.perf_counter()
 
@@ -168,99 +170,112 @@ class Executor:
         # 2. every pending ObjectRef maps to exactly one fenced lease;
         # 3. a busy actor has one such lease and is released in finally;
         # 4. materialization requires both no pending lease and Engine complete.
-        while len(completed) < len(slices):
-            while (
-                next_microbatch < len(slices)
-                and len(active) < max_active_microbatches
-            ):
-                engine = self._admit_microbatch(slices[next_microbatch])
-                active[next_microbatch] = _MicrobatchSlot(
-                    next_microbatch,
-                    engine,
-                )
-                next_microbatch += 1
-                high_watermark = max(high_watermark, len(active))
-
-            self._dispatch_ready(active, pending)
-
-            # 只有没有 pending lease 的 microbatch 才能离开 active 集合。
-            pending_microbatches = {
-                lease.microbatch_index for lease in pending.values()
-            }
-            for index, slot in tuple(active.items()):
-                if (
-                    index not in pending_microbatches
-                    and slot.engine.is_complete()
+        try:
+            while len(completed) < len(slices):
+                while (
+                    next_microbatch < len(slices)
+                    and len(active) < max_active_microbatches
                 ):
-                    completed[index] = materialize_tree(
-                        self.plan,
-                        slot.engine,
-                        self.store,
+                    execution_started = True
+                    engine = self._admit_microbatch(slices[next_microbatch])
+                    active[next_microbatch] = _MicrobatchSlot(
+                        next_microbatch,
+                        engine,
                     )
-                    # materialize 已把最终业务对象复制到 driver output；cache
-                    # 只用于一次粗块去重，不能把所有 microbatch 的 payload 留到 run 结束。
-                    self.store.clear_cache()
-                    # 最终业务值已经复制到 driver 输出；清空 ValueTable 会释放
-                    # page-image 等 ObjectRef；结果只保留不可变计数快照。
-                    released = slot.engine.release_values()
-                    metrics_by_microbatch[index] = MicrobatchMetrics(
-                        index=index,
-                        entity_count=slot.engine.entity_count,
-                        item_count=slot.engine.item_count,
-                        expansion_count=slot.engine.expansion_count,
-                        grain_count=slot.engine.grain_count,
-                        released_values=released,
+                    next_microbatch += 1
+                    high_watermark = max(high_watermark, len(active))
+
+                self._dispatch_ready(active, pending)
+
+                # 只有没有 pending lease 的 microbatch 才能离开 active 集合。
+                pending_microbatches = {
+                    lease.microbatch_index for lease in pending.values()
+                }
+                for index, slot in tuple(active.items()):
+                    if (
+                        index not in pending_microbatches
+                        and slot.engine.is_complete()
+                    ):
+                        completed[index] = materialize_tree(
+                            self.plan,
+                            slot.engine,
+                            self.store,
+                        )
+                        # materialize 已把最终业务对象复制到 driver output；cache
+                        # 只用于一次粗块去重，不能把所有 microbatch 的 payload 留到 run 结束。
+                        self.store.clear_cache()
+                        # 最终业务值已经复制到 driver 输出；清空 ValueTable 会释放
+                        # page-image 等 ObjectRef；结果只保留不可变计数快照。
+                        released = slot.engine.release_values()
+                        metrics_by_microbatch[index] = MicrobatchMetrics(
+                            index=index,
+                            entity_count=slot.engine.entity_count,
+                            item_count=slot.engine.item_count,
+                            expansion_count=slot.engine.expansion_count,
+                            grain_count=slot.engine.grain_count,
+                            released_values=released,
+                        )
+                        del active[index]
+
+                if len(completed) == len(slices):
+                    break
+                if not pending and next_microbatch < len(slices):
+                    # 当前 active microbatch 已完成，但仍有尚未 admission 的 source
+                    # slice；下一 turn 会填充空出的 credit，这不是 deadlock。
+                    continue
+                if not pending:
+                    summaries = ", ".join(
+                        f"microbatch[{index}] {slot.engine.progress_summary()}"
+                        for index, slot in sorted(active.items())
                     )
-                    del active[index]
+                    raise RuntimeError(f"v3.6 Ray runtime deadlocked: {summaries}")
 
-            if len(completed) == len(slices):
-                break
-            if not pending and next_microbatch < len(slices):
-                # 当前 active microbatch 已完成，但仍有尚未 admission 的 source slice；
-                # 下一 turn 会填充空出的 in-flight credit，这不是 deadlock。
-                continue
-            if not pending:
-                summaries = ", ".join(
-                    f"microbatch[{index}] {slot.engine.progress_summary()}"
-                    for index, slot in sorted(active.items())
-                )
-                raise RuntimeError(f"v3.6 Ray runtime deadlocked: {summaries}")
-
-            ready, _ = self.ray.wait(list(pending), num_returns=1)
-            result_ref = ready[0]
-            lease = pending.pop(result_ref)
-            engine = active[lease.microbatch_index].engine
-            try:
-                result = self.ray.get(result_ref)
-            except Exception as error:  # Ray 对用户异常和 actor 异常统一在 get 抛出
-                self._handle_infrastructure_failure(engine, lease, error)
-            else:
-                if isinstance(result, DispatchFailure):
-                    self._handle_dispatch_failure(engine, lease, result)
+                ready, _ = self.ray.wait(list(pending), num_returns=1)
+                result_ref = ready[0]
+                lease = pending.pop(result_ref)
+                engine = active[lease.microbatch_index].engine
+                try:
+                    result = self.ray.get(result_ref)
+                except Exception as error:  # Ray 对用户异常和 actor 异常统一在 get 抛出
+                    self._handle_infrastructure_failure(engine, lease, error)
                 else:
-                    for report in result:
-                        engine.commit_report(report)
-            finally:
-                lease.actor.busy = False
+                    if isinstance(result, DispatchFailure):
+                        self._handle_dispatch_failure(engine, lease, result)
+                    else:
+                        for report in result:
+                            engine.commit_report(report)
+                finally:
+                    lease.actor.busy = False
 
-        elapsed_s = time.perf_counter() - started
-        worker_snapshots = self._observe_workers()
-        calls = self._freeze_call_metrics(worker_snapshots)
-        if any(metrics is None for metrics in metrics_by_microbatch):
-            raise AssertionError("completed run lost a microbatch metrics snapshot")
-        return RunResult(
-            self._merge_outputs([completed[index] for index in range(len(slices))]),
-            elapsed_s,
-            calls,
-            cast(tuple[MicrobatchMetrics, ...], tuple(metrics_by_microbatch)),
-            high_watermark,
-        )
+            elapsed_s = time.perf_counter() - started
+            worker_snapshots = self._observe_workers()
+            calls = self._freeze_call_metrics(worker_snapshots)
+            if any(metrics is None for metrics in metrics_by_microbatch):
+                raise AssertionError("completed run lost a microbatch metrics snapshot")
+            return RunResult(
+                self._merge_outputs([completed[index] for index in range(len(slices))]),
+                elapsed_s,
+                calls,
+                cast(tuple[MicrobatchMetrics, ...], tuple(metrics_by_microbatch)),
+                high_watermark,
+            )
+        except BaseException:
+            # Ray Data uses the same execution-level fail-stop contract: once an
+            # exception escapes an active execution, pending actor work is not
+            # treated as a reusable clean queue. Preserve the original exception.
+            if execution_started:
+                try:
+                    self.close()
+                except BaseException:
+                    pass
+            raise
 
     def close(self) -> None:
         """释放 actors；仅关闭由本 Executor 初始化的 Ray runtime。"""
 
         if self._closed:
             return
+        self._closed = True
 
         for actors in self._actors.values():
             for actor in actors:
@@ -272,7 +287,6 @@ class Executor:
         self.store.clear_cache()
         if self._owns_ray and self.ray.is_initialized():
             self.ray.shutdown()
-        self._closed = True
 
     # ── Observation and immutable result snapshots ──────────────────────
 
@@ -359,9 +373,9 @@ class Executor:
 
     def _normalize_sources(
         self,
-        source_columns: tuple[Iterable[Any], ...],
+        source_columns: tuple[Sequence[Any], ...],
     ) -> tuple[tuple[Any, ...], ...]:
-        """冻结 sources，并校验列数和行对齐。"""
+        """Eagerly snapshot finite sources and validate row alignment."""
 
         if len(source_columns) != len(self.plan.source_ports):
             raise ValueError("source column count does not match Pipeline.forward")

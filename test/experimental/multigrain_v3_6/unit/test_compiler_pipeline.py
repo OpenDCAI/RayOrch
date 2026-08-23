@@ -84,6 +84,42 @@ def test_logical_program_contains_only_declared_logical_facts():
     }
 
 
+def test_compiled_program_snapshots_ray_module_configuration():
+    class ConfiguredPipeline(mg.Pipeline):
+        def __init__(self, module):
+            self.module = module
+
+        def forward(self, values):
+            return self.module(values)
+
+    module = (
+        mg.RayModule(U)
+        .pre_init(version="v1")
+        .ray_options(replicas=2, num_cpus=1)
+    )
+    pipeline = ConfiguredPipeline(module)
+    first = pipeline.compile()
+    first_call = next(iter(first.logical.calls))
+
+    module.init_kwargs["version"] = "v2"
+    module.init_kwargs["added"] = True
+    module.options["replicas"] = 3
+    module.options["num_cpus"] = 2
+
+    assert first.logical.call(first_call).udf.init_kwargs == (("version", "v1"),)
+    assert first.plan.pool(first_call).replicas == 2
+    assert dict(first.plan.pool(first_call).ray_options)["num_cpus"] == 1
+
+    second = pipeline.compile()
+    second_call = next(iter(second.logical.calls))
+    assert second.logical.call(second_call).udf.init_kwargs == (
+        ("version", "v2"),
+        ("added", True),
+    )
+    assert second.plan.pool(second_call).replicas == 3
+    assert dict(second.plan.pool(second_call).ray_options)["num_cpus"] == 2
+
+
 def test_every_origin_has_one_explicit_semantic_descriptor():
     p0, p1 = PortRef(0), PortRef(1)
     origins = (

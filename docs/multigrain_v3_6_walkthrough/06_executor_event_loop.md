@@ -127,9 +127,9 @@ flowchart TD
 
 ---
 
-## 5. `run()` 前置处理：source 与 microbatch slices
+## 5. `run()` 前置处理：finite sources 与 microbatch slices
 
-`_normalize_sources()` 把 iterable 冻结为 tuples，并验证：
+`_normalize_sources()` 把公开 `Sequence` 输入 eager materialize 为 tuples，并验证：
 
 - source 列数等于 `Pipeline.forward` 参数数；
 - 所有列 row-aligned。
@@ -140,7 +140,8 @@ flowchart TD
 sources=([], []) -> slices=[((), ())]
 ```
 
-这样空输入走同一 admission/completion/materialization 语义，不需要旁路返回。
+这样空输入走同一 admission/completion/materialization 语义，不需要旁路返回。这里明确采用
+finite eager input contract，不声明 streaming input/output 语义。
 
 每次 run：
 
@@ -347,14 +348,19 @@ actor_instances += 1
 
 ---
 
-## 14. `close()` 与 Ray runtime ownership
+## 14. 终局异常、`close()` 与 Ray runtime ownership
+
+只要一个 microbatch 已经 admission，之后若异常逃出 `run()`，Executor 就进入 fail-stop：先
+best-effort `close()` actor pool，再原样抛出最初异常。原因是此时可能仍有 actor RPC 在执行或排队，
+仅把本地 `busy` bit 清零不足以证明物理队列已经干净。成功完成的 Executor 仍可跨 run 复用；
+source 数量、参数或已知长度不一致等 admission 前错误不会污染 Executor。
 
 `close()` 幂等执行：
 
-1. kill 本 Executor 创建的所有 actor handles；
-2. 清空 actor containers 和 BlockStore cache；
-3. 只有 `_owns_ray=True` 才 `ray.shutdown()`；
-4. 标记 closed，后续 `run()` 拒绝。
+1. 先标记 closed，使 cleanup 本身局部失败时也不能再次复用；
+2. kill 本 Executor 创建的所有 actor handles；
+3. 清空 actor containers 和 BlockStore cache；
+4. 只有 `_owns_ray=True` 才 `ray.shutdown()`。
 
 推荐：
 
@@ -363,8 +369,9 @@ with Executor(pipeline) as executor:
     result = executor.run(values)
 ```
 
-context manager 在正常、业务异常和 Ctrl-C 展开路径上都会调用 `close()`。构造期间异常则由
-`__init__` 自己的 cleanup guard 负责。
+context manager 在正常路径和 Ctrl-C 展开路径上都会调用 `close()`；终局业务/基础设施异常即使
+没有 context manager，也由 `run()` 自身触发 fail-stop。构造期间异常则由 `__init__` 自己的
+cleanup guard 负责。
 
 ---
 

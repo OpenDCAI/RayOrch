@@ -128,6 +128,10 @@ flowchart LR
 `Executor` 默认可以自行 `ray.init()`；用 `with` 能确保 actor 和由它启动的 Ray runtime
 在异常路径上也被关闭。
 
+`run()` 的公开输入合同是有限、可重复遍历的 `Sequence`。Executor 会在执行前把各列 eager
+materialize 为 tuple，以冻结本次运行的输入并一次性校验 row alignment；V3.6 当前不声明
+streaming input/output 语义。
+
 ---
 
 ## 3. 一个真正体现 V3.6 的例子

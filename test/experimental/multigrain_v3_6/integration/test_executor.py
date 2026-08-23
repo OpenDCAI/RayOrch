@@ -378,9 +378,9 @@ class AbortPipeline(mg.Pipeline):
 
 
 def test_default_udf_policy_aborts_with_complete_dispatch_context():
+    executor = Executor(AbortPipeline())
     with pytest.raises(mg.ExecutionError) as captured:
-        with Executor(AbortPipeline()) as executor:
-            executor.run(range(4))
+        executor.run(range(4))
 
     message = str(captured.value)
     assert "AlwaysUdfError" in message
@@ -388,6 +388,9 @@ def test_default_udf_policy_aborts_with_complete_dispatch_context():
     assert "ArithmeticError" in message
     assert "deterministic UDF error" in message
     assert "generation=0" in message
+    assert executor._closed
+    with pytest.raises(RuntimeError, match="Executor is closed"):
+        executor.run(range(4))
 
 
 class WrongCardinality:
