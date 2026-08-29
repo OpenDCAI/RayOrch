@@ -15,6 +15,12 @@ For development:
 pip install -r requirements-dev.txt
 ```
 
+## Reproduce the 64-GPU MinerU comparison
+
+The frozen TaiJi WeData launch contracts, environment pins, and commands for
+the 8 x 8 H20 RayOrch and Ray Data experiments are documented in
+[`experiments/mineru_64gpu_repro/README.md`](experiments/mineru_64gpu_repro/README.md).
+
 ## Core Concepts
 
 - `RayModule`: wraps an operator class into Ray actors with optional replica

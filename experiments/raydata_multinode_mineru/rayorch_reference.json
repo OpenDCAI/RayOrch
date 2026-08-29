@@ -1,0 +1,20 @@
+{
+  "engine": "rayorch_multigrain_v3_6",
+  "run_id": "rayorch_v36_multigrain_scaling_8x8_20260825_1910",
+  "input_documents": 3690,
+  "documents": 3690,
+  "pages": 174744,
+  "completed_documents": 3689,
+  "render_failed_documents": 1,
+  "startup_s": 508.206,
+  "measured_wall_s": 3627.363,
+  "end_to_end_wall_s": 4135.71,
+  "pages_per_s": 48.1738,
+  "ocr_batch_fill_ratio": 0.8610454115421002,
+  "ocr_rpc_count": 3171,
+  "output_complete": true,
+  "global_success": true,
+  "business_status": "completed",
+  "failure": null,
+  "source_state": "experiments/taiji_multinode_mineru/state/rayorch_v36_multigrain_scaling_8x8_20260825_1910.json"
+}

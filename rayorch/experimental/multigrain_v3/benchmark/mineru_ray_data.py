@@ -8,9 +8,10 @@ correctness，应用显式携带 ``parent_id`` 与 ``page_ordinal``，并在 Ray
 from __future__ import annotations
 
 import argparse
-import glob
+from io import BytesIO
 import json
 import os
+import pickle
 import time
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,12 @@ from .mineru import (
     MinerUPdfToPages,
     MinerUVlmOcrPage,
     ResourceSampler,
+    _is_hdfs_uri,
+    _pdf_stem,
     _runtime_env,
 )
+from .profile_events import ProfileEventWriter
+from ...multigrain_v3_6.benchmark.mineru import _select_pdfs
 
 
 def _rows_from_batch(batch: dict[str, Any]) -> list[dict[str, Any]]:
@@ -43,13 +48,21 @@ def _page_from_row(row: dict[str, Any]) -> dict[str, Any]:
 
     from PIL import Image
 
-    image_rgb = row["image_rgb"]
-    if not hasattr(image_rgb, "shape"):
-        raise ValueError("image_rgb must be a numpy-compatible tensor")
+    image_rgb = row.get("image_rgb")
+    if image_rgb is not None:
+        if not hasattr(image_rgb, "shape"):
+            raise ValueError("image_rgb must be a numpy-compatible tensor")
+        image = Image.fromarray(image_rgb, mode="RGB")
+    else:
+        image_jpeg = row.get("image_jpeg")
+        if not isinstance(image_jpeg, (bytes, bytearray, memoryview)):
+            raise ValueError("page row requires image_rgb or image_jpeg")
+        with Image.open(BytesIO(bytes(image_jpeg))) as decoded:
+            image = decoded.convert("RGB")
     return {
         "pdf_path": str(row["pdf_path"]),
         "page_id": int(row["page_id"]),
-        "img_pil": Image.fromarray(image_rgb, mode="RGB"),
+        "img_pil": image,
         "scale": float(row["scale"]),
         "page_width": int(row["page_width"]),
         "page_height": int(row["page_height"]),
@@ -57,13 +70,40 @@ def _page_from_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _encode_page_jpeg(image_rgb: Any, quality: int = 90) -> bytes:
+    """Compress a rendered page before the global Ray Data shuffle."""
+
+    from PIL import Image
+
+    if not hasattr(image_rgb, "shape"):
+        raise ValueError("image_rgb must be a numpy-compatible tensor")
+    output = BytesIO()
+    Image.fromarray(image_rgb, mode="RGB").save(
+        output,
+        format="JPEG",
+        quality=quality,
+        optimize=False,
+        progressive=False,
+    )
+    return output.getvalue()
+
+
 class RayDataRenderPdf:
     """Ray Data callable actor：渲染一个 PDF row，并显式附加 parent/ordinal。"""
 
-    def __init__(self, dpi: int = 200) -> None:
+    def __init__(
+        self,
+        dpi: int = 200,
+        profile_dir: str | None = None,
+        profile_system: str = "raydata",
+    ) -> None:
         """创建与 V3 benchmark 相同的 PDF renderer。"""
 
-        self.renderer = MinerUPdfToPages(dpi=dpi)
+        self.renderer = MinerUPdfToPages(
+            dpi=dpi,
+            profile_dir=profile_dir,
+            profile_system=profile_system,
+        )
 
     def __call__(self, row: dict[str, Any]) -> list[dict[str, Any]]:
         """把单个 PDF 展开为可被 Ray Data 跨 parent 重组的 page rows。"""
@@ -71,6 +111,23 @@ class RayDataRenderPdf:
         parent_id = int(row["parent_id"])
         pdf_path = str(row["pdf_path"])
         pages = self.renderer.run([pdf_path])[0]
+        if not pages:
+            import numpy as np
+
+            return [
+                {
+                    "parent_id": parent_id,
+                    "page_ordinal": 0,
+                    "pdf_path": pdf_path,
+                    "page_id": -1,
+                    "image_rgb": np.zeros((1, 1, 3), dtype="uint8"),
+                    "scale": 1.0,
+                    "page_width": 0,
+                    "page_height": 0,
+                    "pdf_len": 0,
+                    "render_failed": True,
+                }
+            ]
         return [
             {
                 "parent_id": parent_id,
@@ -85,6 +142,7 @@ class RayDataRenderPdf:
                 "page_width": int(page["page_width"]),
                 "page_height": int(page["page_height"]),
                 "pdf_len": int(page["pdf_len"]),
+                "render_failed": False,
             }
             for ordinal, page in enumerate(pages)
         ]
@@ -97,38 +155,70 @@ class RayDataOcrPages:
         self,
         model: str = DEFAULT_MODEL,
         gpu_memory_utilization: float = 0.8,
+        profile_dir: str | None = None,
+        profile_system: str = "raydata",
     ) -> None:
         """初始化一个 persistent MinerU vLLM OCR 实例。"""
 
         self.ocr = MinerUVlmOcrPage(
             model=model,
             gpu_memory_utilization=gpu_memory_utilization,
+            profile_dir=profile_dir,
+            profile_system=profile_system,
         )
 
-    def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
+    def __call__(self, batch: dict[str, Any]) -> Any:
         """保留应用 lineage columns，并为每个 page 添加 OCR result。"""
 
         import numpy as np
 
         rows = _rows_from_batch(batch)
-        pages = [_page_from_row(row) for row in rows]
-        contents = self.ocr.run(pages)
-        if len(contents) != len(rows):
+        valid_indexes = [
+            index
+            for index, row in enumerate(rows)
+            if not bool(row.get("render_failed", False))
+        ]
+        pages = [_page_from_row(rows[index]) for index in valid_indexes]
+        valid_contents = self.ocr.run(pages) if pages else []
+        if len(valid_contents) != len(valid_indexes):
             raise ValueError(
                 "MinerU OCR output count does not match Ray Data input batch"
             )
-        return {
-            "parent_id": batch["parent_id"],
-            "page_ordinal": batch["page_ordinal"],
-            "pdf_path": batch["pdf_path"],
-            "page_id": batch["page_id"],
-            "image_rgb": batch["image_rgb"],
-            "scale": batch["scale"],
-            "page_width": batch["page_width"],
-            "page_height": batch["page_height"],
-            "pdf_len": batch["pdf_len"],
-            "content": np.asarray(contents, dtype=object),
-        }
+        contents: list[Any] = [None] * len(rows)
+        for index, content in zip(valid_indexes, valid_contents, strict=True):
+            contents[index] = content
+        import pyarrow as pa
+
+        image_jpeg = [_encode_page_jpeg(row["image_rgb"]) for row in rows]
+        content_pickle = [
+            pickle.dumps(content, protocol=pickle.HIGHEST_PROTOCOL)
+            for content in contents
+        ]
+        # Explicit large_binary is required: a single 1/64 hash partition can
+        # exceed Arrow binary's signed 32-bit (2 GiB) offset limit even after
+        # JPEG compression.
+        return pa.table({
+            "parent_id": pa.array(batch["parent_id"]),
+            "page_ordinal": pa.array(batch["page_ordinal"]),
+            "pdf_path": pa.array(batch["pdf_path"]),
+            "page_id": pa.array(batch["page_id"]),
+            # Do not carry raw page tensors through groupby/shuffle.  At 200
+            # DPI they exceed a terabyte for this corpus and OOM the final
+            # HashShuffleAggregator.  JPEG keeps the downstream crop contract
+            # while bounding shuffle and per-document reduce memory.
+            "image_jpeg": pa.array(image_jpeg, type=pa.large_binary()),
+            "scale": pa.array(batch["scale"]),
+            "page_width": pa.array(batch["page_width"]),
+            "page_height": pa.array(batch["page_height"]),
+            "pdf_len": pa.array(batch["pdf_len"]),
+            "render_failed": pa.array(batch.get(
+                "render_failed",
+                np.asarray([False] * len(rows), dtype="bool"),
+            )),
+            "content_pickle": pa.array(
+                content_pickle, type=pa.large_binary()
+            ),
+        })
 
 
 class RayDataSmokeOcrPages:
@@ -164,13 +254,29 @@ class RayDataSmokeOcrPages:
 class RayDataAssemblePdf:
     """Ray Data group callable：按 page ordinal 排序并组装一个 PDF。"""
 
-    def __init__(self, output_dir: str, parse_method: str = "vlm") -> None:
+    def __init__(
+        self,
+        output_dir: str,
+        parse_method: str = "vlm",
+        spool_batches: bool = False,
+        remote_output_dir: str | None = None,
+        profile_dir: str | None = None,
+        profile_system: str = "raydata",
+    ) -> None:
         """创建与 V3 benchmark 相同的 MinerU assemble UDF。"""
 
-        self.assembler = MinerUAssembleDoc(
-            output_dir=output_dir,
-            parse_method=parse_method,
-        )
+        constructor_kwargs: dict[str, Any] = {
+            "output_dir": output_dir,
+            "parse_method": parse_method,
+        }
+        if spool_batches:
+            constructor_kwargs["spool_batches"] = True
+        if remote_output_dir is not None:
+            constructor_kwargs["remote_output_dir"] = remote_output_dir
+        if profile_dir is not None:
+            constructor_kwargs["profile_dir"] = profile_dir
+            constructor_kwargs["profile_system"] = profile_system
+        self.assembler = MinerUAssembleDoc(**constructor_kwargs)
 
     def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
         """校验一个 parent group 的 ordinal 唯一性后输出单个 document row。"""
@@ -191,10 +297,26 @@ class RayDataAssemblePdf:
         pdf_path = str(rows[0]["pdf_path"])
         if any(str(row["pdf_path"]) != pdf_path for row in rows):
             raise ValueError("Ray Data parent group mixes multiple PDFs")
+        render_failed = [
+            bool(row.get("render_failed", False)) for row in rows
+        ]
+        if any(render_failed) and not all(render_failed):
+            raise ValueError("Ray Data parent group mixes failed and valid pages")
+        contents = (
+            []
+            if all(render_failed)
+            else [
+                row["content"]
+                if "content" in row
+                else pickle.loads(bytes(row["content_pickle"]))
+                for row in rows
+            ]
+        )
+        pages = [] if all(render_failed) else [_page_from_row(row) for row in rows]
         output = self.assembler.run(
-            [[row["content"] for row in rows]],
-            [[_page_from_row(row) for row in rows]],
-            [Path(pdf_path).stem],
+            [contents],
+            [pages],
+            [_pdf_stem(pdf_path)],
         )[0]
         return {
             "parent_id": np.asarray(
@@ -254,20 +376,32 @@ def build_dataset(args: argparse.Namespace, pdfs: list[str]):
         rows,
         override_num_blocks=max(1, min(len(rows), args.render_replicas)),
     )
+    resource_options = (
+        {"resources": dict(args.actor_resources)}
+        if getattr(args, "actor_resources", None)
+        else {}
+    )
     pages = dataset.flat_map(
         RayDataRenderPdf,
         concurrency=args.render_replicas,
         num_cpus=1,
-        fn_constructor_kwargs={"dpi": 200},
+        fn_constructor_kwargs={
+            "dpi": 200,
+            "profile_dir": getattr(args, "profile_dir", None),
+            "profile_system": getattr(args, "profile_system", "raydata"),
+        },
+        **resource_options,
     )
-    smoke = bool(args.smoke_no_model)
+    smoke = bool(getattr(args, "smoke_no_model", False))
     ocr_class = RayDataSmokeOcrPages if smoke else RayDataOcrPages
     contents = pages.map_batches(
         ocr_class,
         batch_size=args.batch_size,
         batch_format="numpy",
         concurrency=args.replicas,
-        num_gpus=0 if smoke else 1,
+        num_gpus=(
+            0 if smoke else getattr(args, "gpus_per_ocr_actor", 1.0)
+        ),
         num_cpus=1,
         fn_constructor_kwargs=(
             {}
@@ -275,8 +409,11 @@ def build_dataset(args: argparse.Namespace, pdfs: list[str]):
             else {
                 "model": args.model,
                 "gpu_memory_utilization": args.gpu_memory_utilization,
+                "profile_dir": getattr(args, "profile_dir", None),
+                "profile_system": getattr(args, "profile_system", "raydata"),
             }
         ),
+        **resource_options,
     )
     assemble_class = (
         RayDataSmokeAssemblePdf if smoke else RayDataAssemblePdf
@@ -293,9 +430,18 @@ def build_dataset(args: argparse.Namespace, pdfs: list[str]):
             {}
             if smoke
             else {
-                "output_dir": os.path.abspath(args.output_dir),
+                "output_dir": str(args.output_dir),
+                "spool_batches": bool(
+                    getattr(args, "spool_batches", False)
+                ),
+                "remote_output_dir": getattr(
+                    args, "remote_output_dir", None
+                ),
+                "profile_dir": getattr(args, "profile_dir", None),
+                "profile_system": getattr(args, "profile_system", "raydata"),
             }
         ),
+        **resource_options,
     )
 
 
@@ -305,21 +451,86 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     import ray
 
     flash_repo = os.path.abspath(args.flash_repo)
-    pdfs = sorted(glob.glob(os.path.join(flash_repo, "*.pdf")))[: args.limit]
+    raw_pdf_dirs = getattr(args, "pdf_dirs", None)
+    if raw_pdf_dirs is None:
+        raw_pdf_dirs = [getattr(args, "pdf_dir", None) or flash_repo]
+    elif isinstance(raw_pdf_dirs, str):
+        raw_pdf_dirs = [raw_pdf_dirs]
+    pdf_dirs = [
+        str(value)
+        if _is_hdfs_uri(str(value))
+        else str(Path(str(value)).expanduser().resolve())
+        for value in raw_pdf_dirs
+    ]
+    output_dir = str(args.output_dir)
+    completion_dir = str(getattr(args, "completion_dir", None) or output_dir)
+    pdfs, skipped_existing, discovered_pdfs = _select_pdfs(
+        pdf_dirs,
+        completion_dir,
+        limit=args.limit,
+        skip_existing=bool(getattr(args, "skip_existing", False)),
+        per_input_limits=getattr(args, "pdf_limits", None),
+    )
     if not pdfs:
-        raise FileNotFoundError(f"no PDFs found under {flash_repo}")
+        raise FileNotFoundError("Ray Data has no pending PDFs to process")
+    cold_start_epoch_s = float(
+        getattr(args, "cold_e2e_start_epoch_s", 0.0) or time.time()
+    )
+    cold_start_monotonic_s = float(
+        getattr(args, "cold_e2e_start_monotonic_s", 0.0)
+        or time.perf_counter()
+    )
+    profile = ProfileEventWriter(
+        getattr(args, "profile_driver_dir", None)
+        or getattr(args, "profile_dir", None),
+        system=getattr(args, "profile_system", "raydata"),
+        stage="driver",
+        role="collect",
+    )
+    profile.emit(
+        {
+            "type": "milestone",
+            "name": "cold_e2e_started",
+            "epoch_s": cold_start_epoch_s,
+            "monotonic_s": cold_start_monotonic_s,
+        }
+    )
     os.environ.update(_runtime_env(flash_repo)["env_vars"])
     if not ray.is_initialized():
-        ray.init(
-            address="local",
-            num_cpus=args.num_cpus,
-            num_gpus=0 if args.smoke_no_model else args.replicas,
-            object_store_memory=int(args.object_store_gb * 1024**3),
-            include_dashboard=False,
-            runtime_env=_runtime_env(flash_repo),
-        )
+        init_kwargs: dict[str, Any] = {
+            "address": getattr(args, "ray_address", None) or "local",
+            "include_dashboard": False,
+            "runtime_env": _runtime_env(flash_repo),
+        }
+        if init_kwargs["address"] == "local":
+            init_kwargs.update(
+                num_cpus=args.num_cpus,
+                num_gpus=(
+                    0
+                    if getattr(args, "smoke_no_model", False)
+                    else args.replicas
+                ),
+                object_store_memory=int(args.object_store_gb * 1024**3),
+            )
+        ray.init(**init_kwargs)
+    profile.emit(
+        {
+            "type": "milestone",
+            "name": "ray_initialized",
+            "epoch_s": time.time(),
+            "monotonic_s": time.perf_counter(),
+        }
+    )
 
     dataset = build_dataset(args, pdfs)
+    profile.emit(
+        {
+            "type": "milestone",
+            "name": "plan_built",
+            "epoch_s": time.time(),
+            "monotonic_s": time.perf_counter(),
+        }
+    )
     sampler = ResourceSampler(args.rss_interval_s)
     sampler.start()
     started = time.perf_counter()
@@ -328,21 +539,52 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         driver_start, driver_peak, gpu_samples = sampler.stop()
     wall = time.perf_counter() - started
+    profile.emit(
+        {
+            "type": "milestone",
+            "name": "collect_finished",
+            "epoch_s": time.time(),
+            "monotonic_s": time.perf_counter(),
+        }
+    )
     rows.sort(key=lambda row: int(row["parent_id"]))
     outputs = [row["output"] for row in rows]
     pages = sum(int(output["pages"]) for output in outputs)
+    failed_docs = sorted(
+        str(output["pdf"])
+        for output in outputs
+        if output.get("status") != "completed"
+    )
     gpu_peak = tuple(
-        max((sample.memory_used[index] for sample in gpu_samples), default=0)
+        max(
+            (
+                sample.memory_used[index]
+                for sample in gpu_samples
+                if index < len(sample.memory_used)
+            ),
+            default=0,
+        )
         for index in range(args.replicas)
     )
     payload = {
         "engine": "ray_data",
-        "backend": "smoke_cpu" if args.smoke_no_model else "mineru_vllm",
+        "status": "completed",
+        "backend": (
+            "smoke_cpu"
+            if getattr(args, "smoke_no_model", False)
+            else "mineru_vllm"
+        ),
+        "discovered_pdfs": discovered_pdfs,
+        "skipped_existing": skipped_existing,
         "n_pdf": len(pdfs),
         "pages": pages,
         "docs": len(outputs),
+        "failed_doc_count": len(failed_docs),
+        "failed_docs": failed_docs,
         "batch_size": args.batch_size,
         "replicas": args.replicas,
+        "gpus_per_ocr_actor": getattr(args, "gpus_per_ocr_actor", 1.0),
+        "startup_s": 0.0,
         "measured_wall_s": round(wall, 3),
         "pages_per_s": round(pages / wall, 4),
         "end_to_end_wall_s": round(wall, 3),
@@ -350,7 +592,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "driver_rss_peak": driver_peak,
         "gpu_memory_peak": gpu_peak,
         "explicit_lineage_columns": ["parent_id", "page_ordinal"],
-        "output_dir": os.path.abspath(args.output_dir),
+        "pdf_dir": pdf_dirs[0] if len(pdf_dirs) == 1 else pdf_dirs,
+        "pdf_dirs": pdf_dirs,
+        "output_dir": output_dir,
+        "profile_clock": {
+            "e2e_start_epoch_s": cold_start_epoch_s,
+            "e2e_start_monotonic_s": cold_start_monotonic_s,
+            "benchmark_end_epoch_s": time.time(),
+            "benchmark_end_monotonic_s": time.perf_counter(),
+            "absolute_anchor_estimated": False,
+        },
     }
     artifact_dir = Path(args.artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -366,7 +617,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    with Path(args.result_jsonl).open("a", encoding="utf-8") as handle:
+    result_path = Path(args.result_jsonl)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    with result_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
     return payload
 
@@ -394,6 +647,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--result-jsonl", required=True)
+    parser.add_argument("--profile-dir", default=None)
+    parser.add_argument("--profile-system", default="raydata")
     return parser
 
 

@@ -8,6 +8,14 @@ import pytest
 from rayorch.experimental.multigrain_v3.benchmark import mineru_ray_data
 
 
+def test_runtime_env_disables_vllm_usage_cpu_probe() -> None:
+    env = mineru_ray_data._runtime_env("/tmp/flash")["env_vars"]
+    assert env["VLLM_NO_USAGE_STATS"] == "1"
+    assert env["DO_NOT_TRACK"] == "1"
+    assert env["LOGURU_LEVEL"] == "WARNING"
+    assert env["VLLM_LOGGING_LEVEL"] == "WARNING"
+
+
 def test_rows_from_batch_preserves_object_columns() -> None:
     """numpy object columns 转 row 时不能丢失 parent、ordinal 或 payload。"""
 
@@ -47,6 +55,57 @@ def test_page_from_columnar_row_restores_mineru_record() -> None:
     assert page["img_pil"].size == (18, 12)
     assert page["scale"] == 2.5
     assert page["pdf_len"] == 7
+
+
+def test_jpeg_shuffle_payload_restores_page_without_raw_rgb() -> None:
+    image = np.full((64, 96, 3), 127, dtype=np.uint8)
+    encoded = mineru_ray_data._encode_page_jpeg(image)
+    assert len(encoded) < image.nbytes
+    page = mineru_ray_data._page_from_row(
+        {
+            "pdf_path": "doc.pdf",
+            "page_id": 0,
+            "image_jpeg": encoded,
+            "scale": 2.0,
+            "page_width": 96,
+            "page_height": 64,
+            "pdf_len": 1,
+        }
+    )
+    assert page["img_pil"].size == (96, 64)
+    assert page["img_pil"].mode == "RGB"
+
+
+def test_real_ocr_output_uses_large_binary_shuffle_columns() -> None:
+    import pyarrow as pa
+
+    class FakeOcr:
+        def run(self, pages):
+            return [{"page": page["page_id"]} for page in pages]
+
+    worker = object.__new__(mineru_ray_data.RayDataOcrPages)
+    worker.ocr = FakeOcr()
+    image = np.full((32, 48, 3), 128, dtype=np.uint8)
+    output = worker(
+        {
+            "parent_id": np.asarray([1, 1], dtype=np.int64),
+            "page_ordinal": np.asarray([0, 1], dtype=np.int64),
+            "pdf_path": np.asarray(["doc.pdf", "doc.pdf"], dtype=object),
+            "page_id": np.asarray([0, 1], dtype=np.int64),
+            "image_rgb": np.asarray([image, image]),
+            "scale": np.asarray([2.0, 2.0]),
+            "page_width": np.asarray([48, 48]),
+            "page_height": np.asarray([32, 32]),
+            "pdf_len": np.asarray([2, 2]),
+            "render_failed": np.asarray([False, False]),
+        }
+    )
+    assert isinstance(output, pa.Table)
+    assert output.schema.field("image_jpeg").type == pa.large_binary()
+    assert output.schema.field("content_pickle").type == pa.large_binary()
+    assert "image_rgb" not in output.column_names
+    rows = output.to_pylist()
+    assert [mineru_ray_data.pickle.loads(row["content_pickle"])["page"] for row in rows] == [0, 1]
 
 
 def test_assemble_sorts_page_ordinals_before_reduce(monkeypatch, tmp_path) -> None:

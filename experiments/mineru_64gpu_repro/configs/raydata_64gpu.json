@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "experiment": "mineru_raydata_64gpu",
+  "engine": "raydata",
+  "implementation": "ray_data",
+  "backend": "mineru_vllm",
+  "compute": {
+    "workers": 8,
+    "gpu_per_worker": 8,
+    "gpu_total": 64,
+    "gpu_type": "H20",
+    "location": "zw",
+    "taiji_app_group": "TaiJi_HYAide_LLM_Pretrain_Data",
+    "compute_spec": "experiments/taiji_multinode_mineru/compute_h20_8node_8gpu_zw_pretrain.json"
+  },
+  "launcher_hyperparameters": {
+    "microbatch_size": 24,
+    "max_active_microbatches": 24,
+    "batch_size": 64,
+    "gpu_memory_utilization": 0.32,
+    "ocr_replicas": 128,
+    "gpus_per_ocr_actor": 0.5,
+    "render_replicas": 256,
+    "reduce_replicas": 64,
+    "spool_upload_workers": 8,
+    "spool_drain_timeout_s": 21600
+  },
+  "engine_effective_hyperparameters": {
+    "batch_size": 64,
+    "gpu_memory_utilization": 0.32,
+    "ocr_replicas": 128,
+    "gpus_per_ocr_actor": 0.5,
+    "render_replicas": 256,
+    "reduce_replicas": 64
+  },
+  "launcher_only_or_unused_by_ray_data_engine": {
+    "microbatch_size": 24,
+    "max_active_microbatches": 24,
+    "spool_upload_workers": 8,
+    "spool_drain_timeout_s": 21600
+  },
+  "engine_runtime": {
+    "output_mode": "local_spool_async_ceph",
+    "shuffle_payload": "jpeg_and_pyarrow_large_binary"
+  },
+  "workload": {
+    "pdf_count": 3690,
+    "inputs": [
+      {
+        "uri": "hdfs://hdfs-zw1-teg-hunyuan-hdfshd1-v3/data/tianqiong/TEG/g_teg_tencentchat_dataplat_g_teg_tencentchat_dataplat_tencent_hunyuan_wedata/taiji/x1_data/clapliang/datasets/pdfs_2000",
+        "files": 2000,
+        "bytes": 4060449252
+      },
+      {
+        "uri": "hdfs://hdfs-zw1-teg-hunyuan-hdfshd1-v3/data/tianqiong/TEG/g_teg_tencentchat_dataplat_g_teg_tencentchat_dataplat_tencent_hunyuan_wedata/taiji/x1_data/clapliang/datasets/aidata_pdf_300k_sample",
+        "files": 1690,
+        "bytes": 1099397628624
+      }
+    ],
+    "model_uri": "hdfs://hdfs-zw1-teg-hunyuan-hdfshd1-v3/data/tianqiong/TEG/g_teg_tencentchat_dataplat_g_teg_tencentchat_dataplat_tencent_hunyuan_wedata/taiji/x1_data/clapliang/runtime_assets/rayorch_v36_20260820/MinerU2.5-2509-1.2B",
+    "model_files": 15,
+    "model_bytes": 2323649236,
+    "image_dpi": 200
+  },
+  "dependencies": {
+    "taiji_image": "mirrors.tencent.com/hunyuan-text-data/ray-vllm:2.51.1-py312-tlinux-cu122-vllm11",
+    "ray": "2.51.1",
+    "vllm": "0.11.0",
+    "torch": "2.8.0+cu128",
+    "pyarrow": "19.0.1",
+    "hydp_engine": "0.1.23",
+    "hydp_dataflow_wedata": "0.1.0",
+    "flash_mineru_git": "ssh://git@ssh.github.com:443/OpenDCAI/Flash-mineru.git",
+    "flash_mineru_commit": "7246a353554cee35674d7ef82f2c061db2f43003"
+  },
+  "reference_run": {
+    "run_id": "raydata_mineru_combined3690_8x8_zw_largebinary_20260823_1002",
+    "status": "completed",
+    "pages": 174744,
+    "failed_doc_count": 1,
+    "pages_per_second": 37.5608,
+    "source_digest": "8ebdfc4a0ba377f4db91b701bd843a5631cf8fb9a21d77f8de3d6ea47bc72008"
+  }
+}

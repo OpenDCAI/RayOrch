@@ -10,14 +10,20 @@ import argparse
 import glob
 import json
 import os
+import posixpath
+import shutil
+import socket
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..api import Expand, Map, Pipeline, Reduce
 from ..executor import Executor
+from .profile_events import ProfileEventWriter
 
 
 DEFAULT_FLASH_REPO = (
@@ -31,26 +37,258 @@ DEFAULT_MODEL = (
 V25_ELASTIC_MEDIAN_S = 581.509
 
 
+def _is_hdfs_uri(path: str) -> bool:
+    """Return whether ``path`` is an HDFS URI without importing PyArrow."""
+
+    return urlsplit(path).scheme.lower() == "hdfs"
+
+
+def _pdf_stem(path: str) -> str:
+    """Return a PDF stem for either a local path or an HDFS URI."""
+
+    if _is_hdfs_uri(path):
+        return PurePosixPath(urlsplit(path).path).stem
+    return Path(path).stem
+
+
+def _vllm_port_for_pid(pid: int) -> int:
+    """Allocate a process-stable eight-port slot for node-local vLLM actors."""
+
+    return 10_000 + (pid % 6_000) * 8
+
+
+def _available_vllm_port_for_pid(pid: int) -> int:
+    """Find an unused eight-port slot while the caller holds the init lock.
+
+    PID hashing alone can collide once hundreds of actors share a node, and a
+    vLLM process keeps its TCPStore port for its lifetime. Probe the hashed
+    slot first, then every other slot, binding all eight ports temporarily so
+    adjacent vLLM ports cannot overlap either.
+    """
+
+    slot_count = 6_000
+    first_slot = pid % slot_count
+    for step in range(slot_count):
+        port = 10_000 + ((first_slot + step) % slot_count) * 8
+        probes: list[socket.socket] = []
+        try:
+            for candidate in range(port, port + 8):
+                probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                probes.append(probe)
+                probe.bind(("127.0.0.1", candidate))
+        except OSError:
+            continue
+        finally:
+            for probe in probes:
+                probe.close()
+        return port
+    raise RuntimeError("no free eight-port slot is available for node-local vLLM")
+
+
+def _read_binary_path(
+    path: str,
+    *,
+    hdfs_filesystems: dict[str, Any] | None = None,
+) -> bytes:
+    """Read a local file or HDFS URI, lazily importing PyArrow for HDFS."""
+
+    if not _is_hdfs_uri(path):
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    from pyarrow import fs as pyarrow_fs
+
+    parsed = urlsplit(path)
+    authority = f"{parsed.scheme.lower()}://{parsed.netloc}"
+    filesystem = (
+        hdfs_filesystems.get(authority)
+        if hdfs_filesystems is not None
+        else None
+    )
+    if filesystem is None:
+        filesystem, normalized_path = pyarrow_fs.FileSystem.from_uri(path)
+        if hdfs_filesystems is not None:
+            hdfs_filesystems[authority] = filesystem
+    else:
+        normalized_path = filesystem.normalize_path(parsed.path)
+    with filesystem.open_input_file(normalized_path) as handle:
+        return handle.read()
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """原子提交文本产物，避免恢复逻辑看见截断的最终文件。"""
+
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _hdfs_filesystem_and_path(
+    uri: str,
+    filesystems: dict[str, Any],
+) -> tuple[Any, str]:
+    """Resolve an HDFS URI while reusing one filesystem per authority."""
+
+    from pyarrow import fs as pyarrow_fs
+
+    parsed = urlsplit(uri)
+    authority = f"{parsed.scheme.lower()}://{parsed.netloc}"
+    filesystem = filesystems.get(authority)
+    if filesystem is None:
+        filesystem, path = pyarrow_fs.FileSystem.from_uri(uri)
+        filesystems[authority] = filesystem
+    else:
+        path = filesystem.normalize_path(parsed.path)
+    return filesystem, path.rstrip("/") or "/"
+
+
+def _hdfs_uri_join(root: str, *parts: str) -> str:
+    """Join path components without losing an HDFS authority."""
+
+    return root.rstrip("/") + "/" + "/".join(
+        part.strip("/") for part in parts if part.strip("/")
+    )
+
+
+class _HdfsDataWriter:
+    """Minimal MinerU DataWriter implementation backed by PyArrow HDFS."""
+
+    def __init__(self, filesystem: Any, parent_path: str) -> None:
+        self.filesystem = filesystem
+        self.parent_path = parent_path.rstrip("/")
+
+    def write(self, path: str, data: bytes) -> None:
+        relative = PurePosixPath(path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"HDFS writer path escapes its parent: {path}")
+        remote_path = posixpath.join(self.parent_path, relative.as_posix())
+        self.filesystem.create_dir(
+            posixpath.dirname(remote_path), recursive=True
+        )
+        with self.filesystem.open_output_stream(remote_path) as output:
+            output.write(data)
+
+
+def _hdfs_write_bytes(filesystem: Any, path: str, data: bytes) -> None:
+    filesystem.create_dir(posixpath.dirname(path), recursive=True)
+    with filesystem.open_output_stream(path) as output:
+        output.write(data)
+
+
+def _hdfs_committed_document(
+    filesystem: Any,
+    document_root: str,
+    stem: str,
+    parse_method: str,
+) -> dict[str, Any] | None:
+    """Read a committed document, returning ``None`` for an incomplete path."""
+
+    markdown_path = posixpath.join(
+        document_root, parse_method, f"{stem}.md"
+    )
+    layout_path = posixpath.join(document_root, parse_method, "layout.json")
+    success_path = posixpath.join(document_root, "_SUCCESS")
+    try:
+        with filesystem.open_input_file(markdown_path) as source:
+            markdown = source.read().decode("utf-8")
+        with filesystem.open_input_file(layout_path) as source:
+            layout = json.loads(source.read().decode("utf-8"))
+        with filesystem.open_input_file(success_path) as source:
+            commit = json.loads(source.read().decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(layout, dict) or not isinstance(
+        layout.get("pdf_info"), list
+    ):
+        return None
+    if not isinstance(commit, dict) or commit.get("pdf") != stem:
+        return None
+    return {
+        "chars": len(markdown),
+        "pages": int(commit.get("pages", 0)),
+        "status": str(commit.get("status") or "completed"),
+    }
+
+
 class MinerUPdfToPages:
     """在 CPU actor 中把每个 PDF 渲染为 first-class page records。"""
 
-    def __init__(self, dpi: int = 200) -> None:
+    def __init__(
+        self,
+        dpi: int = 200,
+        profile_dir: str | None = None,
+        profile_system: str = "unknown",
+    ) -> None:
         """保存 PDF 渲染分辨率。"""
 
+        init_epoch_s = time.time()
+        init_monotonic_s = time.perf_counter()
+        self._profile = ProfileEventWriter(
+            profile_dir,
+            system=profile_system,
+            stage="render",
+            role="render",
+        )
         self.dpi = dpi
+        self._hdfs_filesystems: dict[str, Any] = {}
+        self._profile.actor_ready(
+            started_epoch_s=init_epoch_s,
+            started_monotonic_s=init_monotonic_s,
+        )
 
     def run(self, pdf_paths: list[str]) -> list[list[dict[str, Any]]]:
         """逐 PDF 读取字节并返回按 page ordinal 排列的页面记录。"""
 
+        started_epoch_s = time.time()
+        started_monotonic_s = time.perf_counter()
         from flash_mineru.mineru_core.utils.pdf_image_tools import (
             load_images_from_pdf,
         )
 
         groups = []
         for path in pdf_paths:
-            with open(path, "rb") as handle:
-                pdf_bytes = handle.read()
-            images, pdf_doc = load_images_from_pdf(pdf_bytes, dpi=self.dpi)
+            last_error: Exception | None = None
+            for attempt in range(3):
+                try:
+                    pdf_bytes = _read_binary_path(
+                        path,
+                        hdfs_filesystems=self._hdfs_filesystems,
+                    )
+                    images, pdf_doc = load_images_from_pdf(
+                        pdf_bytes, dpi=self.dpi
+                    )
+                    break
+                except Exception as error:
+                    last_error = error
+                    parsed = urlsplit(path)
+                    self._hdfs_filesystems.pop(
+                        f"{parsed.scheme.lower()}://{parsed.netloc}", None
+                    )
+                    if attempt < 2:
+                        time.sleep(0.5 * (2**attempt))
+            else:
+                print(
+                    "RAYORCH_MINERU_RENDER_FAILED "
+                    + json.dumps(
+                        {
+                            "pdf_path": path,
+                            "error": (
+                                f"{type(last_error).__name__}: {last_error}"
+                            ),
+                            "attempts": 3,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                groups.append([])
+                continue
             pages = []
             for page_id, image in enumerate(images):
                 width, height = map(int, pdf_doc[page_id].get_size())
@@ -67,6 +305,13 @@ class MinerUPdfToPages:
                 )
             pdf_doc.close()
             groups.append(pages)
+        self._profile.stage_batch(
+            started_epoch_s=started_epoch_s,
+            started_monotonic_s=started_monotonic_s,
+            items=len(pdf_paths),
+            batch_size=len(pdf_paths),
+            output_items=sum(len(group) for group in groups),
+        )
         return groups
 
 
@@ -77,48 +322,130 @@ class MinerUVlmOcrPage:
         self,
         model: str = DEFAULT_MODEL,
         gpu_memory_utilization: float = 0.8,
+        profile_dir: str | None = None,
+        profile_system: str = "unknown",
     ) -> None:
         """加载 vLLM 模型并创建 MinerUClient；每个 actor 只初始化一次。"""
 
+        init_epoch_s = time.time()
+        init_monotonic_s = time.perf_counter()
+        self._profile = ProfileEventWriter(
+            profile_dir,
+            system=profile_system,
+            stage="ocr",
+            role="model",
+        )
+        import fcntl
         from mineru_vl_utils import MinerUClient
         from vllm import LLM
 
-        self.llm = LLM(
-            model=model,
-            gpu_memory_utilization=gpu_memory_utilization,
-        )
+        with open("/tmp/rayorch-vllm-init.lock", "a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                os.environ["VLLM_PORT"] = str(
+                    _available_vllm_port_for_pid(os.getpid())
+                )
+                self.llm = LLM(
+                    model=model,
+                    gpu_memory_utilization=gpu_memory_utilization,
+                )
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         self.client = MinerUClient(
             backend="vllm-engine",
             vllm_llm=self.llm,
+        )
+        self._profile.actor_ready(
+            started_epoch_s=init_epoch_s,
+            started_monotonic_s=init_monotonic_s,
         )
 
     def run(self, pages: list[dict[str, Any]]) -> list[Any]:
         """对一个 logical page batch 执行两阶段 VLM extraction。"""
 
-        return list(
+        started_epoch_s = time.time()
+        started_monotonic_s = time.perf_counter()
+        result = list(
             self.client.batch_two_step_extract(
                 images=[page["img_pil"] for page in pages]
             )
         )
+        self._profile.stage_batch(
+            started_epoch_s=started_epoch_s,
+            started_monotonic_s=started_monotonic_s,
+            items=len(pages),
+            batch_size=len(pages),
+        )
+        return result
 
 
 class PdfMetadata:
     """生成 Reduce UDF 所需的轻量 parent context，避免传输 PDF anchor payload。"""
 
+    def __init__(
+        self,
+        profile_dir: str | None = None,
+        profile_system: str = "unknown",
+    ) -> None:
+        init_epoch_s = time.time()
+        init_monotonic_s = time.perf_counter()
+        self._profile = ProfileEventWriter(
+            profile_dir,
+            system=profile_system,
+            stage="metadata",
+            role="select",
+        )
+        self._profile.actor_ready(
+            started_epoch_s=init_epoch_s,
+            started_monotonic_s=init_monotonic_s,
+        )
+
     def run(self, paths: list[str]) -> list[str]:
         """把 PDF path 转为用于输出目录命名的 stem。"""
 
-        return [Path(path).stem for path in paths]
+        started_epoch_s = time.time()
+        started_monotonic_s = time.perf_counter()
+        result = [_pdf_stem(path) for path in paths]
+        self._profile.stage_batch(
+            started_epoch_s=started_epoch_s,
+            started_monotonic_s=started_monotonic_s,
+            items=len(paths),
+            batch_size=len(paths),
+        )
+        return result
 
 
 class MinerUAssembleDoc:
     """在不接收 PDF anchor payload 的情况下组装有序页面结果。"""
 
-    def __init__(self, output_dir: str, parse_method: str = "vlm") -> None:
+    def __init__(
+        self,
+        output_dir: str,
+        parse_method: str = "vlm",
+        spool_batches: bool = False,
+        remote_output_dir: str | None = None,
+        profile_dir: str | None = None,
+        profile_system: str = "unknown",
+    ) -> None:
         """保存输出根目录和 MinerU parse method。"""
 
+        init_epoch_s = time.time()
+        init_monotonic_s = time.perf_counter()
+        self._profile = ProfileEventWriter(
+            profile_dir,
+            system=profile_system,
+            stage="assemble_write",
+            role="assemble",
+        )
         self.output_dir = output_dir
         self.parse_method = parse_method
+        self.spool_batches = spool_batches
+        self.remote_output_dir = remote_output_dir
+        self._hdfs_filesystems: dict[str, Any] = {}
+        self._profile.actor_ready(
+            started_epoch_s=init_epoch_s,
+            started_monotonic_s=init_monotonic_s,
+        )
 
     def run(
         self,
@@ -128,6 +455,8 @@ class MinerUAssembleDoc:
     ) -> list[dict[str, Any]]:
         """把 ordered OCR/page GROUPs 写成 Markdown、layout JSON 和摘要。"""
 
+        started_epoch_s = time.time()
+        started_monotonic_s = time.perf_counter()
         from flash_mineru.mineru_core.data.data_reader_writer import (
             FileBasedDataWriter,
         )
@@ -139,17 +468,49 @@ class MinerUAssembleDoc:
         )
         from flash_mineru.mineru_core.utils.enum_class import MakeMode
 
+        if self.spool_batches:
+            outputs = self._spool_local_batch(
+                grouped_contents,
+                grouped_pages,
+                stems,
+                file_writer=FileBasedDataWriter,
+                result_to_middle_json=result_to_middle_json,
+                vlm_union_make=vlm_union_make,
+                make_mode=MakeMode,
+            )
+            self._profile.stage_batch(
+                started_epoch_s=started_epoch_s,
+                started_monotonic_s=started_monotonic_s,
+                items=len(stems),
+                batch_size=len(stems),
+                output_published=True,
+            )
+            return outputs
+
         outputs = []
         for contents, pages, stem in zip(
             grouped_contents,
             grouped_pages,
             stems,
         ):
+            if _is_hdfs_uri(self.output_dir):
+                outputs.append(
+                    self._write_hdfs_document(
+                        contents,
+                        pages,
+                        stem,
+                        result_to_middle_json=result_to_middle_json,
+                        vlm_union_make=vlm_union_make,
+                        make_mode=MakeMode,
+                    )
+                )
+                continue
             markdown_dir = Path(self.output_dir) / stem / self.parse_method
             image_dir = markdown_dir / "images"
             image_dir.mkdir(parents=True, exist_ok=True)
+            incomplete = markdown_dir / ".rayorch-incomplete"
+            _atomic_write_text(incomplete, "document assembly in progress\n")
             image_writer = FileBasedDataWriter(str(image_dir))
-            markdown_writer = FileBasedDataWriter(str(markdown_dir))
             middle = result_to_middle_json(
                 list(contents),
                 list(pages),
@@ -160,22 +521,237 @@ class MinerUAssembleDoc:
                 MakeMode.MM_MD,
                 "images",
             )
-            markdown_writer.write_string(f"{stem}.md", markdown)
-            (markdown_dir / "layout.json").write_text(
+            markdown_path = markdown_dir / f"{stem}.md"
+            _atomic_write_text(markdown_path, markdown)
+            _atomic_write_text(
+                markdown_dir / "layout.json",
                 json.dumps(middle, indent=2),
-                encoding="utf-8",
             )
+            incomplete.unlink()
             outputs.append(
                 {
                     "pdf": stem,
-                    "md_path": str(
-                        (markdown_dir / f"{stem}.md").resolve()
-                    ),
+                    "md_path": str(markdown_path.resolve()),
                     "chars": len(markdown),
                     "pages": len(pages),
+                    "status": "completed" if pages else "render_failed",
                 }
             )
+        self._profile.stage_batch(
+            started_epoch_s=started_epoch_s,
+            started_monotonic_s=started_monotonic_s,
+            items=len(stems),
+            batch_size=len(stems),
+            output_published=True,
+        )
         return outputs
+
+    def _spool_local_batch(
+        self,
+        grouped_contents: list[list[Any]],
+        grouped_pages: list[list[dict[str, Any]]],
+        stems: list[str],
+        *,
+        file_writer: Any,
+        result_to_middle_json: Any,
+        vlm_union_make: Any,
+        make_mode: Any,
+    ) -> list[dict[str, Any]]:
+        """Atomically publish one locally assembled batch for an uploader."""
+
+        if _is_hdfs_uri(self.output_dir):
+            raise ValueError("batch spool root must be node-local, not HDFS")
+        spool_root = Path(self.output_dir)
+        batch_id = f"{time.time_ns()}-{os.getpid()}-{uuid.uuid4().hex}"
+        staging_root = spool_root / "staging" / batch_id
+        ready_root = spool_root / "ready" / batch_id
+        documents_root = staging_root / "docs"
+        outputs: list[dict[str, Any]] = []
+        manifest_documents = []
+        try:
+            for contents, pages, stem in zip(
+                grouped_contents,
+                grouped_pages,
+                stems,
+                strict=True,
+            ):
+                document_root = documents_root / stem
+                markdown_dir = document_root / self.parse_method
+                image_dir = markdown_dir / "images"
+                image_dir.mkdir(parents=True, exist_ok=True)
+                middle = result_to_middle_json(
+                    list(contents),
+                    list(pages),
+                    file_writer(str(image_dir)),
+                )
+                markdown = vlm_union_make(
+                    middle["pdf_info"],
+                    make_mode.MM_MD,
+                    "images",
+                )
+                _atomic_write_text(markdown_dir / f"{stem}.md", markdown)
+                _atomic_write_text(
+                    markdown_dir / "layout.json",
+                    json.dumps(middle, indent=2),
+                )
+                status = "completed" if pages else "render_failed"
+                commit = {
+                    "pdf": stem,
+                    "status": status,
+                    "pages": len(pages),
+                    "chars": len(markdown),
+                }
+                _atomic_write_text(
+                    document_root / "_SUCCESS",
+                    json.dumps(commit, sort_keys=True) + "\n",
+                )
+                manifest_documents.append(commit)
+                output_root = self.remote_output_dir or self.output_dir
+                outputs.append(
+                    {
+                        "pdf": stem,
+                        "md_path": _hdfs_uri_join(
+                            output_root,
+                            stem,
+                            self.parse_method,
+                            f"{stem}.md",
+                        ),
+                        "chars": len(markdown),
+                        "pages": len(pages),
+                        "status": status,
+                    }
+                )
+            _atomic_write_text(
+                staging_root / "manifest.json",
+                json.dumps(
+                    {
+                        "batch_id": batch_id,
+                        "documents": manifest_documents,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n",
+            )
+            ready_root.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staging_root, ready_root)
+        except BaseException:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            raise
+        return outputs
+
+    def _write_hdfs_document(
+        self,
+        contents: list[Any],
+        pages: list[dict[str, Any]],
+        stem: str,
+        *,
+        result_to_middle_json: Any,
+        vlm_union_make: Any,
+        make_mode: Any,
+    ) -> dict[str, Any]:
+        """Write and atomically commit one complete document directly to HDFS."""
+
+        filesystem, output_root = _hdfs_filesystem_and_path(
+            self.output_dir,
+            self._hdfs_filesystems,
+        )
+        final_root = posixpath.join(output_root, stem)
+        committed = _hdfs_committed_document(
+            filesystem,
+            final_root,
+            stem,
+            self.parse_method,
+        )
+        if committed is not None:
+            return {
+                "pdf": stem,
+                "md_path": _hdfs_uri_join(
+                    self.output_dir,
+                    stem,
+                    self.parse_method,
+                    f"{stem}.md",
+                ),
+                **committed,
+            }
+        staging_root = posixpath.join(
+            posixpath.dirname(output_root),
+            "_staging",
+            f"{stem}.{uuid.uuid4().hex}",
+        )
+        markdown_dir = posixpath.join(staging_root, self.parse_method)
+        image_dir = posixpath.join(markdown_dir, "images")
+        filesystem.create_dir(image_dir, recursive=True)
+        try:
+            middle = result_to_middle_json(
+                list(contents),
+                list(pages),
+                _HdfsDataWriter(filesystem, image_dir),
+            )
+            markdown = vlm_union_make(
+                middle["pdf_info"],
+                make_mode.MM_MD,
+                "images",
+            )
+            markdown_name = f"{stem}.md"
+            _hdfs_write_bytes(
+                filesystem,
+                posixpath.join(markdown_dir, markdown_name),
+                markdown.encode("utf-8"),
+            )
+            _hdfs_write_bytes(
+                filesystem,
+                posixpath.join(markdown_dir, "layout.json"),
+                json.dumps(middle, indent=2).encode("utf-8"),
+            )
+            status = "completed" if pages else "render_failed"
+            _hdfs_write_bytes(
+                filesystem,
+                posixpath.join(staging_root, "_SUCCESS"),
+                (
+                    json.dumps(
+                        {
+                            "pdf": stem,
+                            "status": status,
+                            "pages": len(pages),
+                            "chars": len(markdown),
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+            filesystem.create_dir(posixpath.dirname(final_root), recursive=True)
+            try:
+                filesystem.move(staging_root, final_root)
+            except Exception:
+                committed = _hdfs_committed_document(
+                    filesystem,
+                    final_root,
+                    stem,
+                    self.parse_method,
+                )
+                if committed is None:
+                    raise
+                try:
+                    filesystem.delete_dir(staging_root)
+                except Exception:
+                    pass
+        except BaseException:
+            try:
+                filesystem.delete_dir(staging_root)
+            except Exception:
+                pass
+            raise
+        return {
+            "pdf": stem,
+            "md_path": _hdfs_uri_join(
+                self.output_dir, stem, self.parse_method, markdown_name
+            ),
+            "chars": len(markdown),
+            "pages": len(pages),
+            "status": status,
+        }
 
 
 class MinerUV3Pipeline(Pipeline):
@@ -260,6 +836,7 @@ class GpuSample:
     monotonic_s: float
     utilization: tuple[int | None, ...]
     memory_used: tuple[int, ...]
+    epoch_s: float | None = None
 
 
 class ResourceSampler:
@@ -326,9 +903,14 @@ def _gpu_sample() -> GpuSample:
                 utilization.append(None)
             memory.append(int(pynvml.nvmlDeviceGetMemoryInfo(handle).used))
         pynvml.nvmlShutdown()
-        return GpuSample(time.monotonic(), tuple(utilization), tuple(memory))
+        return GpuSample(
+            time.monotonic(),
+            tuple(utilization),
+            tuple(memory),
+            epoch_s=time.time(),
+        )
     except Exception:
-        return GpuSample(time.monotonic(), (), ())
+        return GpuSample(time.monotonic(), (), (), epoch_s=time.time())
 
 
 def _runtime_env(flash_repo: str) -> dict[str, Any]:
@@ -338,7 +920,17 @@ def _runtime_env(flash_repo: str) -> dict[str, Any]:
     pythonpath = os.pathsep.join(
         path for path in (flash_repo, os.getcwd(), current) if path
     )
-    return {"env_vars": {"PYTHONPATH": pythonpath}}
+    return {
+        "env_vars": {
+            "PYTHONPATH": pythonpath,
+            "VLLM_NO_USAGE_STATS": "1",
+            "DO_NOT_TRACK": "1",
+            "LOGURU_LEVEL": os.environ.get("LOGURU_LEVEL", "WARNING"),
+            "VLLM_LOGGING_LEVEL": os.environ.get(
+                "VLLM_LOGGING_LEVEL", "WARNING"
+            ),
+        }
+    }
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:

@@ -1,0 +1,122 @@
+[profiles.ray-h20-2node]
+# Reference only.  The launcher reads this private file only for an explicit
+# submit/status/cleanup operation; plan/static checks never open it.
+cmk_file = "/ABSOLUTE/PATH/TO/YOUR/CMK"
+compute_spec_file = "compute_h20_2node.json"
+remote_workdir = "hydp_runs/clapliang/rayorch_v36_mineru_h20_2node"
+wait = true
+poll_interval = 10
+max_wait = 172800
+compute_ready_timeout = 7200
+poll_error_grace = 300
+concurrency = 1
+
+# Intentional: orchestrate.py detaches only after the full job is RUNNING and
+# leaves both that job and its owned compute alive.  Use the explicit cleanup
+# command (with the compute id as confirmation) after inspecting completion.
+keep_compute = true
+keep_remote_files = true
+
+[profiles.ray-h20-2x4-zw-pretrain]
+cmk_file = "/ABSOLUTE/PATH/TO/YOUR/CMK"
+compute_spec_file = "compute_h20_2node_4gpu_zw_pretrain.json"
+remote_workdir = "hydp_runs/clapliang/rayorch_v36_mineru_h20_2x4_zw_pretrain"
+wait = true
+poll_interval = 10
+max_wait = 172800
+compute_ready_timeout = 7200
+poll_error_grace = 300
+concurrency = 1
+keep_compute = true
+keep_remote_files = true
+
+[profiles.ray-h20-1x4-zw-pretrain]
+cmk_file = "/ABSOLUTE/PATH/TO/YOUR/CMK"
+compute_spec_file = "compute_h20_1node_4gpu_zw_pretrain.json"
+remote_workdir = "hydp_runs/clapliang/rayorch_v36_mineru_h20_1x4_zw_pretrain"
+wait = true
+poll_interval = 10
+max_wait = 172800
+compute_ready_timeout = 7200
+poll_error_grace = 300
+concurrency = 1
+keep_compute = true
+keep_remote_files = true
+
+[profiles.ray-h20-1x8-zw-pretrain]
+cmk_file = "/ABSOLUTE/PATH/TO/YOUR/CMK"
+compute_spec_file = "compute_h20_1node_8gpu_zw_pretrain.json"
+remote_workdir = "hydp_runs/clapliang/rayorch_v36_mineru_h20_1x8_zw_pretrain"
+wait = true
+poll_interval = 10
+max_wait = 172800
+compute_ready_timeout = 7200
+poll_error_grace = 300
+concurrency = 1
+keep_compute = true
+keep_remote_files = true
+
+[profiles.ray-h20-2x8-zw-pretrain]
+cmk_file = "/ABSOLUTE/PATH/TO/YOUR/CMK"
+compute_spec_file = "compute_h20_2node_8gpu_zw_pretrain.json"
+remote_workdir = "hydp_runs/clapliang/rayorch_v36_mineru_h20_2x8_zw_pretrain"
+wait = true
+poll_interval = 10
+max_wait = 172800
+compute_ready_timeout = 7200
+poll_error_grace = 300
+concurrency = 1
+keep_compute = true
+keep_remote_files = true
+
+[profiles.ray-h20-4x8-zw-pretrain]
+cmk_file = "/ABSOLUTE/PATH/TO/YOUR/CMK"
+compute_spec_file = "compute_h20_4node_8gpu_zw_pretrain.json"
+remote_workdir = "hydp_runs/clapliang/rayorch_v36_mineru_h20_4x8_zw_pretrain"
+wait = true
+poll_interval = 10
+max_wait = 172800
+compute_ready_timeout = 7200
+poll_error_grace = 300
+concurrency = 1
+keep_compute = true
+keep_remote_files = true
+
+[profiles.ray-h20-8x8]
+cmk_file = "/ABSOLUTE/PATH/TO/YOUR/CMK"
+compute_spec_file = "compute_h20_8node_8gpu.json"
+remote_workdir = "hydp_runs/clapliang/rayorch_v36_mineru_h20_8x8"
+wait = true
+poll_interval = 10
+max_wait = 172800
+compute_ready_timeout = 7200
+poll_error_grace = 300
+concurrency = 1
+keep_compute = true
+keep_remote_files = true
+
+[profiles.ray-h20-8x8-gy]
+cmk_file = "/ABSOLUTE/PATH/TO/YOUR/CMK"
+compute_spec_file = "compute_h20_8node_8gpu_gy.json"
+remote_workdir = "hydp_runs/clapliang/rayorch_v36_mineru_h20_8x8_gy"
+wait = true
+poll_interval = 10
+max_wait = 172800
+compute_ready_timeout = 7200
+poll_error_grace = 300
+concurrency = 1
+keep_compute = true
+keep_remote_files = true
+
+[profiles.ray-h20-8x8-zw-pretrain]
+cmk_file = "/ABSOLUTE/PATH/TO/YOUR/CMK"
+compute_spec_file = "compute_h20_8node_8gpu_zw_pretrain.json"
+remote_workdir = "hydp_runs/clapliang/raydata_mineru_h20_8x8_zw_pretrain"
+wait = true
+poll_interval = 10
+max_wait = 172800
+compute_ready_timeout = 7200
+poll_error_grace = 300
+concurrency = 1
+keep_compute = true
+keep_remote_files = true

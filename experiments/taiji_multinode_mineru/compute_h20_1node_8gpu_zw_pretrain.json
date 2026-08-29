@@ -1,0 +1,73 @@
+{
+  "runtime": "ray",
+  "description": "RayOrch multigrain_v3_6 MinerU scaling: one Zhongwei H20 worker with eight GPUs.",
+  "runtime_spec": {
+    "provider": "ModelService",
+    "servingEnv": "test",
+    "image": "mirrors.tencent.com/hunyuan-text-data/ray-vllm:2.51.1-py312-tlinux-cu122-vllm11",
+    "gpu_image": "mirrors.tencent.com/hunyuan-text-data/ray-vllm:2.51.1-py312-tlinux-cu122-vllm11",
+    "taiji_app_group": "TaiJi_HYAide_LLM_Pretrain_Data",
+    "taiji_app_group_location": "zw",
+    "dynamic_scheduling_config": {
+      "dynamicSchedulingResourceQueue": {"private": {"enable": true}}
+    },
+    "driver_placement_group": {"index": -1, "num_cpu": 0},
+    "autoscaler": {"idleTimeoutSeconds": 86400},
+    "override_config": {"cluster_config": {}, "job_config": {}}
+  },
+  "resource": {
+    "driver_cpu": 16,
+    "driver_mem": 131072,
+    "driver_gpu": 0,
+    "extra": {
+      "cpu_provider": {
+        "namespace": "fengluan-37596-offline",
+        "gaia_id": "17968",
+        "cpu_type": "tdw",
+        "enable_pod_affinity": true
+      },
+      "override_config": {"hostNetwork": true}
+    },
+    "executor_group": [
+      {
+        "replicas": 1,
+        "min_replicas": 1,
+        "max_replicas": 1,
+        "num_cpu": 32,
+        "num_mem": 262144,
+        "num_gpu": 8,
+        "extra": {
+          "override_config": {"privileged": true, "hostNetwork": true},
+          "gpu_provider": {
+            "taiji": {
+              "app_group_name": "TaiJi_HYAide_LLM_Pretrain_Data",
+              "cluster_type": 1,
+              "gpu_type": "H20",
+              "owners": "null",
+              "enable_node_cpu": true,
+              "app_group_location": "zw",
+              "dynamic_scheduling_config": {
+                "dynamicSchedulingResourceQueue": {"private": {"enable": true}}
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "env": {
+    "NVIDIA_DISABLE_REQUIRE": "true",
+    "RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION": "0.30",
+    "RAY_DATA_OP_RESERVATION_RATIO": "0.05",
+    "RAY_DATA_OBJECT_STORE_MEMORY_LIMIT_FRACTION": "0.85",
+    "RAY_local_fs_capacity_threshold": "0.99",
+    "RAY_ENABLE_UV_RUN_RUNTIME_ENV": "0",
+    "RUNTIME_ENV_RETRY_TIMES": "10",
+    "RUNTIME_ENV_RETRY_INTERVAL_MS": "5000",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1"
+  },
+  "launch_timeout": 7200,
+  "cull_idle_timeout": 86400
+}
