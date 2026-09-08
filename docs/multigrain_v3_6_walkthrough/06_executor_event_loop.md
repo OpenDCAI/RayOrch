@@ -1,32 +1,68 @@
-# 06：逐段读懂 `execution/executor.py`——Ray actor 与多 microbatch 事件循环
+# 06. Executor event loop: Ray transport and cleanup
 
-主源码：[`execution/executor.py`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py)。
+[`execution/executor.py`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py)
+is the only component that owns Ray actor handles and pending RPC references.
+The Chinese version is retained as
+[`06_executor_event_loop.zh.md`](06_executor_event_loop.zh.md).
 
-Executor 是 V3.6 唯一认识 Ray 调度对象的主组件。它不会解释 Filter/Reduce 或直接写 Item；它
-只把 active Engine 的 READY Grain 送入空闲 actor，再把 Worker 结果交回原 Engine。
+## At a glance
+
+The loop admits bounded microbatches, asks the engine for eligible grains,
+reserves a batch, submits it to an actor, and feeds the generation-fenced
+result back to the engine. Multiple microbatches share persistent actor pools,
+but one physical RPC never mixes grains from unrelated calls.
+
+Capacity controls are independent: microbatch admission, active microbatches,
+call batch size, replicas, per-actor outstanding RPCs, and actor method
+concurrency. The outstanding window includes calls waiting in the Ray mailbox;
+keeping it shallow avoids early binding and head-of-line blocking for variable
+PDF/OCR work.
+
+On every dispatch failure the reservation is released in a `finally` path before
+retry, actor replacement, or run termination. This prevents a permanently busy
+actor. Infrastructure retries replace a dead actor when the compiled policy
+allows it; opaque UDF failures follow the pure `RecoveryPolicy` algebra.
+
+At commit time the executor rechecks suppression barriers. An already submitted,
+healthy sibling commits normally if no barrier exists; if a barrier was
+established while it was in flight, its value is discarded as `SUPPRESSED`.
+
+Integration tests should cover actor construction failure, actor crash and
+replacement, persistent pools, multiple microbatches, cleanup, late reports,
+and repeated runs.
 
 ---
 
-## 1. Executor 的准确职责
+## 06. Reading `execution/executor.py` section by section: Ray actors and the multi-microbatch event loop
 
-Executor 拥有：
+Main source: [`execution/executor.py`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py).
 
-- Ray runtime ownership；
-- 每个 Call 的持久 actor pool；
-- actor busy capacity；
-- pending Ray ObjectRef→dispatch lease 映射；
-- active/completed microbatch 生命周期；
-- work-conserving dispatch；
-- 物理异常分类、actor replacement 与 recovery handoff；
-- run-local metrics 和最终输出合并。
+The Executor is the only main component in V3.6 that knows about Ray scheduling objects. It does
+not interpret Filter/Reduce or write Items directly; it merely feeds the READY Grains of an
+active Engine into idle actors, and hands Worker results back to the originating Engine.
 
-Executor 不拥有：
+---
 
-- Item/Expansion/Entity 与 lineage；
-- GrainRecord/queue/generation 的直接写入；
-- primitive outcome 代数；
-- UDF input/output normalization；
-- Logical Origin 或 compiler pass。
+### 1. The Executor's exact responsibilities
+
+The Executor owns:
+
+- Ray runtime ownership;
+- a persistent actor pool per Call;
+- actor busy capacity;
+- the pending Ray ObjectRef to pending RPC mapping;
+- active/completed microbatch lifecycles;
+- work-conserving dispatch;
+- physical exception classification, actor replacement, and recovery handoff;
+- run-local metrics and final output merging.
+
+The Executor does not own:
+
+- Item/Expansion/Entity and lineage;
+- direct writes of GrainRecord/queue/generation;
+- the primitive outcome algebra;
+- UDF input/output normalization;
+- Logical Origin or compiler passes.
 
 ```mermaid
 flowchart LR
@@ -44,60 +80,61 @@ flowchart LR
 
 ---
 
-## 2. 源码地图
+### 2. Source map
 
-| 源码段 | 作用 | 核心不变量 |
+| Source section | Role | Core invariant |
 | --- | --- | --- |
-| [四个 driver-local DTO](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L30-L67) | counters、actor、microbatch、lease | Ray 对象不泄漏到 Engine |
-| [`Executor.__init__`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L70-L121) | 编译、Ray ownership、建 pool、ready barrier | 半初始化也能 cleanup |
-| [`run`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L125-L257) | 完整 driver event loop | pending Ref 与 lease 一一对应 |
-| [`close`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L259-L275) | actor 与 owned Ray runtime 回收 | 幂等、区分外部 Ray |
-| [observation/metrics](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L279-L356) | best-effort snapshot 与 run-local 冻结 | 诊断不改变业务结果 |
-| [source admission](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L360-L391) | source columns→独立 Engine | microbatch 间不共享语义状态 |
-| [`_dispatch_ready`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L393-L435) | 空闲 actor 领取 READY work | 一个 RPC 不跨 microbatch |
-| [failure/recovery](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L439-L518) | typed failure→policy/action/actor replace | infra 与 UDF failure 分离 |
-| [pool 与纯 helpers](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L522-L577) | actor 构造、名字、输出树合并 | pool 只按 Call 创建 |
+| [four driver-local DTOs](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L30-L67) | counters, actor, microbatch, pending RPC | Ray objects do not leak into the Engine |
+| [`Executor.__init__`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L70-L121) | compile, Ray ownership, build pools, ready barrier | even a half-initialized Executor can clean up |
+| [`run`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L125-L257) | the complete driver event loop | pending Refs and pending RPCs correspond one to one |
+| [`close`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L259-L275) | reclaim actors and the owned Ray runtime | idempotent, distinguishes external Ray |
+| [observation/metrics](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L279-L356) | best-effort snapshot and run-local freezing | diagnostics never change business results |
+| [source admission](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L360-L391) | source columns to an independent Engine | no semantic state is shared across microbatches |
+| [`_dispatch_ready`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L393-L435) | an idle actor picks up READY work | one RPC never spans microbatches |
+| [failure/recovery](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L439-L518) | typed failure to policy/action/actor replace | infra failures are separated from UDF failures |
+| [pool and pure helpers](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L522-L577) | actor construction, naming, output tree merging | pools are created per Call only |
 
 ---
 
-## 3. 四个 driver-local DTO
+### 3. Four driver-local DTOs
 
-### `_CallCounters`
+#### `_CallCounters`
 
-记录当前 `run()` 的 actor instances、RPC、Grain、retry 与 batch sizes。每次 run 重建，避免与
-持久 actor 的 lifetime observations 混淆。
+Records the current `run()`'s actor instances, RPCs, Grains, retries, and batch sizes. It is
+rebuilt on every run to avoid confusion with the lifetime observations of persistent actors.
 
-### `_ActorSlot`
+#### `_ActorSlot`
 
 ```text
 CallRef + actor handle + busy bit
 ```
 
-它是 driver 的 capacity token。Engine 不知道哪个 actor 执行 Grain。
+It is the driver's capacity token. The Engine does not know which actor executes a Grain.
 
-### `_MicrobatchSlot`
+#### `_MicrobatchSlot`
 
 ```text
 admission index + unique MicrobatchEngine
 ```
 
-每个 source slice 有独立 RuntimeState/DispatchState；actor pool 可以共享，但语义事实不能跨
-microbatch 混在一个 Engine。
+Each source slice has its own RuntimeState/DispatchState; actor pools may be shared, but semantic
+facts must not be mixed into one Engine across microbatches.
 
-### `_DispatchLease`
+#### `_PendingRpc`
 
 ```text
 microbatch index + actor slot + exact DispatchBatch
 ```
 
-pending ObjectRef 只保存为 dict key，lease 是它返回后恢复完整上下文的唯一记录。generation 仍
-在 GrainPlan/DispatchState 中，不在 lease 复制一份计数。
+A pending ObjectRef is kept only as a dict key; the pending RPC is the sole record that restores full
+context once it returns. The generation still lives in `GrainInvocation`/`DispatchState`, and is not
+copied as another counter inside the pending_rpc.
 
 ---
 
-## 4. `__init__()`：编译、Ray ownership 与异常清理
+### 4. `__init__()`: compilation, Ray ownership, and exceptional cleanup
 
-构造按以下顺序执行：
+Construction proceeds in this order:
 
 ```mermaid
 flowchart TD
@@ -115,157 +152,174 @@ flowchart TD
     Store --> Pools --> Ready
 ```
 
-`_owns_ray` 是明确生命周期合同：
+`_owns_ray` is an explicit lifecycle contract:
 
-- Executor 自己初始化 Ray → `close()` 必须 shutdown；
-- 调用方已初始化 Ray → `close()` 只杀自己的 actors，不关闭外部 runtime。
+- If the Executor initializes Ray itself, `close()` must shut it down;
+- if the caller has already initialized Ray, `close()` only kills its own actors and does not
+  shut down the external runtime.
 
-构造 pool 前先为每个 Call 登记空 list，再逐 actor append。若第 N 个 actor 构造或 ready barrier
-同步失败，外层 `except` 调用 `close()`，前 N-1 个 handle 仍在统一容器中可回收。
+Before building a pool, an empty list is registered for each Call and actors are appended one by
+one. If construction of the Nth actor or the ready barrier synchronization fails, the outer
+`except` calls `close()`, and the first N-1 handles are still reclaimable from the unified
+container.
 
-`ready()` barrier 确保 UDF/model 构造完成后才允许 `run()` 开始计时。
+The `ready()` barrier guarantees that `run()` only starts timing after UDF/model construction has
+completed.
 
 ---
 
-## 5. `run()` 前置处理：finite sources 与 microbatch slices
+### 5. `run()` pre-processing: finite sources and microbatch slices
 
-`_normalize_sources()` 把公开 `Sequence` 输入 eager materialize 为 tuples，并验证：
+`_ready_fifo_by_callize_sources()` eagerly materializes the public `Sequence` inputs into tuples and
+validates that:
 
-- source 列数等于 `Pipeline.forward` 参数数；
-- 所有列 row-aligned。
+- the number of source columns equals the number of `Pipeline.forward` parameters;
+- all columns are row-aligned.
 
-`microbatch_size` 把列按相同范围切片。空输入仍创建一个空 slice：
+`microbatch_size` slices the columns by the same ranges. Empty input still produces one empty
+slice:
 
 ```text
 sources=([], []) -> slices=[((), ())]
 ```
 
-这样空输入走同一 admission/completion/materialization 语义，不需要旁路返回。这里明确采用
-finite eager input contract，不声明 streaming input/output 语义。
+This way empty input follows the same admission/completion/materialization semantics, with no
+need for a bypass return. A finite eager input contract is deliberately adopted here; no
+streaming input/output semantics are declared.
 
-每次 run：
+On every run:
 
-- 清理 driver BlockStore dereference cache；
-- 重建 `_CallCounters`；
-- 创建 run-local `active/completed/pending` 容器；
-- actor pool 和 Worker UDF 实例保持持久。
+- the driver BlockStore dereference cache is cleared;
+- `_CallCounters` is rebuilt;
+- run-local `active/completed/pending` containers are created;
+- the actor pools and Worker UDF instances remain persistent.
 
 ---
 
-## 6. 事件循环的四条不变量
+### 6. Four invariants of the event loop
 
-源码在 while 前直接列出：
+The source lists them right before the `while`:
 
 ```text
 1. active[index] uniquely owns that microbatch's Engine
-2. every pending ObjectRef maps to exactly one fenced lease
-3. a busy actor has one such lease and is released in finally
-4. materialization requires no pending lease + Engine complete
+2. every pending ObjectRef maps to exactly one fenced pending RPC
+3. a busy actor has one such pending RPC and is released in finally
+4. materialization requires no pending RPC + Engine complete
 ```
 
-把这四条记住，后面的 100 多行可以看成重复维护它们。
+Keep these four in mind, and the following 100-plus lines can be read as repeatedly maintaining
+them.
 
 ```mermaid
 stateDiagram-v2
     [*] --> NotAdmitted
     NotAdmitted --> Active: admission credit available
     Active --> Active: dispatch / report / propagation
-    Active --> Completed: no pending lease and Engine complete
+    Active --> Completed: no pending RPC and Engine complete
     Completed --> [*]: merge outputs
 ```
 
 ---
 
-## 7. Event-loop 第一段：填充 active admission window
+### 7. Event loop part 1: filling the active admission window
 
-只要：
+As long as:
 
 ```text
-还有 source slices
+source slices remain
 and len(active) < max_active_microbatches
 ```
 
-就调用 `_admit_microbatch()`：
+`_admit_microbatch()` is called, which:
 
-1. 创建独立 `MicrobatchEngine(plan)`；
-2. 每个 source column 写一个 coarse block；
-3. 创建逐行 `RowBinding`；
-4. 编译器 demand control 的 source 直接使用原 bool values；
-5. `engine.admit_sources()`；
-6. `engine.close_admission()`。
+1. creates an independent `MicrobatchEngine(plan)`;
+2. writes each source column as one coarse block;
+3. creates per-row `RowBinding`s;
+4. lets compiler demand control use the original bool values directly for sources;
+5. calls `engine.admit_sources()`;
+6. calls `engine.close_admission()`.
 
-`max_active_microbatches` 只限制同时活跃的 source slices，不改变每个 Call 的 actor replicas 或
-dispatch batch size。
+`max_active_microbatches` only limits how many source slices are active at once; it does not change
+the actor replicas per Call or the dispatch batch size.
 
 ---
 
-## 8. Event-loop 第二段：work-conserving dispatch
+### 8. Event loop part 2: work-conserving dispatch
 
-`_dispatch_ready()` 外层按 Call 和 actor slot 遍历。每个空闲 actor：
+`_dispatch_ready()` iterates over Calls and actor slots in its outer loops. For each idle actor:
 
-1. 查询每个 active Engine 对该 Call 的最高 dispatch priority；
-2. 以 `(priority, microbatch_index)` 取最小候选；
-3. 从该 Engine reserve，最多 `pool.batch_size`；
-4. 逐 Grain 投影 `GrainPlan`；
-5. 取 compiler 生成的 output layouts；
-6. 提交一次 actor RPC；
-7. 标记 actor busy，并登记 ObjectRef→lease；
-8. 更新 run-local counters。
+1. query every active Engine for its highest dispatch priority for that Call;
+2. take the minimum candidate by `(priority, microbatch_index)`;
+3. reserve from that Engine, at most `pool.batch_size`; if this only cleans up
+   barriered READY Grains, no RPC is sent this round;
+4. project a `GrainInvocation` per Grain for the non-empty live batch;
+5. take the compiler-generated output layouts;
+6. submit one actor RPC;
+7. mark the actor busy and register `ObjectRef -> _PendingRpc` in `pending_rpcs`;
+8. update run-local counters.
 
 ```mermaid
 flowchart TD
     Actor["idle actor for Call c"]
     Candidates["active Engines with priority(c)"]
     Select["min priority, then admission index"]
-    Reserve["Engine.reserve_dispatch"]
-    Plans["Engine.grain_plan for each Grain"]
+    Reserve["Engine.reserve_dispatch<br/>live batch or cleanup-only"]
+    Invocations["Engine.grain_invocation for each Grain"]
     RPC["actor.execute.remote"]
-    Lease["pending[ObjectRef] = lease"]
+    PendingRpc["pending_rpcs[ObjectRef] = _PendingRpc"]
 
-    Actor --> Candidates --> Select --> Reserve --> Plans --> RPC --> Lease
+    Actor --> Candidates --> Select --> Reserve --> Invocations --> RPC --> PendingRpc
 ```
 
-调度是即时、work-conserving 的：actor 空闲就发送当前可见 Grain，不伪装支持 timer-based batch
-等待窗口。
+Dispatch is immediate and work-conserving: whenever an actor is idle, the currently visible
+Grains are sent, with no pretense of supporting a timer-based batch waiting window.
 
-一个 RPC 严格来自一个 microbatch。不同 microbatch 可以同时占用同一 Call pool 的不同 actors，
-但不会为了凑 batch 把多个 Engine 的 Grain 静默混合。
+A cleanup-only reserve publishes `SUPPRESSED` facts and may expose a Call that was already
+traversed earlier in this round; therefore `_dispatch_ready()` returns a progress bit. If there is
+no pending RPC at that moment, the event loop simply starts the next round instead of
+misdiagnosing valid local state advancement as a deadlock.
+
+One RPC comes strictly from one microbatch. Different microbatches may occupy different actors of
+the same Call pool at the same time, but Grains from multiple Engines are never silently mixed
+just to fill a batch.
 
 ---
 
-## 9. Event-loop 第三段：完成、materialize 与 release
+### 9. Event loop part 3: completion, materialize, and release
 
-一个 active microbatch 只有同时满足：
+An active microbatch may leave active only when both hold:
 
 ```text
-its index not referenced by any pending lease
+its index not referenced by any pending RPC
 and engine.is_complete()
 ```
 
-才可以离开 active。
+The order is:
 
-顺序是：
+1. `materialize_tree()` reads business values along the public output tree;
+2. the BlockStore dereference cache is cleared;
+3. `engine.release_values()` clears the runtime binding tables;
+4. the Entity/Item/Expansion/Grain/released metrics of that microbatch are frozen;
+5. the active slot is deleted and the admission credit is released.
 
-1. `materialize_tree()` 按 public output tree 读取业务值；
-2. 清理 BlockStore dereference cache；
-3. `engine.release_values()` 清除 runtime binding 表；
-4. 冻结该 microbatch 的 Entity/Item/Expansion/Grain/released metrics；
-5. 删除 active slot，释放 admission credit。
-
-materialized Python output 已复制到 driver result，因此 Engine 不必继续持有 page image 等中间
-ObjectRef。语义 outcome 与计数仍保留到 snapshot 完成。
+Materialized Python output has already been copied into the driver result, so the Engine does not
+need to keep holding intermediate ObjectRefs such as page images. Semantic outcomes and counters
+are still retained until the snapshot completes.
 
 ---
 
-## 10. Event-loop 第四段：等待一个完成 RPC
+### 10. Event loop part 4: waiting for one completing RPC
 
-若尚未全部完成：
+If not everything is complete yet:
 
-- active 已完成但还有未 admission slice，且无 pending → 直接下一轮填 credit；
-- active 未完成、无 pending 且无新 slice → 抛带每个 Engine summary 的 deadlock；
-- pending 非空 → `ray.wait(..., num_returns=1)`。
+- active is complete but unadmitted slices remain and nothing is pending, so go straight to the
+  next round to fill credit;
+- active is incomplete, nothing is pending, and there is no new slice, so raise a deadlock
+  carrying every Engine's summary;
+- pending is non-empty, so `ray.wait(..., num_returns=1)`.
 
-拿到一个 ref 后，先从 `pending` pop lease，再定位原 microbatch Engine。
+After obtaining one ref, first pop `_PendingRpc` from `pending_rpcs`, then locate the original microbatch
+Engine.
 
 ```text
 ray.get raises
@@ -275,49 +329,58 @@ result is DispatchFailure
     -> typed contract/UDF failure path
 
 result is tuple[WorkerReport]
-    -> engine.commit_report for each Grain
+    -> engine.commit_reports(exact `DispatchBatch`, complete result)
 
 finally
     -> actor.busy = False
 ```
 
-`finally` 保证成功、可恢复失败或抛出终局异常时都不会遗留假 busy capacity。
+`finally` guarantees that no fake busy capacity is left behind on success, on a recoverable
+failure, or when a terminal exception is raised.
 
 ---
 
-## 11. typed failure：每层只补自己拥有的上下文
+### 11. Typed failure: each layer adds only the context it owns
 
-### Contract error
+#### Contract error
 
-Worker ABI 已确定性违反，Executor 直接生成 `ExecutionError`，不做 UDF retry/split。
+The Worker ABI has been deterministically violated, so the Executor generates an
+`ExecutionError` directly, with no UDF retry/split.
 
-### UDF error
+#### UDF error
 
-Executor 读取该 Call 的 `RecoveryPolicy`，用 batch 的 completed UDF retries 和 Grain count 得到
-`RecoveryAction`。非 ABORT 动作交给 Engine/DispatchState 执行；Executor 只更新物理 metrics。
+The Executor reads the `RecoveryPolicy` of that Call and derives a `RecoveryAction` from the
+batch's completed UDF retries and Grain count. If a suppression barrier has already hit part of the
+`DispatchBatch`, the Engine first projects the live subset, and the policy only looks at live Grains;
+the barriered subset is not retried. Non-ABORT actions are handed to Engine/DispatchState; the Executor
+only updates metrics for the Grains that are actually replayed.
 
-### Infrastructure error
+#### Infrastructure error
 
-Ray `get()` 抛错说明 actor/transport 不可信。Engine 查询并执行 infrastructure retry budget；若
-允许，Executor kill 旧 actor、创建新 actor，并保留 exact batch 重试。
+A Ray `get()` exception means the actor/transport is untrustworthy. The Engine first seals the
+barriered subset, then queries and executes the infrastructure retry budget only for the
+live subset; the Executor still replaces the untrusted actor regardless of whether the data subset
+has already been fully suppressed. Only Grains that are genuinely live/requeued count toward retry
+metrics.
 
-### 最终错误拼装
+#### Final error assembly
 
-Worker 只提供 wire failure details；Executor 再加入：
+The Worker supplies only wire failure details; the Executor adds:
 
-- Call index；
-- UDF name；
-- 全部 GrainRef；
-- 当前 generation；
-- Worker traceback 或 infra exception type。
+- the Call index;
+- the UDF name;
+- all GrainRefs;
+- the current generation;
+- the Worker traceback or the infra exception type.
 
-这避免 Worker 读取 Program，也避免 Engine 认识 UDF display name。
+This keeps the Worker from reading the Program, and keeps the Engine from knowing UDF display
+names.
 
 ---
 
-## 12. `_replace_actor()`：为什么替换 handle 而不是替换 slot
+### 12. `_replace_actor()`: why replace the handle instead of the slot
 
-`_DispatchLease` 持有 `_ActorSlot` 对象。基础设施失败时，Executor：
+`_PendingRpc` holds the `_ActorSlot` object. On an infrastructure failure the Executor:
 
 ```text
 kill old slot.handle
@@ -325,72 +388,80 @@ slot.handle = newly created actor
 actor_instances += 1
 ```
 
-保留 slot identity，finally 仍可把 `slot.busy=False`；actor pool list 也无需到处更新引用。新 actor
-使用同一 Call 的 UdfSpec、input layout 与 Ray options。
+The slot identity is preserved so that `finally` can still set `slot.busy=False`, and the actor
+pool list does not need its references updated everywhere. The new actor uses the same Call's
+UdfSpec, input layout, and Ray options.
 
 ---
 
-## 13. observation 与 metrics 为什么分开
+### 13. Why observation and metrics are separate
 
-业务 microbatches 完成后，`_observe_workers()` 并发请求所有 actor snapshots。单个 observe 失败
-只记录 `WorkerSnapshot.error`，不会推翻已经 materialize 的业务输出。
+After the business microbatches complete, `_observe_workers()` concurrently requests snapshots
+from all actors. A failure of a single observe only records a `WorkerSnapshot.error`; it does not
+overturn business output that has already been materialized.
 
-`_freeze_call_metrics()` 按 CallRef 顺序输出 public tuple，避免把内部 Ref-keyed dict 暴露给用户。
+`_freeze_call_metrics()` emits a public tuple ordered by CallRef, avoiding exposure of the
+internal Ref-keyed dict to users.
 
-| 指标 | 口径 |
+| Metric | Accounting |
 | --- | --- |
-| `CallMetrics.rpcs/grains/retries/batch_sizes` | 当前 run |
-| `CallMetrics.actor_instances` | 当前 run 使用/替换过的 actor 数 |
-| `WorkerSnapshot.lifetime_calls` | 持久 actor lifetime |
-| `MicrobatchMetrics` | 单个完成 source slice 的语义规模快照 |
+| `CallMetrics.rpcs/grains/retries/batch_sizes` | current run |
+| `CallMetrics.actor_instances` | number of actors used/replaced in the current run |
+| `WorkerSnapshot.lifetime_calls` | persistent actor lifetime |
+| `MicrobatchMetrics` | semantic scale snapshot of one completed source slice |
 
-重复 `run()` 时前两类口径因此是明确的，而不是不加说明地混为一组 counters。
+When `run()` is repeated, the accounting of the first two categories is therefore explicit, rather
+than being silently blended into one set of counters.
 
 ---
 
-## 14. 终局异常、`close()` 与 Ray runtime ownership
+### 14. Terminal exceptions, `close()`, and Ray runtime ownership
 
-只要一个 microbatch 已经 admission，之后若异常逃出 `run()`，Executor 就进入 fail-stop：先
-best-effort `close()` actor pool，再原样抛出最初异常。原因是此时可能仍有 actor RPC 在执行或排队，
-仅把本地 `busy` bit 清零不足以证明物理队列已经干净。成功完成的 Executor 仍可跨 run 复用；
-source 数量、参数或已知长度不一致等 admission 前错误不会污染 Executor。
+As soon as even one microbatch has been admitted, if an exception later escapes `run()`, the
+Executor enters fail-stop: it first best-effort `close()`s the actor pool and then re-raises the
+original exception unchanged. The reason is that actor RPCs may still be executing or queued at
+that point; merely clearing the local `busy` bit is not enough to prove the physical queue is
+clean. An Executor that completed successfully can still be reused across runs; pre-admission
+errors such as mismatched source count, arguments, or known length do not contaminate the
+Executor.
 
-`close()` 幂等执行：
+`close()` is idempotent:
 
-1. 先标记 closed，使 cleanup 本身局部失败时也不能再次复用；
-2. kill 本 Executor 创建的所有 actor handles；
-3. 清空 actor containers 和 BlockStore cache；
-4. 只有 `_owns_ray=True` 才 `ray.shutdown()`。
+1. mark closed first, so that a partial failure inside cleanup itself cannot lead to reuse;
+2. kill every actor handle created by this Executor;
+3. clear the actor containers and the BlockStore cache;
+4. call `ray.shutdown()` only when `_owns_ray=True`.
 
-推荐：
+Recommended:
 
 ```python
 with Executor(pipeline) as executor:
     result = executor.run(values)
 ```
 
-context manager 在正常路径和 Ctrl-C 展开路径上都会调用 `close()`；终局业务/基础设施异常即使
-没有 context manager，也由 `run()` 自身触发 fail-stop。构造期间异常则由 `__init__` 自己的
-cleanup guard 负责。
+The context manager calls `close()` on both the normal path and the Ctrl-C unwinding path;
+terminal business/infrastructure exceptions trigger fail-stop from `run()` itself even without a
+context manager. Exceptions during construction are handled by `__init__`'s own cleanup guard.
 
 ---
 
-## 15. 输出树怎样跨 microbatch 合并
+### 15. How the output tree is merged across microbatches
 
-每个 microbatch materialize 出与 `Pipeline.forward()` 同构的 list/tuple tree。`_merge_outputs()`：
+Each microbatch materializes a list/tuple tree isomorphic to `Pipeline.forward()`.
+`_merge_outputs()`:
 
-- 叶子 list 按 admission index 顺序拼接；
-- tuple 递归按相同位置合并；
-- 其他形状拒绝。
+- concatenates leaf lists in admission index order;
+- merges tuples recursively by the same position;
+- rejects any other shape.
 
-因此异步完成顺序不会改变公开 row 顺序。`completed` dict 用 microbatch index 保存，最终按
-`range(len(slices))` 读取。
+Asynchronous completion order therefore never changes the public row order. The `completed` dict
+is keyed by microbatch index and finally read in `range(len(slices))` order.
 
 ---
 
-## 16. 跟踪两个并发 PDF microbatches
+### 16. Tracing two concurrent PDF microbatches
 
-设 `max_active_microbatches=2`，Render 与 OCR 各有一个 actor：
+Let `max_active_microbatches=2`, with one actor each for Render and OCR:
 
 ```mermaid
 sequenceDiagram
@@ -414,26 +485,31 @@ sequenceDiagram
     X->>O: M1 OCR batch
 ```
 
-两个 Engine 完全独立，但 Render/OCR actor capacity 被 work-conserving 地共享。任何一个 RPC 都
-不会同时包含 M0 与 M1 Grain，所以 recovery 与 metrics 仍能精确归属。
+The two Engines are completely independent, but Render/OCR actor capacity is shared in a
+work-conserving way. No RPC ever contains both M0 and M1 Grains, so recovery and metrics can still
+be attributed precisely.
 
 ---
 
-## 17. 修改 Executor 前的检查清单
+### 17. Checklist before modifying the Executor
 
-- 新状态是否确实属于 actor/RPC/capacity/lifecycle，而非 Engine 语义？
-- 每个 pending ObjectRef 是否仍有唯一 lease？
-- actor busy 是否在所有退出路径可靠释放？
-- 一个 RPC 是否仍只来自一个 Call、一个 microbatch？
-- selection 是否通过 Engine/DispatchState API，而不是 Executor 直接改 queue？
-- contract/UDF/record/infra failure 是否保持分层？
-- actor replacement 是否不改变 Grain identity，只触发 generation retry？
-- materialize 前是否确认无 pending lease且 Engine complete？
-- output 是否按 admission 顺序合并，而非 completion 顺序？
-- close 是否继续区分 owned/external Ray runtime？
-- diagnostics 是否 best-effort，不反向影响业务语义？
+- Does the new state genuinely belong to actor/RPC/capacity/lifecycle rather than Engine
+  semantics?
+- Does every pending ObjectRef still have exactly one pending RPC?
+- Is actor busy reliably released on all exit paths?
+- Does one RPC still come from only one Call and one microbatch?
+- Does selection go through the Engine/DispatchState API rather than the Executor mutating queues
+  directly?
+- Are contract/UDF/RecordFailure/GroupFailure/infra failures still layered, with explicit Failures excluded from
+  retry?
+- Does actor replacement leave Grain identity unchanged and only trigger a generation retry?
+- Before materialize, is it confirmed that there is no pending RPC and the Engine is complete?
+- Is output merged in admission order rather than completion order?
+- Does close still distinguish owned from external Ray runtime?
+- Are diagnostics best-effort, never feeding back into business semantics?
 
-如果 Executor 新增了 `if isinstance(effect, FilterEffect)` 或直接修改 `GrainRecord.phase`，就是明确
-的越层实现。
+If the Executor grows an `if isinstance(effect, FilterEffect)` or mutates `GrainRecord.phase`
+directly, that is a clear case of cross-layer implementation.
 
-返回[导读索引](README.md)，或继续阅读随后补充的 V3→V3.6 架构可读性审计。
+Back to the [walkthrough index](README.md), or continue with the
+[V3 → V3.6 architecture readability audit](07_v3_vs_v36_readability.md).

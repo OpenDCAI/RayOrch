@@ -1,46 +1,73 @@
-# 03：逐段读懂 `runtime/engine.py`——单个 microbatch 的语义状态机
+# 03. Runtime engine: semantic facts and fixed-point propagation
 
-主源码：[`runtime/engine.py`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py)。
+[`runtime/engine.py`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py)
+owns one microbatch's mutable semantic tables. The Chinese walkthrough is
+retained as [`03_runtime_engine.zh.md`](03_runtime_engine.zh.md).
 
-这是 V3.6 最大、也最值得分段理解的文件。它长的原因不是同时承担 Ray、compiler 和 Worker，
-而是集中拥有一个 microbatch 中所有动态**语义事实**的发布顺序：Item、Expansion、Entity、
-ValueBinding 与 lineage。
+## At a glance
+
+The engine is a single writer. Item, expansion, and entity publications enter
+one private fact FIFO. `advance()` consumes the FIFO and applies the precompiled
+effect indexes until no new fact remains. Facts are notifications; canonical
+tables hold the state.
+
+The engine distinguishes `Domain`, `Entity`, `Item`, `Grain`, and `Expansion`.
+Structural effects use explicit parent and ordinal relationships, so nested
+expand/reduce/broadcast operations do not depend on Python object identity.
+
+Every item ends in exactly one of `PRESENT`, `DROPPED`, `FAILED`, or
+`SUPPRESSED`. Multi-output reports are validated before any output is published.
+Repeated terminal publication is idempotent; contradictory publication is
+rejected.
+
+`GroupFailure` writes a direct-parent barrier into the same engine state. The
+dispatch dequeue barrier check uses it to seal ready siblings, while the commit
+path rechecks it for late in-flight reports. No actor is killed and no committed
+result is rolled back.
+
+Tests should exercise empty domains, nested relationships, repeated facts,
+atomic reports, and a late report racing a suppression barrier.
 
 ---
 
-## 1. 一句话职责
+## 03. Reading `runtime/engine.py` section by section — the semantic state machine of a single microbatch
 
-`MicrobatchEngine` 是一个 source microbatch 的单写者事件状态机：接收冻结的 `RuntimePlan`，
-把 source/Worker report 发布为 canonical facts，再执行 Effect 直到局部不动点。
+Main source: [`runtime/engine.py`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py).
 
-它拥有：
+This is the largest file in V3.6 and the one most worth understanding in segments. It is long not because it simultaneously carries Ray, the compiler, and the Worker, but because it centrally owns the publication order of all dynamic **semantic facts** inside one microbatch: Item, Expansion, Entity, ValueBinding, and lineage.
 
-- `RuntimeState.items/values/expansions/pending_grains/entity_lineage`；
-- Domain→Entity 的枚举索引；
-- 只携带 Ref 的事实 FIFO；
-- source admission、Worker report semantic commit 与 materialization 投影；
-- Filter/Reduce/Broadcast/Call-input Effect 的解释。
+---
 
-它组合但不拥有：
+### 1. Responsibility in one sentence
 
-- `DispatchState` 内部的 Grain phase、generation 和 runnable queues。
+`MicrobatchEngine` is the single-writer event state machine of one source microbatch: it takes a frozen `RuntimePlan`, publishes source/Worker reports as canonical facts, and then applies Effects until a local fixed point.
 
-它明确不拥有：
+It owns:
 
-- Logical Origin 与 compiler analysis；
-- actor handle、Ray ObjectRef RPC、actor capacity；
-- UDF 执行和 batch Python 值解释；
-- recovery policy 的纯决策逻辑。
+- `RuntimeState.items/values/expansions/pending_grains/entity_lineage`;
+- the Domain→Entity enumeration index;
+- the fact FIFO, which carries only Refs;
+- source admission, Worker report semantic commit, and materialization projection;
+- interpretation of the Filter/Reduce/Broadcast/Call-input Effects.
 
-继续读源码前，先用一句话区分最容易混淆的三个词：canonical table 保存“已经成立的完整
-事实”，`_facts` FIFO 保存“已经成立但尚待传播的事实身份”，`advance()` 则反复消费这些身份
-并应用 Effect，直到 FIFO 为空。后文所有 publication 都位于这个闭环中。
+It composes but does not own:
+
+- Grain phase, generation, and runnable queues inside `DispatchState`.
+
+It explicitly does not own:
+
+- Logical Origin and compiler analysis;
+- actor handles, Ray ObjectRef RPCs, and actor capacity;
+- UDF execution and the interpretation of batch Python values;
+- the pure decision logic of the recovery policy.
+
+Before continuing into the source, separate the three most easily confused terms in one sentence: the canonical table holds "complete facts that already hold", the `_fact_queue` FIFO holds "fact identities that already hold but are still pending propagation", and `advance()` repeatedly consumes those identities and applies Effects until the FIFO is empty. Every publication described below lives inside this closed loop.
 
 ```mermaid
 flowchart LR
-    Plan["RuntimePlan<br/>不可变 Effects"]
+    Plan["RuntimePlan<br/>immutable Effects"]
     Inputs["source / WorkerReport"]
-    Engine["MicrobatchEngine<br/>语义事实 owner"]
+    Engine["MicrobatchEngine<br/>semantic fact owner"]
     State["RuntimeState<br/>canonical tables"]
     Facts["Fact FIFO<br/>Refs only"]
     Dispatch["DispatchState<br/>Grain owner"]
@@ -55,148 +82,142 @@ flowchart LR
 
 ---
 
-## 2. 源码地图
+### 2. Source map
 
-| 源码段 | 主要职责 | 建议何时读 |
+| Source section | Main responsibility | When to read |
 | --- | --- | --- |
-| [私有 commit DTO 与 FactEvent](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L73-L81) | 把复杂 report 暂存意图；封闭事实类型 | 第一遍 |
-| [`__init__` 与只读投影](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L84-L303) | 建状态 owner，并向 Executor/materializer 暴露窄接口 | 第一遍略读 |
-| [`admit_sources`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L307-L347) | 原子接纳行对齐 source | 第一遍 |
-| [`advance/_apply_item_effect`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L349-L388) | 唯一事实 fixed-point loop | 必须精读 |
-| [`commit_success`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L404-L541) | report 全量预检与 mutation frontier | 必须精读 |
-| [失败/恢复交界](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L543-L608) | 语义失败发布与 Dispatch 恢复动作 | 第二遍 |
-| [Item/Expansion publication gateway](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L610-L678) | canonical fact 的唯一发布入口 | 必须精读 |
-| [Call input interpreter](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L682-L761) | Item facts 怎样形成 READY/SEALED Grain | 必须精读 |
-| [Filter](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L763-L807) | 同 Entity source/mask 归约 | 第二遍 |
-| [Reduce](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L809-L882) | Expansion/members/values 恢复 group | 第二遍精读 |
-| [Broadcast](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L884-L922) | source 与 target Entity 双触发投影 | 第二遍 |
-| [Entity/lineage](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L924-L986) | 稳定 child identity 与祖先导航 | 第二遍 |
+| [private commit DTOs and FactEvent](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L73-L81) | stage complex reports as intents; sealed fact types | first pass |
+| [`__init__` and read-only projections](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L84-L303) | build the state owner and expose narrow interfaces to the Executor/materializer | skim on the first pass |
+| [`admit_sources`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L307-L347) | atomically admit row-aligned sources | first pass |
+| [`advance/_apply_item_effect`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L349-L388) | the only fact fixed-point loop | read closely |
+| [`commit_reports`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L431-L491) | whole-batch preflight, barrier discovery, and mutation frontier | read closely |
+| [failure/recovery boundary](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L543-L608) | semantic failure publication and Dispatch recovery actions | second pass |
+| [Item/Expansion publication gateway](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L610-L678) | the only publication entry point for canonical facts | read closely |
+| [Call input interpreter](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L682-L761) | how Item facts form READY/SEALED Grains | read closely |
+| [Filter](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L763-L807) | same-Entity source/mask reduction | second pass |
+| [Reduce](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L809-L882) | Expansion/members/values restore the group | second pass, read closely |
+| [Broadcast](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L884-L922) | dual-trigger projection over source and target Entity | second pass |
+| [Entity/lineage](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L924-L986) | stable child identity and ancestor navigation | second pass |
 
 ---
 
-## 3. 先盘点数据结构，再读控制流
+### 3. Inventory the data structures before reading the control flow
 
-### 3.1 构造函数中的五份状态
+#### 3.1 Core state in the constructor
 
 ```python
 self.plan = plan
 self._state = RuntimeState()
 self._dispatch = DispatchState()
-self._facts = deque()
+self._suppression_barriers = _SuppressionBarrierIndex()
+self._fact_queue = deque()
 self._entities_by_domain = defaultdict(dict)
 self._admission_closed = False
 ```
 
-它们分别回答不同问题：
+Each of them answers a different question:
 
-| 字段 | 回答的问题 | 为什么不是重复状态 |
+| Field | Question it answers | Why it is not duplicate state |
 | --- | --- | --- |
-| `plan` | 某种事实发布后应触发哪些 Effect？ | 静态只读接线 |
-| `_state` | 当前有哪些 Item/Expansion/value/lineage 事实？ | canonical 动态语义表 |
-| `_dispatch` | 哪些 Grain READY/IN_FLIGHT/SEALED？ | 独立物理调度 owner |
-| `_facts` | 哪些新事实尚未传播？ | 临时通知，只存 Ref |
-| `_entities_by_domain` | 某 Domain 已有哪些 Entity？ | canonical lineage 的枚举索引 |
+| `plan` | which Effects should fire after a given fact is published? | static read-only wiring |
+| `_state` | which Item/Expansion/value/lineage facts currently exist? | canonical dynamic semantic table |
+| `_dispatch` | which Grains are READY/IN_FLIGHT/SEALED? | independent physical scheduling owner |
+| `_suppression_barriers` | which Call + direct parent has already been isolated? | stores only monotone barriers, does not copy Grain state |
+| `_fact_queue` | which new facts have not been propagated yet? | transient notification, stores only Refs |
+| `_entities_by_domain` | which Entities does a given Domain already have? | enumeration index over canonical lineage |
 
-`_facts` 不保存 outcome、binding 或 children，因此它不是第二份真相。处理事件时总是拿 Ref 回到
-`_state` 读取 canonical record。
+`_fact_queue` stores no outcome, binding, or children, so it is not a second source of truth. When handling an event, always take the Ref back to `_state` and read the canonical record.
 
-`_entities_by_domain` 看似能从 lineage 推导，但 root Entity 不在 child lineage 中，而且广播与
-materialization 频繁需要按 Domain 枚举；它是 Engine 自己维护的必要索引，不在其他组件复制。
+`_entities_by_domain` looks derivable from lineage, but root Entities are not part of child lineage, and broadcast plus materialization frequently need enumeration by Domain; it is a necessary index maintained by the Engine itself and is not duplicated in other components.
 
-### 3.2 到底有几个队列或等待结构
+#### 3.2 How many queues or waiting structures are there really?
 
-只看 `MicrobatchEngine` 自己，它真正拥有的 FIFO 只有一个：`_facts`。附近另外几种“等待”分别
-属于不同 owner，不能都笼统叫 Engine queue：
+Looking at `MicrobatchEngine` alone, it truly owns exactly one FIFO: `_fact_queue`. The other nearby kinds of "waiting" belong to different owners and must not all be lumped together as the Engine queue:
 
-| 结构 | 数据结构 | Owner | 保存什么 | 何时离开 |
+| Structure | Data structure | Owner | What it holds | When it leaves |
 | --- | --- | --- | --- | --- |
-| `_facts` | `deque[ItemRef \| ExpansionRef \| EntityRef]` | Engine | 已成立但尚未传播的事实身份 | `advance()` 消费 |
-| `pending_grains` | `dict[GrainRef, PendingGrain]` | RuntimeState/Engine | 尚未由 Call input 代数决定的槽位 | Grain 变 READY 或直接 SEALED |
-| `_normal` | `deque[_ReadyEntry]` | DispatchState | 首次可执行 Grain | 被 reserve |
-| `_immediate` | `deque[DispatchBatch]` | DispatchState | 需优先重试的精确 group | 被 reserve |
-| `_tail` | `deque[DispatchBatch]` | DispatchState | 延后重试或二分隔离 group | 正常工作之后 reserve |
-| `pending` | `dict[ObjectRef, _DispatchLease]` | Executor | 已发出、尚未返回的 Ray RPC | `ray.wait/get` 完成 |
+| `_fact_queue` | `deque[ItemRef \| ExpansionRef \| EntityRef]` | Engine | fact identities that hold but are not yet propagated | consumed by `advance()` |
+| `pending_grains` | `dict[GrainRef, PendingGrain]` | RuntimeState/Engine | slots not yet decided by the Call input algebra | the Grain becomes READY or directly SEALED |
+| `_ready_fifo_by_call` | `dict[CallRef, deque[GrainRef]]` | DispatchState | first-time runnable Grains partitioned by Call | reserved, or suppressed by a parent barrier |
+| `_immediate_retry_queue` | `deque[DispatchBatch]` | DispatchState | exact DispatchBatches that need priority retry | reserved |
+| `_deferred_recovery_queue` | `deque[DispatchBatch]` | DispatchState | deferred or bisected recovery batches | reserved after READY work |
+| `pending_rpcs` | `dict[ObjectRef, _PendingRpc]` | Executor | issued Ray RPCs that have not returned | `ray.wait/get` completes |
 
-这张表同时解释了为什么不能把它们合成一个“任务队列”：
+This table also explains why they cannot be merged into a single "task queue":
 
-- `_facts` 调度语义传播，不代表需要 Worker；
-- `pending_grains` 是输入槽状态，不具有 FIFO 顺序；
-- 三个 Dispatch queue 调度 Grain phase；
-- Executor `pending` 追踪物理 RPC，而不是语义 READY 状态。
+- `_fact_queue` schedules semantic propagation and does not imply that a Worker is needed;
+- `pending_grains` is input-slot state and has no FIFO order;
+- the three Dispatch queues schedule Grain phase;
+- the Executor `pending_rpcs` map tracks physical RPCs, not semantic READY state.
 
-### 3.3 四类动态事实怎样转移
+#### 3.3 How the four kinds of dynamic facts transition
 
-读后续方法前，先记住各状态的最短路径：
+Before reading the following methods, memorize the shortest path of each state:
 
-| 动态对象 | 初始表示 | 允许的变化 | 最终保存位置 |
+| Dynamic object | Initial representation | Allowed changes | Final stored location |
 | --- | --- | --- | --- |
-| Entity | 表中不存在 | absent → published | Domain index；child 另有 lineage |
-| Item | 表中不存在 | unresolved → 一个 terminal outcome | `RuntimeState.items`，PRESENT 另有 binding |
-| Expansion | 表中不存在 | unresolved → SUCCEEDED/DROPPED/FAILED | `RuntimeState.expansions` |
-| Grain | pending slots 或尚不存在 | WAITING → READY/SEALED；READY ↔ IN_FLIGHT → SEALED | `DispatchState` |
+| Entity | absent from the table | absent → published | Domain index; children additionally carry lineage |
+| Item | absent from the table | unresolved → exactly one terminal outcome | `RuntimeState.items`; PRESENT additionally carries a binding |
+| Expansion | absent from the table | unresolved → SUCCEEDED/DROPPED/FAILED | `RuntimeState.expansions` |
+| Grain | pending slots, or does not exist yet | WAITING → READY/SEALED; READY ↔ IN_FLIGHT → SEALED | `DispatchState` |
 
-前三类 publication 可能向 `_facts` 追加 Ref；Grain phase 不进入 `_facts`，它通过 DispatchState 的
-queue 与 Executor 协作。后面的 admission、report commit 和 Effect interpreter 都只是沿这四条
-状态路径制造新事实。
+The first three kinds of publication may append a Ref to `_fact_queue`; Grain phase never enters `_fact_queue` — it cooperates with the Executor through the DispatchState queues. Admission, report commit, and the Effect interpreters below only manufacture new facts along these four state paths.
 
 ---
 
-## 4. 只读投影：为什么前 200 行不等于业务逻辑膨胀
+### 4. Read-only projections: why the first 200 lines are not business-logic bloat
 
-[`ready_count` 到 `progress_summary`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L104-L303)
-主要是窄接口，目的是阻止 Executor 或 materializer直接读可变内部 dict。
+[`ready_count` through `progress_summary`](../../rayorch/experimental/multigrain_v3_6/runtime/engine.py#L104-L303)
+are mostly narrow interfaces; their purpose is to stop the Executor or the materializer from reading mutable internal dicts directly.
 
-可以按四组理解。
+They can be understood in four sections.
 
-### 4.1 计数和 Grain snapshots
+#### 4.1 Counts and Grain snapshots
 
-`entity_count/item_count/expansion_count/grain_count` 用于冻结 metrics；Grain snapshot 委托
-`DispatchState`，不会泄露可变 `GrainRecord`。
+`entity_count/item_count/expansion_count/grain_count` are used for frozen metrics; the Grain snapshot delegates to `DispatchState` and never leaks the mutable `GrainRecord`.
 
-### 4.2 dispatch 门面
+#### 4.2 Dispatch facade
 
-`dispatch_priority()` 与 `reserve_dispatch()` 让 Executor 选择工作，但实际 queue/phase 写入仍在
-DispatchState。Engine 不复制 ready queue。
+`dispatch_priority()` and `reserve_dispatch()` let the Executor choose work, but the actual queue/phase writes still live in DispatchState. The Engine does not copy the ready queue.
 
-### 4.3 completion 合同
+#### 4.3 Completion contract
 
-`is_complete()` 不只看 ready queue。它依次要求：
+`is_complete()` does not look only at the ready queue. It requires, in order:
 
-- admission 已关闭；
-- 事实 FIFO 为空；
-- 没有 pending Call input slots；
-- Dispatch 没有 runnable/recovery queue；
-- 所有 Grain SEALED；
-- 所有 public output Port × Entity 都有终态 Item。
+- admission is closed;
+- the fact FIFO is empty;
+- there are no pending Call input slots;
+- Dispatch has no runnable/recovery queue;
+- every Grain is SEALED;
+- every public output Port × Entity has a terminal Item.
 
-因此“暂时没有 READY Grain”不会被误判为完成。
+Therefore "there is temporarily no READY Grain" is never mistaken for completion.
 
-### 4.4 Worker/materialization 投影
+#### 4.4 Worker/materialization projections
 
-`grain_plan()` 把 semantic Item 变成纯物理 `RowBinding | GroupInput | MissingInput`：
+`grain_invocation()` turns semantic Items into purely physical `RowBinding | NestedGroupInput | MissingInput`:
 
-- REQUIRED/PRESENT 或 OPTIONAL/PRESENT → row/group binding；
-- OPTIONAL/DROPPED → `MissingInput`；
-- nested group → 扁平 leaf bindings + CSR offsets。
+- REQUIRED/PRESENT or OPTIONAL/PRESENT → row/group binding;
+- OPTIONAL/DROPPED → `MissingInput`;
+- nested group → flattened leaf bindings + CSR offsets.
 
-它不读取 payload；Worker 才通过 BlockStore 解引用。
+It does not read payloads; the Worker dereferences them through BlockStore.
 
-`ordered_items()`、`value_binding()`、`group_rows()` 服务最终 materialization。`release_values()`
-只在完成后清空 binding 表，保留 Item outcome、Entity 和 Grain 审计事实。
+`ordered_items()`, `value_binding()`, and `nested_group_rows()` serve final materialization. `release_values()` clears the binding table only after completion, preserving Item outcome, Entity, and Grain audit facts.
 
 ---
 
-## 5. `admit_sources()`：动态世界从哪里开始
+### 5. `admit_sources()`: where the dynamic world begins
 
-source admission 先做完整预检：
+Source admission first runs a complete preflight:
 
-1. binding keys 必须与 Program source Ports 完全一致；
-2. 所有 source 列行数相同；
-3. controls 只为编译器 demand 的 source 提供；
-4. controls 与行数对齐且严格为 bool；
-5. 当前 Engine 尚未接纳 root Entities。
+1. binding keys must exactly match the Program source Ports;
+2. all source columns have the same row count;
+3. controls are provided only for sources demanded by the compiler;
+4. controls are row-aligned and strictly bool;
+5. the current Engine has not yet admitted root Entities.
 
-预检通过后才发布：
+Only after the preflight passes does it publish:
 
 ```text
 for each source row index i:
@@ -208,21 +229,19 @@ for each source Port p and row i:
 advance()
 ```
 
-为什么先 Entity 后 Item 没有顺序依赖？Entity event 可能先尝试 Broadcast，但 source Item 尚未
-存在时只返回等待；随后 source Item event 会通过另一条 Broadcast source trigger 再尝试。两条
-触发路径共同保证 publication 顺序无关。
+Why is there no ordering dependency between publishing the Entity first and the Item second? The Entity event may attempt Broadcast first, but when the source Item does not exist yet it simply returns "wait"; afterwards the source Item event tries again through the other Broadcast source trigger. The two trigger paths together make publication order irrelevant.
 
 ---
 
-## 6. `advance()`：全文件最重要的 25 行
+### 6. `advance()`: the most important 25 lines in the file
 
-事实类型只有：
+There are only three fact types:
 
 ```python
 _FactEvent = ItemRef | ExpansionRef | EntityRef
 ```
 
-循环取出一个新事实并按类型查 RuntimePlan 索引：
+The loop takes one new fact and looks up the RuntimePlan index by type:
 
 ```mermaid
 flowchart TD
@@ -239,90 +258,90 @@ flowchart TD
     Kind --> Entity --> Publish
 ```
 
-这个循环形成局部 fixed point：只要某个 Effect 发布了新 Item/Expansion/Entity，它会追加到同一
-FIFO，直到没有新事实。
+This loop forms a local fixed point: as long as some Effect publishes a new Item/Expansion/Entity, it is appended to the same FIFO until no new fact remains.
 
-为什么不在 `_publish_item()` 里直接递归调用所有下游？FIFO 有三个必要作用：
+Why not call all downstream Effects recursively inside `_publish_item()`? The FIFO has three necessary roles:
 
-- publication 先完整写 canonical record，再进入传播，避免下游观察半成品；
-- 深 Pipeline 不依赖 Python 递归栈，也不会在一次 commit 中产生难追踪的重入；
-- 三类事实统一从一个穷尽入口分派，到达顺序可测试，新增关系不会暗接一条递归捷径。
+- publication writes the complete canonical record first and only then enters propagation, so downstream never observes a half-built record;
+- deep Pipelines do not depend on the Python recursion stack, and do not produce hard-to-trace reentrancy inside a single commit;
+- the three fact kinds are dispatched uniformly from one exhaustive entry, so arrival order is testable and a newly added relation cannot secretly wire up a recursive shortcut.
 
-因此 `_facts + advance()` 不是额外业务概念，而是 Engine 内部把“事实写入”和“事实传播”分开的
-最小调度机制。把它删除通常只会让同样的控制流散落回每个 publication 方法。
+Therefore `_fact_queue + advance()` is not an extra business concept; it is the minimal scheduling mechanism inside the Engine that separates "fact write" from "fact propagation". Removing it usually only scatters the same control flow back into every publication method.
 
-`_apply_item_effect()` 对封闭 `ItemEffect` 联合穷尽 match：
+`_apply_item_effect()` performs an exhaustive match over the sealed `ItemEffect` union:
 
-- `CallInputEffect` → 填 Grain input slot；
-- `FilterEffect` → 尝试决定 Filter target；
-- `BroadcastEffect` → 从 source 向现有 target Entities 投影；
-- `ReduceEffect` → 找 parent 并尝试恢复 group。
+- `CallInputEffect` → fill a Grain input slot;
+- `FilterEffect` → try to decide the Filter target;
+- `BroadcastEffect` → project from the source onto existing target Entities;
+- `ReduceEffect` → find the parent and try to restore the group.
 
-Engine 不读取 `PortOrigin`，也没有按 Port 类型散落的反向扫描；新增 Effect 若没有被穷尽处理，
-类型检查或 `assert_never` 会暴露。
+The Engine never reads `PortOrigin`, nor does it scatter reverse scans by Port type; if a newly added Effect is not handled exhaustively, type checking or `assert_never` will expose it.
 
 ---
 
-## 7. `commit_success()`：为什么要分三阶段
+### 7. `commit_reports()`: why the whole WorkerDispatchResult must be seen first
 
-成功 report 是全文件风险最高的入口，因为一个 Grain 可以同时产生：
+The whole WorkerDispatchResult is the highest-risk entry point in the file, because a single Grain can simultaneously produce:
 
-- 多个 output Ports；
-- scalar 或 expanded rows；
-- 多个 aligned expanded Ports；
-- control manifests；
-- child Entities、parent group binding 与后续传播。
+- multiple output Ports;
+- scalar or expanded rows;
+- multiple aligned expanded Ports;
+- control manifests;
+- child Entities, parent group binding, and downstream propagation.
 
-因此源码明确分为 mutation frontier 前后。
+And a `GroupFailure` at the back of the same batch must also suppress an earlier same-parent success at the front of that batch. The Executor therefore no longer commits report by report; the source first validates pending RPC coverage, then discovers all barriers in stable DispatchBatch order, and only afterwards enters the mutation frontier.
 
-### 7.1 Phase 1：逐 output 预检并构造 publication intents
+#### 7.1 Phase 1: identity and barrier preflight
 
-先验证 report generation 与 `IN_FLIGHT` phase，然后证明：
+reports must correspond one-to-one with `DispatchBatch.grains`, with no duplicates and no omissions, and each generation must still be `IN_FLIGHT`. Then all `GroupFailure` `(CallRef, parent_anchor)` pairs are collected first; the first writer within a single WorkerDispatchResult is determined by DispatchBatch grain order, not by report tuple order.
 
-- report output Port 集合与 Call outputs 精确相等，无重复；
-- expanded report 与编译后的 `ExpandEffect` 精确匹配；
-- expanded output 不同时报告 scalar；
-- non-expanded output 必须报告 scalar；
-- control manifest 是否存在由 RuntimePlan demand 决定；
-- control 值与 expanded rows 对齐且严格是 bool。
+#### 7.2 Phase 2: per-live-output preflight and construction of publication intents
 
-`_ExpandedOutputCommit` 只是 mutation 前的不可变意图 DTO，不进入 RuntimeState。
+First validate the report generation and the `IN_FLIGHT` phase, then prove:
 
-### 7.2 Phase 2：验证 aligned Expansion 的整体合同
+- the report output Port set is exactly equal to the Call outputs, with no duplicates;
+- the expanded report exactly matches the compiled `ExpandEffect`;
+- an expanded output does not simultaneously report a scalar;
+- a non-expanded output must report a scalar;
+- whether a control manifest exists is decided by RuntimePlan demand;
+- control values are aligned with the expanded rows and strictly bool.
 
-同一 child Domain 的多个 aligned output 共享一个 `ExpansionRef(child_domain, parent_entity)`。
-因此必须整体证明：
+`_ExpandedOutputCommit` is only an immutable intent DTO that exists before mutation; it never enters RuntimeState.
 
-- 所有 reporter 的 cardinality 相同；
-- reporter Port 集合完整；
-- 该 Expansion 尚未发布。
+#### 7.3 Phase 3: validate the whole contract of the aligned Expansion
 
-这一步防止先发布 output A 的三个 children，才发现 output B 报告了四行。
+Multiple aligned outputs of the same child Domain share one `ExpansionRef(child_domain, parent_entity)`. It must therefore be proven as a whole:
 
-### 7.3 Mutation frontier
+- all reporters have the same cardinality;
+- the reporter Port set is complete;
+- that Expansion has not been published yet.
 
-所有外部 report 形状检查通过后才：
+This step prevents publishing three children of output A first and only then discovering that output B reported four rows.
+
+#### 7.4 Mutation frontier
+
+Only after every external report shape check has passed:
 
 ```python
 self._dispatch.seal(grain, report.generation)
 ```
 
-从这里向下不再运行用户代码，也不再接受未验证的 report 结构；只按已构造 intents 通过规范
-publication gateway 写状态。
+From here down, no user code runs and no unverified report structure is accepted; state is written only through the canonical publication gateway according to the already constructed intents.
 
-### 7.4 Phase 3：按依赖顺序发布
+#### 7.5 Phase 4: publish in priority and dependency order
 
-每个 Expansion 依次：
+Each report follows exactly one path: an explicit `RecordFailure/GroupFailure -> FAILED`; a success that hits an already existing or in-batch barrier `-> SUPPRESSED`; only other successes consume the prepared intents. A suppressed expanded payload does not create child Entities or a successful Expansion.
+
+Each Expansion proceeds in order:
 
 ```text
 create child Entities
 → publish Expansion(SUCCEEDED, children)
 → publish each child Item
-→ publish parent group Item(GroupBinding)
+→ publish parent group Item(NestedGroupBinding)
 ```
 
-所有 expanded/scalar outputs 写完后只调用一次 `advance()`，让下游看到完整的本 Grain
-publication turn。
+Only after all expanded/scalar outputs have been written is `advance()` called exactly once, so that downstream observes the complete publication turn of this Grain.
 
 ```mermaid
 sequenceDiagram
@@ -331,9 +350,10 @@ sequenceDiagram
     participant D as DispatchState
     participant S as RuntimeState
 
-    X->>E: commit_success(GrainReport)
-    E->>D: validate IN_FLIGHT + generation
-    E->>E: validate every output/layout/control
+    X->>E: commit_reports(DispatchBatch, WorkerReports)
+    E->>D: validate exact coverage + IN_FLIGHT + generation
+    E->>E: discover GroupFailure barriers
+    E->>E: validate every live output/layout/control
     E->>E: validate aligned cardinality/reporters
     E->>D: seal Grain
     E->>S: publish Entities/Expansion/Items
@@ -342,103 +362,96 @@ sequenceDiagram
 
 ---
 
-## 8. `commit_failure()` 与恢复边界
+### 8. Explicit failure, suppression barrier, and recovery boundary
 
-最终业务失败与可恢复 dispatch 失败不是一回事。
+A final business failure is not the same thing as a recoverable dispatch failure.
 
-### 最终失败提交
+#### Final failure commit
 
-`commit_failure()` 验证当前 attempt 后：
+After `_apply_failure()` validates the current attempt:
 
-- seal Grain；
-- 每个 output Item 发布为 `FAILED`；
-- 若 output 原本要 Expand，Expansion 发布为 `FAILED`，表示 child cardinality 不可知；
-- `advance()` 把 suppression 传播给下游。
+- seal the Grain;
+- publish every output Item as `FAILED`;
+- if the output was meant to Expand, publish the Expansion as `FAILED`, meaning the child cardinality is unknown;
+- `advance()` propagates suppression downstream.
 
-### 仍可恢复
+`GroupFailure` still publishes the Grain that explicitly returned it as `FAILED`, while establishing a `(CallRef, immediate parent EntityRef)` barrier inside the Engine. READY Grains of the same scope, later-arriving inputs, and late-arriving successes become `SUPPRESSED` at the three entries reserve/admission/commit respectively; other parents/Calls are not directly affected, and already committed facts are not rolled back.
 
-`apply_udf_recovery()` 接受已经由纯 `RecoveryPolicy` 决定的 `RecoveryAction`：
+#### Still recoverable
 
-- `FAIL_SINGLETON` 才进入语义 failure commit；
-- retry/split 交给 DispatchState 修改 phase/queue；
-- `ABORT` 不允许伪装成 microbatch 内状态变化，直接由上层终止 run。
+`apply_udf_recovery()` accepts the `RecoveryAction` already decided by the pure `RecoveryPolicy`:
 
-基础设施失败也先由 policy 判断，再让 DispatchState requeue。Engine 不创建/替换 actor；那是
-Executor 的职责。
+- only `FAIL_SINGLETON` enters semantic failure commit;
+- retry/split is handed to DispatchState to modify phase/queue;
+- `ABORT` is not allowed to disguise itself as an intra-microbatch state change; the upper layer terminates the run directly.
+
+Once a barrier has been established, if an earlier-issued pending RPC then suffers an opaque/infra failure, the Engine first partitions its DispatchBatch into barriered and live subsets: the former is terminalized without consuming budget, and only the latter is retried under the original policy. Infra failures are still handled by the Executor replacing the actor; actor health is orthogonal to data isolation.
 
 ---
 
-## 9. 两个 publication gateway：canonical fact 的唯一入口
+### 9. Two publication gateways: the only entry point for canonical facts
 
-### 9.1 `_publish_item()`
+#### 9.1 `_publish_item()`
 
-一个 Item publication 必须同时提交：
+One Item publication must commit all of:
 
 ```text
 outcome + optional binding + optional cause + optional control
 ```
 
-不变量包括：
+Its invariants include:
 
-- `PRESENT` 必须有 binding；
-- 非 PRESENT 不能有 binding；
-- control 只属于 PRESENT 且必须是 bool；
-- 首次 publication 写入表并 enqueue ItemRef；
-- 同 record + 同 binding 重放幂等返回；
-- 终态冲突或字段不同直接 `CommitError`。
+- `PRESENT` must carry a binding;
+- non-PRESENT must not carry a binding;
+- control belongs only to PRESENT and must be bool;
+- the first publication writes the table and enqueues the ItemRef;
+- replaying the same record with the same binding returns idempotently;
+- a terminal conflict or differing fields raises `CommitError` directly.
 
-这就是“publish”的准确含义：让一个此前未决的 Item 事实单调进入终态并激活下游，不是
-`ray.put()`，也不是日志广播。
+This is the precise meaning of "publish": to make a previously undecided Item fact monotonically enter a terminal state and activate downstream. It is not `ray.put()`, nor is it log broadcast.
 
-### 9.2 `_publish_expansion()`
+#### 9.2 `_publish_expansion()`
 
-Expansion 同样只允许首次终态或完全相同的幂等重放。它把 outcome、ordered children 与 cause
-作为一个 record 提交，再 enqueue `ExpansionRef`。
+Expansion likewise allows only a first terminal state or a completely identical idempotent replay. It commits outcome, ordered children, and cause as one record, then enqueues the `ExpansionRef`.
 
-Entity 由 `_publish_entity()` 负责，形成第三个 publication gateway；它在文件后部是因为与
-lineage helper 放在一起。
+Entity is handled by `_publish_entity()`, which forms a third publication gateway; it sits in the later part of the file because it is grouped with the lineage helpers.
 
-三个 gateway 是 `_facts.append(...)` 的唯一位置，因此任何下游激活都来自已经写入 canonical
-table 的事实。
+The three gateways are the only places where `_fact_queue.append(...)` occurs, so any downstream activation comes from a fact that has already been written into a canonical table.
 
 ---
 
-## 10. Call input：多个 Item 怎样形成一个 Grain
+### 10. Call input: how multiple Items form one Grain
 
-`_accept_call_input()` 根据 Effect 中的 `call + input_index` 找到：
+`_accept_call_input()` uses the `call + input_index` in the Effect to find:
 
 ```text
 GrainRef(call, item.entity)
 ```
 
-尚未决的输入放入 `PendingGrain.slots`。每收到一个 Item 都调用一次 `_classify_call()`，但真正
-优先级由纯 `call_transition()` 决定：
+Undecided inputs go into `PendingGrain.slots`. Every received Item triggers one `_classify_call()`, but the real priority is decided by the pure `call_transition()`:
 
 ```text
 failure/suppression > unresolved > required drop > ready
 ```
 
-结果有四种：
+There are four results:
 
-| CallAction | Engine 动作 |
+| CallAction | Engine action |
 | --- | --- |
-| `WAIT` | 保留 pending slots |
-| `READY` | DispatchState 创建 READY Grain 并入 normal queue |
-| `DROP_OUTPUTS` | 直接创建 SEALED Grain，outputs 发布 DROPPED |
-| `SUPPRESS_OUTPUTS` | 直接创建 SEALED Grain，outputs 发布 SUPPRESSED |
+| `WAIT` | keep the pending slots |
+| `READY` | DispatchState creates a READY Grain and enqueues it into the ready queue |
+| `DROP_OUTPUTS` | directly create a SEALED Grain, publish the outputs as DROPPED |
+| `SUPPRESS_OUTPUTS` | directly create a SEALED Grain, publish the outputs as SUPPRESSED |
 
-所以同一个 Call 的所有输入是对称的状态槽，没有 `driven_by`。哪个输入先到只影响何时重新尝试
-classification，不影响最终 Grain 身份或结论。
+So all inputs of the same Call are symmetric state slots, with no `driven_by`. Which input arrives first only affects when classification is retried, not the final Grain identity or conclusion.
 
-当 Grain 离开 WAITING 后，pending entry 被删除；DispatchState 的 GrainRecord 成为唯一物理
-生命周期事实。
+Once a Grain leaves WAITING, its pending entry is deleted; the `GrainRecord` in DispatchState becomes the only physical lifecycle fact.
 
 ---
 
-## 11. Filter：同 Entity 的两个 gate
+### 11. Filter: two gates on the same Entity
 
-`_try_filter(effect, entity)` 只处理三个 ItemRef：target、source、mask，它先检查 target 是否已经
-发布，再把两个可能未决的 outcome/control 交给纯 `filter_transition()`。
+`_try_filter(effect, entity)` handles only three ItemRefs: target, source, and mask. It first checks whether the target has already been published, then hands the two possibly undecided outcome/control to the pure `filter_transition()`.
 
 ```text
 source unresolved/non-PRESENT/PRESENT
@@ -447,87 +460,81 @@ source unresolved/non-PRESENT/PRESENT
 → target outcome or WAIT
 ```
 
-若结果 PRESENT，target 复用 source 的 binding；只有编译器 demand 时才复制 source control。
-若结果非 PRESENT，cause 明确指向 source 或 mask 的规范原因。
+If the result is PRESENT, the target reuses the source's binding; the source control is copied only when the compiler demands it. If the result is non-PRESENT, the cause explicitly points at the canonical cause of the source or the mask.
 
-Filter 不创建 Entity、不搬 payload、不调用 Worker。因此实现集中在一个 Effect interpreter，
-不需要相邻 Filter fusion 才能保证语义完整。
+Filter creates no Entity, moves no payload, and calls no Worker. The implementation is therefore concentrated in a single Effect interpreter, and adjacent-Filter fusion is not required to keep the semantics complete.
 
 ---
 
-## 12. Reduce：为什么代码比 Filter 长
+### 12. Reduce: why the code is longer than Filter
 
-Reduce 必须同时等待三类事实：
+Reduce must wait for three kinds of facts simultaneously:
 
-1. `ExpansionRef(child_domain, parent)` 决定 children 是否存在及其顺序；
-2. 每个 child 的 members Item 决定资格；
-3. survivor 的 value Item 提供 payload binding。
+1. `ExpansionRef(child_domain, parent)` decides whether children exist and what their order is;
+2. the members Item of each child decides eligibility;
+3. the value Item of each survivor provides the payload binding.
 
-`reduce_transition()` 只返回 outcome、survivor indices 和明确 cause；Engine 再负责组装 binding。
+`reduce_transition()` returns only the outcome, the survivor indices, and an explicit cause; the Engine is then responsible for assembling the binding.
 
-### 单层 group
+#### Single-level group
 
-survivor values 都是 `RowBinding` 时：
+When all survivor values are `RowBinding`:
 
 ```text
-GroupLayout.one_level(n) + survivor ItemRefs
+NestedGroupLayout.one_level(n) + survivor ItemRefs
 ```
 
-### 多层 group
+#### Multi-level group
 
-value 已经是 `GroupBinding` 时，Engine 使用 `GroupLayout.nest()` 拼接子 CSR layout，并把所有
-leaf ItemRef 扁平保存。这样多轮 Reduce 不生成递归 Python object tree 作为 runtime 真相：
+When the value is already a `NestedGroupBinding`, the Engine uses `NestedGroupLayout.nest()` to concatenate the child CSR layouts and stores all leaf ItemRefs flattened. In this way multiple rounds of Reduce do not generate a recursive Python object tree as the runtime truth:
 
 ```text
-GroupBinding
+NestedGroupBinding
 ├── offsets_by_level
 └── flat_items
 ```
 
-Worker 在边界上才用 offsets 重建用户看到的 nested list。
+The Worker reconstructs the nested list the user sees from the offsets only at the boundary.
 
-空 group 也显式保留 depth，因此 `[]` 和嵌套深度不同的空结构不会混淆。
-
----
-
-## 13. Broadcast：为什么需要两个触发方向
-
-Broadcast 的完成条件是“祖先 source Item 已发布”且“后代 target Entity 已创建”。两者到达顺序
-不固定：
-
-- source 先到：`_try_broadcast_from_source()` 枚举已有 target Entities；
-- Entity 先到：`_try_broadcast_to_entity()` 查对应 ancestor source。
-
-最终 publication 只有 `_try_broadcast_to_entity()` 一处。它通过 lineage 找祖先，透明复制
-outcome/binding/cause，并按 Effect 决定是否复制 control。
-
-这不是两份 Broadcast 实现，而是两个事件入口汇聚到一个规范写路径。
+Empty groups also explicitly preserve depth, so `[]` and empty structures with different nesting depths are never confused.
 
 ---
 
-## 14. Entity 与 lineage：多轮 Expand 怎样保持稳定身份
+### 13. Broadcast: why two trigger directions are needed
 
-child Entity 由：
+Broadcast completes when "the ancestor source Item has been published" and "the descendant target Entity has been created". The arrival order of the two is not fixed:
+
+- source arrives first: `_try_broadcast_from_source()` enumerates the existing target Entities;
+- Entity arrives first: `_try_broadcast_to_entity()` looks up the corresponding ancestor source.
+
+The final publication happens in exactly one place, `_try_broadcast_to_entity()`. It finds the ancestor through lineage, transparently copies outcome/binding/cause, and decides whether to copy control according to the Effect.
+
+This is not two Broadcast implementations, but two event entries converging onto one canonical write path.
+
+---
+
+### 14. Entity and lineage: how multiple Expand rounds keep identity stable
+
+A child Entity is constructed from:
 
 ```text
 EntityRef(child_domain, cantor_pair(parent.value, ordinal))
 ```
 
-构造。身份只依赖 parent identity 和 child ordinal，不依赖 Worker 完成顺序。
+Its identity depends only on the parent identity and the child ordinal, not on Worker completion order.
 
-`EntityParent(parent_entity, ordinal)` 显式保存在 lineage 中，因此：
+`EntityParent(parent_entity, ordinal)` is stored explicitly in lineage, so:
 
-- `_parent_of()` 能做一级 Reduce；
-- `_ancestor_entity()` 能做跨多层 Broadcast；
-- `entity_coordinate()` 能恢复 root/ordinal path，稳定 materialization 顺序；
-- 多轮 Expand 自然形成线性记录的 parent chain，易于诊断。
+- `_parent_of()` can do one-level Reduce;
+- `_ancestor_entity()` can do Broadcast across multiple levels;
+- `entity_coordinate()` can recover the root/ordinal path, stabilizing materialization order;
+- multiple Expand rounds naturally form a linear parent chain of records, which is easy to diagnose.
 
-Cantor pairing 只是当前 Domain 内的紧凑 occurrence 编码；DomainRef 仍是 EntityRef 的另一半，
-所以不同 Domain 中相同整数不会混为同一 Entity。
+Cantor pairing is only a compact occurrence encoding within the current Domain; DomainRef remains the other half of EntityRef, so the same integer in different Domains never collapses into the same Entity.
 
 ---
 
-## 15. 完整跟踪 PDF 的一个 root Entity
+### 15. Tracing one root Entity of the PDF example
 
 ```mermaid
 sequenceDiagram
@@ -548,28 +555,26 @@ sequenceDiagram
     D-->>W: only runnable OCR Grains
     W-->>E: text reports
     E->>E: Reduce waits for Expansion + members + values
-    E->>E: publish parent text GroupBinding
+    E->>E: publish parent text NestedGroupBinding
 ```
 
-被 Filter 丢弃的 page Entity 仍然存在；对应 OCR Grain 直接 SEALED，OCR output DROPPED。Reduce
-根据 `members=kept_pages` 排除该位置，但保留其余 child 的原始 ordinal 顺序。
+A page Entity dropped by the Filter still exists; its corresponding OCR Grain is directly SEALED and the OCR output is DROPPED. Reduce excludes that position based on `members=kept_pages`, but preserves the original ordinal order of the remaining children.
 
 ---
 
-## 16. 修改 Engine 前的检查清单
+### 16. Checklist before modifying the Engine
 
-- 新动态事实是否属于 Item、Expansion 或 Entity；若不是，真的需要第四类 publication 吗？
-- canonical record 是否先写表、再把 Ref 放入唯一 FIFO？
-- outcome 组合是否在纯 transitions 中穷尽，而不是 Engine 内散落优先级 if/else？
-- RuntimePlan 是否已经给出完整 Effect，Engine 是否避免回读 Origin？
-- 新写路径是否经过唯一 publication gateway？
-- report 的全部外部合同是否在 mutation frontier 前预检？
-- 两种到达顺序是否汇聚到同一写路径，而不是复制实现？
-- Grain phase/generation 是否仍只由 DispatchState 修改？
-- actor/Ray 行为是否仍留在 execution 层？
-- nested group 是否继续使用 canonical layout + flat leaves？
+- Does the new dynamic fact belong to Item, Expansion, or Entity; if not, is a fourth kind of publication really needed?
+- Is the canonical record written to the table first, and only then is the Ref placed into the single FIFO?
+- Are outcome combinations exhausted in the pure transitions, rather than scattered as priority if/else inside the Engine?
+- Does the RuntimePlan already provide the complete Effect, and does the Engine avoid reading Origin back?
+- Does the new write path go through the single publication gateway?
+- Are all external contracts of a report preflighted before the mutation frontier?
+- Do both arrival orders converge onto the same write path, instead of duplicating the implementation?
+- Are Grain phase/generation still modified only by DispatchState?
+- Do actor/Ray behaviors still stay in the execution layer?
+- Do nested groups still use canonical layout + flat leaves?
 
-如果一个改动要求 Executor 直接写 Item，或要求 Engine 根据 actor handle 判断 outcome，就是明确的
-跨层飞线。
+If a change requires the Executor to write Items directly, or requires the Engine to decide an outcome from an actor handle, that is a clear cross-layer flywire.
 
-下一篇：[04：DispatchState 与 Grain 调度](04_dispatch_state.md)。
+Next: [04: DispatchState and Grain scheduling](04_dispatch_state.md).

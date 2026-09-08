@@ -13,7 +13,7 @@
 | ID | 级别 | 结论 | 是否值得处理 |
 | --- | --- | --- | --- |
 | V36-A01 | P1 发布门禁 | 当前目录重组后的精确工作树尚未重新完成真实 Ray/性能证据闭环 | 发布或提交前必须明确门禁 |
-| V36-A02 | P1 生命周期 | `run()` 终止失败后，其他 pending lease 与 actor capacity 没有复用或 fail-stop 合同 | 值得修，推荐选择简单 fail-stop |
+| V36-A02 | P1 生命周期 | 已采用 fail-stop：执行开始后的终止失败会关闭 Executor 及其 actors | 已解决 |
 | V36-A03 | P2 解耦 | 通用 `Worker.observe()` 仍探测 OCR/Table workload 字段名 | 值得做小型收口 |
 | V36-A04 | P2 易用性 | RayModule symbolic call 尚不能诚实穿透 UDF 的 Python 泛型签名 | 值得继续设计，不宜立即实现 |
 
@@ -69,13 +69,13 @@ export，或 benchmark adapter 在远端解析到不同类。此时算法完全�
 
 ---
 
-## 3. V36-A02：终止失败后的 Executor 没有封闭生命周期合同
+## 3. V36-A02：终止失败后的 Executor fail-stop 合同（已解决）
 
 ### 源码事实
 
 [`Executor.run()`](../../rayorch/experimental/multigrain_v3_6/execution/executor.py#L125-L257)
-把 `active` 和 `pending` 保存在单次调用的局部变量中。dispatch 时会先把 actor 标为
-`busy=True`，并登记 `ObjectRef → _DispatchLease`；处理一个完成 ref 时，只在该 lease 的
+把 `active` 和 `pending_rpcs` 保存在单次调用的局部变量中。dispatch 时会先把 actor 标为
+`busy=True`，并登记 `ObjectRef → _PendingRpc`；处理一个完成 ref 时，在对应 pending RPC 的
 `finally` 中释放对应 actor。
 
 如果以下任一路径抛出终止异常：
@@ -83,11 +83,11 @@ export，或 benchmark adapter 在远端解析到不同类。此时算法完全�
 - Worker contract error；
 - UDF recovery 决定 `ABORT`；
 - infrastructure retry 耗尽；
-- `commit_report()` 拒绝报告；
+- `commit_reports()` 拒绝完整 WorkerDispatchResult；
 - `KeyboardInterrupt` 或其他异常退出；
 
-当前 `run()` 会直接离开。尚未完成的其他 `pending` 字典随栈丢失，它们对应的 actor slot 仍可能
-保持 `busy=True`，而 Executor 没有 `_failed/_poisoned` 状态禁止再次运行。
+当前实现不会把这些在途请求视为可复用的干净状态。异常逃离 active execution 时，`run()` 的
+fail-stop 边界调用 `close()`，释放本 Executor 的 actors，并保留原始异常。
 
 ### Bad case
 
@@ -95,22 +95,22 @@ export，或 benchmark adapter 在远端解析到不同类。此时算法完全�
 
 1. Call A 和 Call B 都已有 pending RPC；
 2. A 首先返回确定性合同错误，`run()` 抛出 `ExecutionError`；
-3. B 的 ref 不再被 wait/get，B 的唯一 actor slot 仍为 busy；
-4. 用户捕获异常但没有立刻 `close()`，随后对同一 Executor 再次 `run()`；
-5. 新 run 需要 B，但 `_dispatch_ready()` 永远跳过它，最终可能 deadlock。
+3. B 的 ref 不再被 wait/get；
+4. fail-stop 边界关闭 Executor 与其 actor slots；
+5. 后续 `run()` 由 `_closed` 检查直接拒绝，不会以永久 busy actor 的形式 deadlock。
 
 现有测试覆盖“成功后重复 run”，失败测试则都放在 `with Executor(...)` 内；context manager 退出会
 `close()`，因此没有覆盖“捕获失败后复用仍打开的 Executor”。
 
 ### 为什么值得修
 
-这是生命周期状态不封闭，不是缺少一个零散 cleanup if。继续支持失败后透明复用，需要取消或
-drain 所有 RPC、恢复所有 lease、处理已经完成但未消费的结果，并判断每个 microbatch Engine
-是否还能安全重用，抽象成本很高。
+透明复用需要取消或 drain 所有 RPC、恢复所有 actor capacity、处理已经完成但未消费的结果，
+并判断每个 microbatch Engine 是否还能安全重用，抽象成本很高。因此实现选择了较小且明确的
+fail-stop 合同。
 
-### 建议方案
+### 已采用方案
 
-推荐采用明确、轻量的 **Executor fail-stop**：
+采用明确、轻量的 **Executor fail-stop**：
 
 - source 数量、列长和参数范围等纯输入预检在进入执行态前完成；这类 preflight `ValueError`
   不污染 Executor；
@@ -123,7 +123,7 @@ drain 所有 RPC、恢复所有 lease、处理已经完成但未消费的结果�
 这与 microbatch Engine 的语义恢复没有混合：recovery policy 能处理的失败仍在同一次 `run()`
 内恢复；只有已经决定向用户抛出的终止失败才关闭物理执行器。
 
-待 QA：确认终止 `run()` 后采用 fail-stop，不承诺同一 Executor 的失败后复用。
+对应回归验证终止失败后 Executor 已关闭，且不会遗留可被后续 run 误判为可用的 busy actor。
 
 ---
 
@@ -186,11 +186,11 @@ symbolic API 与运行时 signature binding，等候选方案能通过 TODO 中�
 
 ## 6. 已审视但当前不建议修改
 
-### `MicrobatchEngine.commit_success()` 较长
+### `MicrobatchEngine.commit_reports()` 较长
 
-它目前按“全部 output 预检 → aligned Expansion 整体校验 → mutation frontier → 依赖序发布”分成
-清楚的三阶段，而且只有一种 Worker report schema。此时抽出 `ReportValidator` 会增加 DTO 和
-跨文件跳转，却没有消除第二份实现。
+它目前按“完整 batch identity 预检 → barrier discovery → 全部 live output 预检 → mutation
+frontier → 依赖序发布”分成清楚的阶段，而且只有一种 Worker report schema。此时抽出
+`ReportValidator` 会增加 DTO 和跨文件跳转，却没有消除第二份实现。
 
 只有将来出现第二种 report/backend schema，需要共享同一个纯 validation result 时才值得抽取。
 

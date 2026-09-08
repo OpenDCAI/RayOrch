@@ -48,7 +48,7 @@ flowchart LR
     R --> E["MicrobatchEngine<br/>Item / Expansion / Entity propagation"]
     E --> Q["DispatchState<br/>Grain phase / generation / queues"]
     R --> X["Executor<br/>actor capacity / RPC"]
-    R --> W["Worker ABI<br/>GrainPlan / CallOutputLayout"]
+    R --> W["Worker ABI<br/>GrainInvocation / CallOutputLayout"]
     E --> M["Materialization"]
 ```
 
@@ -60,7 +60,7 @@ flowchart LR
 | `ProgramAnalysis` | 可重算的 uses、Call outputs、Expansion sources、control fixed point、group depth | actor handle、runtime state |
 | `RuntimePlan` | Port Domain 表、Call ABI、input/output layouts、不可变 Effects 及其触发索引、pool、输出树 | `PortOrigin`、业务 payload、动态 Entity |
 | `MicrobatchEngine` | Item/Expansion/Entity lineage 与结构传播 | Grain 调度策略、logical Origin、actor handle、业务值解释 |
-| `DispatchState` | Grain phase/generation、normal/immediate/tail queues、精确 batch recovery | Item/Expansion publication、UDF policy、actor handle |
+| `DispatchState` | Grain phase/generation、ready/immediate-retry/deferred-recovery queues、精确 DispatchBatch recovery | Item/Expansion publication、UDF policy、actor handle |
 | `Executor` | actor 生命周期、RPC、multi-microbatch capacity | primitive 语义、lineage 推导 |
 | `Worker` | value-only batch UDF 与稳定 DTO | Program、runtime tables、Ray 调度策略 |
 

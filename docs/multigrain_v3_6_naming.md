@@ -1,82 +1,165 @@
-# Multigrain V3.6 命名与架构宪法
+# MultiGrain v3.6 naming and architecture constitution
 
-> **文档生态位：规范性的词汇、后缀、状态所有权和模块落点。** 本文用于命名/架构 review，
-> 不是顺序教程；全部文档关系见
-> [`V3.6 文档地图`](multigrain_v3_6_documentation_map.md)。
+This document defines the stable vocabulary used by the reviewer artifact.
+The Chinese translation is retained as
+[`multigrain_v3_6_naming.zh.md`](multigrain_v3_6_naming.zh.md).
+
+## At a glance
+
+### Stable nouns
+
+| Term | Meaning | Owner |
+| --- | --- | --- |
+| `Port` | Public symbolic handle during authoring | `api.py` |
+| `PortRef` | Immutable compiled coordinate | `model.py` |
+| `Domain` / `Entity` | Granularity level and one occurrence in that level | runtime engine |
+| `Item` | Port/entity intersection | runtime engine |
+| `Grain` | Call/entity execution unit | dispatch state |
+| `Expansion` | Ordered parent-to-child relation | runtime engine |
+| `LogicalProgram` | User declarations and provenance | `program/` |
+| `RuntimePlan` | Frozen physical execution contract | `program/plan.py` |
+| `Effect` | Lowered structural rule applied to facts | `program/lowering.py` |
+| `DispatchState` | Grain phases, generations, and queues | `runtime/dispatch.py` |
+| `Executor` | Ray actor and RPC transport | `execution/executor.py` |
+| `Worker` | Value-only UDF adapter | `execution/worker.py` |
+
+### Layer suffixes
+
+Names should reveal their layer instead of introducing synonyms:
+
+```text
+logical   user-declared graph facts
+analysis  discardable compiler-derived facts
+plan      immutable lowered execution facts
+runtime   semantic microbatch state
+dispatch  physical grain scheduling state
+execution Ray transport and worker calls
+```
+
+`Ref` types are coordinates, not mutable records. `Spec` types are immutable
+contracts. `State` types own mutable runtime tables. `Effect` types are lowered
+rules and must not own queues or actor handles.
+
+### Failure vocabulary
+
+`RecordFailure` means one producing grain failed. `GroupFailure` means that grain
+failed and its same-call, same-direct-parent uncommitted siblings are
+suppressed. `FAILED` and `SUPPRESSED` are item outcomes; `ABORT`, `RETRY`, and
+`SPLIT` are recovery actions for opaque dispatch failures. Do not use "poison",
+"drop", and "retry" interchangeably in API names or state transitions.
+
+### Placement rules
+
+- Add a public authoring object only when it changes the user declaration
+  language; put it in `api.py` or `functional.py`.
+- Put static invariants in `program/`; never make runtime code re-interpret an
+  origin.
+- Put mutable semantic facts in `runtime/`; keep actor handles out of it.
+- Put Ray-specific behavior in `execution/`; keep it ignorant of primitive
+  semantics.
+- Put immutable cross-layer DTOs and pure recovery decisions at the package
+  root (`protocol.py` and `recovery.py`).
+
+The goal is one name, one owner, and one publication path for every concept.
+
+---
+
+> **Document niche: normative vocabulary, suffixes, state ownership, and module placement.**
+> This document is intended for naming/architecture review; it is not a sequential
+> tutorial. See the [`V3.6 documentation map`](multigrain_v3_6_documentation_map.md)
+> for all document relationships.
 >
-> 目标：一份语义只使用一个词；名称直接表达所在层级；普通用户不需要理解执行器内部对象。
+> Goal: one word per semantic concept; a name directly expresses the layer it lives
+> in; ordinary users do not need to understand executor-internal objects.
 >
-> 状态：宪法已批准并落地；已提交 release baseline 通过真实 Ray 与性能门禁。当前未提交目录
-> 重组的精确证据范围见
-> [`架构审计待确认项`](todos/22-v36-architecture-audit-findings.md)。
+> Status: the constitution is approved and landed; the committed release baseline
+> passes the real-Ray and performance gates. For the precise evidence scope of the
+> directory reorganization that is not yet committed, see
+> [`Architecture audit open items`](todos/22-v36-architecture-audit-findings.md).
 
-## 0. 版本边界
+## 0. Version boundary
 
-V3.5 冻结在提交 `5f59566`，作为已经完成真实 Ray 与性能回归的可执行 oracle。
-V3.6 从该提交独立派生，只允许改变命名、封装、公共数据结构和代码组织，不新增或
-删除数据流语义。
+V3.5 is frozen at commit `5f59566` as an executable oracle that has already
+completed real-Ray and performance regression. V3.6 is derived independently from
+that commit and is only allowed to change naming, encapsulation, public data
+structures, and code organization; it MUST NOT add or remove dataflow semantics.
 
-版本约束：
+Version constraints:
 
-1. V3.5 源码、测试和文档保持冻结；
-2. V3.6 runtime/compiler 不得 import V3.5 实现；
-3. V3.5/V3.6 可以只在 paired test/benchmark 中同时作为被测对象出现；
-4. V3.6 不提供 V3.5 名称兼容 alias；
-5. V3.6 完成必须证明语义等价，并重新通过 MinerU 368 PDF、Docling 和视频负载；
-6. 性能结果必须报告 paired trial 的均值、方差和相对差异，不能用单次耗时宣称等价。
+1. V3.5 source, tests, and documentation remain frozen;
+2. V3.6 runtime/compiler MUST NOT import V3.5 implementations;
+3. V3.5/V3.6 may appear together as subjects under test only in paired test/benchmark;
+4. V3.6 provides no compatibility alias for V3.5 names;
+5. V3.6 completion MUST prove semantic equivalence and re-pass the MinerU 368 PDF,
+   Docling, and video workloads;
+6. Performance results MUST report the mean, variance, and relative difference of
+   paired trials; equivalence MUST NOT be claimed from a single elapsed time.
 
-## 1. 约束与非目标
+## 1. Constraints and non-goals
 
-这轮不是为了机械减少 `dataclass` 数量，也不追求把所有对象塞进一个“大节点”。
-必须同时满足以下约束：
+This round is not about mechanically reducing the number of `dataclass`es, nor
+about stuffing every object into one "big node". All of the following constraints
+MUST hold simultaneously:
 
-1. 不合并具有不同身份公式、生命周期或写入权的数据结构。
-2. 不用兼容 alias 保留旧名称；V3.6 尚未发布，新旧词汇不能长期并存。
-3. 原语名称从 `F.*`、LogicalProgram、语义分析、RuntimePlan 到状态转移保持一致。
-4. 后缀表达对象在架构中的职责，而不是作者的临时偏好。
-5. 根包只暴露用户完成任务所需的 API；维护者类型从所属模块显式导入。
-6. 改名不得改变状态机、数据身份、调度顺序或恢复语义。
-7. 每个旧术语必须有唯一去向；全仓搜索是实施完成条件。
+1. Data structures with different identity formulas, lifetimes, or write authority
+   MUST NOT be merged.
+2. Old names MUST NOT be preserved through compatibility aliases; V3.6 is not yet
+   released, so old and new vocabularies MUST NOT coexist long term.
+3. Primitive names stay consistent from `F.*`, LogicalProgram, semantic analysis,
+   RuntimePlan, through to state transitions.
+4. A suffix expresses an object's responsibility in the architecture, not an
+   author's temporary preference.
+5. The root package exposes only the API users need to complete their task;
+   maintainer types are imported explicitly from their owning module.
+6. Renaming MUST NOT change the state machine, data identity, scheduling order, or
+   recovery semantics.
+7. Every legacy term MUST have exactly one destination; a repo-wide search is the
+   completion condition of the implementation.
 
-以下做法不属于本轮目标：
+The following are NOT goals of this round:
 
-- 合并 `Origin -> Semantics -> Effect -> Record` 编译分层；
-- 合并 `Entity / Item / Grain / Expansion` 动态身份；
-- 为旧名称增加 deprecated wrapper、property 或 re-export；
-- 仅为了缩短文件而搬运代码。
+- merging the `Origin -> Semantics -> Effect -> Record` compilation layers;
+- merging the `Entity / Item / Grain / Expansion` dynamic identities;
+- adding deprecated wrappers, properties, or re-exports for legacy names;
+- moving code around only to shorten files.
 
-## 2. 两套心智模型
+## 2. Two mental models
 
-### 2.1 普通用户模型
+### 2.1 Ordinary user model
 
-普通用户主路径只需要理解下列七组常驻概念：
+The ordinary user's main path only needs to understand the following seven
+resident concepts:
 
-1. `Pipeline`：声明一张数据流；
-2. `Port`：在 `forward()` 内表示一列逻辑数据；
-3. `RayModule`：声明用户计算及其执行配置；
-4. `F.expand/filter/reduce/broadcast`：显式改变粒度、成员或对齐关系；
-5. `Executor`：编译并执行 Pipeline；
-6. `RunResult`：取得输出和只读运行指标；
-7. `ItemOutcome / RecordFailure`：表达非正常数据终态或在 UDF 内标记单条失败。
+1. `Pipeline`: declares one dataflow;
+2. `Port`: represents one logical data column inside `forward()`;
+3. `RayModule`: declares user computation and its execution configuration;
+4. `F.expand/filter/reduce/broadcast`: explicitly changes granularity, membership,
+   or alignment;
+5. `Executor`: compiles and executes the Pipeline;
+6. `RunResult`: obtains outputs and read-only run metrics;
+7. `ItemOutcome / RecordFailure`: expresses abnormal data terminal states, or marks
+   a single record failure inside a UDF.
 
-`RecoveryPolicy` 是按需扩展：只有用户需要改变默认 fail-fast 行为时才进入主路径，
-不能成为每个示例都必须理解或配置的样板代码。
+`RecoveryPolicy` is opt-in: it enters the main path only when a user needs to
+change the default fail-fast behavior, and MUST NOT become boilerplate that every
+example must understand or configure.
 
 ```mermaid
 flowchart LR
-    Input["Python 输入列"] --> Pipeline["Pipeline"]
+    Input["Python input columns"] --> Pipeline["Pipeline"]
     Pipeline --> Port["Port"]
     Module["RayModule"] --> Pipeline
     Primitive["F.expand / filter / reduce / broadcast"] --> Pipeline
     Pipeline --> Executor["Executor"]
     Executor --> Result["RunResult"]
-    Policy["RecoveryPolicy（按需）"] --> Executor
+    Policy["RecoveryPolicy (opt-in)"] --> Executor
 ```
 
-用户不需要理解 `DomainRef`、`EntityRef`、`GrainRef`、`RuntimePlan`、
-`DispatchState` 或运行时 Engine，除非进入维护者/诊断文档。
+Users do not need to understand `DomainRef`, `EntityRef`, `GrainRef`,
+`RuntimePlan`, `DispatchState`, or the runtime Engine unless they enter
+maintainer/diagnostic documentation.
 
-公共根包的目标导出集合为：
+The target export set of the public root package is:
 
 ```text
 F
@@ -95,32 +178,37 @@ RecordFailure
 MISSING
 ```
 
-`OptionalInput` 是 `F.optional(port)` 的内部返回类型，用户使用该函数即可，不要求从
-根包导入它。`functional` 模块、各种 `*Ref`、`LogicalProgram`、`RuntimePlan` 和
-Worker/Engine 类型不再从根包 re-export。
+`OptionalInput` is the internal return type of `F.optional(port)`; users just call
+the function and are not required to import it from the root package. The
+`functional` module, the various `*Ref`s, `LogicalProgram`, `RuntimePlan`, and the
+Worker/Engine types are no longer re-exported from the root package.
 
-### 2.2 维护者身份模型
+### 2.2 Maintainer identity model
 
-维护者只需要记住三种静态身份和四种动态身份：
+Maintainers only need to remember three static identities and four dynamic
+identities:
 
-| 层级 | 身份 | 唯一公式 | 回答的问题 |
-|---|---|---|---|
-| 静态 | `PortRef` | Program 内整数 | 数据在图上的哪个位置？ |
-| 静态 | `DomainRef` | Program 内整数 | 哪些 Entity 可以按身份对齐？ |
-| 静态 | `CallRef` | Program 内整数 | 这是哪个 RayModule 调用点？ |
-| 动态 | `EntityRef` | `DomainRef × occurrence` | 当前是哪一个业务实体？ |
-| 动态 | `ItemRef` | `PortRef × EntityRef` | 某个实体在某个 Port 上的事实是什么？ |
-| 动态 | `GrainRef` | `CallRef × EntityRef` | 哪一次逻辑计算可以被调度？ |
-| 动态 | `ExpansionRef` | `child DomainRef × parent EntityRef` | 一次 Expand 产生了哪些有序 children？ |
+| Layer | Identity | Uniqueness formula | Question answered |
+| --- | --- | --- | --- |
+| Static | `PortRef` | program-local integer | Where is this data located on the graph? |
+| Static | `DomainRef` | program-local integer | Which Entities can be aligned by identity? |
+| Static | `CallRef` | program-local integer | Which RayModule call site is this? |
+| Dynamic | `EntityRef` | `DomainRef × occurrence` | Which business entity is this? |
+| Dynamic | `ItemRef` | `PortRef × EntityRef` | What is the fact for one entity on one Port? |
+| Dynamic | `GrainRef` | `CallRef × EntityRef` | Which logical computation can be scheduled? |
+| Dynamic | `ExpansionRef` | `child DomainRef × parent EntityRef` | Which ordered children did one Expand produce? |
 
-如果公式仍然抽象，先看[入门教程 4.2 节的 PDF→Page→OCR 完整例子](multigrain_v3_6_getting_started.md#42-用一条-pdf-流水线逐个理解七种-ref)：
-它把 Port/Entity/Item 分别类比为列、行、单元格，并逐步展示 Item 如何使 Grain 就绪、
-Grain 又如何产生新的 Item。
+If the formulas still feel abstract, first read
+[section 4.2 of the getting-started tutorial, the complete PDF→Page→OCR example](multigrain_v3_6_getting_started.md#42-understanding-the-seven-refs-one-by-one-with-a-pdf-pipeline):
+it analogizes Port/Entity/Item to columns, rows, and cells, and step by step shows
+how an Item makes a Grain ready and how a Grain in turn produces new Items.
 
-四种动态身份不得合并：它们的唯一公式、终态和触发的下游 Effect 不同。保留这些
-小型值对象是在消除隐式身份所有者和跨组件飞线，而不是制造概念。
+The four dynamic identities MUST NOT be merged: their uniqueness formulas,
+terminal states, and triggered downstream Effects differ. Keeping these small value
+objects removes implicit identity owners and cross-component flywires instead of
+inventing concepts.
 
-## 3. 架构层级与状态所有权
+## 3. Architecture layers and state ownership
 
 ```mermaid
 flowchart LR
@@ -137,40 +225,47 @@ flowchart LR
     Executor --> Dispatch
 ```
 
-`LogicalProgram` 是符号追踪完成后冻结的轻量逻辑程序，不是一套需要扩张的通用 IR
-框架。V3.6 不引入 `IRNode` 基类、Visitor、Block、Instruction、SSA 或节点继承树。
-它只保存 Call、Port、Domain、Origin、sources 和 output tree。
+`LogicalProgram` is the lightweight logical program frozen after symbolic tracing;
+it is not a general IR framework that needs to grow. V3.6 does not introduce an
+`IRNode` base class, a Visitor, Block, Instruction, SSA, or a node inheritance
+tree. It only stores Call, Port, Domain, Origin, sources, and the output tree.
 
-这是一条概念分层，不要求为了形式主义禁止所有双向 import。真正约束是：
+This is a conceptual layering; it does not require forbidding every bidirectional
+import for formalism's sake. The real constraints are:
 
-- API 不读取运行时状态；
-- LogicalProgram 不保存 derived analysis、物理配置或任何运行时状态；
-- Analysis 不保存 actor 或动态事实；
-- RuntimePlan 不解释 `PortOrigin`；
-- MicrobatchEngine 是语义事实唯一写入者；
-- DispatchState 是 Grain phase、generation 和 runnable queue 的唯一写入者；
-- Worker 只消费 ABI DTO，不读取 RuntimeState。
+- the API MUST NOT read runtime state;
+- LogicalProgram MUST NOT store derived analysis, physical configuration, or any
+  runtime state;
+- Analysis MUST NOT store actors or dynamic facts;
+- RuntimePlan MUST NOT interpret `PortOrigin`;
+- MicrobatchEngine is the sole writer of semantic facts;
+- DispatchState is the sole writer of Grain phase, generation, and runnable queues;
+- the Worker only consumes ABI DTOs and does not read RuntimeState.
 
-### 3.1 三份静态表示各自只有一个问题
+### 3.1 Each of the three static representations answers exactly one question
 
 ```text
-LogicalProgram   用户声明了什么？
-ProgramAnalysis  从声明中可以推导出什么？
-RuntimePlan      哪类运行时事实应触发哪些 Effect？
+LogicalProgram    What did the user declare?
+ProgramAnalysis   What can be derived from the declaration?
+RuntimePlan       Which runtime facts should trigger which Effects?
 ```
 
-- `LogicalProgram` 是唯一逻辑真相，immutable；
-- `ProgramAnalysis` 完全可丢弃、可重算，不是第二份逻辑真相；
-- `RuntimePlan` 是唯一静态执行接线，运行时不得回查 Origin 补全语义。
+- `LogicalProgram` is the single logical truth, immutable;
+- `ProgramAnalysis` is fully discardable and recomputable; it is not a second
+  logical truth;
+- `RuntimePlan` is the single static execution wiring; the runtime MUST NOT look
+  back at Origin to complete semantics.
 
-RayModule 的 replicas、batch、recovery 和 Ray resource options 是显式的物理编译输入，
-不进入 LogicalProgram；它们在 lowering 时立即规范化为 `ActorPoolSpec`。这条输入边只
-服务物理计划，不参与 control demand、依赖闭包或任何运行时状态，因此不是跨层回查。
+RayModule replicas, batch, recovery, and Ray resource options are explicit
+physical compilation inputs and do not enter LogicalProgram; they are normalized
+immediately into `ActorPoolSpec` at lowering time. This input edge only serves the
+physical plan and does not participate in control demand, dependency closure, or
+any runtime state, so it is not a cross-layer back-reference.
 
-### 3.2 状态机不挂在 LogicalProgram 节点上
+### 3.2 The state machine does not hang off LogicalProgram nodes
 
-`LogicalProgram` 只定义运行时引用使用的静态坐标系。动态状态集中保存在以 Ref 为 key
-的权威状态表中：
+`LogicalProgram` only defines the static coordinate system used by runtime refs.
+Dynamic state is centralized in authoritative state tables keyed by Ref:
 
 ```text
 RuntimeState
@@ -182,12 +277,13 @@ RuntimeState
 
 DispatchState
 ├── GrainRef -> GrainRecord
-├── normal queue
-├── immediate retry queue
-└── tail retry queue
+├── ready queue
+├── immediate-retry queue
+└── deferred-recovery queue
 ```
 
-状态表只保存事实；合法转移由无状态纯函数计算：
+State tables only store facts; legal transitions are computed by stateless pure
+functions:
 
 ```text
 item_transition
@@ -199,122 +295,140 @@ reduce_transition
 broadcast_transition
 ```
 
-因此不存在“每个 Origin 节点拥有一个可变状态机对象”的模型，也不存在节点之间直接
-回调。MicrobatchEngine 只通过 RuntimePlan 的触发索引消费事实并发布新事实。
+Therefore there is no model in which "every Origin node owns a mutable state
+machine object", and there are no direct callbacks between nodes. MicrobatchEngine
+consumes facts and publishes new facts only through the RuntimePlan trigger
+indexes.
 
-### 3.3 唯一写入权
+### 3.3 Sole write authority
 
-这里的 **publish（发布）** 是状态机术语，准确含义是“让一个运行时事实正式生效”：
-先校验完整记录是否合法，再把它登记到唯一的 canonical table，并在首次登记时把其
-`Ref` 放入事实队列，供 `advance()` 继续传播。它不是网络广播、Ray Object Store
-的 `put()`，也不是向用户暴露数据。之所以不叫普通 `set`，是因为这一步不仅修改字典，
-还建立了“下游现在可以观察并消费这个事实”的状态机边界。
+Here **publish** is a state-machine term whose precise meaning is "making a
+runtime fact officially take effect": first validate that the complete record is
+legal, then register it into the single canonical table, and on first registration
+place its `Ref` into the fact queue for `advance()` to keep propagating. It is not
+a network broadcast, not Ray Object Store `put()`, and not exposing data to the
+user. It is not called a plain `set` because this step does more than mutate a
+dict: it establishes the state-machine boundary at which "downstream may now
+observe and consume this fact".
 
-- `MicrobatchEngine._publish_item()` 是 ItemRecord/ValueBinding 的规范发布入口；
-- `MicrobatchEngine._publish_expansion()` 是 ExpansionRecord 的规范发布入口；
-- `MicrobatchEngine._publish_entity()` 是 EntityParent 的规范发布入口；
-- `MicrobatchEngine._accept_call_input()` 独占 PendingGrain 输入槽累积；
-- `DispatchState` 独占 GrainRecord、generation 和三个 runnable queue；
-- Executor、materialize 和 Worker 只能通过公开只读查询或命令方法协作。
+- `MicrobatchEngine._publish_item()` is the canonical publication entry point for
+  ItemRecord/ValueBinding;
+- `MicrobatchEngine._publish_expansion()` is the canonical publication entry point
+  for ExpansionRecord;
+- `MicrobatchEngine._publish_entity()` is the canonical publication entry point
+  for EntityParent;
+- `MicrobatchEngine._accept_call_input()` exclusively accumulates PendingGrain
+  input slots;
+- `DispatchState` exclusively owns GrainRecord, generation, and the three runnable
+  queues;
+- Executor, materialize, and the Worker may only collaborate through public
+  read-only queries or command methods.
 
-`MicrobatchEngine` 内部字段必须叫 `_state`，`RuntimeState` 不从 `runtime` 聚合入口
-re-export。测试若需要验证表结构，应测试只读查询、Metrics/Snapshot 或所属模块的
-局部单元，而不能依赖 `RunResult` 暴露一个可变 Engine。
+The internal field of `MicrobatchEngine` MUST be named `_state`, and `RuntimeState`
+MUST NOT be re-exported from the `runtime` aggregation entry point. If a test needs
+to verify table structure, it SHOULD test read-only queries, Metrics/Snapshot, or
+the owning module's local unit, and MUST NOT rely on `RunResult` exposing a mutable
+Engine.
 
-## 4. 后缀语法
+## 4. Suffix grammar
 
-同一后缀在所有模块中必须表达同一种职责。
+The same suffix MUST express the same responsibility in every module.
 
-| 后缀 | 含义 | 可变性 | 示例 |
-|---|---|---|---|
-| `Ref` | 无行为的稳定身份 | frozen | `ItemRef`, `ExpansionRef` |
-| `Spec` | 用户声明经规范化后的静态定义/配置 | frozen | `CallSpec`, `ActorPoolSpec` |
-| `Origin` | LogicalProgram 中某个 Port 的直接生产表达式 | frozen | `FilterOrigin`, `ReduceOrigin` |
-| `Semantics` | 原语对分析阶段暴露的完整归一化合同 | frozen | `PrimitiveSemantics` |
-| `Use` | analysis 中一条反向使用边 | frozen | `CallUse`, `PrimitiveUse` |
-| `Effect` | 编译后由某类事实触发的运行时动作 | frozen | `ReduceEffect`, `ExpandEffect` |
-| `Layout` | 有序位置/嵌套结构或 ABI 排列 | frozen | `GroupLayout`, `CallInputLayout` |
-| `Plan` | 执行前发送给消费者的指令 | frozen | `GrainPlan`, `RuntimePlan` |
-| `Report` | 执行后返回给提交方的结果 | frozen | `GrainReport`, `OutputReport` |
-| `Record` | 状态所有者保存的权威事实 | owner 决定 | `ItemRecord`, `ExpansionRecord` |
-| `Snapshot` | 跨组件或诊断使用的不可变副本 | frozen | `GrainSnapshot`, `WorkerSnapshot` |
-| `Outcome` | 只包含互斥终态的枚举 | enum | `ItemOutcome`, `ExpansionOutcome` |
-| `Phase` | 包含中间阶段的生命周期枚举 | enum | `GrainPhase` |
-| `Binding` | 逻辑值到物理地址/组合结构的引用 | frozen | `RowBinding`, `GroupBinding` |
-| `Batch` | 一次调度必须整体保持的精确 Grain 集合 | frozen | `DispatchBatch` |
-| `Lease` | Executor 对一次在途物理请求的所有权 | frozen/private | `_DispatchLease` |
-| `State` | 唯一写入者拥有的一组可变表或状态机 | mutable | `RuntimeState`, `DispatchState` |
-| `Policy` | 输入事实到动作的纯决策配置 | frozen | `RecoveryPolicy` |
-| `Metrics` | 已聚合的数值统计 | snapshot/run-local | `CallMetrics` |
+| Suffix | Meaning | Mutability | Examples |
+| --- | --- | --- | --- |
+| `Ref` | stable identity without behavior | frozen | `ItemRef`, `ExpansionRef` |
+| `Spec` | static definition/configuration normalized from a user declaration | frozen | `CallSpec`, `ActorPoolSpec` |
+| `Origin` | the direct producing expression of one Port inside LogicalProgram | frozen | `FilterOrigin`, `ReduceOrigin` |
+| `Semantics` | the complete normalized contract a primitive exposes to the analysis stage | frozen | `PrimitiveSemantics` |
+| `Use` | one reverse use edge inside analysis | frozen | `CallUse`, `PrimitiveUse` |
+| `Effect` | a runtime action triggered by a class of facts after compilation | frozen | `ReduceEffect`, `ExpandEffect` |
+| `Layout` | ordered position/nested structure or ABI arrangement | frozen | `NestedGroupLayout`, `CallInputLayout` |
+| `Plan` | immutable, compiled instructions for a runtime owner | frozen | `RuntimePlan` |
+| `Invocation` | one executable unit with its resolved physical inputs | frozen | `GrainInvocation` |
+| `Report` | results returned to the submitter after execution | frozen | `GrainReport`, `PortOutputReport` |
+| `Record` | authoritative fact held by the state owner | decided by the owner | `ItemRecord`, `ExpansionRecord` |
+| `Snapshot` | immutable copy used across components or for diagnostics | frozen | `GrainSnapshot`, `WorkerSnapshot` |
+| `Outcome` | enum containing only mutually exclusive terminal states | enum | `ItemOutcome`, `ExpansionOutcome` |
+| `Phase` | lifecycle enum that also contains intermediate stages | enum | `GrainPhase` |
+| `Binding` | reference from a logical value to a physical address/grouped structure | frozen | `RowBinding`, `NestedGroupBinding` |
+| `Batch` | the exact Grain set that one dispatch must preserve as a whole | frozen | `DispatchBatch` |
+| `Rpc` | one submitted physical request and its finalization context | frozen/private | `_PendingRpc` |
+| `State` | mutable tables or state machines owned by a single writer | mutable | `RuntimeState`, `DispatchState` |
+| `Policy` | pure decision configuration from input facts to actions | frozen | `RecoveryPolicy` |
+| `Metrics` | already-aggregated numeric statistics | snapshot/run-local | `CallMetrics` |
 
-约束：
+Constraints:
 
-- `State` 不再用于终态枚举，终态一律叫 `Outcome`。
-- `Key` 不用于领域身份，身份一律叫 `Ref`。
-- `Rule` 不用于已 lower 的运行时动作，动作一律叫 `Effect`。
-- `Invocation` 不再作为 `Grain` 的同义词。
-- `Take` 不再作为 Worker 输入描述词。
-- `Origin` 只属于 LogicalProgram；运行时血缘不使用 `Origin`。
+- `State` is no longer used for terminal-state enums; terminal states are always
+  called `Outcome`.
+- `Key` is not used for domain identity; identity is always called `Ref`.
+- `Rule` is not used for already-lowered runtime actions; actions are always called
+  `Effect`.
+- `Invocation` is no longer a synonym for `Grain`.
+- `Take` is no longer used as a Worker input descriptor.
+- `Origin` belongs only to LogicalProgram; runtime lineage does not use `Origin`.
 
-## 5. 原语词汇必须贯穿编译流水线
+## 5. Primitive vocabulary must run through the compilation pipeline
 
-原语动词固定为：
+The primitive verbs are fixed as:
 
 ```text
 Source / CallOutput / Expand / Filter / Reduce / Broadcast
 ```
 
-每个原语沿编译阶段保持同一个词根：
+Each primitive keeps the same word root across compilation stages:
 
-| 用户/API | LogicalProgram | Semantics | RuntimePlan | 状态转移 |
-|---|---|---|---|---|
-| source 参数 | `SourceOrigin` | `SOURCE` | source admission | item publication |
-| `RayModule(...)` 输出 | `CallOutputOrigin` | `CALL_OUTPUT` | worker output | call transition |
+| User/API | LogicalProgram | Semantics | RuntimePlan | State transition |
+| --- | --- | --- | --- | --- |
+| source argument | `SourceOrigin` | `SOURCE` | source admission | item publication |
+| `RayModule(...)` output | `CallOutputOrigin` | `CALL_OUTPUT` | worker output | call transition |
 | `F.expand` | `ExpandOrigin` | `EXPAND` | `ExpandEffect` | expansion transition |
 | `F.filter` | `FilterOrigin` | `FILTER` | `FilterEffect` | filter transition |
 | `F.reduce` | `ReduceOrigin` | `REDUCE` | `ReduceEffect` | reduce transition |
 | `F.broadcast` | `BroadcastOrigin` | `BROADCAST` | `BroadcastEffect` | broadcast transition |
 
-`Group` 只描述 Reduce 产生或消费的成组数据，例如 `GroupLayout`、`GroupBinding`
-和 `GroupInput`；它不再作为 `F.reduce` 原语的别名。
+`Group` only describes grouped data produced or consumed by Reduce, for example
+`NestedGroupLayout`, `NestedGroupBinding`, and `NestedGroupInput`; it is no longer an alias for the
+`F.reduce` primitive.
 
-`Expand` 是原语动词；`Expansion` 是一次动态展开事实。两者不能互换：
+`Expand` is the primitive verb; `Expansion` is one dynamic expansion fact. The two
+MUST NOT be interchanged:
 
 ```text
-ExpandOrigin / ExpandEffect        编译期动作
-ExpansionRef / ExpansionRecord    运行时事实
-ExpansionOutcome                  运行时终态
+ExpandOrigin / ExpandEffect        compile-time actions
+ExpansionRef / ExpansionRecord     runtime facts
+ExpansionOutcome                   runtime terminal state
 ```
 
-## 6. Call、Grain、Batch、Lease 的唯一边界
+## 6. The single boundary of Call, Grain, Batch, and pending RPC
 
 ```mermaid
 flowchart LR
-    Call["CallRef<br/>静态调用点"] --> Grain1["GrainRef<br/>Call × Entity"]
+    Call["CallRef<br/>static call site"] --> Grain1["GrainRef<br/>Call × Entity"]
     Call --> Grain2["GrainRef"]
-    Grain1 --> Batch["DispatchBatch<br/>一次精确 RPC 分组"]
+    Grain1 --> Batch["DispatchBatch<br/>one exact RPC packing unit"]
     Grain2 --> Batch
-    Batch --> Lease["_DispatchLease<br/>ObjectRef + actor + microbatch"]
-    Lease --> Reports["GrainReport / GrainFailureReport"]
+    Batch --> PendingRpc["_PendingRpc<br/>ObjectRef + actor + microbatch"]
+    PendingRpc --> Reports["GrainReport / GrainFailureReport"]
 ```
 
-- `Call` 永远是静态图节点。
-- `Grain` 永远是动态的单实体逻辑计算。
-- `DispatchBatch` 永远是 recovery 必须原样保留的一组 Grain。
-- `_DispatchLease` 永远是 Executor 私有的物理在途请求。
-- Worker 的输入叫 `GrainPlan`，输出叫 `GrainReport` 或
-  `GrainFailureReport`。
+- `Call` is always a static graph node.
+- `Grain` is always a dynamic single-entity logical computation.
+- `DispatchBatch` is always a set of Grains that recovery must preserve verbatim.
+- `_PendingRpc` is always the Executor-private physical in-flight request.
+- The Worker's input is called `GrainInvocation`, and its output is called `GrainReport`
+  or `GrainFailureReport`.
 
-不再出现 `InvocationPlan`、`PendingInvocation`、`CallReport` 或
-`DispatchSelection`。
+`InvocationPlan`, `PendingInvocation`, `CallReport`, and `DispatchSelection` no
+longer appear.
 
-## 7. Microbatch 与内部 Engine
+## 7. Microbatch and the internal Engine
 
-`Arena` 是历史实现词，用户必须额外学习它与 source microbatch 的关系。V3.6
-统一使用 `Microbatch`：
+`Arena` is a historical implementation term that forced users to additionally
+learn its relationship to the source microbatch. V3.6 uniformly uses `Microbatch`:
 
-| 当前名称 | 目标名称 |
-|---|---|
+| Current name | Target name |
+| --- | --- |
 | `ArenaEngine` | `MicrobatchEngine` |
 | `_ArenaSlot` | `_MicrobatchSlot` |
 | `_admit_arena` | `_admit_microbatch` |
@@ -322,10 +436,11 @@ flowchart LR
 | `max_in_flight` | `max_active_microbatches` |
 | `RunResult.max_active_arenas` | `RunResult.peak_active_microbatches` |
 
-一个 MicrobatchEngine 管理一个 source microbatch 及其完整派生闭包。Expand 后实体数
-可以大于 source row 数，这不改变它的所有权边界。
+One MicrobatchEngine manages one source microbatch and its complete derived
+closure. After Expand, the number of entities may exceed the number of source
+rows; this does not change its ownership boundary.
 
-`RunResult` 不再暴露可变的 Engine。目标合同为：
+`RunResult` no longer exposes a mutable Engine. The target contract is:
 
 ```text
 RunResult
@@ -336,42 +451,49 @@ RunResult
 └── peak_active_microbatches
 ```
 
-`MicrobatchMetrics` 只提供 `entity/item/expansion/grain/released-value` 数量等不可变诊断，
-不暴露 `RuntimeState`、RuntimePlan 或物理 payload 引用。`RunResult` 本身即代表所有
-microbatch 已完成，因此不重复保存恒为 true 的 `complete` 字段；聚合
-`released_values` 由 microbatch metrics 求和得到。精细 Grain generation 测试属于
-`DispatchState` 单元测试，不通过 `RunResult` 泄露 Engine 来完成。
+`MicrobatchMetrics` only provides immutable diagnostics such as
+`entity/item/expansion/grain/released-value` counts, and does not expose
+`RuntimeState`, RuntimePlan, or physical payload references. `RunResult` itself
+already means that all microbatches have completed, so it does not redundantly
+store a `complete` field that is always true; the aggregate `released_values` is
+obtained by summing microbatch metrics. Fine-grained Grain generation tests belong
+to `DispatchState` unit tests and are not done by leaking the Engine through
+`RunResult`.
 
-`RunResult.calls` 不再以内部 `CallRef` 为 key。每个 frozen `CallMetrics` 直接包含稳定的
-`call_index`、`udf_name`、run-local RPC/Grain/retry/batch 指标，以及该 Call 的
-`worker_snapshots`。这样普通诊断不要求用户先理解或导入 `CallRef`。Executor 内部使用
-私有 `_CallCounters` 累加，run 结束时一次性冻结为 `CallMetrics`。
+`RunResult.calls` is no longer keyed by the internal `CallRef`. Each frozen
+`CallMetrics` directly contains the stable `call_index`, `udf_name`, run-local
+RPC/Grain/retry/batch metrics, and the `worker_snapshots` of that Call. Ordinary
+diagnostics therefore do not require users to first understand or import `CallRef`.
+The Executor accumulates internally with a private `_CallCounters` and freezes it
+into `CallMetrics` once at the end of the run.
 
-## 8. 逐模块目标命名
+## 8. Target naming per module
 
-本节是实施时的唯一映射表。未列出的现有名称默认保留。
+This section is the single mapping table used during implementation. Existing
+names not listed here are kept by default.
 
 ### `model.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `ShapeState` | `ExpansionOutcome` |
 
-保留 `CallRef / PortRef / DomainRef / EntityRef / ItemRef / GrainRef`、
-`InputMode`、`ItemOutcome` 和 `GrainPhase`。
+Keep `CallRef / PortRef / DomainRef / EntityRef / ItemRef / GrainRef`,
+`InputMode`, `ItemOutcome`, and `GrainPhase`.
 
 ### `api.py` / `functional.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `OptionalPort` | `OptionalInput` |
 
-`OptionalInput` 只改变一个 Call 输入的 `InputMode`，不创建 Port。
+`OptionalInput` only changes the `InputMode` of one Call input; it does not create
+a Port.
 
 ### `program/logical.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `GroupOrigin` | `ReduceOrigin` |
 | `InputSpec` | `CallInputSpec` |
 | `KernelSpec` | `UdfSpec` |
@@ -379,26 +501,27 @@ microbatch 已完成，因此不重复保存恒为 true 的 `complete` 字段；
 
 ### `program/semantics.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `PrimitiveKind.GROUP` | `PrimitiveKind.REDUCE` |
 | `GROUP_VALUE` | `REDUCE_VALUE` |
 | `GROUP_MEMBERS` | `REDUCE_MEMBERS` |
 
 ### `program/analysis.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `DerivedFacts` | `ProgramAnalysis` |
 | `shape_reporters_by_domain` | `expansion_sources_by_domain` |
 
-`CallUse / PrimitiveUse / LogicalUse` 保留；`Use` 是标准的编译器反向边词汇。
-`group_depth_by_port` 也保留，因为它描述数据嵌套深度，不是 Reduce 原语名称。
+`CallUse / PrimitiveUse / LogicalUse` are kept; `Use` is the standard compiler term
+for a reverse edge. `group_depth_by_port` is also kept, because it describes data
+nesting depth rather than naming the Reduce primitive.
 
 ### `program/plan.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `GroupEffect` | `ReduceEffect` |
 | `ExpansionRule` | `ExpandEffect` |
 | `PoolSpec` | `ActorPoolSpec` |
@@ -407,10 +530,10 @@ microbatch 已完成，因此不重复保存恒为 true 的 `complete` 字段；
 | `CompiledProgram.runtime` | `CompiledProgram.plan` |
 | `CompiledProgram.explain` | `CompiledProgram.explanation` |
 
-RuntimePlan 索引按“触发源”命名：
+RuntimePlan indexes are named after their trigger source:
 
-| 当前字段 | 目标字段 |
-|---|---|
+| Current field | Target field |
+| --- | --- |
 | `effects_by_item_port` | `item_effects_by_source` |
 | `expansions_by_source` | `expand_effects_by_source` |
 | `shape_reporters_by_domain` | `expansion_sources_by_domain` |
@@ -419,12 +542,13 @@ RuntimePlan 索引按“触发源”命名：
 | `effects_by_entity_domain` | `broadcast_effects_by_target_domain` |
 | `pools_by_call` | `actor_pools_by_call` |
 
-所有索引必须引用同一份 Effect 对象，不允许重新构造 equal clone。
+All indexes MUST reference the same Effect object; reconstructing an equal clone is
+not allowed.
 
 ### `runtime/transitions.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `shape_transition` | `expansion_transition` |
 | `expansion_shape_transition` | `expansion_outcome_from_item` |
 | `GroupCause` | `ReduceCause` |
@@ -433,64 +557,67 @@ RuntimePlan 索引按“触发源”命名：
 
 ### `protocol.py`
 
-| 当前 | 目标 |
-|---|---|
-| `InvocationPlan` | `GrainPlan` |
+| Current | Target |
+| --- | --- |
+| `InvocationPlan` | `GrainInvocation` |
 | `CallReport` | `GrainReport` |
 | `CallFailureReport` | `GrainFailureReport` |
 | `InputLayout` | `CallInputLayout` |
 | `OutputLayout` | `CallOutputLayout` |
-| `GroupTake` | `GroupInput` |
+| `GroupTake` | `NestedGroupInput` |
 | `MissingTake` | `MissingInput` |
 | `InputTake` | `GrainInput` |
 
-`ScalarTake` 删除：标量输入直接使用已有 `RowBinding`，不再为单字段 wrapper 增加一个
-概念。目标联合为：
+`ScalarTake` is deleted: scalar inputs use the existing `RowBinding` directly, and
+no concept is added for a single-field wrapper. The target union is:
 
 ```text
-GrainInput = RowBinding | GroupInput | MissingInput
+GrainInput = RowBinding | NestedGroupInput | MissingInput
 ```
 
-`ExpandedRows`、`OutputReport`、`WorkerReport`、`DispatchFailure` 保留。它们分别表示
-expanded Port 的行集合、一个输出 Port 的报告、Worker 报告联合和整批物理失败。
+`ExpandedRows`, `PortOutputReport`, `WorkerReport`, and `DispatchFailure` are kept.
+They respectively denote the row set of an expanded Port, the report of one output
+Port, the Worker report union, and a whole-batch physical failure.
 
 ### `runtime/state.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `ShapeKey` | `ExpansionRef` |
 | `ShapeRecord` | `ExpansionRecord` |
 | `ShapeRecord.state` | `ExpansionRecord.outcome` |
 | `EntityOrigin` | `EntityParent` |
-| `GroupShape` | `GroupLayout` |
-| `GroupBinding.shape` | `GroupBinding.layout` |
+| `GroupShape` | `NestedGroupLayout` |
+| `NestedGroupBinding.shape` | `NestedGroupBinding.layout` |
 | `PendingInvocation` | `PendingGrain` |
 | `RuntimeState.shapes` | `RuntimeState.expansions` |
 | `RuntimeState.pending` | `RuntimeState.pending_grains` |
 
-`EntityParent` 是 child Entity 的直接父引用和 ordinal；`Origin` 只留给 LogicalProgram。
+`EntityParent` is the direct parent reference and ordinal of a child Entity;
+`Origin` is reserved for LogicalProgram only.
 
 ### `runtime/dispatch.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `DispatchSelection` | `DispatchBatch` |
 
-保留 `DispatchState`、私有 `GrainRecord` 和公开只读 `GrainSnapshot`。
+Keep `DispatchState`, the private `GrainRecord`, and the public read-only
+`GrainSnapshot`.
 
 ### `runtime/engine.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `ArenaEngine` | `MicrobatchEngine` |
-| `invocation_plan` | `grain_plan` |
+| `invocation_plan` | `grain_invocation` |
 | `shape_count` | `expansion_count` |
 | `_publish_shape` | `_publish_expansion` |
 | `_try_group` | `_try_reduce` |
 | `_ExpansionCommit` | `_ExpandedOutputCommit` |
 | `state` | `_state` |
 
-事实队列统一为：
+The fact queue is unified as:
 
 ```text
 _FactEvent = ItemRef | ExpansionRef | EntityRef
@@ -498,10 +625,10 @@ _FactEvent = ItemRef | ExpansionRef | EntityRef
 
 ### `execution/executor.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `_ArenaSlot` | `_MicrobatchSlot` |
-| `_Dispatch` | `_DispatchLease` |
+| `_Dispatch` | `_PendingRpc` |
 | `arena_index` | `microbatch_index` |
 | `_admit_arena` | `_admit_microbatch` |
 | `RunResult.arenas` | `RunResult.microbatches: tuple[MicrobatchMetrics, ...]` |
@@ -510,89 +637,119 @@ _FactEvent = ItemRef | ExpansionRef | EntityRef
 | `RunResult.workers` | `CallMetrics.worker_snapshots` |
 | `CallMetrics.actor_starts` | `CallMetrics.actor_instances` |
 
-`CallMetrics` 是 frozen、run-local 的公开快照；可变累加器叫私有 `_CallCounters`。
-`CallMetrics` 通过 `call_index + udf_name` 提供人类可读身份，不向用户泄露 `CallRef`。
-`actor_instances` 表示本轮可用及 replacement 后参与统计的 actor 实例数，不再错误暗示
-所有 persistent actor 都是在本轮启动的。
+`CallMetrics` is a frozen, run-local public snapshot; the mutable accumulator is
+the private `_CallCounters`. `CallMetrics` provides a human-readable identity through
+`call_index + udf_name` and does not leak `CallRef` to users. `actor_instances`
+denotes the number of actor instances available in this run and counted after
+replacement; it no longer wrongly implies that every persistent actor was started
+in this run.
 
 ### `execution/worker.py`
 
-| 当前 | 目标 |
-|---|---|
+| Current | Target |
+| --- | --- |
 | `WorkerObservation` | `WorkerSnapshot` |
 | `ValueStore` | `BlockStore` |
 | `WorkerObservation.calls` | `WorkerSnapshot.lifetime_calls` |
-| 参数名 `invocations` | `grain_plans` |
+| parameter name `invocations` | `invocations` |
 
-`WorkerSnapshot.lifetime_calls` 明确是 actor lifetime 计数，不与 run-local
-`CallMetrics.rpcs` 混称。
+`WorkerSnapshot.lifetime_calls` is explicitly an actor lifetime count and is not
+confused with the run-local `CallMetrics.rpcs`.
 
 ### `recovery.py`
 
-`UdfRecoveryMode`、`RecoveryAction` 和 `RecoveryPolicy` 已符合后缀合同，不改名。
-Policy 只做纯决策；DispatchState 执行物理 phase/queue 变化；MicrobatchEngine 发布语义终态。
+`UdfRecoveryMode`, `RecoveryAction`, and `RecoveryPolicy` already satisfy the
+suffix contract and are not renamed. Policy only makes pure decisions;
+DispatchState performs physical phase/queue changes; MicrobatchEngine publishes
+semantic terminal states.
 
-## 9. 公共错误与诊断用语
+## 9. Public error and diagnostic wording
 
-错误信息同样遵守上述词汇：
+Error messages obey the same vocabulary:
 
-- 用户错误优先显示 RayModule/UDF 名、输入参数名和 `microbatch`，而不是内部 Ref repr；
-- 维护者上下文统一使用 `call=... grain=... generation=...`；
-- 不再产生 `Invocation`、`Shape`、`Group Effect` 或 `Arena` 文案；
-- Worker 合同错误使用 `expected/actual`、`input/output port`、`grain/generation`；
-- `ProgramExplanation` 中原语名与 `F.*` 一致，使用 `reduce` 而不是 `group`。
+- user errors SHOULD show the RayModule/UDF name, the input parameter name, and
+  `microbatch` first, rather than internal Ref reprs;
+- maintainer context uniformly uses `call=... grain=... generation=...`;
+- no more `Invocation`, `Shape`, `Group Effect`, or `Arena` wording is produced;
+- Worker contract errors use `expected/actual`, `input/output port`, and
+  `grain/generation`;
+- primitive names in `ProgramExplanation` match `F.*`, using `reduce` rather than
+  `group`.
 
-## 10. 实现后源码契合性审计
+## 10. Post-implementation source conformance audit
 
-总体结论：V3.6 已按本宪法完成 breaking 收口；编译器和状态机架构沿用 V3.5 已验证
-的职责分层，没有为改名重写语义算法。
+Overall conclusion: V3.6 has completed its breaking closure according to this
+constitution; the compiler and state-machine architecture reuses the
+responsibility layering already validated in V3.5, and no semantic algorithm was
+rewritten for the renaming.
 
-已经契合：
+Already conforming:
 
-- `_ProgramBuilder.build()` 冻结 LogicalProgram，builder 不进入 runtime；
-- `semantics.describe_origin()` 是 Origin 到统一语义的封闭解析入口；
-- analysis 只保存可重算派生事实，不持有 actor 或动态记录；
-- RuntimePlan 不包含 PortOrigin，runtime/Executor/Worker 均不导入 logical 模块；
-- RuntimePlan 的多个触发索引引用同一份 Effect，verifier 使用对象 identity 防止第二份真相；
-- MicrobatchEngine 通过 `_FactEvent` 和 `advance()` 消费 RuntimePlan 索引，不在运行时重新解析 Origin；
-- Item、Expansion、Entity 的生产写入集中在 Engine 的 `_publish_*` 路径；
-- GrainRecord、generation 和 runnable queues 只由 DispatchState 修改；
-- materialize 只调用 Engine 的只读查询，不读取 RuntimeState table；
-- Worker 只接收 protocol DTO，不持有 RuntimePlan 或 RuntimeState。
+- `_ProgramBuilder.build()` freezes LogicalProgram, and the builder does not enter
+  the runtime;
+- `semantics.describe_origin()` is the closed resolution entry point from Origin to
+  unified semantics;
+- analysis only stores recomputable derived facts and holds no actors or dynamic
+  records;
+- RuntimePlan contains no PortOrigin, and runtime/Executor/Worker do not import the
+  logical module;
+- multiple RuntimePlan trigger indexes reference the same Effect, and the verifier
+  uses object identity to prevent a second truth;
+- MicrobatchEngine consumes RuntimePlan indexes through `_FactEvent` and
+  `advance()`, and does not re-resolve Origin at runtime;
+- production writes of Item, Expansion, and Entity are concentrated in the Engine's
+  `_publish_*` path;
+- GrainRecord, generation, and runnable queues are modified only by DispatchState;
+- materialize only calls the Engine's read-only queries and does not read
+  RuntimeState tables;
+- the Worker only receives protocol DTOs and holds neither RuntimePlan nor
+  RuntimeState.
 
-已经完成的收口：
+Closures already completed:
 
-- Engine 的权威表只存在于私有 `_state`；
-- `runtime.__init__` 不再聚合导出 RuntimeState 和记录类型；
-- RunResult 只保存 frozen `CallMetrics` 与 `MicrobatchMetrics`，不保存 live Engine；
-- integration tests 和教程不再通过公开结果读取 Engine/RuntimeState；
-- 根包只暴露第 2.1 节的用户任务 API；
-- 标量 Grain 输入直接使用 `RowBinding`，不存在零语义 `ScalarTake` wrapper；
-- `ExpansionRecord.outcome`、`WorkerSnapshot.lifetime_calls` 和
-  `CallMetrics.actor_instances` 已统一消除歧义词。
+- the Engine's authoritative tables exist only in the private `_state`;
+- `runtime.__init__` no longer aggregates and exports RuntimeState and record types;
+- RunResult only stores frozen `CallMetrics` and `MicrobatchMetrics`, not a live
+  Engine;
+- integration tests and the tutorial no longer read Engine/RuntimeState through
+  public results;
+- the root package exposes only the user-task API of section 2.1;
+- scalar Grain input uses `RowBinding` directly, and the zero-semantics
+  `ScalarTake` wrapper no longer exists;
+- `ExpansionRecord.outcome`, `WorkerSnapshot.lifetime_calls`, and
+  `CallMetrics.actor_instances` have uniformly eliminated ambiguous words.
 
-下列结构不构成飞线，不应为了“绝对分层”重复实现：
+The following structures do not constitute flywires and SHOULD NOT be
+re-implemented for the sake of "absolute layering":
 
-- RuntimePlan 复用 frozen `CallSpec` 和 `DomainSpec`；它们是必要静态定义，不是动态状态；
-- MicrobatchEngine 直接读写自己的 `_state`；它就是该状态表的唯一 owner；
-- 同一个 ReduceEffect 同时出现在 Item 与 Expansion 触发索引；索引只持有同一个对象引用；
-- RayModule physical options 绕过 LogicalProgram 进入 lowering；它们不参与逻辑语义，且
-  唯一落点是 ActorPoolSpec。
+- RuntimePlan reuses frozen `CallSpec` and `DomainSpec`; they are necessary static
+  definitions, not dynamic state;
+- MicrobatchEngine reads and writes its own `_state` directly; it is the single
+  owner of that state table;
+- the same ReduceEffect appears in both the Item and Expansion trigger indexes; the
+  indexes only hold a reference to the same object;
+- RayModule physical options bypass LogicalProgram and enter lowering; they do not
+  participate in logical semantics, and their single destination is ActorPoolSpec.
 
-## 11. 实施顺序与完成门禁
+## 11. Implementation order and completion gates
 
-批准后只允许按以下顺序实施：
+After approval, implementation is only allowed in this order:
 
-1. 修改身份、终态和 LogicalProgram 名称；让类型错误暴露全部传播点。
-2. 修改 semantics、analysis、RuntimePlan 和 transitions。
-3. 修改 Worker ABI、RuntimeState、DispatchState 和 MicrobatchEngine。
-4. 修改 Executor 公共参数、RunResult snapshot 和根包 exports。
-5. 修改 benchmark、示例、教程和测试。
-6. 运行 denylist 搜索，确认旧词只存在于本迁移文档的“当前名称”列。
-7. 运行 `git diff --check`、核心 pyright、全部 Ray-free 测试和真实 Ray integration。
-8. 审计 optimizer on/off 语义等价，并确认命名改动没有新增第二份状态或 lookup 飞线。
+1. Rename identities, terminal states, and LogicalProgram names; let type errors
+   expose every propagation point.
+2. Change semantics, analysis, RuntimePlan, and transitions.
+3. Change the Worker ABI, RuntimeState, DispatchState, and MicrobatchEngine.
+4. Change Executor public parameters, the RunResult snapshot, and root package
+   exports.
+5. Change benchmarks, examples, tutorials, and tests.
+6. Run the denylist search and confirm that legacy words exist only in the
+   "current name" column of this migration document.
+7. Run `git diff --check`, core pyright, all Ray-free tests, and real-Ray
+   integration.
+8. Audit semantic equivalence with the optimizer on/off, and confirm that the
+   renaming introduced no second copy of state and no lookup flywire.
 
-源码 denylist：
+Source denylist:
 
 ```text
 ShapeKey ShapeRecord ShapeState GroupShape EntityOrigin
@@ -603,27 +760,35 @@ ArenaEngine arena_size max_in_flight WorkerObservation ValueStore
 ScalarTake GroupTake MissingTake InputTake InputLayout OutputLayout ExplainPlan
 ```
 
-允许保留的相近词仅限：
+Similar words that are allowed to remain are limited to:
 
-- `GroupLayout / GroupBinding / GroupInput`：描述成组数据；
-- `RuntimeState / DispatchState`：拥有可变表或状态机；
-- 本文迁移映射中的旧名称；
-- V3/V3.1/V3.2/V3.3/V3.4/V3.5 历史实现与历史文档，不做跨版本机械替换。
-- paired benchmark 为调用历史 V3 API 而保留的参数名，只允许出现在 V3 arm 的适配边。
+- `NestedGroupLayout / NestedGroupBinding / NestedGroupInput`: describing grouped data;
+- `RuntimeState / DispatchState`: owning mutable tables or state machines;
+- the legacy names inside the migration mapping of this document;
+- V3/V3.1/V3.2/V3.3/V3.4/V3.5 historical implementations and historical documents,
+  which are not mechanically replaced across versions;
+- parameter names retained by the paired benchmark in order to call historical V3
+  APIs; they may only appear on the adaptation edge of the V3 arm.
 
-## 12. 宪法修改规则
+## 12. Constitution amendment rules
 
-实施中若发现映射不成立，必须先修改本文并说明语义原因，再修改源码；不能在单个
-module 内临时发明第三个同义词。新增概念必须回答：
+If a mapping turns out not to hold during implementation, this document MUST be
+amended first with the semantic reason, and only then may the source be changed; a
+third synonym MUST NOT be invented ad hoc inside a single module. A new concept
+MUST answer:
 
-1. 它是否有独立身份公式、生命周期或写入权？
-2. 它能否使用现有后缀表达？
-3. 普通用户是否必须看到它？
-4. 删除它会不会重新引入隐式分支、重复状态或跨组件回查？
+1. Does it have an independent identity formula, lifetime, or write authority?
+2. Can it be expressed using an existing suffix?
+3. Must an ordinary user see it?
+4. Would deleting it reintroduce implicit branching, duplicated state, or a
+   cross-component back-reference?
 
-只有至少一个问题给出明确的“是/会”，新概念才有存在理由。
+Only when at least one question yields a clear "yes" does the new concept have a
+reason to exist.
 
-真实性能收口记录见
-[`2026-08-08_release_regression.md`](experiments/multigrain_v3_6/2026-08-08_release_regression.md)：
-MinerU 368 PDF、Docling 48 PDF、Caption 256 与 Multimodal 256 的两轮 paired trial 均在
-±2% 内，且身份与结构合同通过。该结果确认本命名与所有权重构没有制造可观测的系统性开销。
+The real performance closure record is in
+[`2026-08-08_release_regression.md`](experiments/multigrain_v3_6/2026-08-08_release_regression.md):
+the two paired trial rounds of MinerU 368 PDF, Docling 48 PDF, Caption 256, and
+Multimodal 256 all fell within ±2%, and the identity and structure contract passed.
+This result confirms that this renaming and the ownership restructuring did not
+create observable systematic overhead.

@@ -1,21 +1,50 @@
-# 05：逐段读懂 `execution/worker.py`——物理 binding 怎样变成 UDF batch
+# 05. Worker ABI: binding a grain batch to a UDF
 
-主源码：[`execution/worker.py`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py)。
+[`execution/worker.py`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py)
+is deliberately Ray-independent. The Chinese walkthrough is retained as
+[`05_worker_abi.zh.md`](05_worker_abi.zh.md).
 
-Worker 位于语义状态机与用户代码之间。它不认识 Program、Domain 或 Filter/Reduce；它只接收
-编译好的 input/output layout 和一批物理 `GrainPlan`，调用一次 batch UDF，再返回逐 Grain
-报告。
+## At a glance
+
+The compiler supplies a `CallInputLayout` and `CallOutputLayout`. For each
+reserved `GrainInvocation`, the worker resolves value bindings and group inputs into
+ordinary Python positional and keyword columns, invokes the UDF once, and
+normalizes the result into a tuple of per-grain reports.
+
+The worker does not read `LogicalProgram`, infer lineage, choose recovery, or
+touch actor handles. It validates output arity and row alignment. A
+`RecordFailure` produces a `GrainFailureReport` for the current grain; a
+`GroupFailure` sets the report's sibling-suppression bit. Both are ordinary
+return values and do not request a retry.
+
+An exception that prevents per-grain reports becomes a serializable
+`DispatchFailure`. `RecoveryPolicy` is evaluated by the executor, not by the
+worker. This separation keeps UDF binding testable without Ray.
+
+Tests should cover keyword order, optional inputs, multiple outputs, failure
+sentinels, malformed return shapes, and exception snapshots.
 
 ---
 
-## 1. Worker 的边界为什么重要
+## 05. Reading `execution/worker.py` section by section: how physical binding becomes a UDF batch
 
-Engine 维护细粒度身份，但 payload 应在粗粒度块中传输；UDF 应看到自然 Python values，而不是
-RayOrch 内部 Ref。Worker 负责这次双向翻译：
+Main source: [`execution/worker.py`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py).
+
+The Worker sits between the semantic state machine and user code. It knows nothing about
+Program, Domain, or Filter/Reduce; it only receives the compiled input/output layout plus a
+batch of physical `GrainInvocation`s, invokes the batch UDF once, and returns per-Grain reports.
+
+---
+
+### 1. Why the Worker boundary matters
+
+The Engine maintains fine-grained identity, but payloads should travel in coarse-grained
+blocks; the UDF should see natural Python values rather than RayOrch-internal Refs. The
+Worker owns this two-way translation:
 
 ```mermaid
 flowchart LR
-    Plans["GrainPlans<br/>Refs + bindings"]
+    Plans["GrainInvocations<br/>Refs + bindings"]
     Store["BlockStore"]
     Columns["positional/keyword<br/>Python value columns"]
     UDF["persistent UDF.run"]
@@ -25,41 +54,41 @@ flowchart LR
     Plans --> Store --> Columns --> UDF --> Raw --> Store --> Reports
 ```
 
-Worker 拥有：
+The Worker owns:
 
-- 持久 UDF 实例；
-- 一次 RPC 内的列式输入/输出转换；
-- Worker ABI 合同校验；
-- UDF/contract 异常的可序列化快照；
-- run 之外的 lifetime observation counters。
+- the persistent UDF instance;
+- columnar input/output conversion within a single RPC;
+- Worker ABI contract validation;
+- serializable snapshots of UDF/contract exceptions;
+- lifetime observation counters outside a run.
 
-Worker 不拥有：
+The Worker does not own:
 
-- Ray actor handle 或调度队列；
-- Item/Expansion/Entity 状态；
-- recovery 决策；
-- RuntimePlan 或 LogicalProgram。
+- Ray actor handles or dispatch queues;
+- Item/Expansion/Entity state;
+- recovery decisions;
+- RuntimePlan or LogicalProgram.
 
 ---
 
-## 2. 源码地图
+### 2. Source map
 
-| 源码段 | 作用 | 核心问题 |
+| Source section | Role | Core question |
 | --- | --- | --- |
-| [错误、snapshot、BlockStore](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L33-L59) | 定义 Ray-free 边界 | Worker 最少依赖什么？ |
-| [`Worker.__init__`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L62-L76) | 构造持久 UDF | class 与 callable 怎样统一？ |
-| [`execute/_execute`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L78-L216) | 一次 batch 的完整主路径 | 多输出如何保持逐 Grain 原子？ |
-| [`_dispatch_failure`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L218-L229) | 冻结异常信息 | 为什么不直接传 exception？ |
-| [`observe`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L231-L256) | best-effort 物理诊断 | 为什么不参与调度？ |
-| [`_input_columns`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L258-L290) | bindings→value columns | group/optional 怎样还原？ |
-| [`_normalize_outputs`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L292-L314) | raw return→列式合同 | 单输出/多输出括号语义是什么？ |
-| [`_sequence/_rss_bytes`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L316-L331) | 小型合同和诊断 helper | 哪些容器类型被接受？ |
+| [errors, snapshot, BlockStore](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L33-L59) | defines the Ray-free boundary | What is the minimum the Worker depends on? |
+| [`Worker.__init__`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L62-L76) | constructs the persistent UDF | How are a class and a callable unified? |
+| [`execute/_execute`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L78-L216) | the complete main path of one batch | How do multiple outputs stay atomic per Grain? |
+| [`_dispatch_failure`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L218-L229) | freezes exception information | Why not pass the exception object directly? |
+| [`observe`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L231-L256) | best-effort physical diagnostics | Why does it not participate in scheduling? |
+| [`_input_columns`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L258-L290) | bindings to value columns | How are group/optional restored? |
+| [`_ready_fifo_by_callize_outputs`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L292-L314) | raw return to columnar contract | What is the parenthesis semantics of single vs. multiple outputs? |
+| [`_sequence/_rss_bytes`](../../rayorch/experimental/multigrain_v3_6/execution/worker.py#L316-L331) | small contract and diagnostic helpers | Which container types are accepted? |
 
 ---
 
-## 3. `BlockStore`：让 Worker 不依赖 Ray
+### 3. `BlockStore`: keeping the Worker free of Ray
 
-Worker 只要求：
+The Worker requires only:
 
 ```python
 class BlockStore(Protocol):
@@ -67,24 +96,25 @@ class BlockStore(Protocol):
     def put(self, values: tuple[Any, ...]) -> BlockRef: ...
 ```
 
-因此核心 Worker 可以在单元测试中使用内存 store，也可以由
+So the core Worker can use an in-memory store in unit tests, and
 [`ray_backend.py`](../../rayorch/experimental/multigrain_v3_6/execution/ray_backend.py)
-提供 Ray Object Store 实现。
+can supply a Ray Object Store implementation.
 
-数据粒度分两层：
+Data granularity has two layers:
 
 ```text
-BlockRef         -> 一整列/粗块的句柄
+BlockRef         -> handle for a whole column / coarse block
 RowBinding       -> BlockRef + row index
-ItemRef          -> 语义上的 Port × Entity（Worker 看不到）
+ItemRef          -> semantic Port x Entity (invisible to the Worker)
 ```
 
-Worker 输入 `GrainPlan` 只携带 binding；它无需知道 binding 原来属于哪个 ItemRef，因为 Engine 已
-按 Call input 顺序投影完成。
+The Worker's input `GrainInvocation` carries only the binding; it does not need to know which
+ItemRef the binding originally belonged to, because the Engine has already projected by Call
+input order.
 
 ---
 
-## 4. 构造：一个 actor 内只有一个持久 UDF 实例
+### 4. Construction: one persistent UDF instance per actor
 
 ```python
 self.udf = target(*init_args, **kwargs) if isinstance(target, type) else target
@@ -92,41 +122,43 @@ self.input_layout = input_layout
 self.calls = 0
 ```
 
-- target 是 class 时，在 actor 初始化阶段实例化一次；
-- target 是函数或 callable instance 时直接复用；
-- `input_layout` 来自 compiler，Worker 不反射 Pipeline；
-- `calls` 是 actor lifetime 计数，不是单次 `Executor.run()` 指标。
+- When target is a class, it is instantiated once during actor initialization;
+- when target is a function or a callable instance, it is reused directly;
+- `input_layout` comes from the compiler; the Worker does not reflect over the Pipeline;
+- `calls` is an actor lifetime counter, not a per-`Executor.run()` metric.
 
-这也是 Executor 创建 actor 后要等待 `ready()` barrier 的原因：模型/UDF 初始化成本不混入 run
-计时。
+This is also why the Executor waits for the `ready()` barrier after creating an actor: model/UDF
+initialization cost must not leak into run timing.
 
 ---
 
-## 5. `execute()` 为什么包一层 `_execute()`
+### 5. Why `execute()` wraps `_execute()`
 
-公开 `execute()` 只负责捕获 `WorkerContractError` 并转换成
-`DispatchFailure(CONTRACT_ERROR)`。内部 `_execute()` 则：
+The public `execute()` only catches `WorkerContractError` and converts it into
+`DispatchFailure(CONTRACT_ERROR)`. The internal `_execute()` instead:
 
-- 对 UDF 自身抛出的普通 Exception 转成 `UDF_ERROR`；
-- 对合法逐记录失败生成 `GrainFailureReport`；
-- 正常结果生成 `GrainReport`。
+- converts an ordinary Exception thrown by the UDF itself into `UDF_ERROR`;
+- produces a `GrainFailureReport` for a legitimate per-record failure;
+- produces a `GrainReport` for a normal result.
 
-这样三种失败层级不会混淆：
+In this way the three failure levels never get confused:
 
-| 层级 | 表达 | 是否已有逐 Grain 报告 | 典型恢复 |
+| Level | Representation | Per-Grain report already available? | Typical recovery |
 | --- | --- | ---: | --- |
-| contract error | `DispatchFailure(CONTRACT_ERROR)` | 否 | fail-fast |
-| opaque UDF throw | `DispatchFailure(UDF_ERROR)` | 否 | policy retry/split/abort |
-| record failure | `GrainFailureReport` | 是 | 直接提交该 Grain FAILED |
-| actor/Ray crash | `ray.get()` 抛错 | 否 | Executor 替换 actor、infra retry |
+| contract error | `DispatchFailure(CONTRACT_ERROR)` | no | fail-fast |
+| opaque UDF throw | `DispatchFailure(UDF_ERROR)` | no | policy retry/split/abort |
+| record failure | `GrainFailureReport` | yes | commit that Grain as FAILED directly |
+| `GroupFailure` | `GrainFailureReport(suppress_siblings=True)` | yes | Engine establishes a same-parent suppression barrier, no retry |
+| actor/Ray crash | `ray.get()` raises | no | Executor replaces the actor, infra retry |
 
-Worker 不捕获所有 BaseException，也不把 Ray actor crash伪装成 UDF 错误。
+The Worker does not catch all `BaseException`s, and it does not disguise a Ray actor crash as a
+UDF error.
 
 ---
 
-## 6. `_input_columns()`：把 row-major GrainPlans 转成 column-major UDF 参数
+### 6. `_input_columns()`: turning row-major GrainInvocations into column-major UDF arguments
 
-假设一次 dispatch 有三个 Grain、两个 Call inputs：
+Suppose one dispatch has three Grains and two Call inputs:
 
 ```text
 g0.inputs = (page0, lang0)
@@ -134,32 +166,33 @@ g1.inputs = (page1, lang1)
 g2.inputs = (page2, lang2)
 ```
 
-Worker 转置为：
+The Worker transposes this into:
 
 ```text
 columns[0] = [page0_value, page1_value, page2_value]
 columns[1] = [lang0_value, lang1_value, lang2_value]
 ```
 
-每种 `GrainInput` 有唯一还原方式：
+Each kind of `GrainInput` has exactly one restoration rule:
 
-| GrainInput | Worker 值 |
+| GrainInput | Worker value |
 | --- | --- |
 | `RowBinding` | `store.get(binding)` |
-| `MissingInput` | 唯一公开哨兵 `MISSING` |
-| `GroupInput(bindings, offsets)` | 读取 leaves，再 `restore_group()` 重建 nested list |
+| `MissingInput` | the single public sentinel `MISSING` |
+| `NestedGroupInput(bindings, offsets)` | read the leaves, then `restore_nested_group()` rebuilds the nested list |
 
-所有 Grain 的 input arity 必须相同；否则说明 Engine/plan 合同已破坏，抛
-`WorkerContractError`。
+All Grains must have the same input arity; otherwise the Engine/plan contract is already broken
+and a `WorkerContractError` is raised.
 
-Group 在 Engine 内保存扁平 leaves + CSR offsets，只在 UDF 边界恢复 Python 嵌套结构。因此
-runtime 不需要为每个 nested group 长期保存递归对象。
+A group is stored inside the Engine as flat leaves plus CSR offsets, and the Python nested
+structure is restored only at the UDF boundary. Therefore the runtime does not need to keep
+recursive objects alive for every nested group.
 
 ---
 
-## 7. positional 与 keyword 输入怎样重建
+### 7. How positional and keyword inputs are rebuilt
 
-compiler 生成：
+The compiler produces:
 
 ```text
 CallInputLayout(
@@ -168,7 +201,7 @@ CallInputLayout(
 )
 ```
 
-Worker 校验总列数后切分：
+The Worker validates the total column count and then splits:
 
 ```python
 positional = columns[:layout.positional_count]
@@ -177,13 +210,13 @@ keywords = dict(zip(layout.keyword_names, keyword_columns))
 raw = udf.run(*positional, **keywords)
 ```
 
-例如静态调用：
+For example, the static call:
 
 ```python
 self.ocr(pages, language=languages)
 ```
 
-运行时实际是：
+is actually, at runtime:
 
 ```python
 udf.run(
@@ -192,25 +225,26 @@ udf.run(
 )
 ```
 
-keyword name 只由 compiler layout 提供，logical input value 自身仍只是 `PortRef + InputMode`。
+Keyword names come only from the compiler layout; the logical input value itself is still just
+`PortRef + InputMode`.
 
 ---
 
-## 8. `_normalize_outputs()`：最容易写错的返回形状
+### 8. `_ready_fifo_by_callize_outputs()`: the easiest return shape to get wrong
 
-设本次 batch 有 `G` 个 Grain、Call 有 `M` 个逻辑输出。
+Let this batch have `G` Grains and the Call have `M` logical outputs.
 
-### 单输出 Call
+#### Single-output Call
 
-UDF 直接返回一列，长度必须为 G：
+The UDF returns one column directly, whose length must be G:
 
 ```python
 return [value0, value1, ..., value_G_minus_1]
 ```
 
-### 多输出 Call
+#### Multi-output Call
 
-UDF 外层必须有 M 列，每列长度为 G：
+The UDF's outer layer must have M columns, each of length G:
 
 ```python
 return (
@@ -219,144 +253,158 @@ return (
 )
 ```
 
-这里不是每个 Grain 返回一个 `(text, score)` tuple 的 row-major 结构，而是 output-column-major。
-公式是：
+This is not a row-major structure where each Grain returns a `(text, score)` tuple; it is
+output-column-major. The formula is:
 
 ```text
 raw[M output columns][G Grain rows]
 ```
 
-Worker 只接受 list/tuple 作为 ABI sequence，防止把字符串、generator 或 ndarray 意外按另一种
-规则展开。
+The Worker accepts only list/tuple as the ABI sequence, preventing a string, generator, or
+ndarray from being accidentally expanded under a different rule.
 
 ---
 
-## 9. `RecordFailure`：多输出如何保持逐 Grain 原子
+### 9. Two failure values: how multiple outputs stay atomic per Grain
 
-normalize 后，Worker 先扫描所有输出列：只要第 i 行任意一列是 `RecordFailure`，该 Grain 的
-全部输出都标为失败。
+After normalization, the Worker first scans all output columns: if row i has a `RecordFailure`
+or `GroupFailure` in any column, every output of that Grain is marked failed.
 
 ```text
 text column  = ["a", "b", RecordFailure(cause)]
 score column = [0.9, 0.8, 0.1]
 
-grain 2 -> one GrainFailureReport; score 0.1 也不可见
+grain 2 -> one GrainFailureReport; score 0.1 is not visible either
 ```
 
-如果不先做这次横向扫描，Worker 可能先为 text 发布失败，再为 score 发布成功，破坏一个
-multi-output Grain 的原子 outcome。
+Without this horizontal scan first, the Worker might publish a failure for text and then a
+success for score, breaking the atomic outcome of a multi-output Grain.
 
-扫描只选择每个 Grain 第一个 failure 作为 cause；报告阶段不是第二次业务决策。
+A deterministic join is used at the same position: `GroupFailure > RecordFailure > normal`; the
+cause is the first highest-priority sentinel in compiler output layout order. The Worker only
+sets internal behavior bits; it never reads parent/lineage. The barrier scope is interpreted by
+the Engine on the driver.
 
 ---
 
-## 10. expanded output：一列 group 怎样变成 child rows
+### 10. Expanded output: how one column of groups becomes child rows
 
-若 `CallOutputLayout.expanded_ports` 非空，UDF 返回列中的每个 Grain value 必须还是 sequence：
+If `CallOutputLayout.expanded_ports` is non-empty, each Grain value in the UDF's returned column
+must still be a sequence:
 
 ```python
 return [
-    [page_0_0, page_0_1],  # root Grain 0 的 group
-    [],                    # root Grain 1 的空 group
-    [page_2_0],            # root Grain 2 的 group
+    [page_0_0, page_0_1],  # group of root Grain 0
+    [],                    # empty group of root Grain 1
+    [page_2_0],            # group of root Grain 2
 ]
 ```
 
-Worker：
+The Worker:
 
-1. 跳过已失败 Grain；
-2. 每个成功行转 tuple group；
-3. 把所有 group 扁平为一个 coarse block；
-4. 用累计 offset 为每个 group 创建 RowBindings；
-5. 为 layout 中每个 aligned expanded Port 报告相同 rows；
-6. 若某 expanded Port 被 demand control，同时附上原 bool group。
+1. skips already-failed Grains;
+2. converts each successful row into a tuple group;
+3. flattens all groups into one coarse block;
+4. creates RowBindings for each group using cumulative offsets;
+5. reports the same rows for every aligned expanded Port in the layout;
+6. if an expanded Port is demand-controlled, also attaches the original bool group.
 
-Worker 不创建 EntityRef 或 ExpansionRef。它只报告有序 rows；Engine 用当前 parent Grain 与编译期
-child Domain 创建语义身份并验证 aligned cardinality。
+The Worker does not create EntityRefs or ExpansionRefs. It only reports ordered rows; the Engine
+creates semantic identity from the current parent Grain and the compile-time child Domain, and
+validates aligned cardinality.
 
 ---
 
-## 11. scalar output：block row 与 control
+### 11. Scalar output: block row and control
 
-非 expanded output 把整个 output column 一次 `store.put(values)`，然后每个成功 Grain 使用：
+A non-expanded output does a single `store.put(values)` for the whole output column, and each
+successful Grain then uses:
 
 ```text
 RowBinding(shared_block, original_batch_index)
 ```
 
-失败位置即使物理存在于粗块，也没有任何 ItemRef 引用，不会 materialize。
+Even if a failed position physically exists in the coarse block, no ItemRef references it, so it
+is never materialized.
 
-若 RuntimePlan 标记该 Port 需要 control，所有 live values 必须是严格 bool，并同时写入
-`OutputReport.control`。业务 value 与 control 当前是同一个 bool，但通过独立字段越过协议边界，
-Engine 不需要解引用 payload 来判断 Filter。
+If the RuntimePlan marks the Port as needing control, all live values must be strict bools and
+are also written into `PortOutputReport.control`. The business value and the control are currently
+the same bool, but they cross the protocol boundary through independent fields, so the Engine
+does not need to dereference the payload to decide a Filter.
 
-输出不得包含输入专用 `MISSING` 哨兵；缺失输出必须用明确 failure/outcome 语义表达。
+Outputs must not contain the input-only `MISSING` sentinel; a missing output must be expressed
+with explicit failure/outcome semantics.
 
 ---
 
-## 12. 最终怎样按 Grain 组装报告
+### 12. How the report is finally assembled per Grain
 
-每个输入 `GrainPlan` 精确得到一个结果：
+Each input `GrainInvocation` yields exactly one result:
 
 ```text
 failure[i] exists
-    -> GrainFailureReport(grain, generation, cause)
+    -> GrainFailureReport(grain, generation, cause, suppress_siblings)
 
 otherwise
-    -> GrainReport(grain, generation, all OutputReports in layout order)
+    -> GrainReport(grain, generation, all PortOutputReports in layout order)
 ```
 
-generation 原样回传，让 DispatchState 拒绝旧 attempt。Worker 不自行递增 generation，也不决定
-retry。
+The generation is passed back verbatim so that `DispatchState` can reject stale attempts. The
+Worker does not increment the generation itself, nor does it decide on a retry.
 
-`GrainReport.outputs` 按 compiler layout 顺序生成；Engine 仍会验证 Port 集合精确匹配，不能因为
-Worker 是内部组件就跳过 commit preflight。
-
----
-
-## 13. `_dispatch_failure()`：为什么传异常快照而不是异常对象
-
-用户 exception 未必可 picklable。Worker 在本地冻结：
-
-- failure kind；
-- 完整异常类型名；
-- message；
-- 格式化 traceback。
-
-Executor 再把这些 wire details 与它拥有的 Call/UDF/Grain/generation 上下文合并成
-`ExecutionError`。这样异常层次清楚，也避免 Worker 反向读取 Program。
+`GrainReport.outputs` is produced in compiler layout order; the Engine still verifies that the
+Port set matches exactly, and commit preflight must not be skipped just because the Worker is an
+internal component.
 
 ---
 
-## 14. `observe()`：诊断不参与语义
+### 13. `_dispatch_failure()`: why pass an exception snapshot instead of an exception object
 
-`WorkerSnapshot` 只包含 lifetime calls、pid、RSS、少量标量 audit 或 observation error。
-Executor 在业务输出完成后 best-effort 收集；失败不会推翻已经完成的业务结果。
+A user exception is not necessarily picklable. The Worker freezes locally:
 
-它与 run-local `CallMetrics.rpcs/grains/retries` 口径不同：Worker actor 可以跨多次 `run()` 持久化，
-所以 `lifetime_calls` 是 actor lifetime 累计。
+- the failure kind;
+- the full exception type name;
+- the message;
+- the formatted traceback.
+
+The Executor then merges these wire details with the Call/UDF/Grain/generation context it owns
+into an `ExecutionError`. This keeps the exception hierarchy clear and avoids the Worker reading
+the Program backwards.
 
 ---
 
-## 15. Ray adapter 为什么只有 96 行
+### 14. `observe()`: diagnostics do not participate in semantics
+
+`WorkerSnapshot` contains only lifetime calls, pid, RSS, and a handful of scalar audit or
+observation errors. The Executor collects it best-effort after business output has completed; a
+failure does not overturn business results that have already been produced.
+
+Its accounting differs from run-local `CallMetrics.rpcs/grains/retries`: a Worker actor can
+persist across multiple `run()` calls, so `lifetime_calls` is an actor-lifetime accumulation.
+
+---
+
+### 15. Why the Ray adapter is only 96 lines
 
 [`execution/ray_backend.py`](../../rayorch/experimental/multigrain_v3_6/execution/ray_backend.py)
-只做两件事：
+does only two things:
 
-- `_RayBlockStore` 把 `BlockRef` 映射到 Ray ObjectRef，并在一次 RPC/materialize turn 内缓存粗块；
-- `_RayWorkerActor` 把 Ray actor 方法转发给 Ray-free `Worker`。
+- `_RayBlockStore` maps a `BlockRef` to a Ray ObjectRef and caches coarse blocks within one
+  RPC/materialize turn;
+- `_RayWorkerActor` forwards Ray actor methods to the Ray-free `Worker`.
 
-Actor `execute()` 前后清空本地 block cache，防止输入 payload 跨 RPC 泄漏。它不解释 Program，也
-不实现第二份 output normalization。
+The actor clears its local block cache before and after `execute()` to prevent input payloads
+from leaking across RPCs. It does not interpret the Program, and it does not implement a second
+copy of output normalization.
 
 ---
 
-## 16. 跟踪 PDF 例子的 OCR batch
+### 16. Tracing the PDF example's OCR batch
 
-假设 OCR Call 一次收到三个 READY Grain，其中语言是 keyword input：
+Suppose the OCR Call receives three READY Grains at once, with language as a keyword input:
 
 ```text
-GrainPlans
+GrainInvocations
 g(page0): RowBinding(page0), RowBinding(lang0)
 g(page1): RowBinding(page1), RowBinding(lang1)
 g(page2): RowBinding(page2), RowBinding(lang2)
@@ -365,32 +413,39 @@ Worker call
 ocr.run([page0, page1, page2], language=[lang0, lang1, lang2])
 
 UDF return
-["text0", RecordFailure(bad_page), "text2"]
+["text0", GroupFailure(bad_document), "text2"]
 
-WorkerResult
+WorkerDispatchResult
 GrainReport(page0, scalar binding)
-GrainFailureReport(page1, bad_page)
+GrainFailureReport(page1, bad_document, suppress_siblings=True)
 GrainReport(page2, scalar binding)
 ```
 
-Executor/Engine 分别提交三个报告；失败 page 不会污染另外两个 Grain，也不会要求 Worker 认识
-它们在 PDF lineage 中的位置。
+The Executor hands the complete WorkerDispatchResult to the Engine in one shot. page1 itself becomes
+`FAILED`; page0/page2 successes that are in the same Call, share the same direct PDF parent, and
+have not yet been committed become `SUPPRESSED`. The Worker does not know lineage, so reports
+belonging to other PDF parents are still committed normally. If only a `RecordFailure` were
+returned here, page0/page2 would remain successful.
 
 ---
 
-## 17. 修改 Worker 前的检查清单
+### 17. Checklist before modifying the Worker
 
-- Worker 是否仍只接收 DTO/layout/BlockStore，而不是 RuntimePlan 或 Engine？
-- 输入是否先按 Grain row 转置为 Call input columns？
-- positional/keyword ABI 是否只由 `CallInputLayout` 决定？
-- 多输出是否继续使用 `M columns × G rows`？
-- 任一 output 的 `RecordFailure` 是否封闭该 Grain 的全部 outputs？
-- expanded rows 是否只报告 binding，不创建语义 Entity？
-- contract/UDF/record/infra failure 是否保持四层分类？
-- 异常 wire DTO 是否不要求用户 exception 可序列化？
-- generation 是否只回传、不在 Worker 修改？
-- 新执行后端是否实现 BlockStore/actor adapter，而不是复制 Worker 逻辑？
+- Does the Worker still receive only DTOs/layout/BlockStore, rather than RuntimePlan or Engine?
+- Are inputs first transposed from Grain rows into Call input columns?
+- Is the positional/keyword ABI decided solely by `CallInputLayout`?
+- Do multiple outputs still use `M columns x G rows`?
+- Does a Failure sentinel on any output close off all outputs of that Grain, with stable Failure
+  priority?
+- Do expanded rows only report bindings, without creating semantic Entities?
+- Are contract/UDF/RecordFailure/GroupFailure/infra failures still layered, with only opaque/infra entering
+  recovery?
+- Does the exception wire DTO avoid requiring the user exception to be serializable?
+- Is the generation only passed back, never modified inside the Worker?
+- Does a new execution backend implement the BlockStore/actor adapter instead of duplicating
+  Worker logic?
 
-如果 UDF 需要知道 `DomainRef` 或 Worker 想直接调用 `engine._publish_item()`，ABI 已经越界。
+If the UDF needs to know a `DomainRef`, or the Worker wants to call `engine._publish_item()`
+directly, the ABI has already been crossed.
 
-下一篇：[06：Executor 事件循环](06_executor_event_loop.md)。
+Next: [06: Executor event loop](06_executor_event_loop.md).

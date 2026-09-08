@@ -1,105 +1,222 @@
-# MultiGrain V3.6 架构与维护手册
+# MultiGrain v3.6 maintainer guide
 
-> **文档生态位：跨组件合同与修改纪律。** 本文假设读者已经完成
-> [`从零上手`](multigrain_v3_6_getting_started.md)，不再重新教授第一个 Pipeline 或逐个解释
-> 七种 Ref。它回答：每份静态/动态状态归谁所有，组件之间只能传什么，新增功能应修改哪条
-> 固定路径，以及怎样证明没有引入飞线。
+This guide states ownership and change discipline. The Chinese version remains
+at [`multigrain_v3_6_maintainer_guide.zh.md`](multigrain_v3_6_maintainer_guide.zh.md).
 
-若尚未确定该读本文还是规范、源码导读或实验报告，先看
-[`V3.6 文档地图`](multigrain_v3_6_documentation_map.md)。
+## At a glance
 
-需要逐段理解某个长文件时，转到
-[`复杂源码导读`](multigrain_v3_6_walkthrough/README.md)；需要最短、规范性的设计结论时，查看
-[`状态机设计合同`](multigrain_v3_6_design.md) 和
-[`命名宪法`](multigrain_v3_6_naming.md)。
+### 1. Ownership table
 
----
-
-## 1. 文档分层
-
-| 文档 | 目标读者 | 解决的问题 | 不承担什么 |
+| Area | Owner | Safe inputs | Must not do |
 | --- | --- | --- | --- |
-| [`从零上手`](multigrain_v3_6_getting_started.md) | 初次使用和初次读源码的人 | 怎样写、概念是什么、一次执行如何发生 | 不逐段解释长文件 |
-| 本维护手册 | 要修改框架的人 | owner、协议、依赖、修改与验证路径 | 不重复完整 API 教程 |
-| [`复杂源码导读`](multigrain_v3_6_walkthrough/README.md) | 正在打开具体 `.py` 的人 | 数据结构、队列、状态转移和逐段控制流 | 不定义新的架构真相 |
-| [`设计合同`](multigrain_v3_6_design.md) | review/发版 | 哪些语义与纪律不可破坏 | 不展开实现细节 |
-| [`编译边界`](multigrain_v3_6.md) | compiler 维护者 | 为什么需要固定编译流水线 | 不讲 Ray event loop |
-| [`命名宪法`](multigrain_v3_6_naming.md) | API/数据结构设计者 | 同一概念应使用什么词 | 不描述执行顺序 |
+| Authoring | `api.py`, `functional.py` | user declarations and symbolic ports | instantiate Ray actors or evaluate payloads |
+| Logical model | `program/logical.py` | immutable calls, ports, domains, origins | store reverse indexes or runtime state |
+| Analysis | `program/analysis.py` | logical program | read actors, queues, or business values |
+| Lowering | `program/lowering.py` | verified analysis | infer new semantics not in `semantics.py` |
+| Static verification | `program/verify.py` | logical program or runtime plan | mutate the plan |
+| Runtime semantics | `runtime/engine.py` | compiled effects and canonical facts | read `PortOrigin` or call Ray |
+| Physical dispatch | `runtime/dispatch.py` | grain coordinates and generations | publish items or infer lineage |
+| Ray transport | `execution/executor.py` | engine API and immutable plan | interpret `F.*` or business outcomes |
+| Worker ABI | `execution/worker.py`, `protocol.py` | value-only layouts and DTOs | retain engine references or choose retry policy |
+| Recovery algebra | `recovery.py` | immutable attempt facts | own attempts, queues, or actors |
+| Output | `runtime/materialize.py`, `execution/result.py` | sealed read-only facts | mutate semantic state |
 
-如果不同文档的解释发生冲突，优先级是：源码与测试合同 → design/naming 合同 → 维护手册 →
-入门教程和逐段导读。逐段导读中的行号只是当前源码导航，不是 API 稳定承诺。
+There is one semantic writer per engine. New state should be added to the
+owner's table and publication path, not introduced as an observer-side cache.
+
+### 2. Adding a primitive
+
+Use this order:
+
+1. define its immutable origin in `program/logical.py`;
+2. add its exhaustive semantics entry in `program/semantics.py`;
+3. extend analysis and lowering with the same named contract;
+4. add verifier checks for malformed ancestry and alignment;
+5. add runtime effect application and transition tests;
+6. add one integration test proving worker and materialization behavior;
+7. update the English design and getting-started documents, then synchronize
+   the `.zh.md` translation.
+
+Do not add an ad-hoc `if` in `runtime/engine.py` for a structural operation.
+The primitive must lower to an immutable effect and enter the existing fact
+publication path.
+
+### 3. Failure and retry changes
+
+Keep two axes separate:
+
+- explicit data outcomes (`RecordFailure` and `GroupFailure`) are returned by a
+  UDF and committed as semantic facts;
+- opaque UDF or infrastructure exceptions are reduced by `RecoveryPolicy` and
+  may cause retry, replacement, split, or abort.
+
+`GroupFailure` may suppress only uncommitted siblings sharing the same call and
+direct parent. It must never roll back a committed result, revoke an already
+submitted RPC, or suppress a different parent. The dequeue barrier check and commit
+fence are the two required sites; adding a separate manager or pending RPC subsystem
+would duplicate state ownership.
+
+### 4. Dispatch and lifecycle rules
+
+Every reservation carries a generation. A report is accepted only when the
+grain is still in flight and the generation matches. On any dispatch failure,
+the executor must release its reservation in a `finally` path before retrying,
+replacing an actor, or aborting the run. This prevents a permanently busy actor.
+
+Ready queues are physical indexes, not semantic truth. The engine remains the
+source of truth for whether a grain is eligible; queue entries are rechecked at
+dequeue and stale entries are discarded.
+
+### 5. Testing checklist
+
+Run the Ray-free suite first:
+
+```bash
+pytest test/experimental/multigrain_v3_6/unit
+```
+
+Then run integration and benchmark gates:
+
+```bash
+pytest test/experimental/multigrain_v3_6/integration
+pytest test/experimental/multigrain_v3_6/benchmark
+```
+
+Changes touching compiler or runtime semantics should cover optimized and
+unoptimized plans, nested/empty domains, repeated reports, stale generations,
+multi-output atomicity, healthy siblings beside a `GroupFailure`, and a late
+in-flight report after a barrier. Workload numbers belong in an experiment
+report and must identify the exact source snapshot and options.
+
+### 6. Documentation discipline
+
+English unqualified Markdown files are the public/reviewer surface. Chinese
+translations use `.zh.md` in the same directory. Keep links in English files
+pointing to English files; Chinese files may link to either language when
+cross-referencing is useful. Do not copy a new design decision into multiple
+documents without assigning one normative owner.
 
 ---
 
-## 2. 维护者必须守住的八条不变量
+> **Document niche: cross-component contracts and change discipline.** This
+> document assumes the reader has already completed
+> [`Getting started from zero`](multigrain_v3_6_getting_started.md); it does not
+> re-teach the first Pipeline or explain the seven Refs one by one. It answers: who
+> owns each piece of static/dynamic state, what may be passed between components,
+> which fixed path a new feature should modify, and how to prove that no flywire
+> (a cross-layer shortcut wire) was introduced.
 
-1. **Call 只表示计算。** 只有 RayModule Call 创建 Grain、actor 和 RPC。
-2. **F.* 只表示结构。** Expand/Filter/Reduce/Broadcast 不创建隐藏 Worker。
-3. **LogicalProgram 只保存声明事实。** reverse indexes、control closure 和 pool 不回填进去。
-4. **RuntimePlan 是 runtime 的完整静态接线。** Engine 不回读 PortOrigin 或 compiler internals。
-5. **canonical fact 先完整发布，再传播。** FIFO 只携带 Ref，不复制 outcome/value/children。
-6. **每份可变状态只有一个 owner。** 尤其 Grain phase/generation 只由 DispatchState 修改。
-7. **纯函数做分类，owner 执行动作。** transition/recovery policy 不写表或 queue。
-8. **Worker 是 value-only ABI。** 不接收 Program、RuntimeState、Domain lineage 或调度策略。
+If you are not sure whether to read this document, the constitution, the source
+walkthrough, or the experiment report, start with the
+[`V3.6 documentation map`](multigrain_v3_6_documentation_map.md).
 
-这八条比“目录必须绝对单向”更重要。若为了严格依赖图引入无意义 adapter，会增加理解成本；
-但任何反向读取可变状态或复制语义决策都必须拒绝。
+When you need to understand a long file paragraph by paragraph, go to the
+[`complex source walkthrough`](multigrain_v3_6_walkthrough/README.md); when you
+need the shortest normative design conclusions, see the
+[`state-machine design contract`](multigrain_v3_6_design.md) and the
+[`naming constitution`](multigrain_v3_6_naming.md).
 
 ---
 
-## 3. 静态世界：三层数据结构
+## 1. Documentation layering
+
+| Document | Target reader | Problem solved | What it does not carry |
+| --- | --- | --- | --- |
+| [`Getting started from zero`](multigrain_v3_6_getting_started.md) | first-time users and first-time source readers | how to write, what the concepts are, how one execution happens | does not explain long files paragraph by paragraph |
+| this maintainer guide | people who will modify the framework | owners, protocols, dependencies, modification and verification paths | does not repeat the complete API tutorial |
+| [`Complex source walkthrough`](multigrain_v3_6_walkthrough/README.md) | people opening a specific `.py` | data structures, queues, state transitions, and paragraph-level control flow | does not define new architectural truth |
+| [`Design contract`](multigrain_v3_6_design.md) | review/release | which semantics and disciplines must not be broken | does not expand implementation details |
+| [`Compilation boundary`](multigrain_v3_6_compiler_boundary.md) | compiler maintainers | why a fixed compilation pipeline is needed | does not talk about the Ray event loop |
+| [`Naming constitution`](multigrain_v3_6_naming.md) | API/data-structure designers | which word to use for the same concept | does not describe execution order |
+
+If explanations in different documents conflict, the priority is: source and test
+contracts → design/naming contracts → maintainer guide → getting-started tutorial
+and paragraph-level walkthrough. Line numbers in the paragraph-level walkthrough
+are only current source navigation, not an API stability promise.
+
+---
+
+## 2. Eight invariants that maintainers must uphold
+
+1. **Call only means computation.** Only a RayModule Call creates Grains, actors,
+   and RPCs.
+2. **F.\* only means structure.** Expand/Filter/Reduce/Broadcast do not create
+   hidden Workers.
+3. **LogicalProgram only stores declaration facts.** Reverse indexes, control
+   closure, and pools are not back-filled into it.
+4. **RuntimePlan is the complete static wiring of the runtime.** The Engine does
+   not read back PortOrigin or compiler internals.
+5. **A canonical fact is fully published first, then propagated.** The FIFO carries
+   only Refs, not copies of outcome/value/children.
+6. **Every piece of mutable state has exactly one owner.** In particular, Grain
+   phase/generation is modified only by DispatchState.
+7. **Pure functions classify; the owner performs the action.** transition/recovery
+   policy MUST NOT write tables or queues.
+8. **Worker is a value-only ABI.** It does not receive Program, RuntimeState,
+   Domain lineage, or scheduling policy.
+
+These eight matter more than "directories must be absolutely unidirectional".
+Introducing meaningless adapters just to obtain a strict dependency graph
+increases comprehension cost; but any reverse read of mutable state or any
+duplicated semantic decision MUST be rejected.
+
+---
+
+## 3. Static world: three layers of data structures
 
 ```mermaid
 flowchart LR
     Author["Pipeline + RayModule + F.*"]
-    Logical["LogicalProgram<br/>声明事实"]
-    Analysis["ProgramAnalysis<br/>可重算派生事实"]
-    Plan["RuntimePlan<br/>执行接线"]
+    Logical["LogicalProgram<br/>declaration facts"]
+    Analysis["ProgramAnalysis<br/>recomputable derived facts"]
+    Plan["RuntimePlan<br/>execution wiring"]
 
     Author --> Logical --> Analysis --> Plan
 ```
 
 ### 3.1 LogicalProgram
 
-唯一保存：
+It stores only:
 
-- `CallRef → CallSpec`；
-- `PortRef → PortSpec(domain, origin)`；
-- `DomainRef → DomainSpec(parent)`；
-- ordered source Ports；
-- public output tuple tree。
+- `CallRef → CallSpec`;
+- `PortRef → PortSpec(domain, origin)`;
+- `DomainRef → DomainSpec(parent)`;
+- ordered source Ports;
+- the public output tuple tree.
 
-它回答“用户声明了什么”，不保存 consumers、control demand、actor pool、Effect 或动态 Entity。
+It answers "what did the user declare", and does not store consumers, control
+demand, actor pool, Effect, or dynamic Entities.
 
 ### 3.2 ProgramAnalysis
 
-由 LogicalProgram 一次计算且可以丢弃重算：
+Computed once from LogicalProgram and discardable/recomputable:
 
-- `semantics_by_port`；
-- `consumers_by_port`；
-- `outputs_by_call`；
-- `expansion_sources_by_domain`；
-- control-demand fixed point；
-- group depth。
+- `semantics_by_port`;
+- `consumers_by_port`;
+- `outputs_by_call`;
+- `expansion_sources_by_domain`;
+- control-demand fixed point;
+- group depth.
 
-Analysis 不是第二份用户声明；任何字段都必须能从 LogicalProgram 和统一
-`describe_origin()` 重新得到。
+Analysis is not a second copy of the user declaration; every field MUST be
+re-derivable from LogicalProgram and the unified `describe_origin()`.
 
 ### 3.3 RuntimePlan
 
-只保存 runtime 真正需要的静态合同：
+It stores only the static contracts the runtime actually needs:
 
-- Port→Domain 与 Call outputs；
-- canonical structural Effects；
-- source/domain→Effect trigger indexes；
-- input/output Worker layouts；
-- Call→ActorPoolSpec；
-- public output tree。
+- Port→Domain and Call outputs;
+- canonical structural Effects;
+- source/domain→Effect trigger indexes;
+- input/output Worker layouts;
+- Call→ActorPoolSpec;
+- public output tree.
 
-触发索引引用 canonical catalog 中同一个 Effect object，不复制相等规则。RuntimePlan 不保存
-PortOrigin，因此 Engine 无法偷偷成为第二个 compiler。
+Trigger indexes reference the same Effect object in the canonical catalog instead
+of duplicating equality rules. RuntimePlan does not store PortOrigin, so the Engine
+cannot secretly become a second compiler.
 
-### 3.4 固定 compiler pipeline
+### 3.4 Fixed compiler pipeline
 
 ```text
 verify LogicalProgram
@@ -109,119 +226,129 @@ verify LogicalProgram
 → verify RuntimePlan
 ```
 
-`optimize=False` 只关闭 rewrite，仍走相同 verifier、analysis 和 lowering。新增编译阶段必须有
-清晰全局合同；当前不是可任意重排的 PassManager。
+`optimize=False` only turns off rewrite; it still runs the same verifier, analysis,
+and lowering. A new compilation stage MUST have a clear global contract; this is
+currently not a freely re-orderable PassManager.
 
-详细源码见[编译流水线导读](multigrain_v3_6_walkthrough/02_compiler_pipeline.md)。
+For source details see the
+[compilation pipeline walkthrough](multigrain_v3_6_walkthrough/02_compiler_pipeline.md).
 
 ---
 
-## 4. 动态世界：owner、表与等待结构
+## 4. Dynamic world: owners, tables, and waiting structures
 
-### 4.1 语义事实 owner
+### 4.1 Semantic fact owner
 
-`MicrobatchEngine` 独占：
+`MicrobatchEngine` exclusively owns:
 
-| 状态 | key | record/value |
+| State | key | record/value |
 | --- | --- | --- |
-| Entity 枚举 | DomainRef | ordered EntityRef set/index |
+| Entity enumeration | DomainRef | ordered EntityRef set/index |
 | child lineage | EntityRef | parent EntityRef + ordinal |
 | ItemTable | ItemRef | terminal outcome + cause + control |
-| ValueTable | ItemRef | RowBinding 或 GroupBinding |
+| ValueTable | ItemRef | RowBinding or NestedGroupBinding |
 | ExpansionTable | ExpansionRef | outcome + ordered children + cause |
 | pending Call inputs | GrainRef | dense ItemRef slots |
-| semantic notifications | — | `_facts` identity-only FIFO |
+| semantic notifications | — | `_fact_queue` identity-only FIFO |
 
-### 4.2 Grain 物理状态 owner
+### 4.2 Grain physical state owner
 
-`DispatchState` 独占：
+`DispatchState` exclusively owns:
 
-| 状态 | 数据结构 | 含义 |
+| State | data structure | meaning |
 | --- | --- | --- |
-| Grain records | `dict[GrainRef, GrainRecord]` | phase、generation、infra failures |
-| normal work | `deque[_ReadyEntry]` | 首次 READY Grain，可按 batch size 聚合 |
-| immediate recovery | `deque[DispatchBatch]` | 优先重试 exact group |
-| tail recovery | `deque[DispatchBatch]` | 延后重试或二分隔离 group |
+| Grain records | `dict[GrainRef, GrainRecord]` | phase, generation, infra failures, frozen parent anchor |
+| READY work | `dict[CallRef, deque[GrainRef]]` | first-time READY Grains partitioned by Call |
+| immediate-retry work | `deque[DispatchBatch]` | priority retry of the exact DispatchBatch |
+| deferred-recovery work | `deque[DispatchBatch]` | deferred retry or bisected DispatchBatch |
 
-### 4.3 物理执行 owner
+Same-parent data isolation additionally uses one private `_SuppressionBarrierIndex`
+inside the Engine. Its underlying key is `(CallRef, parent_anchor)`. It does not own Grain
+phase/queue and does not enter the Worker; the three queues and late reports all
+consult this one microbatch-local barrier table through `GrainRecord.parent_anchor`.
 
-`Executor` 独占：
+### 4.3 Physical execution owner
 
-| 状态 | 含义 |
+`Executor` exclusively owns:
+
+| State | meaning |
 | --- | --- |
-| Call→actor slots | actor handle 与 busy capacity |
-| active microbatches | admission index→唯一 Engine |
-| pending RPCs | ObjectRef→generation-fenced dispatch lease |
-| run-local counters | RPC、Grain、retry、batch sizes |
-| Ray ownership | close 时是否 shutdown runtime |
+| Call→actor slots | actor handle and busy capacity |
+| active microbatches | admission index → unique Engine |
+| pending RPCs | `dict[ObjectRef, _PendingRpc]` |
+| run-local counters | RPC, Grain, retry, batch sizes |
+| Ray ownership | whether to shutdown the runtime at close |
 
-### 4.4 不要把所有等待结构都叫 queue
+### 4.4 Do not call every waiting structure a queue
 
 ```text
-_facts             = 已成立、待传播的语义 Ref FIFO
-pending_grains     = 尚未决定的 Call input slots dict
-normal/immediate/
-tail               = READY Grain 物理选择 queues
-Executor.pending   = 已提交、待返回的 RPC lease map
+_fact_queue             = semantic Ref FIFO for facts that hold and await propagation
+pending_grains     = dict of not-yet-decided Call input slots
+ready/immediate-retry/
+deferred-recovery  = physical selection queues for READY Grains
+Executor.pending_rpcs = ObjectRef -> _PendingRpc
 ```
 
-它们的元素、owner 和终止条件都不同。合并只会把语义传播、输入 barrier、调度优先级和 Ray
-transport 混为一谈。
+Their elements, owners, and termination conditions all differ. Merging them would
+only conflate semantic propagation, the input barrier, scheduling priority, and Ray
+transport.
 
 ---
 
-## 5. 四类动态事实与状态转移
+## 5. Four kinds of dynamic facts and state transitions
 
-| 对象 | 身份 | 状态路径 | 谁写 |
+| Object | Identity | State path | Who writes |
 | --- | --- | --- | --- |
 | Entity | Domain × occurrence | absent → published | Engine `_publish_entity` |
 | Item | Port × Entity | unresolved → PRESENT/DROPPED/FAILED/SUPPRESSED | Engine `_publish_item` |
 | Expansion | child Domain × parent Entity | unresolved → SUCCEEDED/DROPPED/FAILED | Engine `_publish_expansion` |
-| Grain | Call × Entity | WAITING → READY/SEALED；READY→IN_FLIGHT；IN_FLIGHT→READY/SEALED | DispatchState |
+| Grain | Call × Entity | WAITING → READY/SEALED; READY→IN_FLIGHT; IN_FLIGHT→READY/SEALED | DispatchState |
 
-Entity、Item、Expansion 首次 publication 会把其 Ref 加入 `_facts`。Grain phase 不进入语义 FIFO，
-而是进入 Dispatch queues。
+The first publication of an Entity, Item, or Expansion adds its Ref to `_fact_queue`.
+Grain phase does not enter the semantic FIFO; it enters the Dispatch queues.
 
-### 5.1 publication 与 fixed point
+### 5.1 publication and fixed point
 
 ```mermaid
 flowchart TD
     Source["source / Worker report / Effect result"]
     Publish["typed publication gateway"]
     Table["write complete canonical record"]
-    Facts["enqueue Ref in _facts"]
+    Facts["enqueue Ref in _fact_queue"]
     Advance["advance: look up Effects"]
     Decision["pure transition"]
 
     Source --> Publish --> Table --> Facts --> Advance --> Decision --> Publish
 ```
 
-publication 不是 Ray 发送；它是事实从 unresolved 跨过可见性边界。`advance()` 只消费已经完整
-写表的 Ref，直到不再产生新事实。
+publication is not a Ray send; it is a fact crossing the visibility boundary out of
+unresolved. `advance()` only consumes Refs whose tables have been completely
+written, until no new facts are produced.
 
-### 5.2 为什么不直接递归调用下游
+### 5.2 Why not call downstream directly by recursion
 
-- 避免 commit 内部重入和半成品可见；
-- 深图不依赖 Python 递归栈；
-- Item/Expansion/Entity 从一个封闭入口穷尽分派；
-- 到达顺序可以通过 fixed-point tests 验证。
+- avoids re-entrancy inside a commit and half-built visibility;
+- deep graphs do not depend on the Python recursion stack;
+- Item/Expansion/Entity are dispatched exhaustively from one closed entry point;
+- arrival order can be verified through fixed-point tests.
 
-详细数据结构和控制流见[Engine 导读](multigrain_v3_6_walkthrough/03_runtime_engine.md)。
+For detailed data structures and control flow see the
+[Engine walkthrough](multigrain_v3_6_walkthrough/03_runtime_engine.md).
 
 ---
 
-## 6. Call input、F.* 与身份规则
+## 6. Call inputs, F.\*, and identity rules
 
-### 6.1 Call input 对 Entity 对称
+### 6.1 Call inputs are symmetric with respect to Entity
 
-同一个 Call 的所有 inputs 必须位于 execution Domain。参数位置只描述 Worker ABI slot，不决定
-Grain identity：
+All inputs of the same Call MUST live in the execution Domain. Parameter position
+only describes the Worker ABI slot; it does not determine Grain identity:
 
 ```text
 GrainRef = CallRef × EntityRef
 ```
 
-输入代数优先级：
+Input algebra priority:
 
 ```text
 FAILED/SUPPRESSED exists → suppress outputs
@@ -230,24 +357,25 @@ otherwise REQUIRED drop → drop outputs
 otherwise               → READY
 ```
 
-因此没有 `driven_by`。Optional+DROPPED 在 Worker 中还原为 `MISSING`；Required+DROPPED 使 Grain
-无需 Worker 直接 SEALED。
+There is therefore no `driven_by`. Optional+DROPPED is restored to `MISSING` in the
+Worker; Required+DROPPED makes the Grain SEALED directly without a Worker.
 
-### 6.2 F.* 的结构合同
+### 6.2 Structural contract of F.\*
 
-| primitive | Domain 变化 | 动态依赖 | payload 行为 |
+| primitive | Domain change | dynamic dependency | payload behavior |
 | --- | --- | --- | --- |
-| Filter | 不变 | source + bool mask | PRESENT 时 alias source binding |
-| Expand | parent→child | successful Call report | 报告 rows 后创建 child Entities |
-| Reduce | child→parent 一层 | Expansion + members + values | 建 GroupBinding，不执行聚合 UDF |
+| Filter | unchanged | source + bool mask | alias source binding when PRESENT |
+| Expand | parent→child | successful Call report | create child Entities after reporting rows |
+| Reduce | child→parent, one level | Expansion + members + values | build NestedGroupBinding, do not execute an aggregation UDF |
 | Broadcast | ancestor→descendant | source Item + target Entity | alias ancestor binding/outcome |
 
-新增结构 primitive 必须同时回答 logical inputs、control demand/transfer、Domain 合同、Runtime Effect、
-动态 transition 与所有触发事件。
+A new structural primitive MUST simultaneously answer: logical inputs, control
+demand/transfer, Domain contract, Runtime Effect, dynamic transition, and all
+triggering events.
 
 ---
 
-## 7. 跨组件只能传稳定 DTO
+## 7. Only stable DTOs may cross components
 
 ```mermaid
 sequenceDiagram
@@ -256,94 +384,117 @@ sequenceDiagram
     participant W as Worker
 
     X->>E: reserve_dispatch(Call)
-    E-->>X: DispatchBatch
-    X->>E: grain_plan(Grain)
-    E-->>X: GrainPlan + generation + bindings
-    X->>W: execute(GrainPlans, CallOutputLayouts)
+    E-->>X: DispatchBatch or cleanup-only None
+    X->>E: grain_invocation(Grain)
+    E-->>X: GrainInvocation + generation + bindings
+    X->>W: execute(GrainInvocations, CallOutputLayouts)
     W-->>X: tuple[WorkerReport] or DispatchFailure
-    X->>E: commit_report(WorkerReport)
+    X->>E: commit_reports(DispatchBatch, tuple[WorkerReport])
 ```
 
 ### 7.1 Engine→Worker
 
-`GrainPlan.inputs` 只有：
+`GrainInvocation.inputs` contains only:
 
-- `RowBinding`；
-- `GroupInput(flat bindings + CSR offsets)`；
-- `MissingInput`。
+- `RowBinding`;
+- `NestedGroupInput(flat bindings + CSR offsets)`;
+- `MissingInput`.
 
-Worker 不接收 ItemRecord、RuntimeState 或 Domain lineage。
+The Worker does not receive ItemRecord, RuntimeState, or Domain lineage.
 
 ### 7.2 Worker→Engine
 
-Worker result 只有：
+Worker results are only:
 
-- `GrainReport`：一个 Grain 的完整多输出成功报告；
-- `GrainFailureReport`：确定到一个 Grain 的记录失败；
-- `DispatchFailure`：尚不能形成逐 Grain reports 的 UDF/contract failure。
+- `GrainReport`: a complete multi-output success report for one Grain;
+- `GrainFailureReport`: an explicit failure localized to one Grain, using an
+  internal binary bit to distinguish whether a same-parent barrier should be
+  established;
+- `DispatchFailure`: a UDF/contract failure that cannot yet be turned into
+  per-Grain reports.
 
-Engine 必须再次验证 generation、Port 集合、scalar/expanded shape、control demand 与 aligned
-cardinality。内部 Worker 不是跳过 commit boundary 的理由。
+The Engine MUST re-validate generation, the Port set, scalar/expanded shape,
+control demand, and aligned cardinality. An internal Worker is not a reason to skip
+the commit boundary.
 
-### 7.3 payload 与 control
+### 7.3 payload and control
 
-业务值通过 `BlockRef + RowBinding` 粗粒度存放。control manifest 是编译器 demand 的独立 bool
-投影，使 Engine 无需解引用 payload 就能执行 Filter。只有 Worker/BlockStore 和 final materializer
-读取业务值。
+Business values are stored coarsely through `BlockRef + RowBinding`. The control
+manifest is an independent bool projection of the compiler demand, so that the
+Engine can execute Filter without dereferencing the payload. Only the
+Worker/BlockStore and the final materializer read business values.
 
-详细 ABI 见[Worker 导读](multigrain_v3_6_walkthrough/05_worker_abi.md)。
-
----
-
-## 8. Worker report 的 mutation frontier
-
-成功 report 分三阶段：
-
-1. 校验所有 output、expanded rows 与 control，构造 immutable commit intents；
-2. 验证 aligned Expansion 的 cardinality 和完整 reporter set；
-3. seal Grain，再按 Expansion→Entity→Item 依赖顺序 publication，最后 `advance()`。
-
-mutation frontier 前不能写 canonical tables；frontier 后不能再执行用户代码或解析未验证结构。
-多输出 Call 的单个 Grain 必须原子成功或失败，不能出现一半 Ports PRESENT、一半 FAILED。
+For the detailed ABI see the
+[Worker walkthrough](multigrain_v3_6_walkthrough/05_worker_abi.md).
 
 ---
 
-## 9. Failure 分类与恢复
+## 8. The mutation frontier of a Worker report
 
-| failure | 发生位置 | 表达 | 策略 |
+A complete WorkerDispatchResult has four phases:
+
+1. reports correspond one-to-one with DispatchBatch grains, and all phase/generation values
+   are valid;
+2. pre-scan all `GroupFailure` barriers in DispatchBatch order;
+3. validate output, expanded rows, control, and aligned cardinality only for
+   reports that are ultimately live, and construct immutable commit intents;
+4. explicit failures become `FAILED`, successes hit by a barrier become
+   `SUPPRESSED`, and the remaining successes go through ordinary publication;
+   finally `advance()` is called exactly once.
+
+Canonical tables MUST NOT be written before the mutation frontier; after the
+frontier, user code MUST NOT run and unvalidated structures MUST NOT be parsed. A
+single Grain of a multi-output Call MUST succeed or fail atomically; it MUST NOT
+end up with half of its Ports PRESENT and half FAILED.
+
+---
+
+## 9. Failure classification and recovery
+
+| failure | where it occurs | representation | policy |
 | --- | --- | --- | --- |
-| record failure | UDF 返回某行 `RecordFailure` | `GrainFailureReport` | 该 Grain FAILED |
-| contract error | Worker ABI 不匹配 | `DispatchFailure(CONTRACT_ERROR)` | fail-fast |
-| opaque UDF throw | 一次 batch call 抛错 | `DispatchFailure(UDF_ERROR)` | retry/split/abort policy |
+| record failure | UDF returns `RecordFailure` for a row | `GrainFailureReport` | that Grain is FAILED |
+| `GroupFailure` | UDF returns `GroupFailure` for a row | `GrainFailureReport(suppress_siblings=True)` | current Grain FAILED; uncommitted siblings with the same Call and direct parent are SUPPRESSED |
+| contract error | Worker ABI mismatch | `DispatchFailure(CONTRACT_ERROR)` | fail-fast |
+| opaque UDF throw | one batch call raises | `DispatchFailure(UDF_ERROR)` | retry/split/abort policy |
 | infrastructure failure | Ray get/actor/transport | driver exception | replace actor + independent retry budget |
 
-分层职责：
+Layering responsibilities:
 
 ```text
-RecoveryPolicy  -> immutable facts 到 RecoveryAction
-DispatchState   -> phase/generation/queue 动作
-Engine          -> 最终 FAILED Item/Expansion publication
-Executor        -> actor replacement 与 ExecutionError context
+RecoveryPolicy  -> immutable facts to RecoveryAction
+DispatchState   -> phase/generation/queue actions
+Engine          -> batch commit, suppression barrier, and final Item/Expansion publication
+Executor        -> actor replacement and ExecutionError context
 ```
 
-UDF retry 保留 GrainRef，增加 generation。旧 attempt 报告即使迟到，也会被 fencing 拒绝。详细见
-[Dispatch 导读](multigrain_v3_6_walkthrough/04_dispatch_state.md) 和
-[Executor 导读](multigrain_v3_6_walkthrough/06_executor_event_loop.md)。
+A UDF retry preserves the GrainRef and increments the generation. Reports from an
+old attempt are rejected by fencing even if they arrive late. For details see the
+[Dispatch walkthrough](multigrain_v3_6_walkthrough/04_dispatch_state.md) and the
+[Executor walkthrough](multigrain_v3_6_walkthrough/06_executor_event_loop.md).
+
+Both explicit failures are normal return values inside a complete batch and do not
+go through `RecoveryPolicy`. Once a suppression barrier is established, READY is closed at
+the dequeue barrier check, WAITING is closed at input admission, and late successes are
+closed at the commit barrier check; an already-committed PRESENT is not rolled back and an
+RPC already sent to an actor is not cancelled. For an opaque/infra failure, the
+its `DispatchBatch` is first partitioned by barrier and only the live subset consumes retry
+budget.
 
 ---
 
-## 10. 生命周期、materialize 与资源释放
+## 10. Lifecycle, materialize, and resource release
 
-一个 microbatch 只有同时满足以下条件才完成：
+A microbatch completes only when all of the following hold simultaneously:
 
-- source admission closed；
-- `_facts` 和 pending Call slots 为空；
-- Dispatch runnable/recovery queues 为空；
-- 所有 Grain SEALED；
-- public output Port × Entity 全部终态；
-- Executor 没有该 microbatch 的 pending RPC lease。
+- source admission closed;
+- `_fact_queue` and pending Call slots are empty;
+- Dispatch runnable/recovery queues are empty;
+- all Grains are SEALED;
+- all public output Port × Entity pairs are terminal;
+- the Executor holds no pending RPC for this microbatch.
 
-完成顺序：
+Completion order:
 
 ```text
 materialize public output tree
@@ -353,14 +504,14 @@ materialize public output tree
 → release active admission credit
 ```
 
-`Executor.close()` kill 自己的 actors；只有它主动初始化 Ray 时才 shutdown runtime。推荐始终用
-context manager。
+`Executor.close()` kills its own actors; it shuts down the runtime only when it
+itself initialized Ray. Always prefer the context manager.
 
 ---
 
-## 11. 新功能应沿哪条路径修改
+## 11. Which path a new feature should follow
 
-### 11.1 新结构 primitive
+### 11.1 New structural primitive
 
 ```mermaid
 flowchart LR
@@ -377,9 +528,10 @@ flowchart LR
     Origin --> Semantics --> Verify --> Analysis --> Effect --> VerifyPlan --> Transition --> Engine --> Tests
 ```
 
-任何一步答不清，不能先在 Engine 补临时 `if`。
+If any step cannot be answered, you MUST NOT first patch a temporary `if` into the
+Engine.
 
-### 11.2 新 RayModule 物理配置
+### 11.2 New RayModule physical configuration
 
 ```text
 RayModule.ray_options
@@ -388,58 +540,64 @@ RayModule.ray_options
 → Executor
 ```
 
-不影响逻辑依赖的配置不得进入 LogicalProgram 或 Engine。
+Configuration that does not affect logical dependencies MUST NOT enter
+LogicalProgram or the Engine.
 
-### 11.3 新 Worker ABI 字段
+### 11.3 New Worker ABI field
 
-按顺序修改：
+Modify in this order:
 
 ```text
 protocol DTO
 → compiler layout
-→ Engine GrainPlan/report preflight
+→ Engine GrainInvocation/report preflight
 → Worker normalization
 → Ray-free contract tests
 → real-Ray integration
 ```
 
-Worker 和 Engine 不允许通过共享私有 dict 绕开 DTO。
+The Worker and the Engine MUST NOT bypass the DTO through a shared private dict.
 
-### 11.4 新恢复策略
+### 11.4 New recovery policy
 
-先在 `RecoveryPolicy` 增加纯决策和穷举 tests，再让 DispatchState 执行新 `RecoveryAction`。只有
-确实需要新的物理状态时才扩 GrainRecord；不要把 actor handle 塞进去。
+First add the pure decision and exhaustive tests in `RecoveryPolicy`, then let
+DispatchState execute the new `RecoveryAction`. Extend GrainRecord only when new
+physical state is genuinely required; do not push actor handles into it.
 
-### 11.5 新 compiler rewrite
+### 11.5 New compiler rewrite
 
-必须：
+It MUST:
 
-- 证明 primitive 在 outcome、identity、control、Grain/actor 行为上透明；
-- 记录 `CanonicalRewrite`；
-- 保留 LogicalProgram；
-- optimized/unoptimized 通过完整语义等价回归。
-
----
-
-## 12. 明确禁止的飞线
-
-- Executor 直接修改 Item/Expansion/Entity/Grain tables；
-- Engine 读取 PortOrigin、Pipeline 或 actor handle；
-- Worker 读取 RuntimePlan、Domain lineage 或 recovery policy；
-- F.* 创建隐藏 RayModule/actor；
-- trigger queue 携带 outcome/value，成为 canonical record 副本；
-- 同一个 structural target 在多个索引中保存独立 Effect clones；
-- 用某个默认/第一个输入决定 Grain identity；
-- compiler optimization 删除有业务失败、成员或 actor 语义的节点；
-- 通用框架按 OCR/Table 等 workload 名字探测特殊字段。
-
-最后一条当前仍有一处 P2 残留；源码证据、bad case 和候选收口统一记录在
-[`V3.6 架构审计待确认项`](todos/22-v36-architecture-audit-findings.md)，不在维护合同中提前
-宣布修复方案。
+- prove that the primitive is transparent in outcome, identity, control, and
+  Grain/actor behavior;
+- record a `CanonicalRewrite`;
+- preserve LogicalProgram;
+- pass the complete optimized/unoptimized semantic-equivalence regression.
 
 ---
 
-## 13. 验证路径
+## 12. Explicitly forbidden flywires
+
+- Executor directly modifying Item/Expansion/Entity/Grain tables;
+- Engine reading PortOrigin, Pipeline, or actor handles;
+- Worker reading RuntimePlan, Domain lineage, or recovery policy;
+- F.\* creating a hidden RayModule/actor;
+- a trigger queue carrying outcome/value and becoming a copy of the canonical
+  record;
+- the same structural target holding independent Effect clones in multiple indexes;
+- deciding Grain identity from some default/first input;
+- compiler optimization deleting nodes that carry business failures, members, or
+  actor semantics;
+- a general framework probing special fields by workload names such as OCR/Table.
+
+The last item still has one P2 residue; the source evidence, bad cases, and
+candidate closures are recorded together in
+[`V3.6 architecture audit open items`](todos/22-v36-architecture-audit-findings.md);
+a fix is not announced in advance inside the maintenance contract.
+
+---
+
+## 13. Verification paths
 
 ### 13.1 Ray-free
 
@@ -447,13 +605,13 @@ Worker 和 Engine 不允许通过共享私有 dict 绕开 DTO。
 pytest -q test/experimental/multigrain_v3_6/unit
 ```
 
-重点门禁：
+Key gates:
 
-- package dependency AST test；
-- compiler logical/plan completeness；
-- transition Cartesian products；
-- nested Expand/Reduce、control closure、recovery/fencing；
-- optimized/unoptimized semantic parity。
+- package dependency AST test;
+- compiler logical/plan completeness;
+- transition Cartesian products;
+- nested Expand/Reduce, control closure, recovery/fencing;
+- optimized/unoptimized semantic parity.
 
 ### 13.2 Real Ray
 
@@ -462,9 +620,10 @@ RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 pytest -q test/experimental/multigrain_v3_6/integration
 ```
 
-修改 actor lifecycle、RPC、BlockStore、Worker ABI、recovery 或 close ownership 时必须运行。
+Must be run when modifying actor lifecycle, RPC, BlockStore, Worker ABI, recovery,
+or close ownership.
 
-### 13.3 静态检查
+### 13.3 Static checks
 
 ```bash
 pyright rayorch/experimental/multigrain_v3_6
@@ -472,47 +631,53 @@ python -m compileall -q rayorch/experimental/multigrain_v3_6
 git diff --check
 ```
 
-### 13.4 性能
+### 13.4 Performance
 
-单元测试不能证明性能。真实 workload 结论使用 paired runs、相同模型/cache/硬件和均值方差；
-当前发布回归记录见
-[`2026-08-08_release_regression.md`](experiments/multigrain_v3_6/2026-08-08_release_regression.md)。
+Unit tests cannot prove performance. Real workload conclusions use paired runs, the
+same model/cache/hardware, and mean/variance; the current release regression record
+is
+[`2026-08-08_release_regression.md`](experiments/multigrain_v3_6/2026-08-08_release_regression.md).
 
 ---
 
-## 14. 故障定位
+## 14. Failure localization
 
-| 症状 | 第一检查点 | 然后读 |
+| Symptom | First checkpoint | Then read |
 | --- | --- | --- |
-| compile Domain mismatch | API 中 Port Domain 是否显式对齐 | authoring + compiler walkthrough |
-| chained Filter control 缺失 | `describe_origin` control predecessor 与 analysis fixed point | compiler walkthrough |
-| Engine deadlock | `_facts/pending_grains/Dispatch queues/public outputs` summary | Engine walkthrough |
-| stale report | Grain generation 与 lease group | Dispatch walkthrough |
-| Worker output arity/shape | CallInput/OutputLayout 与 column-major return | Worker walkthrough |
-| UDF 与 infra failure 混淆 | `DispatchFailureKind` 或 ray.get exception | Executor walkthrough |
-| materialize 后仍持有大对象 | ValueTable release 与 BlockStore cache | Engine/Executor walkthrough |
-| optimized only mismatch | explanation rewrites 与 unoptimized baseline | compiler walkthrough |
+| compile Domain mismatch | whether Port Domains are explicitly aligned in the API | authoring + compiler walkthrough |
+| chained Filter control missing | `describe_origin` control predecessor and analysis fixed point | compiler walkthrough |
+| Engine deadlock | `_fact_queue/pending_grains/Dispatch queues/public outputs` summary | Engine walkthrough |
+| stale report | Grain generation and DispatchBatch | Dispatch walkthrough |
+| Worker output arity/shape | CallInput/OutputLayout and column-major return | Worker walkthrough |
+| UDF vs infra failure confusion | `DispatchFailureKind` or ray.get exception | Executor walkthrough |
+| large objects still held after materialize | ValueTable release and BlockStore cache | Engine/Executor walkthrough |
+| optimized-only mismatch | explanation rewrites and unoptimized baseline | compiler walkthrough |
 
-不要从最终 `ExecutionError` 文本反向猜全部语义；先按 failure 层级定位 owner，再查看其 canonical
-状态或 immutable snapshot。
+Do not reverse-engineer all of the semantics from the final `ExecutionError` text;
+first locate the owner by failure layer, then inspect its canonical state or
+immutable snapshot.
 
 ---
 
-## 15. 源码逐段导读入口
+## 15. Paragraph-level source walkthrough entries
 
-推荐按数据结构变换顺序，而不是从 Executor 倒推：
+Recommended in data-structure transformation order rather than reasoning backwards
+from the Executor:
 
-1. [`api.py：符号建图`](multigrain_v3_6_walkthrough/01_authoring_api.md)
-2. [`compiler：LogicalProgram→RuntimePlan`](multigrain_v3_6_walkthrough/02_compiler_pipeline.md)
-3. [`engine.py：语义表、Fact FIFO 与 publication`](multigrain_v3_6_walkthrough/03_runtime_engine.md)
-4. [`dispatch.py：Grain records 与三个 queues`](multigrain_v3_6_walkthrough/04_dispatch_state.md)
-5. [`worker.py：binding/value/report ABI`](multigrain_v3_6_walkthrough/05_worker_abi.md)
-6. [`executor.py：actor slots、pending leases 与 event loop`](multigrain_v3_6_walkthrough/06_executor_event_loop.md)
-7. [`V3→V3.6 架构审计`](multigrain_v3_6_walkthrough/07_v3_vs_v36_readability.md)
+1. [`api.py: symbolic graph construction`](multigrain_v3_6_walkthrough/01_authoring_api.md)
+2. [`compiler: LogicalProgram→RuntimePlan`](multigrain_v3_6_walkthrough/02_compiler_pipeline.md)
+3. [`engine.py: semantic tables, Fact FIFO, and publication`](multigrain_v3_6_walkthrough/03_runtime_engine.md)
+4. [`dispatch.py: Grain records and the three queues`](multigrain_v3_6_walkthrough/04_dispatch_state.md)
+5. [`worker.py: binding/value/report ABI`](multigrain_v3_6_walkthrough/05_worker_abi.md)
+6. [`executor.py: actor slots, pending RPCs, and event loop`](multigrain_v3_6_walkthrough/06_executor_event_loop.md)
+7. [`V3→V3.6 architecture audit`](multigrain_v3_6_walkthrough/07_v3_vs_v36_readability.md)
 
-上述第 7 篇只做 V3/V3.6 架构比较。当前待 QA 的实现与发布问题见
-[`架构审计待确认项`](todos/22-v36-architecture-audit-findings.md)。
+Item 7 only compares the V3/V3.6 architectures. Current implementation and release
+issues pending QA are in
+[`Architecture audit open items`](todos/22-v36-architecture-audit-findings.md).
 
-维护时最短复述：LogicalProgram 保存声明；compiler 生成完整 RuntimePlan；Engine 只发布语义事实；
-DispatchState 只管 Grain；Worker 只运行 values；Executor 只管 Ray。新增功能必须沿这条既有路径
-进入，而不是在两个 owner 之间拉一根快捷线。
+The shortest restatement for maintenance: LogicalProgram stores declarations; the
+compiler produces a complete RuntimePlan; the Engine only publishes semantic facts;
+DispatchState only manages Grains; the Worker only runs values; the Executor only
+manages Ray. A new feature MUST enter along this existing path instead of pulling a
+shortcut wire between two owners.

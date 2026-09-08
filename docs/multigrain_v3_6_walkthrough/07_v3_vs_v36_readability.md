@@ -1,82 +1,129 @@
-# 07：V3→V3.6 架构可读性审计——是否已经达到当前最优抽象
+# 07. V3 versus V3.6: readability audit
 
-> **文档生态位：V3 与 V3.6 的解释成本和架构质量对比。** 本文不维护待修 backlog；当前
-> 源码问题、证据缺口和候选方案统一见
-> [`V3.6 架构审计待确认项`](../todos/22-v36-architecture-audit-findings.md)。全部阅读路线见
-> [`V3.6 文档地图`](../multigrain_v3_6_documentation_map.md)。
+This page records the architectural comparison; it is not another runtime
+component. The Chinese audit is retained as
+[`07_v3_vs_v36_readability.zh.md`](07_v3_vs_v36_readability.zh.md).
 
-这篇不介绍新功能，而是回答一个更严格的问题：V3.6 是否只是把 V3 的大文件拆开，还是确实
-消除了导致 V3 难读、难改和多处真相的根因？
+## At a glance
 
-对照源码：
+V3.6 makes three boundaries explicit:
 
-- V3：[`api.py`](../../rayorch/experimental/multigrain_v3/api.py)、
-  [`dag.py`](../../rayorch/experimental/multigrain_v3/dag.py)、
-  [`arena/engine.py`](../../rayorch/experimental/multigrain_v3/arena/engine.py)、
+1. a fixed compiler turns symbolic declarations into a frozen runtime plan;
+2. a single-writer engine owns semantic facts and a private fact FIFO;
+3. a Ray executor owns transport, actors, and RPC lifecycle.
+
+The result is more code in the narrow runtime files but fewer cross-layer
+assumptions. Structural operations do not create hidden actors, and transport
+code does not interpret primitive semantics. `RecordFailure` and `GroupFailure`
+are explicit data outcomes, while opaque dispatch failures remain a separate
+recovery algebra.
+
+The audit should be read with the tests: readability is useful only when each
+owner has a small, executable contract. Historical v3--v3.5 directories are
+kept for comparison and are not part of the reviewer baseline.
+
+---
+
+## 07. V3→V3.6 architecture readability audit: has it reached the current optimal abstraction?
+
+> **Document niche: comparing the explanation cost and architectural quality
+> of V3 and V3.6.** This page does not maintain a repair backlog; current source
+> problems, evidence gaps, and candidate solutions are all collected in
+> [`V3.6 Architecture Audit Open Items`](../todos/22-v36-architecture-audit-findings.md).
+> All reading routes are listed in the
+> [`V3.6 Documentation Map`](../multigrain_v3_6_documentation_map.md).
+
+This page introduces no new functionality. It answers a stricter question: is
+V3.6 merely the result of splitting V3's large files apart, or has it actually
+eliminated the root causes that made V3 hard to read, hard to change, and
+scattered across multiple sources of truth?
+
+Source code under comparison:
+
+- V3: [`api.py`](../../rayorch/experimental/multigrain_v3/api.py),
+  [`dag.py`](../../rayorch/experimental/multigrain_v3/dag.py),
+  [`arena/engine.py`](../../rayorch/experimental/multigrain_v3/arena/engine.py),
   [`model.py`](../../rayorch/experimental/multigrain_v3/model.py)
-- V3.6：[`api.py`](../../rayorch/experimental/multigrain_v3_6/api.py)、
-  [`program/`](../../rayorch/experimental/multigrain_v3_6/program)、
-  [`runtime/`](../../rayorch/experimental/multigrain_v3_6/runtime)、
+- V3.6: [`api.py`](../../rayorch/experimental/multigrain_v3_6/api.py),
+  [`program/`](../../rayorch/experimental/multigrain_v3_6/program),
+  [`runtime/`](../../rayorch/experimental/multigrain_v3_6/runtime),
   [`execution/`](../../rayorch/experimental/multigrain_v3_6/execution)
 
 ---
 
-## 1. 先给结论
+### 1. The conclusion first
 
-结论分两层：
+The conclusion has two layers:
 
-1. **相对 V3，V3.6 是逻辑抽象层面的实质性跃迁，不是文件搬家。** 它已经是 V3→V3.6
-   各版中，静态语义、动态状态机、唯一写入权和用户心智模型最清晰的一版。
-2. **不能称为脱离约束的“绝对最优解”。** 当前核心架构已经接近局部最优，继续大拆通常只会
-   增加 DTO 和跳转；生命周期、诊断协议、验证证据和 symbolic typing 等边角仍需独立 QA。
+1. **Relative to V3, V3.6 is a substantive leap at the level of logical
+   abstraction, not a file-shuffling exercise.** Across all versions from V3 to
+   V3.6, it is the one with the clearest static semantics, dynamic state
+   machine, single write authority, and user mental model.
+2. **It cannot be called an "absolute optimum" that escapes all constraints.**
+   The current core architecture is already close to a local optimum; further
+   large splits usually only add DTOs and indirection. Lifecycle, diagnostic
+   protocols, verification evidence, and symbolic typing still need independent
+   QA on the periphery.
 
-因此最准确的判断是：
+The most accurate judgment is therefore:
 
-> V3.6 已经达到当前语义范围内值得冻结的主架构；完成独立审计项不要求再做概念级重构，也
-> 不应为了缩短文件而拆散状态 owner。
+> V3.6 has reached a main architecture worth freezing within the current
+> semantic scope; completing the independent audit items does not require
+> another concept-level refactor, nor should state owners be broken apart just
+> to make files shorter.
 
 ---
 
-## 2. “更优”用什么标准判断
+### 2. What criteria decide "better"?
 
-不能只用文件行数。当前排除 benchmark 后，V3 核心约 4,821 行，V3.6 核心约 5,259 行；V3.6
-并没有靠少写代码取胜。
+Line count alone is not enough. Excluding benchmarks today, the V3 core is
+about 4,821 lines and the V3.6 core is about 5,259 lines; V3.6 does not win by
+writing less code.
 
-本审计使用五个标准：
+This audit uses five criteria:
 
-| 标准 | 好的表现 |
+| Criterion | What good looks like |
 | --- | --- |
-| 心智正交 | 计算、结构、身份、状态、物理执行能分别解释 |
-| 唯一事实 | 每份可变状态有一个 owner，索引不成为第二份记录 |
-| 局部可推理 | 读一个 feature 不需要跨多个无关机制追条件 |
-| 穷尽性 | 新 primitive/outcome/event 漏实现时能静态或测试失败 |
-| 修改路径 | 新功能沿固定路径落地，不需要跨层快捷线 |
+| Mental orthogonality | computation, structure, identity, state, and physical execution can each be explained separately |
+| Single source of truth | every piece of mutable state has one owner, and indexes do not become a second record |
+| Local reasonability | reading one feature does not require chasing conditions across several unrelated mechanisms |
+| Exhaustiveness | when a new primitive/outcome/event is left unimplemented, static checks or tests fail |
+| Modification path | new features land along a fixed path, without cross-layer shortcuts |
 
-按这些标准，V3.6 的优势来自重新选择抽象边界，而非目录更漂亮。
-
----
-
-## 3. V3 并不是“完全没有好设计”
-
-为了避免错误归因，先保留 V3 的真实优点：
-
-- `ArenaEngine` 对外确实是 single writer；`RunDriver` 没有直接读写 Arena 内部 tables。
-- `PortId / EntityId / ItemRef / GrainId` 已经区分静态位置、业务 occurrence 和计算身份。
-- `GroupShape` 使用 CSR offsets，支持 nested empty group，是后来版本应继承的正确方向。
-- `CompiledDAG` 已有 direct consumer indexes，不是完全靠运行时全图扫描。
-- execution pool 与 Arena 分离，actor credit 和 multi-Arena overlap 已有明确实现。
-- hashed lineage identity 与 generation fencing 具备强正确性基础。
-
-所以 V3 的问题不宜简单概括为“所有组件互相乱改状态”。更准确地说：
-
-> 外部边界已有纪律，但内部把过多正交语义压进 `StageSpec + ArenaEngine`，形成一个逻辑上高度
-> 耦合的巨型解释器。
+Measured against these criteria, V3.6's advantage comes from re-choosing the
+abstraction boundaries, not from having a prettier directory layout.
 
 ---
 
-## 4. V3 难读的第一个根因：一个 Stage 同时代表计算与结构
+### 3. V3 was not "completely without good design"
 
-V3 用户 API 暴露：
+To avoid misattribution, V3's real merits are preserved here:
+
+- `ArenaEngine` really was a single writer from the outside; `RunDriver` did not
+  directly read or write Arena's internal tables.
+- `PortId / EntityId / ItemRef / GrainId` already separated static position,
+  business occurrence, and computational identity.
+- `GroupShape` used CSR offsets and supported nested empty groups, the right
+  direction for later versions to inherit.
+- `CompiledDAG` already had direct consumer indexes rather than relying
+  entirely on full-graph runtime scans.
+- The execution pool was separated from Arena, and actor credit and multi-Arena
+  overlap already had clear implementations.
+- Hashed lineage identity and generation fencing provided a strong correctness
+  foundation.
+
+So V3's problems should not be summarized crudely as "all components mutate
+each other's state." More precisely:
+
+> The external boundary already had discipline, but internally too many
+> orthogonal semantics were compressed into `StageSpec + ArenaEngine`, forming a
+> logically highly coupled giant interpreter.
+
+---
+
+### 4. Root cause 1: one Stage represented both computation and structure
+
+The V3 user API exposed:
 
 ```text
 Map(UDF)
@@ -85,105 +132,121 @@ Expand(UDF)
 Reduce(UDF)
 ```
 
-每个 primitive 都是 UDF stage、actor pool、input alignment 和结构语义的组合。
-[`_TraceContext.call()`](../../rayorch/experimental/multigrain_v3/api.py#L125-L237) 必须先按 Python
-class 映射 `Primitive`，再分别决定：
+Every primitive was a combination of UDF stage, actor pool, input alignment,
+and structural semantics.
+[`_TraceContext.call()`](../../rayorch/experimental/multigrain_v3/api.py#L125-L237)
+first had to map the Python class to a `Primitive`, and then decide separately:
 
-- input names 与 modes；
-- `driving_input`；
-- output count；
-- Reduce anchor/members/scope path；
-- UDF 与 execution config。
+- input names and modes;
+- `driving_input`;
+- output count;
+- the Reduce anchor/members/scope path;
+- UDF and execution config.
 
-这造成一个名称同时回答过多问题：
-
-```text
-Filter 是一段计算？一个 mask 关系？一组同步转发 outputs？一个 actor stage？
-```
-
-V3.6 改为两个正交轴：
+This made one name answer too many questions at once:
 
 ```text
-RayModule Call = 计算边界、Grain、actor、RPC
-F.*            = Port/Domain 结构关系，不创建 Call
+Is Filter a piece of computation? a mask relation?
+a set of synchronously forwarded outputs? an actor stage?
 ```
 
-因此 `F.filter(values, masks)` 不再需要 driving input，不执行 UDF，也不为所有输入隐式产生 outputs。
-这不是 API 换皮，而是让“计算发生在哪里”和“数据粒度如何变化”可以独立推理。
+V3.6 replaces this with two orthogonal axes:
+
+```text
+RayModule Call = computation boundary, Grain, actor, RPC
+F.*            = Port/Domain structural relations, creates no Call
+```
+
+As a result, `F.filter(values, masks)` no longer needs a driving input, does not
+execute a UDF, and does not implicitly produce outputs for all inputs. This is
+not an API reskin; it makes "where computation happens" and "how data
+granularity changes" independently reason-able.
 
 ---
 
-## 5. 第二个根因：Port 与 scope 都依赖 Stage 解释
+### 5. Root cause 2: Port and scope both depended on Stage interpretation
 
-V3 `PortId` 是：
+In V3, `PortId` was:
 
 ```text
 PortId(stage, output)
 ```
 
-Port 位置与 producer Stage identity 耦合。某 Port 位于哪个粒度，则由
-[`_TraceContext._scope()`](../../rayorch/experimental/multigrain_v3/api.py#L281-L307) 递归查看
-producer kind，并用 Expand Stage ids 拼 tuple 推导。
+Port position was coupled to producer Stage identity. The granularity a Port
+lived at was derived by
+[`_TraceContext._scope()`](../../rayorch/experimental/multigrain_v3/api.py#L281-L307),
+which recursively inspected the producer kind and assembled a tuple from Expand
+Stage ids.
 
-这会让读者在理解一个 Port 时同时追问：
+This forces a reader to chase down several questions at once when trying to
+understand a single Port:
 
-1. producer 是哪个 Stage？
-2. Stage 是 Map/Filter/Expand/Reduce 哪种？
-3. driving input 是哪个？
-4. scope tuple 如何经 Reduce 回退？
+1. which Stage is the producer?
+2. is the Stage Map/Filter/Expand/Reduce, and which one?
+3. which one is the driving input?
+4. how does the scope tuple fall back through a Reduce?
 
-V3.6 把三个坐标拆开：
+V3.6 splits the three coordinates apart:
 
 ```text
-PortRef   = 图上数据位置
-CallRef   = 静态计算调用点
-DomainRef = Entity 对齐空间
+PortRef   = data position on the graph
+CallRef   = static computation call site
+DomainRef = Entity alignment space
 ```
 
-每个 `PortSpec` 直接保存 Domain；Domain 自身是一棵显式 parent tree。Expand 创建 child Domain，
-Reduce 回 parent，Filter 保持 Domain，Broadcast 显式跨 ancestor→descendant。
+Each `PortSpec` stores its Domain directly, and Domain itself is an explicit
+parent tree. Expand creates a child Domain, Reduce returns to the parent,
+Filter keeps the Domain, and Broadcast explicitly crosses ancestor→descendant.
 
-因此同 Domain Call input alignment 无需从 StageKind 递归推断。这是显著降低人类工作记忆的核心
-变化。
+Therefore, input alignment for Calls in the same Domain no longer needs to be
+recursively inferred from `StageKind`. This is the core change that
+significantly reduces human working-memory load.
 
 ---
 
-## 6. 第三个根因：Grain 身份携带完整输入形状
+### 6. Root cause 3: Grain identity carried the full input shape
 
-V3 `GrainId` 由 Stage 和按编译顺序排列的 `InputBinding` 哈希得到；Group input 还带 shape。这个
-方案确定且强健，但理解某次逻辑计算身份时，需要同时理解 input names、ordered ItemRefs、group
-shape 和 stage semantics。
+In V3, `GrainId` was obtained by hashing the Stage together with the
+`InputBinding`s ordered by compilation; Group inputs additionally carried a
+shape. This scheme is deterministic and robust, but understanding the identity
+of one logical computation required simultaneously understanding input names,
+ordered `ItemRef`s, group shape, and stage semantics.
 
-V3.6 将同 Domain Call 的所有输入身份对齐，Grain 简化为：
+V3.6 aligns the identities of all inputs of a Call in the same Domain, and
+Grain simplifies to:
 
 ```text
 GrainRef = CallRef × EntityRef
 ```
 
-多输入只影响 Worker ABI slots，多输出只影响同一 Grain 的 output Items；它们不改变 Grain
-identity。这样自然删除了 `driving_input/driven_by` 身份权威。
+Multiple inputs only affect Worker ABI slots, and multiple outputs only affect
+the output Items of the same Grain; neither changes Grain identity. This
+naturally removes `driving_input/driven_by` as an identity authority.
 
-代价是 V3.6 明确要求 Call inputs 同 Domain；跨粒度必须先写结构关系。这个限制不是能力退化，
-而是拒绝隐式 join，从而换取完备、可预测的身份代数。
+The cost is that V3.6 explicitly requires Call inputs to share the same Domain;
+crossing granularity requires writing a structural relation first. This
+restriction is not a capability regression — it is a refusal of implicit joins,
+traded for a complete and predictable identity algebra.
 
 ---
 
-## 7. 第四个根因：ArenaEngine 是单写者，但拥有太多种状态
+### 7. Root cause 4: ArenaEngine was a single writer, but owned too many kinds of state
 
-V3 [`ArenaEngine`](../../rayorch/experimental/multigrain_v3/arena/engine.py) 共 1,469 行。构造函数
-同时建立：
+The V3 [`ArenaEngine`](../../rayorch/experimental/multigrain_v3/arena/engine.py)
+is 1,469 lines in total. Its constructor establishes, all at once:
 
-- Grain/Item/Entity/Expand tables；
-- pending invocations 与 ReduceAccumulator；
-- value/block tables；
-- receipt queue；
-- Stage normal/immediate/tail queues；
-- dispatch leases；
-- hard-limit counters；
-- recovery tasks/budgets；
-- metrics 与 timeline。
+- Grain/Item/Entity/Expand tables;
+- pending invocations and `ReduceAccumulator`;
+- value/block tables;
+- the receipt queue;
+- Stage ready, immediate-retry, and deferred-recovery queues;
+- pending RPCs;
+- hard-limit counters;
+- recovery tasks/budgets;
+- metrics and timeline.
 
-单写者避免了外部竞态，却不能避免内部认知耦合。同一个文件必须同时解释：
+A single writer avoids external races, but it cannot avoid internal cognitive
+coupling. The same file had to explain all of the following at once:
 
 ```text
 receipt routing
@@ -196,39 +259,44 @@ receipt routing
 → materialize/reclaim
 ```
 
-读 `_publish_item()` 前后并不能只关心 publication，还要理解 queue、limit、reduce slot、block
-ownership 与 failure task。
+Reading around `_publish_item()` does not let you care only about publication;
+you also have to understand queues, limits, the reduce slot, block ownership,
+and the failure task.
 
-V3.6 没有盲目把每张 dict 拆成一个服务，而是按状态机 owner 分成：
+V3.6 does not blindly split every dict into its own service. It divides
+ownership by state-machine owner:
 
-| V3.6 owner | 唯一拥有 |
+| V3.6 owner | Solely owns |
 | --- | --- |
 | `MicrobatchEngine` | Item/Expansion/Entity/value binding/lineage/fact propagation |
-| `DispatchState` | Grain phase/generation/normal-immediate-tail queues |
-| `RecoveryPolicy` | 无状态恢复决策 |
+| `DispatchState` | Grain phase/generation and ready/immediate-retry/deferred-recovery queues |
+| `RecoveryPolicy` | stateless recovery decisions |
 | `Worker` | value-only UDF ABI |
-| `Executor` | actor、RPC lease、capacity、多 microbatch 生命周期 |
+| `Executor` | actor, pending RPC, capacity, multi-microbatch lifecycle |
 
-拆分点对应不同状态机，而不是按代码长度切文件，所以是架构变化。
+The split points correspond to different state machines rather than to slicing
+files by code length, which is why this is an architectural change.
 
 ---
 
-## 8. 第五个根因：V3 runtime 持续解释 `Primitive` kind
+### 8. Root cause 5: the V3 runtime kept interpreting the `Primitive` kind
 
-V3 compiler 生成 `StageSpec(kind, driving_input, reduce, udf, execution, ...)`，Arena/Execution/Worker
-仍在多处读取 `stage.kind`：
+The V3 compiler produced `StageSpec(kind, driving_input, reduce, udf, execution, ...)`,
+and Arena/Execution/Worker still read `stage.kind` in many places:
 
-- routing 时 REDUCE 走 accumulator，其余走 aligned；
-- drop/suppression 时 EXPAND 单独发布 fanout；
-- commit 时 FILTER 与 value outputs 分两套；
-- value commit 内 MAP/REDUCE/EXPAND 再分支；
-- failure output 时 EXPAND 再分支；
-- execution 层对 FILTER output contract 再分支。
+- when routing, REDUCE went to the accumulator and everything else to aligned;
+- on drop/suppression, EXPAND published fanout on its own;
+- on commit, FILTER and value outputs used two separate paths;
+- inside value commit, MAP/REDUCE/EXPAND branched again;
+- on failure output, EXPAND branched again;
+- the execution layer branched again on the FILTER output contract.
 
-这些判断各自有理由，但一项 primitive 语义被横向散布在 authoring、DAG verifier、Arena、Worker
-和 execution 层。新增或改变一种 primitive 时，很难证明没有漏掉某个 `stage.kind` case。
+Each of these judgments has its own rationale, but the semantics of a single
+primitive are spread horizontally across authoring, the DAG verifier, Arena,
+Worker, and the execution layer. When a primitive is added or changed, it is
+hard to prove that no `stage.kind` case was missed.
 
-V3.6 引入固定 compiler boundary：
+V3.6 introduces a fixed compiler boundary:
 
 ```text
 Origin
@@ -238,149 +306,179 @@ Origin
 → Engine interprets Effect
 ```
 
-Engine 源码中没有任何 `PortOrigin`/`FilterOrigin`/`BroadcastOrigin` 解释；Worker 只读取 compiler
-layout。这让静态声明与动态执行真正分离。
+There is no `PortOrigin`/`FilterOrigin`/`BroadcastOrigin` interpretation
+anywhere in the Engine source, and the Worker only reads the compiler layout.
+This truly separates static declaration from dynamic execution.
 
 ---
 
-## 9. 第六个根因：状态组合与物理动作混写
+### 9. Root cause 6: state composition and physical actions were mixed together
 
-V3 `GrainRecord.reserve/release/seal()` 自身维护 phase/outcome/active AttemptToken；ArenaEngine 同时
-决定 recovery preset、修改 queue、发布 outputs 和处理 actor failure。其正确性很强，但维护者要
-从多个 imperative 方法还原完整状态图。
+In V3, `GrainRecord.reserve/release/seal()` itself maintained phase, outcome,
+and the active `AttemptToken`, while `ArenaEngine` simultaneously decided the
+recovery preset, mutated queues, published outputs, and handled actor failure.
+Its correctness was strong, but a maintainer had to reconstruct the full state
+graph from several imperative methods.
 
-V3.6 显式分为：
+V3.6 separates these explicitly:
 
 ```text
-transitions.py  = phase/outcome 的纯封闭代数
+transitions.py  = pure closed algebra of phase/outcome
 RecoveryPolicy  = immutable facts -> RecoveryAction
-DispatchState   = 唯一物理 phase/queue/generation writer
+DispatchState   = the only physical phase/queue/generation writer
 Engine          = semantic publication
 Executor        = actor replacement
 ```
 
-每个 `(phase,event)` 和 outcome 笛卡尔积都可以 Ray-free 穷举测试。维护者不必靠遍历所有调用点
-猜“还有没有另一条合法边”。
+Every `(phase, event)` and outcome Cartesian product can be exhaustively tested
+without Ray. Maintainers no longer have to guess "is there another legal edge?"
+by walking every call site.
 
 ---
 
-## 10. 一份真相是否真的得到实现
+### 10. Is a single source of truth actually implemented?
 
-V3.6 不只是文档声称唯一 owner，还有源码门禁：
+V3.6 does not merely claim a single owner in documentation; it also has source
+gates:
 
 - [`test_package_boundaries.py`](../../test/experimental/multigrain_v3_6/unit/test_package_boundaries.py)
-  用 AST 检查 program/runtime/execution 依赖边界；
+  uses AST checks to enforce the program/runtime/execution dependency boundary;
 - [`test_compiler_pipeline.py`](../../test/experimental/multigrain_v3_6/unit/test_compiler_pipeline.py)
-  证明 Engine 不解释 Origin，且 `DispatchState` 是 Grain phase/generation/counter 的唯一写者；
+  proves that the Engine does not interpret Origin, and that `DispatchState` is
+  the sole writer of Grain phase/generation/counter;
 - [`test_transition_algebra.py`](../../test/experimental/multigrain_v3_6/unit/test_transition_algebra.py)
-  穷举动态状态组合；
-- RuntimePlan verifier 检查每个 structural target 只有一个 Effect object，所有 trigger indexes 指向
-  同一个对象，而非复制等价规则。
+  exhaustively enumerates dynamic state combinations;
+- the RuntimePlan verifier checks that every structural target has exactly one
+  Effect object and that all trigger indexes point at that same object rather
+  than duplicating an equivalent rule.
 
-当前关键事实关系是：
+The current key fact relationships are:
 
 ```mermaid
 flowchart TD
-    Logical["LogicalProgram<br/>用户声明真相"]
-    Analysis["ProgramAnalysis<br/>可重算派生事实"]
-    Plan["RuntimePlan<br/>运行接线真相"]
-    Engine["Engine canonical tables<br/>语义动态真相"]
-    Dispatch["DispatchState<br/>Grain 物理真相"]
-    Executor["Executor<br/>Ray capacity 真相"]
+    Logical["LogicalProgram<br/>user-declared truth"]
+    Analysis["ProgramAnalysis<br/>recomputable derived facts"]
+    Plan["RuntimePlan<br/>runtime wiring truth"]
+    Engine["Engine canonical tables<br/>semantic dynamic truth"]
+    Dispatch["DispatchState<br/>Grain physical truth"]
+    Executor["Executor<br/>Ray capacity truth"]
 
     Logical --> Analysis --> Plan --> Engine --> Dispatch
     Plan --> Executor
 ```
 
-Analysis 与索引的存在不等于第二份真相：前者可由 LogicalProgram 重算，后者引用 canonical
-Effect object；事件 FIFO 也只携带 Ref，不复制 record 内容。
+The existence of Analysis and of indexes does not amount to a second source of
+truth: the former can be recomputed from LogicalProgram, the latter references
+canonical Effect objects, and event FIFOs carry only Refs instead of copying
+record contents.
 
 ---
 
-## 11. V3.6 为什么仍有 989 行 Engine，但不等于回到 V3
+### 11. Why V3.6 still has a 989-line Engine, and why that is not a return to V3
 
-V3.6 Engine 仍需在同一个 mutation owner 内完成：
+The V3.6 Engine still has to complete the following inside one mutation owner:
 
-- source admission；
-- report preflight 与 publication frontier；
-- Item/Expansion/Entity gateway；
-- Call/Filter/Reduce/Broadcast Effect interpretation；
-- lineage 与 group binding 构造。
+- source admission;
+- report preflight and publication frontier;
+- the Item/Expansion/Entity gateway;
+- Call/Filter/Reduce/Broadcast Effect interpretation;
+- lineage and group binding construction.
 
-这些都围绕一个不变量：**只有完整 canonical fact 能被下游观察**。如果为缩短文件，把每种
-primitive 拆成持有 `_state` 的可变 service，就会重新出现共享写入权或一串 owner 回调。
+All of these revolve around one invariant: **only complete canonical facts can
+be observed downstream.** If, just to shorten the file, each primitive were
+split into a mutable service holding `_state`, shared write authority or a chain
+of owner callbacks would reappear.
 
-当前更合理的维护方式是：
+The more reasonable maintenance approach today is:
 
-- 用文件内阶段注释和本套逐段导读降低阅读成本；
-- 纯 outcome 逻辑继续放 `transitions.py`；
-- Grain queue 继续放 `dispatch.py`；
-- 只有当 report validation 出现多种独立协议时，才考虑抽取纯 validator。
+- use in-file stage comments and this set of section-by-section walkthroughs to
+  lower reading cost;
+- keep pure outcome logic in `transitions.py`;
+- keep the Grain queue in `dispatch.py`;
+- extract a pure validator only when report validation actually grows several
+  independent protocols.
 
-所以 `engine.py` 的剩余长度主要是不可约业务语义的集中，而 V3 的 1,469 行 Arena 还混合了
-queue、lease、recovery budget、block ownership、batch timeout 与 timeline。两者性质不同。
+So the remaining length of `engine.py` is mainly a concentration of irreducible
+business semantics, whereas V3's 1,469-line Arena also mixed in queues, pending RPCs,
+recovery budgets, block ownership, batch timeouts, and timeline. The two are
+different in nature.
 
 ---
 
-## 12. `_facts + advance()` 是否是多余抽象
+### 12. Are `_fact_queue + advance()` a redundant abstraction?
 
-不是。它们是 Engine 内部的最小 fixed-point scheduler：
+No. They are the Engine's internal minimal fixed-point scheduler:
 
 ```text
 publication gateway
-    -> 先写完整 canonical record
-    -> enqueue identity-only FactEvent
+    -> first write the complete canonical record
+    -> enqueue an identity-only FactEvent
 advance
-    -> 按 RuntimePlan index 应用 Effects
-    -> 新 publication 再入队
-    -> 队列为空即局部不动点
+    -> apply Effects according to the RuntimePlan index
+    -> new publications are enqueued again
+    -> an empty queue means a local fixed point
 ```
 
-若删除 FIFO，publication gateway 就必须递归调用下游：
+If the FIFO were removed, the publication gateway would have to call downstream
+recursively:
 
-- 深图依赖 Python call stack；
-- commit 中产生重入，下游可能在上游 publication turn 尚未完整时运行；
-- Item/Expansion/Entity 各自容易长出不同递归路径；
-- 新 feature 更容易从某个 gateway 直接调用另一个组件，形成飞线。
+- deep graphs would depend on the Python call stack;
+- re-entrancy would occur during commit, so downstream could run before the
+  upstream publication turn was complete;
+- Item/Expansion/Entity would each easily grow a different recursion path;
+- new features would more easily call another component directly from some
+  gateway, forming a flywire.
 
-因此问题是教程此前先使用 `_facts/advance` 再定义它们，而不是机制本身没有必要。主教程已改为
-先介绍 canonical tables、Fact FIFO 和 `advance()` 的闭环，再解释 publication；详细实现留在
-[Engine 导读](03_runtime_engine.md)。
-
----
-
-## 13. 当前改进项为什么单独维护
-
-架构对比回答“抽象是否更好”，待修清单回答“哪段源码在什么 bad case 下仍有问题”。把两者写在
-同一处，会让尚未 QA 的候选方案看起来像规范结论，也会导致问题状态在多个文档中漂移。
-
-当前完整列表、源码证据、优先级和建议见
-[`V3.6 架构审计待确认项`](../todos/22-v36-architecture-audit-findings.md)，其中包括：
-
-- 当前目录重组与既有真实 workload 报告之间的证据边界；
-- 终止 `run()` 后 Executor 的 fail-stop/复用合同；
-- Worker observation 的 workload 名称飞线；
-- RayModule symbolic typing 的延后设计；
-- 已审视但当前不建议继续拆分的 Engine 逻辑。
-
-这些事项都可以在现有 owner 边界内解决，不构成重新引入通用 IR、driver port 或额外状态机的理由。
+The problem, therefore, is that the tutorial used `_fact_queue/advance` before
+defining them, not that the mechanism itself is unnecessary. The main tutorial
+has been changed to introduce the canonical tables, the fact FIFO, and the
+`advance()` loop first, and publication afterwards; the detailed implementation
+is left to the [Engine walkthrough](03_runtime_engine.md).
 
 ---
 
-## 14. 最终评分
+### 13. Why the current improvement items are maintained separately
 
-| 维度 | V3 | V3.6 | 判断 |
+An architecture comparison answers "is the abstraction better?"; a repair list
+answers "which piece of source still has problems under which bad case?" Writing
+both in one place makes not-yet-QA'd candidate solutions look like normative
+conclusions, and lets problem status drift across several documents.
+
+The current complete list, source evidence, priorities, and recommendations are
+in [`V3.6 Architecture Audit Open Items`](../todos/22-v36-architecture-audit-findings.md),
+including:
+
+- the evidence boundary between the current directory reorganization and
+  existing real-workload reports;
+- the Executor's fail-stop/reuse contract after `run()` terminates;
+- the workload-name flywire in Worker observation;
+- the deferred design of RayModule symbolic typing;
+- Engine logic that has been reviewed but is currently not recommended for
+  further splitting.
+
+All of these can be resolved inside the existing owner boundaries, and none of
+them justifies reintroducing a general IR, a driver port, or an extra state
+machine.
+
+---
+
+### 14. Final scorecard
+
+| Dimension | V3 | V3.6 | Judgment |
 | --- | --- | --- | --- |
-| 用户原语 | compute/structure 合在 Stage primitive | RayModule Call 与 F.* 正交 | V3.6 显著更清楚 |
-| 静态身份 | Port 绑定 producer Stage，scope 递归推导 | Port/Call/Domain 显式分离 | V3.6 更低心智负担 |
-| Grain 身份 | Stage + full InputBindings hash | Call × Entity | V3.6 更直接可调试 |
-| 编译边界 | DAG indexes，但 runtime 继续解释 Primitive | Origin→Effect/layout 后 runtime 不回读 | V3.6 更完整 |
-| 动态状态 | Arena single writer 但职责过宽 | Engine/Dispatch/Executor 按状态机分 owner | V3.6 更局部可推理 |
-| 状态穷尽 | imperative record/Stage branches | 纯 transition + Cartesian tests | V3.6 更易证明 |
-| 恢复 | 功能丰富但侵入 Arena | policy decision/dispatch action/actor replace 分层 | V3.6 更易维护 |
-| 飞线 | 外部边界尚可，内部 kind cases 横向散布 | 主语义无明显飞线；诊断残留单独跟踪 | V3.6 接近冻结标准 |
-| 代码量 | 更少 | 略多 | V3.6 以显式合同换可读性，值得 |
+| User primitives | compute/structure combined in the Stage primitive | RayModule Call orthogonal to `F.*` | V3.6 is significantly clearer |
+| Static identity | Port bound to the producer Stage, scope derived recursively | Port/Call/Domain explicitly separated | V3.6 has a lower mental load |
+| Grain identity | Stage + full `InputBinding`s hash | Call × Entity | V3.6 is more directly debuggable |
+| Compiler boundary | DAG indexes, but the runtime kept interpreting `Primitive` | after Origin→Effect/layout the runtime never reads back | V3.6 is more complete |
+| Dynamic state | Arena single writer, but too broad in responsibility | Engine/Dispatch/Executor own state by state machine | V3.6 is more locally reasonable |
+| State exhaustiveness | imperative record/Stage branches | pure transition + Cartesian tests | V3.6 is easier to prove |
+| Recovery | feature-rich but invasive into Arena | policy decision / dispatch action / actor replacement layering | V3.6 is easier to maintain |
+| Flywires | acceptable external boundary, but internal kind cases spread horizontally | no obvious flywires in the main semantics; diagnostic residue tracked separately | V3.6 is close to the freeze bar |
+| Code volume | less | slightly more | V3.6 trades explicit contracts for readability, and it is worth it |
 
-最终结论：V3.6 不是理论上永远不可改进的“宇宙最优解”，但已经是当前功能集合下的**最佳局部
-架构**。完成独立生命周期/诊断/验证门禁后，最合理动作是冻结主抽象并通过新增 feature 验证
-它，而不是继续拆层或发明新的中间表示。
+Final conclusion: V3.6 is not a theoretically unimprovable "universal optimum",
+but it is already the **best local architecture** for the current feature set.
+After the independent lifecycle/diagnostic/verification gates are completed, the
+most reasonable move is to freeze the main abstractions and validate them by
+adding new features, rather than continuing to split layers or invent a new
+intermediate representation.

@@ -115,6 +115,8 @@ is the single sequential learning path; then use
 for cross-component contracts and modification discipline. Detailed source walkthroughs
 start at
 [`docs/multigrain_v3_6_walkthrough/README.md`](docs/multigrain_v3_6_walkthrough/README.md).
+The reviewer-facing V3.6 Markdown surface is English; Chinese translations are
+kept beside the canonical files with a `.zh.md` suffix.
 
 ## Minimal Example
 

@@ -1,34 +1,167 @@
-# MultiGrain v3.6：封闭状态机与无飞线语义
+# MultiGrain v3.6: closed state machine and failure algebra
 
-> **文档生态位：规范性的状态机与结构语义合同。** review 新行为时按需查阅；第一次学习请走
-> [`V3.6 文档地图`](multigrain_v3_6_documentation_map.md)给出的顺序，不需要从本文开始。
+This is the normative runtime reference. The prior Chinese specification is
+[`multigrain_v3_6_design.zh.md`](multigrain_v3_6_design.zh.md).
 
-顺序学习路径见
-[`multigrain_v3_6_getting_started.md`](multigrain_v3_6_getting_started.md)；跨组件维护合同见
-[`multigrain_v3_6_maintainer_guide.md`](multigrain_v3_6_maintainer_guide.md)。
+## At a glance
 
-## 1. 目标与边界
+### 1. Identity model
 
-v3.6 收敛动态语义，不增加通用 optimizer、registry
-或新的身份概念。目标是让每个状态和每条 primitive 关系都有唯一职责，并让
-runtime 只执行可穷举、与输入顺序无关的状态转移。
+The runtime distinguishes identities that are often conflated in batch
+systems:
 
-本版封闭的是树状、无环 lineage：同 Entity 计算、Expand 细化、Reduce 回收、
-Broadcast 祖先投影、Filter 成员筛选和 Optional 缺省输入。跨无关 Domain 的
-Join/Shuffle、多对多 regroup 与 feedback loop 不属于本合同；将来若支持，必须
-引入新的显式身份原语，不能借用某个输入 Port 充当隐式 driver。
+```text
+Domain   -> a level of entities (for example document or page)
+Entity   -> one occurrence in a Domain
+Item     -> one Port × Entity occurrence
+Grain    -> one Call × execution-Entity invocation
+Expansion -> ordered parent-to-child membership
+```
 
-## 2. 七种身份与四类运行时事实
+`PortRef`, `DomainRef`, `EntityRef`, `ItemRef`, and `GrainRef` are immutable
+coordinates. A coordinate is not a business value and is never reused across
+unrelated domains.
 
-静态图只需要三个坐标，动态执行只需要四个复合身份：
+### 2. Closed phases and outcomes
+
+Dispatch has three phases:
+
+```text
+READY -> IN_FLIGHT -> SEALED
+```
+
+Only reservation moves a ready grain to `IN_FLIGHT`; only a generation-fenced
+report or an explicit terminal decision seals it. The transition table in
+[`runtime/transitions.py`](../rayorch/experimental/multigrain_v3_6/runtime/transitions.py)
+rejects every unlisted phase/event pair.
+
+An item has one terminal outcome:
+
+```text
+PRESENT     value is available
+DROPPED     a filter or required input removed it
+FAILED      its producing grain reported a business failure
+SUPPRESSED  an upstream failure or suppression barrier made it ineligible
+```
+
+Terminal outcomes are idempotent and cannot be overwritten by late reports.
+
+### 3. Fact publication
+
+`MicrobatchEngine` is the single writer for semantic facts. Item, expansion,
+and entity publications enter one private FIFO. `advance()` consumes facts and
+applies the precompiled effect indexes until the local fixed point is reached.
+Facts do not carry a second copy of outcome, lineage, or child state, so the
+FIFO is an event channel rather than another state machine.
+
+`DispatchState` owns only grain phases, generations, and physical queues. It
+does not infer lineage or interpret structural primitives. `Executor` owns Ray
+handles and RPC futures but cannot mutate semantic tables directly.
+
+### 4. Atomic reports
+
+One worker report contains all output ports for one grain and one generation.
+The engine validates the complete report before publishing any output. If an
+output count, row alignment, or binding is invalid, no part of that grain is
+committed. This is the multi-output atomicity boundary.
+
+Generation fencing makes replay safe: a report from an older attempt is ignored
+after a newer generation has been accepted or the grain has been sealed.
+
+### 5. Explicit failure sentinels
+
+`RecordFailure` is a normal UDF return value that fails only the current grain:
+
+```python
+return mg.RecordFailure("malformed page")
+```
+
+`GroupFailure` is the intentionally stronger, separate type:
+
+```python
+return mg.GroupFailure("document is poisoned")
+```
+
+It fails the current grain and establishes a microbatch-local barrier keyed by
+the call and the direct parent. Ready siblings behind that barrier are sealed
+as `SUPPRESSED` at dequeue time. A sibling RPC already sent to another actor is
+not killed; its late report is checked at commit time and is either committed
+normally (if the barrier was not established) or converted to `SUPPRESSED`.
+Other parents, calls, and healthy outputs continue normally.
+
+Neither sentinel requests a retry. Opaque exceptions follow
+[`RecoveryPolicy`](../rayorch/experimental/multigrain_v3_6/recovery.py), which
+reduces immutable retry facts to a closed action set. Infrastructure failures
+may replace an actor and replay a generation while budget remains.
+
+### 6. Recursive parent propagation
+
+Suppression is recorded against the direct parent in the current child domain.
+Downstream effects observe that terminal outcome through the canonical fact FIFO;
+they do not walk arbitrary Python objects or perform a global scan. If a later
+structural operation creates another child domain, its own direct-parent edge
+is published and the same rule is applied there. This makes recursive
+propagation explicit while keeping each dequeue check O(1) average via a
+call/parent barrier set.
+
+### 7. Invariants
+
+The following properties are tested at the Ray-free boundary and again in
+integration tests:
+
+1. every grain is sealed at most once per generation;
+2. every item has at most one terminal outcome;
+3. a failed multi-output grain publishes no partial outputs;
+4. a suppression barrier never suppresses another parent or call;
+5. already submitted RPCs are not revoked, but their commits are fenced;
+6. empty domains and nested expansion/reduction terminate without a hidden
+   sentinel state;
+7. healthy siblings still commit when a different sibling is isolated.
+
+---
+
+## MultiGrain v3.6: Closed State Machine and Flywire-Free Semantics
+
+> **Document niche: the normative state machine and structural semantics contract.**
+> Consult it on demand when reviewing new behavior; for a first read, follow the
+> order given by the [`V3.6 documentation map`](multigrain_v3_6_documentation_map.md).
+> You do not need to start with this document.
+
+For the sequential learning path, see
+[`multigrain_v3_6_getting_started.md`](multigrain_v3_6_getting_started.md); for the
+cross-component maintenance contract, see
+[`multigrain_v3_6_maintainer_guide.md`](multigrain_v3_6_maintainer_guide.md).
+
+### 1. Goals and boundaries
+
+v3.6 converges dynamic semantics; it does not add a general-purpose optimizer,
+registry, or new identity concepts. The goal is to give every state and every
+primitive relationship exactly one responsibility, and to make the runtime
+execute only state transitions that are exhaustively enumerable and independent
+of input order.
+
+What this version closes is tree-shaped, acyclic lineage: same-Entity
+computation, Expand refinement, Reduce reclamation, Broadcast ancestor
+projection, Filter membership selection, and Optional default inputs.
+Join/Shuffle across unrelated Domains, many-to-many regroup, and feedback loops
+are outside this contract; if they are supported in the future, a new explicit
+identity primitive must be introduced, and no input Port may be borrowed as an
+implicit driver.
+
+### 2. Seven identities and four classes of runtime fact
+
+The static graph needs only three coordinates, and dynamic execution needs only
+four composite identities:
 
 ```text
 static:  CallRef / PortRef / DomainRef
 dynamic: EntityRef / ItemRef / GrainRef / ExpansionRef
 ```
 
-`LogicalProgram` 提供前三种 Ref 的稳定定义和关系；状态机不挂在逻辑节点上，而是
-由独立的 `RuntimeState` 与 `DispatchState` 以四种动态 Ref 为 key 保存事实：
+`LogicalProgram` provides the stable definitions and relationships of the first
+three Refs; the state machine is not attached to logical nodes, but is instead
+held by independent `RuntimeState` and `DispatchState`, which store facts keyed
+by the four dynamic Refs:
 
 ```mermaid
 flowchart LR
@@ -46,195 +179,263 @@ flowchart LR
     TF --> DS
 ```
 
-源码目录直接反映这个边界：`program/` 只保存和编译静态 Program，
-`runtime/` 只管单个 microbatch 的动态事实，`execution/` 才持有 Ray actor、
-RPC 和 Worker。根部 `model.py` / `protocol.py` / `recovery.py` 是各层共享的
-Ray-free 合同；依赖门禁测试防止 Program 反向导入 runtime/execution，也防止
-runtime 绕过 RuntimePlan 回读 compiler internals。
+The source directory directly reflects this boundary: `program/` only stores and
+compiles the static Program, `runtime/` only manages the dynamic facts of a
+single microbatch, and only `execution/` holds Ray actors, RPC, and Worker. The
+root `model.py` / `protocol.py` / `recovery.py` are the Ray-free contracts shared
+by every layer; dependency gate tests prevent Program from importing
+runtime/execution in reverse, and prevent runtime from bypassing RuntimePlan to
+read compiler internals back.
 
-四类动态事实分别是：
+The four classes of dynamic fact are:
 
-| 事实 | 身份 | 唯一职责 |
+| Fact | Identity | Sole responsibility |
 | --- | --- | --- |
-| Entity | `Domain × occurrence` | Domain 中不可变的逻辑 occurrence |
-| Item | `Port × Entity` | 某 Port 对该 Entity 的不可变终态 |
-| Grain | `Call × Entity` | RayModule 对该 Entity 的一次逻辑调用 |
-| Expansion | `child Domain × parent Entity` | Expand 是否终态及其有序 child Entities |
+| Entity | `Domain × occurrence` | the immutable logical occurrence in a Domain |
+| Item | `Port × Entity` | the immutable terminal state of one Port for that Entity |
+| Grain | `Call × Entity` | one logical invocation of a RayModule on that Entity |
+| Expansion | `child Domain × parent Entity` | whether an Expand is terminal, and its ordered child Entities |
 
-Entity 只有“不存在→存在”，不存在 dropped/failed 状态。root Entity 由 source
-admission 创建，child Entity 只由成功 Expand 创建；Filter 只改变目标 Item，
-不会删除 Entity。所有 Call 输入属于同一 Domain，因此 Grain 身份不由任一输入
-Port 驱动，`driven_by` 从 API、LogicalProgram 与 runtime 中删除。
+Entity only has "does not exist → exists"; it has no dropped/failed state. root
+Entities are created by source admission, and child Entities only by a
+successful Expand; Filter only changes the target Item and never deletes an
+Entity. All Call inputs belong to the same Domain, so Grain identity is not
+driven by any single input Port, and `driven_by` has been removed from the API,
+LogicalProgram, and runtime.
 
-Item 以表中缺席表示 `UNRESOLVED`，只能一次性进入四个互斥终态：
+Item uses absence from the table to mean `UNRESOLVED`, and can enter the four
+mutually exclusive terminal outcomes exactly once:
 
 ```text
 UNRESOLVED → PRESENT | DROPPED | FAILED | SUPPRESSED
 ```
 
-- `PRESENT`：存在 ValueBinding。
-- `DROPPED`：该 Port 已确认不包含此 Entity。
-- `FAILED`：Item 的直接生产者失败；透明视图可保留该失败。
-- `SUPPRESSED`：生产者因上游失败而未执行。
+- `PRESENT`: a ValueBinding exists.
+- `DROPPED`: the Port is confirmed not to contain this Entity.
+- `FAILED`: the Item's direct producer failed; a transparent view may retain
+  that failure.
+- `SUPPRESSED`: the producer should not execute or commit because of an upstream
+  failure or a same-parent suppression barrier.
 
-Grain 的 `WAITING` 由 pending input slots 表示，不存入 `GrainPhase`：
+A Grain's `WAITING` is represented by pending input slots and is not stored in
+`GrainPhase`:
 
 ```text
 WAITING → READY → IN_FLIGHT → SEALED
     └───────────────────────→ SEALED
+             READY ─────────→ SEALED  (parent suppression)
                IN_FLIGHT → READY  (recovery, generation + 1)
 ```
 
-### READY queue 分区与 driver backpressure
+#### READY queue partitioning and driver backpressure
 
-`DispatchState` 的 normal queue 只属于一个 microbatch，但其中可能同时存在多个
-Call 的 READY Grain。旧实现把它们放在一个共享 `deque` 中；Executor 为某个 Call
-选择 actor batch 时，`priority(call)` 需要线性寻找属于该 Call 的 Grain，
-`reserve(call)` 则扫描并重建整个 deque。即使已经选满 `batch_size`，仍必须访问
-剩余 entry，才能保留其他 Call 和未选 Grain 的顺序。
+`DispatchState`'s ready queue belongs to only one microbatch, but it may hold
+READY Grains of several Calls at the same time. The old implementation put them
+in a single shared `deque`; when the Executor selected an actor batch for one
+Call, `priority(call)` had to linearly search for the Grains belonging to that
+Call, and `reserve(call)` scanned and rebuilt the entire deque. Even after
+`batch_size` was filled, the remaining entries still had to be visited in order
+to preserve the order of other Calls and of unselected Grains.
 
-设当前共享队列有 `N` 个 READY entry，目标 Call 有 `n` 个，batch size 为 `B`：
+Suppose the current shared queue has `N` READY entries, the target Call has `n`,
+and the batch size is `B`:
 
-- 一次 `priority(call)` 最坏为 `O(N)`；
-- 一次 elastic reservation 为 `O(N)`，而不是 `O(B)`；
-- 仅排空目标 Call 的 backlog 就需要扫描
-  `n + (n - B) + (n - 2B) + ... = O(n² / B)`；
-- 若期间还有 `m` 个其他 Call entry 留在队列中，还会额外访问约
-  `ceil(n / B) × m` 次。
+- one `priority(call)` is worst-case `O(N)`;
+- one `any_parent` reservation is `O(N)`, not `O(B)`;
+- draining the target Call's backlog alone requires scanning
+  `n + (n - B) + (n - 2B) + ... = O(n² / B)`;
+- if `m` entries of other Calls remain in the queue meanwhile, about
+  `ceil(n / B) × m` additional visits occur.
 
-这个成本位于单线程 driver 的串行关键路径，而不是 Ray CPU actor 中。Executor
-提交下一批 RPC 前，要在所有 active microbatches 中查询 READY work，再按 Call
-遍历空闲 actor。一个较大的 CPU Call 队列因此可以在轮到 GPU Call 之前制造
-head-of-line blocking。GPU actor 虽然仍持有 GPU resource，上一批结束后却收不到
-新的 `execute.remote()`，表现为 GPU 已分配但 utilization 下降。更多 CPU replicas
-不会并行化这段 driver-local 状态机，反而会增加一次 refill 需要服务的 actor 数。
+This cost sits on the serial critical path of the single-threaded driver, not in
+Ray CPU actors. Before the Executor submits the next batch of RPCs, it must
+query READY work across all active microbatches and then walk idle actors by
+Call. A large CPU Call queue can therefore create head-of-line blocking before
+the GPU Call gets its turn. Although the GPU actor still holds the GPU resource,
+it receives no new `execute.remote()` after the previous batch finishes, which
+shows up as GPU allocated but utilization dropping. More CPU replicas do not
+parallelize this driver-local state machine; they instead increase the number of
+actors that one refill has to serve.
 
-当前实现按 `CallRef` 保存独立 normal FIFO：
+The current implementation keeps an independent ready FIFO per `CallRef`:
 
 ```text
-normal: CallRef -> deque[ReadyEntry]
+ready: CallRef -> deque[GrainRef]
 ```
 
-因此 `priority(call)` 对 normal work 是 `O(1)`；elastic reservation 只从目标
-deque 弹出最多 `B` 个 Grain，为 `O(B)`，排空一个 Call 总计 `O(n)`。不同 Call
-之间本来就没有可观察的 dequeue 顺序，per-Call FIFO 等价于旧共享 FIFO 在该 Call
-上的稳定投影。`parent_bound` 仍可能扫描目标 Call 队列以收集同 parent Grain，但
-不再访问其他 Call，并保持所有未选 Grain 的相对 FIFO 顺序。immediate 与 tail
-recovery queues 保持独立，优先级仍为 immediate → normal → tail。
+Therefore `priority(call)` is `O(1)` for READY work; `any_parent` reservation pops
+at most `B` Grains from the target deque only, which is `O(B)`, and draining one
+Call is `O(n)` in total. There is no observable dequeue order between different
+Calls in the first place, so a per-Call FIFO is equivalent to the stable
+projection of the old shared FIFO onto that Call. `pack_by_parent` may still scan
+the target Call queue to collect same-parent Grains, but it no longer visits
+other Calls and preserves the relative FIFO order of all unselected Grains. The
+immediate-retry and deferred-recovery queues remain independent, and their priority is
+immediate-retry → ready → deferred-recovery.
 
-真实 `GrainRef` 的缩小 microbenchmark 包含 5,536 个 READY entry：共享 deque
-为排空各 Call 访问 3,023,296 个 entry、耗时 2.735 秒；per-Call deque 只访问
-5,536 个 entry、耗时 7.65 毫秒。该结果说明热点来自重复的嵌套 Ref hash、字典查询
-与 deque 重建，而不是一次简单的短循环。
+A microbenchmark using reduced real `GrainRef`s contains 5,536 READY entries:
+the shared deque visited 3,023,296 entries and took 2.735 seconds to drain each
+Call, while the per-Call deque visited only 5,536 entries and took 7.65
+milliseconds. This result shows that the hot spot comes from repeated nested Ref
+hashing, dictionary lookups, and deque rebuilding, not from one simple short
+loop.
 
-在同模型、数据和 batch 参数的 64×H20 四帧视频任务中，旧实现最佳连续 60 秒
-GPU utilization 均值为 73.20%，per-Call queue 的连续 60 秒均值为 97.73%。该
-配置下 decode 实测供给约 1,191 clips/s，而 64 个 fused teacher actors 满载只需
-约 184 clips/s，因此结果与 driver refill 而非 HDFS 吞吐成为主要瓶颈一致。这里的
-utilization 是 workload evidence，不属于运行时语义合同；正确性仍由 Call FIFO、
-`parent_bound` 和 recovery queue 测试独立保证。
+In a 64×H20 four-frame video task with the same model, data, and batch
+parameters, the old implementation's best continuous 60-second GPU utilization
+averaged 73.20%, while the per-Call queue's continuous 60-second average was
+97.73%. Under that configuration, decode measured about 1,191 clips/s, whereas
+64 fused teacher actors at full load need only about 184 clips/s, so the result
+is consistent with driver refill rather than HDFS throughput being the primary
+bottleneck. The utilization here is workload evidence and is not part of the
+runtime semantics contract; correctness is still guaranteed independently by the
+Call FIFO, `pack_by_parent`, and recovery queue tests.
 
-Expansion 必须独立存在，因为“尚无 child”可能是未决、成功展开为空、drop 或失败。
-终态为 `SUCCEEDED(children)`、`DROPPED`、`FAILED`；cardinality 只由
-`len(children)` 派生，不维护第二份数字事实。
+Expansion must exist independently, because "no child yet" may mean pending,
+successfully expanded to empty, dropped, or failed. The terminal states are
+`SUCCEEDED(children)`, `DROPPED`, and `FAILED`; cardinality is derived only from
+`len(children)`, and no second numeric fact is maintained.
 
-## 3. RayModule 的对称输入代数
+### 3. Symmetric input algebra of RayModule
 
-Call 输入没有 driver，按一个交换、与槽位顺序无关的归约决定 Grain：
+Call inputs have no driver; the Grain is decided by a commutative reduction that
+is independent of slot order:
 
-1. 任意 REQUIRED/OPTIONAL 输入为 `FAILED` 或 `SUPPRESSED`：不执行，输出
-   `SUPPRESSED`。
-2. 否则任意 REQUIRED 输入为 `DROPPED`：不执行，输出 `DROPPED`。
-3. 否则 Grain `READY`；OPTIONAL + `DROPPED` 在 Worker ABI 中变成 `MISSING`。
+1. If any REQUIRED/OPTIONAL input is `FAILED` or `SUPPRESSED`: do not execute,
+   output `SUPPRESSED`.
+2. Otherwise, if any REQUIRED input is `DROPPED`: do not execute, output
+   `DROPPED`.
+3. Otherwise the Grain is `READY`; OPTIONAL + `DROPPED` becomes `MISSING` in the
+   Worker ABI.
 
-因此混合 failure/drop 时 failure 优先；全 optional Call 也有明确语义，因为
-terminal Item 本身携带 Entity 身份，不需要必需输入充当身份锚点。
+Therefore, when failure and drop are mixed, failure wins; a fully optional Call
+also has well-defined semantics, because the terminal Item itself carries Entity
+identity and no required input is needed as an identity anchor.
 
-## 4. F.* 的封闭语义
+### 4. Closed semantics of F.*
 
-### Filter
+#### Filter
 
-`F.filter(source, mask)` 保持 Domain/Entity 不变。source 是被筛选值，mask 是
-显式 gate：source 非 PRESENT 时原样传播；否则 mask 的非 PRESENT 原样传播，
-`PRESENT(True)` 复用 source binding，`PRESENT(False)` 产生 `DROPPED`。若输出
-继续作为 mask，control demand 沿 Filter source 做 fixed-point 反传。
+`F.filter(source, mask)` keeps Domain/Entity unchanged. source is the value
+being filtered and mask is the explicit gate: when source is not PRESENT,
+propagate as-is; otherwise a non-PRESENT mask propagates as-is, `PRESENT(True)`
+reuses the source binding, and `PRESENT(False)` produces `DROPPED`. If the
+output continues to serve as a mask, control demand propagates backward along
+the Filter source to a fixed point.
 
-### Broadcast
+#### Broadcast
 
-`F.broadcast(source, like=port)` 中 `like` 只选择目标后代 Domain，不提供成员
-资格。目标 Domain 每个已创建 Entity 通过 lineage 找到 ancestor，并透明复制
-source 的 outcome、binding 和按需 control。若需要继承 `like` 的成员资格，用户
-必须显式 Filter。
+In `F.broadcast(source, like=port)`, `like` only selects the target descendant
+Domain and does not provide membership. Every already-created Entity of the
+target Domain finds its ancestor through lineage and transparently copies the
+source's outcome, binding, and on-demand control. If the membership of `like`
+must be inherited, the user must write an explicit Filter.
 
-### Expand
+#### Expand
 
-Expand 是唯一创建新 Entity 的 primitive。成功 report 产生
-`SUCCEEDED(children)`，包括合法的空 tuple；Call 输出 `DROPPED` 产生
-`ExpansionOutcome.DROPPED`，`FAILED/SUPPRESSED` 产生
-`ExpansionOutcome.FAILED`，且均不创建 child。
-`expand_aligned` 只是多个同一 Call 输出共享一个 Expansion，cardinality 必须相同。
+Expand is the only primitive that creates new Entities. A successful report
+produces `SUCCEEDED(children)`, including a legitimately empty tuple; a Call
+output of `DROPPED` produces `ExpansionOutcome.DROPPED`, and `FAILED/SUPPRESSED`
+produce `ExpansionOutcome.FAILED`, and none of them create children.
+`expand_aligned` is only a way for several outputs of the same Call to share one
+Expansion; the cardinality must be identical.
 
-### Reduce
+#### Reduce
 
-Reduce 回到已经存在的 parent Entity。Expansion 未决时保持 Item 未决；Expansion
-`DROPPED` 产生 `DROPPED`，Expansion `FAILED` 产生 `SUPPRESSED`。Expansion 成功后，
-members `PRESENT` 的 child 入组、`DROPPED` 的 child 排除；members
-`FAILED/SUPPRESSED` 抑制整个结果。只检查 survivors 的 value，任一非 PRESENT
-都会产生 `SUPPRESSED`；零 survivors 产生 PRESENT 空 group。
+Reduce returns to an already existing parent Entity. While the Expansion is
+pending, the Item stays pending; Expansion `DROPPED` produces `DROPPED`, and
+Expansion `FAILED` produces `SUPPRESSED`. After a successful Expansion, children
+whose members are `PRESENT` join the group and children that are `DROPPED` are
+excluded; members `FAILED/SUPPRESSED` suppress the entire result. Only the values
+of survivors are checked, and any non-PRESENT value produces `SUPPRESSED`; zero
+survivors produce a PRESENT empty group.
 
-### Optional 与 aligned API
+#### Optional and aligned API
 
-`F.optional` 只修改 Call 输入策略，不创建 Port/Entity/Grain。`expand_aligned`
-和 `reduce_aligned` 只是共享 Expansion 或 members 的多 Port 写法，不是新 primitive。
+`F.optional` only modifies Call input policy; it does not create a Port, Entity,
+or Grain. `expand_aligned` and `reduce_aligned` are only multi-Port spellings
+that share an Expansion or members; they are not new primitives.
 
-## 5. 实现纪律与验证
+### 5. Implementation discipline and verification
 
-- `semantics.describe_origin()` 是静态 primitive 依赖/control/lowering 的穷尽入口。
-- 独立的纯 transition algebra 是动态 outcome/phase 的穷尽入口；MicrobatchEngine 负责事实
-  发布和 binding，不重新发明状态优先级。
-- 对称 Call 使用交换归约；Filter source、Reduce members 等不对称只能由明确的
-  primitive role 引入，不能由输入顺序或默认 slot 引入。
-- Item、Expansion、Entity publication 是单调且幂等的；冲突 publication 必须失败。
-- `_FactEvent = ItemRef | ExpansionRef | EntityRef` 只是一组事实身份通知：三个唯一
-  publication 入口写 canonical tables 后进入同一 FIFO，`advance()` 是唯一传播入口；
-  Event 不复制 outcome、binding、children 或 lineage。
-- 每个 Filter/Reduce/Broadcast Port 只 lower 成一个完整、不可变的 `XxxEffect`；
-  target catalog、Item trigger 和 Domain trigger 都引用该同一对象，不允许用
-  target-only Route 再回查第二份 Rule。
-- 每种 transition 都用笛卡尔积测试覆盖，而不只用少量端到端 happy path：Call
-  覆盖 required/optional × 四种 ItemOutcome，Filter 覆盖 source × mask × bool，
-  Broadcast 覆盖四种 outcome，Expand 覆盖四种上游 outcome，Reduce 覆盖 Expansion
-  与 members/value gate，Grain 覆盖所有 phase/event 合法与非法组合。
+- `semantics.describe_origin()` is the exhaustive entry point for static
+  primitive dependency/control/lowering.
+- The independent pure transition algebra is the exhaustive entry point for
+  dynamic outcome/phase; `MicrobatchEngine` is responsible for fact publication
+  and binding and does not reinvent state priority.
+- Symmetric Calls use a commutative reduction; asymmetries such as Filter source
+  and Reduce members can only be introduced by an explicit primitive role, not
+  by input order or a default slot.
+- Item, Expansion, and Entity publication are monotonic and idempotent;
+  conflicting publication must fail.
+- `_FactEvent = ItemRef | ExpansionRef | EntityRef` is only a set of fact
+  identity notifications: the three unique publication entries write canonical
+  tables and then enter the same FIFO, and `advance()` is the only propagation
+  entry point; the Event does not copy outcome, binding, children, or lineage.
+- Each Filter/Reduce/Broadcast Port lowers into exactly one complete, immutable
+  `XxxEffect`; the target catalog, Item trigger, and Domain trigger all
+  reference that same object, and it is not allowed to use a target-only Route
+  to look up a second Rule.
+- Every transition is covered by Cartesian-product tests rather than only a few
+  end-to-end happy paths: Call covers required/optional × four ItemOutcomes,
+  Filter covers source × mask × bool, Broadcast covers four outcomes, Expand
+  covers four upstream outcomes, Reduce covers Expansion and the members/value
+  gate, and Grain covers all legal and illegal phase/event combinations.
 
-任何新增 primitive 或状态都必须同时回答：它创建哪种身份、消费哪些事实、产生
-什么终态、control 如何传播、是否需要 Worker，以及现有笛卡尔积中为什么无法
-表达。不能回答这些问题的 feature 不进入 v3.6。
+Any newly added primitive or state must simultaneously answer: which identity it
+creates, which facts it consumes, what terminal state it produces, how control
+propagates, whether a Worker is needed, and why it cannot be expressed in the
+existing Cartesian products. A feature that cannot answer these questions does
+not enter v3.6.
 
-## 6. Failure 分类与恢复代数
+### 6. Failure classification and recovery algebra
 
-failure kind 与 recovery policy 是正交的两个轴：
+failure kind and recovery policy are two orthogonal axes:
 
-- `RecordFailure` 是已经定位到单 Grain 的业务终态，直接走正常 `commit_failure`；
-- `CONTRACT_ERROR` 表示 Worker ABI 被违反，必须 fail-fast；
-- `UDF_ERROR` 是整次 dispatch 的不透明业务异常，由 Call 上的 `RecoveryPolicy` 决策；
-- `INFRA_FAILURE` 表示 actor/RPC 不可信，只能 fresh-actor replay，耗尽后终止 run，
-  不能伪造成 Item failure。
+- `RecordFailure` is a business terminal state already localized to a single
+  Grain; it only commits that Grain as `FAILED`;
+- `GroupFailure` is likewise a business terminal state returned normally: the
+  current Grain becomes `FAILED`, and it establishes a
+  `(CallRef, direct parent EntityRef)` barrier that makes not-yet-committed
+  same-scope siblings `SUPPRESSED`; it does not roll back facts that precede the
+  barrier, and it does not trigger a retry;
+- `CONTRACT_ERROR` means the Worker ABI was violated and must fail fast;
+- `UDF_ERROR` is an opaque business exception for the whole dispatch, decided by
+  the `RecoveryPolicy` on the Call;
+- `INFRA_FAILURE` means the actor/RPC is untrustworthy; only fresh-actor replay
+  is possible, the run terminates once the budget is exhausted, and it must not
+  be faked as an Item failure.
 
-`RecoveryPolicy` 只有 `abort`、`retry_batch`、`retry_tail`、`isolate_tail` 四种
-UDF 模式和独立的 `infra_retries`。默认是 UDF abort、infra retry 一次。
-`isolate_tail` 固定为整组队尾重放一次，随后对仍失败的非 singleton 做二分；
-singleton 才发布 FAILED。因此无需 `max_depth` 或 `min_batch`，执行放大由输入
-cardinality 给出有限上界。
+`RecoveryPolicy` has only four UDF modes — `abort`, `retry_batch`,
+`retry_tail`, `isolate_tail` — plus an independent `infra_retries`. The default
+is UDF abort and one infra retry. `isolate_tail` is fixed as one whole
+queue-tail replay, followed by bisection of the still-failing non-singletons;
+only a singleton publishes FAILED. Hence no `max_depth` or `min_batch` is
+needed, and execution amplification has a finite bound given by input
+cardinality.
 
-恢复动作由 Ray-free 的 `RecoveryPolicy` 纯函数穷举；精确 Grain batch、随 batch
-携带的 `udf_retries` 以及 normal/immediate/tail queues 全部归 `MicrobatchEngine` 内唯一的
-`DispatchState` 所有。Engine 只负责
-Item/Expansion/Entity 传播，Executor 只持有 actor capacity 和 pending ObjectRef，两者都不能
-拥有第二份 READY authority。compiler 把 authoring options 归一化为按 `CallRef`
-唯一索引的强类型 `ActorPoolSpec`；它没有冗余的 `PoolRef` 身份或 `call_to_pool` 映射。
-旧的歧义 `max_retries` 在编译期拒绝，Ray actor options 才保留为不透明尾部配置。
+WorkerDispatchResult must be committed only after a whole-batch pre-scan: explicit
+failures take precedence over the barrier, a successful report that hits the
+barrier is discarded before any Item/Expansion/child Entity is created, and
+successful results of other parents commit normally. READY dequeue, Call input
+admission, late in-flight commit, and opaque/infra recovery all consult the same
+microbatch-local barrier table inside the Engine; Worker/Executor do not parse
+lineage and do not cancel RPCs already started on other actors. The ready queue
+is still partitioned by Call, and each `any_parent` entry adds only one expected O(1)
+hash lookup.
 
-Logical `CallSpec` 直接保存 immutable positional inputs 与 ordered keyword inputs；
-每个输入值只包含 `PortRef + InputMode`。关键字名只存在 kwargs key 中，compiler 在
-lowering 时才生成唯一的 dense slot 顺序和 `CallInputLayout`，runtime 不回读或重新猜测
-Python 调用形状。
+Recovery actions are exhaustively enumerated by the Ray-free pure functions of
+`RecoveryPolicy`; the exact Grain batch, the `udf_retries` carried with the
+batch, and the ready/immediate-retry/deferred-recovery queues all belong to the single
+`DispatchState` inside `MicrobatchEngine`. The Engine is responsible only for
+Item/Expansion/Entity propagation, and the Executor only holds actor capacity and
+pending ObjectRefs; neither may own a second READY authority. The compiler
+normalizes authoring options into a strongly typed `ActorPoolSpec` uniquely
+indexed by `CallRef`; it has no redundant `PoolRef` identity or `call_to_pool`
+mapping. The legacy ambiguous `max_retries` is rejected at compile time, and Ray
+actor options remain opaque trailing configuration.
+
+Logical `CallSpec` directly stores immutable positional inputs and ordered
+keyword inputs; each input value contains only `PortRef + InputMode`. Keyword
+names exist only in kwargs keys, and the compiler generates the unique dense slot
+order and `CallInputLayout` at lowering time; the runtime does not read back or
+re-guess the Python call shape.

@@ -1,37 +1,85 @@
-# 01：逐段读懂 `api.py`——符号调用怎样变成 LogicalProgram
+# 01. Authoring API: from Python calls to symbols
 
-主源码：[`api.py`](../../rayorch/experimental/multigrain_v3_6/api.py)；配套薄封装：
-[`functional.py`](../../rayorch/experimental/multigrain_v3_6/functional.py)。
+The public authoring surface lives in
+[`api.py`](../../rayorch/experimental/multigrain_v3_6/api.py) and
+[`functional.py`](../../rayorch/experimental/multigrain_v3_6/functional.py).
+The Chinese walkthrough is retained in
+[`01_authoring_api.zh.md`](01_authoring_api.zh.md).
 
-这一篇只回答一个问题：用户在 `Pipeline.forward()` 里写下的一串普通 Python 调用，为什么
-不会执行真实业务值，而是稳定地产生 Call、Port、Domain 与 Origin？
+## At a glance
+
+### Trace boundary
+
+`Pipeline.compile()` creates a private trace builder, supplies symbolic source
+ports to `forward()`, and restores the active trace even when tracing raises.
+Inside `forward()`, a `RayModule` call registers a `CallSpec` and returns one or
+more immutable `Port` handles. It never evaluates the UDF.
+
+```python
+class Pipe(mg.Pipeline):
+    def forward(self, documents):
+        pages = mg.F.expand(documents)
+        text = ocr(pages, language=lang)
+        return mg.F.reduce(text, documents)
+```
+
+`Port` is a small public wrapper around a `PortRef` plus a trace-owner token.
+The token prevents a port from one pipeline trace being silently reused in
+another. Positional and keyword inputs are recorded separately and lowered to
+stable worker slots.
+
+### Module configuration
+
+`pre_init()` stores actor constructor arguments; `ray_options()` stores physical
+execution options. Both are copied into the traced call and therefore cannot
+mutate an existing `CompiledProgram`. Changing a module and compiling again
+creates a new snapshot.
+
+`function()` is a convenience adapter for stateless callables. `returns(n)` or
+`num_outputs=n` declares logical output arity. Structural `F.*` helpers create
+relations only; they do not create actors or RPCs.
+
+### Boundary tests
+
+Authoring tests should cover cross-trace ports, positional/keyword layout,
+output arity, immutable compile snapshots, and rejection of module calls made
+outside `Pipeline.forward()`.
 
 ---
 
-## 1. 先看职责边界
+## 01. Reading `api.py` section by section: how a symbolic call becomes a LogicalProgram
 
-`api.py` 拥有的是一次 authoring trace 的可变工作区，最终产出冻结的 `LogicalProgram`。
+Main source: [`api.py`](../../rayorch/experimental/multigrain_v3_6/api.py); companion thin wrapper:
+[`functional.py`](../../rayorch/experimental/multigrain_v3_6/functional.py).
 
-它负责：
+This article answers exactly one question: why does a chain of ordinary Python calls that the user writes inside `Pipeline.forward()` not execute real business values, but stably produce Call, Port, Domain, and Origin?
 
-- 为 source、Call、Port、Domain 分配编译期身份；
-- 校验用户传入的是当前 trace 的 `Port`；
-- 把 positional/keyword/optional 输入记录成 `CallSpec`；
-- 把 `F.*` 记录成显式 Origin 与 Domain 关系；
-- 最终冻结声明图并调用固定 compiler pipeline。
+---
 
-它不负责：
+### 1. Responsibility boundary first
 
-- 计算 control closure、consumer reverse index 等派生事实；
-- 创建 actor 或执行 UDF；
-- 创建 Entity、Item 或 Grain；
-- 决定 Filter/Reduce 的动态 outcome。
+What `api.py` owns is the mutable workspace of one authoring trace; its final output is a frozen `LogicalProgram`.
+
+It is responsible for:
+
+- assigning compile-time identities to source, Call, Port, and Domain;
+- validating that what the user passes in is a `Port` of the current trace;
+- recording positional/keyword/optional inputs as a `CallSpec`;
+- recording `F.*` as explicit Origin and Domain relations;
+- finally freezing the declaration graph and calling the fixed compiler pipeline.
+
+It is not responsible for:
+
+- computing derived facts such as control closure and the consumer reverse index;
+- creating actors or executing UDFs;
+- creating Entity, Item, or Grain;
+- deciding the dynamic outcome of Filter/Reduce.
 
 ```mermaid
 flowchart LR
-    Forward["Pipeline.forward<br/>公开 Port"]
-    Builder["_ProgramBuilder<br/>一次 trace 工作区"]
-    Logical["LogicalProgram<br/>冻结声明事实"]
+    Forward["Pipeline.forward<br/>public Ports"]
+    Builder["_ProgramBuilder<br/>one trace workspace"]
+    Logical["LogicalProgram<br/>frozen declaration facts"]
     Compiler["compile_logical"]
 
     Forward --> Builder --> Logical --> Compiler
@@ -39,26 +87,26 @@ flowchart LR
 
 ---
 
-## 2. 源码地图
+### 2. Source map
 
-| 源码段 | 作用 | 读完应回答的问题 |
+| Source section | Role | Question you should be able to answer after reading |
 | --- | --- | --- |
-| [`Port / OptionalInput`](../../rayorch/experimental/multigrain_v3_6/api.py#L33-L50) | 公开符号句柄 | 为什么 Port 不携带业务值？ |
-| [`RayModule`](../../rayorch/experimental/multigrain_v3_6/api.py#L53-L93) | 声明 UDF 配方与物理选项 | 为什么调用模块时不会构造 actor？ |
-| [`function`](../../rayorch/experimental/multigrain_v3_6/api.py#L96-L117) | 把普通 callable 包成 RayModule | decorator 两种写法如何归一？ |
-| [`Pipeline.compile`](../../rayorch/experimental/multigrain_v3_6/api.py#L120-L153) | 建立并约束一次符号追踪 | trace 为什么一定被清理？ |
-| [`_ProgramBuilder.__init__`](../../rayorch/experimental/multigrain_v3_6/api.py#L156-L179) | 创建 root Domain 与 source Ports | source 身份从哪里来？ |
-| [`call`](../../rayorch/experimental/multigrain_v3_6/api.py#L196-L253) | 记录一个计算调用点 | 多输入、多输出如何影响身份？ |
-| [`expand`](../../rayorch/experimental/multigrain_v3_6/api.py#L255-L307) | 创建 child Domain | aligned outputs 为什么共享 Domain？ |
-| [`reduce/broadcast/filter`](../../rayorch/experimental/multigrain_v3_6/api.py#L309-L384) | 记录其他结构关系 | 哪些操作改变 Domain？ |
-| [`normalize_outputs/build`](../../rayorch/experimental/multigrain_v3_6/api.py#L386-L412) | 冻结输出树与 LogicalProgram | 可变 builder 怎样与编译器隔离？ |
-| [内部小工具](../../rayorch/experimental/multigrain_v3_6/api.py#L414-L449) | 分配 Ref、校验 owner、处理 optional | 哪些入口维持 authoring 不变量？ |
+| [`Port / OptionalInput`](../../rayorch/experimental/multigrain_v3_6/api.py#L33-L50) | public symbolic handle | Why does a Port carry no business value? |
+| [`RayModule`](../../rayorch/experimental/multigrain_v3_6/api.py#L53-L93) | declares the UDF recipe and physical options | Why does calling a module not construct an actor? |
+| [`function`](../../rayorch/experimental/multigrain_v3_6/api.py#L96-L117) | wraps a plain callable into a RayModule | How are the two decorator spellings normalized? |
+| [`Pipeline.compile`](../../rayorch/experimental/multigrain_v3_6/api.py#L120-L153) | establishes and constrains one symbolic trace | Why is the trace always cleaned up? |
+| [`_ProgramBuilder.__init__`](../../rayorch/experimental/multigrain_v3_6/api.py#L156-L179) | creates the root Domain and the source Ports | Where does source identity come from? |
+| [`call`](../../rayorch/experimental/multigrain_v3_6/api.py#L196-L253) | records one compute call site | How do multiple inputs and multiple outputs affect identity? |
+| [`expand`](../../rayorch/experimental/multigrain_v3_6/api.py#L255-L307) | creates a child Domain | Why do aligned outputs share a Domain? |
+| [`reduce/broadcast/filter`](../../rayorch/experimental/multigrain_v3_6/api.py#L309-L384) | records the other structural relations | Which operations change the Domain? |
+| [`normalize_outputs/build`](../../rayorch/experimental/multigrain_v3_6/api.py#L386-L412) | freezes the output tree and the LogicalProgram | How is the mutable builder isolated from the compiler? |
+| [internal helpers](../../rayorch/experimental/multigrain_v3_6/api.py#L414-L449) | allocate Refs, validate owner, handle optional | Which entry points maintain authoring invariants? |
 
 ---
 
-## 3. `Port` 为什么只有两个字段
+### 3. Why `Port` has only two fields
 
-源码核心是：
+The core of the source is:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -67,19 +115,18 @@ class Port:
     _owner: int
 ```
 
-- `ref` 是该 Port 在当前 Program 内的稳定整数身份。
-- `_owner` 是本次 trace 的身份，用来拒绝把另一个 Pipeline 编译产生的 Port 混进来。
+- `ref` is the stable integer identity of this Port inside the current Program.
+- `_owner` is the identity of this trace; it is used to reject mixing in a Port produced by another Pipeline compilation.
 
-`Port` 没有 `value`、`outcome`、`entity` 或 Ray `ObjectRef`。这是有意的：`forward()` 的工作是
-声明“数据位置之间的关系”，不是运行数据。
+`Port` has no `value`, `outcome`, `entity`, or Ray `ObjectRef`. This is intentional: the job of `forward()` is to declare "relations between data locations", not to run data.
 
-例如：
+For example:
 
 ```python
 texts = self.ocr(pages)
 ```
 
-这里 `pages` 和 `texts` 都是静态 Port。真正运行时才会出现：
+Here both `pages` and `texts` are static Ports. Only at real runtime do these appear:
 
 ```text
 ItemRef(pages, page_entity_7)
@@ -87,24 +134,22 @@ ItemRef(texts, page_entity_7)
 GrainRef(ocr_call, page_entity_7)
 ```
 
-`OptionalInput` 也只是包装同一个 Port，它只把某个 Call 输入的 `InputMode` 从 REQUIRED 改为
-OPTIONAL，不创建新 Port，也不改变 Domain。
+`OptionalInput` also only wraps the same Port: it merely changes the `InputMode` of some Call input from REQUIRED to OPTIONAL. It creates no new Port and does not change the Domain.
 
 ---
 
-## 4. `ContextVar`：为什么 RayModule 能找到当前 Builder
+### 4. `ContextVar`: why a RayModule can find the current Builder
 
-模块级 `_ACTIVE_TRACE` 保存当前上下文中的 `_ProgramBuilder`。`RayModule.__call__()` 本身没有
-持有 Pipeline，因此它通过：
+The module-level `_ACTIVE_TRACE` holds the `_ProgramBuilder` of the current context. `RayModule.__call__()` itself does not hold a Pipeline, so it goes through:
 
 ```python
 builder = _ACTIVE_TRACE.get()
 return builder.call(self, args, kwargs)
 ```
 
-把符号调用交给当前 trace。
+to hand the symbolic call to the current trace.
 
-`Pipeline.compile()` 使用 token 和 `finally`：
+`Pipeline.compile()` uses a token and `finally`:
 
 ```python
 token = _ACTIVE_TRACE.set(builder)
@@ -114,133 +159,140 @@ finally:
     _ACTIVE_TRACE.reset(token)
 ```
 
-这段的意义不是线程调度，而是**动态作用域**：
+The point of this is not thread scheduling, but **dynamic scope**:
 
-- 进入 `forward()` 前，RayModule/F.* 可以定位唯一 builder；
-- 无论 forward 正常返回还是抛错，离开后都会恢复旧上下文；
-- 在 `forward()` 外误调用 RayModule 或 F.* 会立即得到 `CompileError`。
+- before entering `forward()`, RayModule/`F.*` can locate the unique builder;
+- whether `forward()` returns normally or raises, the old context is restored after leaving;
+- calling RayModule or `F.*` outside `forward()` by mistake immediately yields a `CompileError`.
 
-因此 builder 不需要被塞进每个 `Port` 或 `RayModule`，也不会成为长期全局可变单例。
+Therefore the builder does not need to be stuffed into every `Port` or `RayModule`, nor does it become a long-lived global mutable singleton.
 
 ---
 
-## 5. `RayModule` 保存配方，不保存 actor
+### 5. `RayModule` stores the recipe, not the actor
 
-`RayModule` 的四类字段分别是：
+The four kinds of fields on `RayModule` are:
 
-| 字段 | 含义 | 最终去向 |
+| Field | Meaning | Final destination |
 | --- | --- | --- |
-| `udf` | callable 或 UDF class | `UdfSpec.target` |
-| `num_outputs` | 逻辑输出 Port 数 | builder 创建多个 `CallOutputOrigin` |
-| `init_args/init_kwargs` | Worker 构造参数 | `UdfSpec`，执行层再实例化 |
-| `options` | pool/Ray 物理配置 | compiler lower 成 `ActorPoolSpec` |
+| `udf` | a callable or a UDF class | `UdfSpec.target` |
+| `num_outputs` | number of logical output Ports | the builder creates multiple `CallOutputOrigin` |
+| `init_args/init_kwargs` | Worker constructor arguments | `UdfSpec`; the execution layer instantiates later |
+| `options` | pool/Ray physical configuration | lowered by the compiler into `ActorPoolSpec` |
 
-所以：
+So:
 
 ```python
 self.ocr = RayModule(OCR).pre_init(model_path).ray_options(
     replicas=4,
     batch_size=16,
+    batching_policy="any_parent",
 )
 ```
 
-只是建立一个可复用配方。直到 `Executor` 创建 actor pool 时，`OCR(model_path)` 才真正执行。
+merely builds a reusable recipe. `OCR(model_path)` is really executed only when the `Executor` creates the actor pool.
 
-`returns(2)` 只声明一次 Call 有两个逻辑输出：
+`batching_policy` is a physical packing policy, not a semantic scope:
+
+| value | one `DispatchBatch` may contain | trade-off |
+| --- | --- | --- |
+| `"any_parent"` | READY Grains from any direct parent of the same Call | default; maximizes packing opportunities |
+| `"single_parent"` | READY Grains sharing one `parent_anchor` | stronger locality, potentially smaller batches |
+
+Neither value changes lineage, Reduce behavior, or the same-parent suppression
+scope of `GroupFailure`. Internally the Executor lowers the selected policy to
+the narrower boolean `pack_by_parent`; that implementation switch is not part of
+the authoring API.
+
+`returns(2)` only declares that one Call has two logical outputs:
 
 ```python
 texts, confidences = self.ocr.returns(2)(pages)
 ```
 
-它不会创建两个 Call；二者拥有不同 `PortRef`，但共同指向同一个 `CallRef`，运行时同一个
-`GrainRef(call, entity)` 原子地产生两份 Item。
+It does not create two Calls: the two have different `PortRef`s but both point to the same `CallRef`, and at runtime the same `GrainRef(call, entity)` atomically produces two Items.
 
 ---
 
-## 6. `Pipeline.compile()`：一次 trace 的入口和出口
+### 6. `Pipeline.compile()`: the entry and exit of one trace
 
-编译入口先检查 `forward()`：
+The compile entry first checks `forward()`:
 
-- 至少有一个 source 参数；
-- 只允许 positional-only 或 positional-or-keyword 参数；
-- 每个参数名成为一个 `SourceOrigin(index, name)`。
+- it has at least one source parameter;
+- only positional-only or positional-or-keyword parameters are allowed;
+- each parameter name becomes a `SourceOrigin(index, name)`.
 
-然后按以下顺序执行：
+Then it executes in the following order:
 
 ```mermaid
 flowchart TD
-    Signature["读取 forward signature"]
-    Builder["创建 _ProgramBuilder"]
-    Sources["把 source PortRef 包成公开 Port"]
-    Trace["执行一次 forward(symbolic Ports)"]
-    Normalize["把返回树改成 PortRef tuple tree"]
-    Build["冻结 LogicalProgram"]
+    Signature["read the forward signature"]
+    Builder["create _ProgramBuilder"]
+    Sources["wrap source PortRefs into public Ports"]
+    Trace["execute forward(symbolic Ports) once"]
+    Normalize["turn the return tree into a PortRef tuple tree"]
+    Build["freeze the LogicalProgram"]
     Compile["compile_logical"]
 
     Signature --> Builder --> Sources --> Trace --> Normalize --> Build --> Compile
 ```
 
-注意“执行 `forward()`”不等于执行数据。它只是让普通 Python 控制流依次调用 builder；因此
-`forward()` 不应根据真实 payload 写动态分支。
+Note that "executing `forward()`" is not executing data. It only lets ordinary Python control flow call the builder in sequence; therefore `forward()` should not write dynamic branches based on real payloads.
 
 ---
 
-## 7. Builder 初始化：先建立坐标系
+### 7. Builder initialization: establish the coordinate system first
 
-`_ProgramBuilder.__init__()` 创建三组计数器：
+`_ProgramBuilder.__init__()` creates three counters:
 
-- `next_port`：下一个 `PortRef`；
-- `next_call`：下一个 `CallRef`；
-- `next_domain`：下一个 `DomainRef`，从 1 开始，因为 0 是 root。
+- `next_port`: the next `PortRef`;
+- `next_call`: the next `CallRef`;
+- `next_domain`: the next `DomainRef`, starting from 1, because 0 is the root.
 
-每个 source 都被放入 `DomainRef(0)`：
+Every source is placed into `DomainRef(0)`:
 
 ```text
 pdfs       -> PortRef(0), DomainRef(0), SourceOrigin(0, "pdfs")
 metadata   -> PortRef(1), DomainRef(0), SourceOrigin(1, "metadata")
 ```
 
-这里同时存在三个“编号”并不冗余：source index 表示用户参数顺序，PortRef 表示图上位置，
-DomainRef 表示 Entity 对齐空间。它们可能当前数值碰巧相同，但语义不能互换。
+Having three "numbers" at the same time is not redundant: the source index is the user parameter order, `PortRef` is the position on the graph, and `DomainRef` is the Entity alignment space. They may coincidentally be equal today, but their semantics are not interchangeable.
 
-`_view_intern` 用结构签名复用完全相同的 F.* view。例如对同一 source/mask 重复调用
-`F.filter`，会返回同一个逻辑 Port，而不是制造两个等价节点。
+`_view_intern` reuses exactly identical `F.*` views by structural signature. For example, calling `F.filter` repeatedly on the same source/mask returns the same logical Port instead of manufacturing two equivalent nodes.
 
 ---
 
-## 8. `call()`：从 Python 调用形状到一个 CallSpec
+### 8. `call()`: from a Python call shape to a CallSpec
 
-以：
+Take:
 
 ```python
 texts = self.ocr(pages, language=languages)
 ```
 
-为例，`call()` 分五步。
+as the example; `call()` has five steps.
 
-### 8.1 校验并拆分输入
+#### 8.1 Validate and split inputs
 
-positional 输入和 keyword 输入分开保存。每个值经 `_input()` 变成：
+Positional inputs and keyword inputs are stored separately. Each value becomes, through `_input()`:
 
 ```text
 CallInputSpec(port=..., mode=REQUIRED | OPTIONAL)
 ```
 
-keyword 名保存在外层 `(name, CallInputSpec)`，不会在 value 对象中重复一份。
+The keyword name is kept in the outer `(name, CallInputSpec)` pair and is not duplicated inside the value object.
 
-### 8.2 检查 Domain 对齐
+#### 8.2 Check Domain alignment
 
-所有输入必须属于同一 Domain。否则 builder 不猜 join 规则，而是要求用户显式写
-`broadcast`、`reduce` 或建立 aligned relation。
+All inputs must belong to the same Domain. Otherwise the builder does not guess join rules; instead it requires the user to explicitly write `broadcast`, `reduce`, or establish an aligned relation.
 
-### 8.3 分配 CallRef
+#### 8.3 Allocate a CallRef
 
-一个源代码调用点得到一个 `CallRef`。同一个 RayModule 在 `forward()` 中调用两次，会得到
-两个 Call，也会在 RuntimePlan 中得到两个独立 actor pool 合同。
+One source call site gets one `CallRef`. Calling the same RayModule twice inside `forward()` yields two Calls, and therefore two independent actor pool contracts in the RuntimePlan.
 
-### 8.4 冻结 UDF 配方和输入 ABI 来源
+#### 8.4 Freeze the UDF recipe and the input ABI source
 
-builder 创建 `UdfSpec` 与 `CallSpec`：
+The builder creates `UdfSpec` and `CallSpec`:
 
 ```text
 CallSpec
@@ -251,58 +303,52 @@ CallSpec
 └── kwargs
 ```
 
-### 8.5 为每个输出创建 Port
+#### 8.5 Create a Port for each output
 
-每个输出得到：
+Each output gets:
 
 ```text
 PortSpec(output_ref, execution_domain, CallOutputOrigin(call, output_index))
 ```
 
-因此多输入不会增加 Grain 数，多输出也不会增加 Grain 数。对每个 Entity，仍只有
-`GrainRef(CallRef, EntityRef)` 一次逻辑计算。
+Therefore multiple inputs do not increase the Grain count, and multiple outputs do not increase the Grain count either. For each Entity there is still only one logical computation, `GrainRef(CallRef, EntityRef)`.
 
 ---
 
-## 9. 四种 F.* 怎样影响 Domain
+### 9. How the four `F.*` helpers affect the Domain
 
-`functional.py` 只是一层很薄的公开函数；真正建图逻辑仍集中在 `_ProgramBuilder`。
+`functional.py` is only a very thin layer of public functions; the real graph-building logic remains concentrated in `_ProgramBuilder`.
 
-| 操作 | 输入约束 | 输出 Domain | 是否创建 Call |
-| --- | --- | --- | ---: |
-| `expand` | group Port 必须来自 Call output | 新 child Domain | 否 |
-| `reduce` | value/members 位于同一 child Domain | 直接 parent Domain | 否 |
-| `broadcast` | source Domain 是 target 的祖先 | target Domain | 否 |
-| `filter` | source/mask 位于同一 Domain | 原 Domain | 否 |
+| Operation | Input constraint | Output Domain | Creates a Call? |
+| --- | --- | --- | --- |
+| `expand` | the group Port must come from a Call output | a new child Domain | No |
+| `reduce` | value/members live in the same child Domain | the direct parent Domain | No |
+| `broadcast` | the source Domain is an ancestor of the target | the target Domain | No |
+| `filter` | source/mask live in the same Domain | the original Domain | No |
 
-### Expand
+#### Expand
 
-`expand_aligned(a, b)` 只允许同一 producer Call 的不同输出，并为二者创建同一个 child
-Domain。这样运行时不是靠“碰巧长度相等”对齐，而是由共享 Expansion 身份表达关系。
+`expand_aligned(a, b)` only allows different outputs of the same producer Call, and creates the same child Domain for both. In this way, at runtime the alignment does not rely on "lengths happening to be equal", but is expressed by the shared Expansion identity.
 
-一个 group Port 只能声明一次 Expand relation；要再次使用应复用已有 expanded Port。
+A group Port may declare an Expand relation only once; to use it again you should reuse the existing expanded Port.
 
-### Reduce
+#### Reduce
 
-Reduce 只回收一级 Domain。`members` 明确决定哪些 child 是成员；省略时默认使用第一个 value
-Port。它不执行 sum，也不创建 UDF。
+Reduce reclaims only one Domain level. `members` explicitly decides which children are members; when omitted it defaults to the first value Port. It does not perform a sum and does not create a UDF.
 
-### Broadcast
+#### Broadcast
 
-source 和 target 已在同一 Domain 时直接返回 source Port；source 是祖先时才创建
-`BroadcastOrigin`。payload 不在建图期复制。
+When source and target are already in the same Domain, the source Port is returned directly; a `BroadcastOrigin` is created only when the source is an ancestor. The payload is not copied at graph-building time.
 
-### Filter
+#### Filter
 
-Filter 只记录 source/mask 关系，Domain 保持不变。它不会删除 Entity；运行时只改变目标
-Item 的 outcome。
+Filter only records the source/mask relation; the Domain stays unchanged. It does not delete Entities; at runtime it only changes the outcome of the target Item.
 
 ---
 
-## 10. `build()`：可变工作区到不可变事实
+### 10. `build()`: from mutable workspace to immutable facts
 
-`normalize_outputs()` 只接受 Port 或非空 tuple 树，以保留多输出的公开结构。`build()` 随后用
-`freeze_mapping()` 复制并冻结 builder 的 calls/ports/domains：
+`normalize_outputs()` accepts only Ports or a non-empty tuple tree, so as to preserve the public structure of multiple outputs. `build()` then uses `freeze_mapping()` to copy and freeze the builder's calls/ports/domains:
 
 ```python
 logical = LogicalProgram(
@@ -314,14 +360,13 @@ logical = LogicalProgram(
 )
 ```
 
-复制很重要：编译器读取的是冻结快照，而不是 builder 仍能修改的 dict。`call_options` 另行传给
-compiler，是因为 actor pool 是物理配置，不属于 LogicalProgram 的逻辑图事实。
+Copying matters: the compiler reads a frozen snapshot, not a dict that the builder can still modify. `call_options` is passed to the compiler separately because an actor pool is physical configuration, not a logical-graph fact of the LogicalProgram.
 
 ---
 
-## 11. 跟踪 PDF 例子
+### 11. Tracing the PDF example
 
-对共同例子，builder 大致产生：
+For the shared example, the builder roughly produces:
 
 ```text
 d0 root
@@ -335,21 +380,20 @@ d0 root
 └── p6 reduce(value=p5, members=p4) text_groups
 ```
 
-这仍然只是静态声明。`page_7` 这样的 Entity、`ItemRef(p5, page_7)` 和 OCR Grain 都要等
-runtime admission/Expand 后才出现。
+This is still only a static declaration. Entities such as `page_7`, `ItemRef(p5, page_7)`, and the OCR Grain all appear only after runtime admission/Expand.
 
 ---
 
-## 12. 修改 `api.py` 前的检查清单
+### 12. Checklist before modifying `api.py`
 
-- 新公开语法是否只增加声明事实，而不是偷偷执行业务数据？
-- 新 Port 是否有唯一 `PortOrigin`，且 Domain 变化明确？
-- 是否需要新 Port，还是只改变 Call input mode？
-- 同一结构表达式是否应被 intern？
-- 多输入是否保持同 Domain 合同？
-- builder 是否只记录 source of truth，把 derived fact 留给 analysis？
-- 物理配置是否仍走 `call_options → lowering → ActorPoolSpec`？
+- Does the new public syntax only add declaration facts, instead of secretly executing business data?
+- Does the new Port have a unique `PortOrigin`, with an explicit Domain change?
+- Is a new Port really needed, or is it only a change of Call input mode?
+- Should the same structural expression be interned?
+- Do multiple inputs still keep the same-Domain contract?
+- Does the builder record only the source of truth, leaving derived facts to analysis?
+- Does physical configuration still flow through `call_options → lowering → ActorPoolSpec`?
 
-如果一个 feature 需要在 `api.py` 里创建 Entity、计算 outcome 或访问 Ray，它几乎肯定放错层。
+If a feature needs to create an Entity, compute an outcome, or touch Ray inside `api.py`, it is almost certainly in the wrong layer.
 
-下一篇：[02：固定编译流水线](02_compiler_pipeline.md)。
+Next: [02: the fixed compiler pipeline](02_compiler_pipeline.md).
