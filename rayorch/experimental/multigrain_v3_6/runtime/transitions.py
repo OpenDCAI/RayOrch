@@ -18,6 +18,7 @@ class GrainEvent(Enum):
     INPUTS_READY = auto()
     INPUTS_TERMINAL = auto()
     RESERVE = auto()
+    SUPPRESS = auto()
     RETRY = auto()
     REPORT = auto()
 
@@ -26,6 +27,7 @@ _GRAIN_TRANSITIONS = {
     (None, GrainEvent.INPUTS_READY): GrainPhase.READY,
     (None, GrainEvent.INPUTS_TERMINAL): GrainPhase.SEALED,
     (GrainPhase.READY, GrainEvent.RESERVE): GrainPhase.IN_FLIGHT,
+    (GrainPhase.READY, GrainEvent.SUPPRESS): GrainPhase.SEALED,
     (GrainPhase.IN_FLIGHT, GrainEvent.RETRY): GrainPhase.READY,
     (GrainPhase.IN_FLIGHT, GrainEvent.REPORT): GrainPhase.SEALED,
 }
@@ -176,7 +178,7 @@ def reduce_transition(
     """按 Expansion→members→survivor values 的显式 gate 归约 Reduce。"""
 
     if len(members) != len(values):
-        raise InvalidTransition("Group members/values must be aligned")
+        raise InvalidTransition("Nested-group members/values must be aligned")
     if expansion is None:
         return ReduceTransition(None)
     if expansion is ExpansionOutcome.DROPPED:

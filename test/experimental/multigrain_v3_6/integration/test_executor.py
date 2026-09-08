@@ -1,8 +1,9 @@
-"""Real Ray actor lifetime, retry fencing and record-level failure boundaries."""
+"""Real Ray actor lifetime, retry fencing and item/group failure boundaries."""
 
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -251,6 +252,122 @@ def test_record_failure_suppresses_only_its_parent():
         if metrics.udf_name.endswith("FailOneLeaf")
     )
     assert transform.grains == 9
+
+
+class FailOneLeafGroup:
+    def run(self, leaves):
+        return [
+            mg.GroupFailure(f"bad parent for {leaf}")
+            if leaf == (1, 1)
+            else leaf
+            for leaf in leaves
+        ]
+
+
+class BadLeafGroupPipeline(mg.Pipeline):
+    def __init__(self, *, transform_batch_size: int = 16) -> None:
+        self.render = mg.RayModule(Render).ray_options(batch_size=8, num_cpus=0)
+        self.transform = mg.RayModule(FailOneLeafGroup).ray_options(
+            batch_size=transform_batch_size,
+            num_cpus=0,
+        )
+
+    def forward(self, parents):
+        leaves = mg.F.expand(self.render(parents))
+        return self.transform(leaves)
+
+
+def test_group_failure_suppresses_uncommitted_siblings_without_retry():
+    with Executor(BadLeafGroupPipeline()) as executor:
+        result = executor.run([0, 1, 2])
+
+    assert result.outputs == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        ItemOutcome.SUPPRESSED,
+        ItemOutcome.FAILED,
+        ItemOutcome.SUPPRESSED,
+        (2, 0),
+        (2, 1),
+        (2, 2),
+    ]
+    transform = next(
+        metrics
+        for metrics in result.calls
+        if metrics.udf_name.endswith("FailOneLeafGroup")
+    )
+    assert transform.grains == 9
+    assert transform.retries == 0
+
+
+def test_group_failure_lazily_skips_ready_sibling_without_deadlock():
+    with Executor(BadLeafGroupPipeline(transform_batch_size=1)) as executor:
+        result = executor.run([0, 1, 2])
+
+    assert result.outputs == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),  # committed before the barrier; monotonic and not rolled back
+        ItemOutcome.FAILED,
+        ItemOutcome.SUPPRESSED,
+        (2, 0),
+        (2, 1),
+        (2, 2),
+    ]
+    transform = next(
+        metrics
+        for metrics in result.calls
+        if metrics.udf_name.endswith("FailOneLeafGroup")
+    )
+    assert transform.grains == 8
+    assert transform.retries == 0
+
+
+class SlowSiblingGroup:
+    def run(self, leaves):
+        results = []
+        for leaf in leaves:
+            if leaf == (0, 0):
+                time.sleep(1.0)
+                results.append(leaf)
+            elif leaf == (0, 1):
+                results.append(mg.GroupFailure("bad parent"))
+            else:
+                results.append(leaf)
+        return results
+
+
+class LateSiblingPipeline(mg.Pipeline):
+    def __init__(self) -> None:
+        self.render = mg.RayModule(Render).ray_options(batch_size=1, num_cpus=0)
+        self.transform = mg.RayModule(SlowSiblingGroup).ray_options(
+            batch_size=1,
+            replicas=2,
+            num_cpus=0,
+        )
+
+    def forward(self, parents):
+        return self.transform(mg.F.expand(self.render(parents)))
+
+
+def test_group_failure_suppresses_success_from_another_in_flight_actor():
+    with Executor(LateSiblingPipeline()) as executor:
+        result = executor.run([0])
+
+    assert result.outputs == [
+        ItemOutcome.SUPPRESSED,
+        ItemOutcome.FAILED,
+        ItemOutcome.SUPPRESSED,
+    ]
+    transform = next(
+        metrics
+        for metrics in result.calls
+        if metrics.udf_name.endswith("SlowSiblingGroup")
+    )
+    assert transform.grains == 2
+    assert transform.retries == 0
 
 
 class MultiOutputFail:

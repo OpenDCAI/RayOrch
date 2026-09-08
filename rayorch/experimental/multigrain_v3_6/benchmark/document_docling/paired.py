@@ -36,6 +36,7 @@ _V3_ONLY_OPTIONS = frozenset(
         "max_inflight_arenas",
         "max_pending_per_actor",
         "actor_max_concurrency",
+        "batch_scope",
     }
 )
 
@@ -54,24 +55,33 @@ class DoclingManifest:
 def _arm_options(
     source_count: int,
     config: CoreMatrixConfig,
-    batch_scope: str,
+    batching_policy: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return V3 options and the explicit v3.6-supported projection."""
 
-    arm_name = f"v3_{batch_scope}"
+    # The comparison package still names its historical arms after the old
+    # v3 scheduler vocabulary. Keep that translation at this adapter boundary;
+    # v3.6 code and CLI expose only the canonical policy names.
+    arm_name = {
+        "any_parent": "v3_elastic",
+        "single_parent": "v3_parent_bound",
+    }.get(batching_policy)
+    if arm_name is None:
+        raise ValueError(f"unknown Docling batching policy: {batching_policy}")
     matches = [
         arm
         for arm in build_matrix_plan(source_count, config)
         if arm.name == arm_name
     ]
     if len(matches) != 1:
-        raise ValueError(f"unknown Docling batch scope: {batch_scope}")
+        raise ValueError(f"unknown Docling batching policy: {batching_policy}")
     v3_options = dict(matches[0].options)
     v36_options = {
         key: value
         for key, value in v3_options.items()
         if key not in _V3_ONLY_OPTIONS
     }
+    v36_options["batching_policy"] = batching_policy
     return v3_options, v36_options
 
 
@@ -471,7 +481,7 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
     v3_options, v36_options = _arm_options(
         len(manifest.paths),
         config,
-        args.batch_scope,
+        args.batching_policy,
     )
 
     started_ray_here = not ray.is_initialized()
@@ -523,7 +533,7 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
             "expected_pages": manifest.expected_pages,
             "expected_tables": args.expected_tables,
         },
-        "batch_scope": args.batch_scope,
+        "batching_policy": args.batching_policy,
         "v3_options": v3_options,
         "v36_options": v36_options,
         "scheduler_contract": {
@@ -580,9 +590,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-jaccard", type=float, default=0.99)
     parser.add_argument("--expected-tables", type=int)
     parser.add_argument(
-        "--batch-scope",
-        choices=("elastic", "parent_bound"),
-        default="elastic",
+        "--batching-policy",
+        choices=("any_parent", "single_parent"),
+        default="any_parent",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--ocr-device", default="cpu")

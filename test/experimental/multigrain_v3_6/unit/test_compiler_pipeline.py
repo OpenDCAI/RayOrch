@@ -62,6 +62,7 @@ def test_root_public_api_is_deliberately_small():
         "Executor",
         "ExecutionError",
         "F",
+        "GroupFailure",
         "ItemOutcome",
         "MISSING",
         "Pipeline",
@@ -152,7 +153,7 @@ def test_engine_has_one_closed_fact_propagation_entry():
     source = inspect.getsource(engine.MicrobatchEngine)
 
     assert set(get_args(engine._FactEvent)) == {ItemRef, ExpansionRef, EntityRef}
-    assert source.count("self._facts.append(") == 3
+    assert source.count("self._fact_queue.append(") == 3
     assert "_receipts" not in source
     assert "groups_by_child_domain" not in source
     assert "broadcasts_by_target_domain" not in source
@@ -366,7 +367,7 @@ def test_pool_options_compile_to_one_typed_physical_contract():
             self.call = mg.RayModule(U).ray_options(
                 replicas=3,
                 batch_size=7,
-                batch_scope="parent_bound",
+                batching_policy="single_parent",
                 recovery=recovery,
                 num_cpus=0.25,
             )
@@ -383,7 +384,7 @@ def test_pool_options_compile_to_one_typed_physical_contract():
     assert set(optimized.plan.actor_pools_by_call) == {call}
     assert pool.replicas == 3
     assert pool.batch_size == 7
-    assert pool.batch_scope == "parent_bound"
+    assert pool.batching_policy == "single_parent"
     assert pool.recovery is recovery
     assert pool.ray_options == (("num_cpus", 0.25),)
 
@@ -395,7 +396,8 @@ def test_pool_options_compile_to_one_typed_physical_contract():
         ({"recovery": "retry"}, "RecoveryPolicy"),
         ({"replicas": True}, "replicas"),
         ({"batch_size": 1.5}, "batch_size"),
-        ({"batch_scope": "global"}, "batch_scope"),
+        ({"batching_policy": "global"}, "batching_policy"),
+        ({"batch_scope": "elastic"}, "replaced by batching_policy"),
     ],
 )
 def test_compiler_rejects_untyped_or_ambiguous_physical_options(

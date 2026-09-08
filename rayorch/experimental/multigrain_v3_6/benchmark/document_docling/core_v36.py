@@ -60,7 +60,7 @@ class DoclingTableJobV36Pipeline(Pipeline):
         parse_replicas: int = 1,
         parse_batch_size: int = 1,
         image_scales: tuple[float, ...] = (1.0, 2.0, 3.0),
-        batch_scope: str = "elastic",
+        batching_policy: str = "any_parent",
         device: str = "cpu",
         layout_device: str | None = None,
         ocr_device: str | None = None,
@@ -78,8 +78,8 @@ class DoclingTableJobV36Pipeline(Pipeline):
     ) -> None:
         """Freeze only execution options that v3.6 actually implements."""
 
-        if batch_scope not in {"elastic", "parent_bound"}:
-            raise ValueError("batch_scope must be elastic or parent_bound")
+        if batching_policy not in {"any_parent", "single_parent"}:
+            raise ValueError("batching_policy must be any_parent or single_parent")
         if ocr_batch_mode not in {
             "reference",
             "recognition_shadow",
@@ -151,7 +151,7 @@ class DoclingTableJobV36Pipeline(Pipeline):
             .ray_options(
                 replicas=layout_replicas,
                 batch_size=layout_batch_size,
-                batch_scope=batch_scope,
+                batching_policy=batching_policy,
                 num_cpus=actor_num_cpus,
                 num_gpus=layout_num_gpus,
                 recovery=recovery,
@@ -168,7 +168,7 @@ class DoclingTableJobV36Pipeline(Pipeline):
             .ray_options(
                 replicas=ocr_replicas,
                 batch_size=ocr_batch_size,
-                batch_scope=batch_scope,
+                batching_policy=batching_policy,
                 num_cpus=actor_num_cpus,
                 recovery=recovery,
             )
@@ -176,14 +176,14 @@ class DoclingTableJobV36Pipeline(Pipeline):
         self.postprocess = RayModule(DoclingPostprocessPages).ray_options(
             replicas=postprocess_replicas,
             batch_size=table_batch_size,
-            batch_scope=batch_scope,
+            batching_policy=batching_policy,
             num_cpus=actor_num_cpus,
             recovery=recovery,
         )
         self.table_prepare = RayModule(self.table_job_stage).ray_options(
             replicas=table_prepare_replicas,
             batch_size=table_batch_size,
-            batch_scope=batch_scope,
+            batching_policy=batching_policy,
             num_cpus=actor_num_cpus,
             recovery=recovery,
         )
@@ -198,7 +198,7 @@ class DoclingTableJobV36Pipeline(Pipeline):
             .ray_options(
                 replicas=table_replicas,
                 batch_size=table_core_batch_size,
-                batch_scope=batch_scope,
+                batching_policy=batching_policy,
                 num_cpus=actor_num_cpus,
                 num_gpus=table_num_gpus,
                 recovery=recovery,

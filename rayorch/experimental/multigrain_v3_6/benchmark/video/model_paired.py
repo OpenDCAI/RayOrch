@@ -285,7 +285,7 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
             "model_path": args.model_path,
             "stride": args.stride,
             "max_frames": args.max_frames,
-            "batch_scope": args.batch_scope,
+            "batching_policy": args.batching_policy,
             "caption_batch_size": args.batch_size,
             "caption_replicas": args.model_replicas,
             "decode_replicas": args.decode_replicas,
@@ -296,7 +296,7 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
         options = {
             "whisper_model_path": args.whisper_model_path,
             "vit_model_path": args.vit_model_path,
-            "batch_scope": args.batch_scope,
+            "batching_policy": args.batching_policy,
         }
 
     started_ray_here = not ray.is_initialized()
@@ -381,9 +381,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-cpus", type=int, default=16)
     parser.add_argument("--num-gpus", type=float, default=4)
     parser.add_argument(
-        "--batch-scope",
-        choices=("elastic", "parent_bound"),
-        default="elastic",
+        "--batching-policy",
+        choices=("any_parent", "single_parent"),
+        default="any_parent",
     )
     parser.add_argument("--model-path")
     parser.add_argument("--stride", type=int, default=12)

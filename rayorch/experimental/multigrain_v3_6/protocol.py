@@ -37,8 +37,8 @@ class ExpandedRows:
 
 
 @dataclass(frozen=True, slots=True)
-class OutputReport:
-    """一个 Call 输出 Port 的物理实现报告。"""
+class PortOutputReport:
+    """One output Port's physical binding report inside a Grain report."""
 
     port: PortRef
     scalar: RowBinding | None = None
@@ -52,12 +52,12 @@ class GrainReport:
 
     grain: GrainRef
     generation: int
-    outputs: tuple[OutputReport, ...]
+    outputs: tuple[PortOutputReport, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class GroupInput:
-    """读取若干行，并按 CSR offsets 重建有序嵌套 group。"""
+class NestedGroupInput:
+    """Read rows and reconstruct one ordered nested value group."""
 
     bindings: tuple[RowBinding, ...]
     offsets_by_level: tuple[tuple[int, ...], ...]
@@ -68,12 +68,12 @@ class MissingInput:
     """Optional+DROPPED 输入；Worker 中重建为唯一 MISSING 哨兵。"""
 
 
-GrainInput = RowBinding | GroupInput | MissingInput
+GrainInput = RowBinding | NestedGroupInput | MissingInput
 
 
 @dataclass(frozen=True, slots=True)
-class GrainPlan:
-    """一个 Grain 的 generation 与纯物理输入选择计划。"""
+class GrainInvocation:
+    """One Grain generation and its resolved physical UDF inputs."""
 
     grain: GrainRef
     generation: int
@@ -88,12 +88,20 @@ class RecordFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class GroupFailure:
+    """UDF 标记当前 Grain 失败，并隔离同 Call、同直接父级兄弟。"""
+
+    cause: Any
+
+
+@dataclass(frozen=True, slots=True)
 class GrainFailureReport:
     """Worker 对单个 Grain 的 generation-fenced 失败报告。"""
 
     grain: GrainRef
     generation: int
     cause: Any
+    suppress_siblings: bool = False
 
 
 WorkerReport = GrainReport | GrainFailureReport
@@ -116,7 +124,7 @@ class DispatchFailure:
     traceback: str
 
 
-WorkerResult = tuple[WorkerReport, ...] | DispatchFailure
+WorkerDispatchResult = tuple[WorkerReport, ...] | DispatchFailure
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,11 +158,11 @@ class CallOutputLayout:
     control_ports: frozenset[PortRef] = frozenset()
 
 
-def restore_group(
+def restore_nested_group(
     leaves: list[Any],
     offsets_by_level: tuple[tuple[int, ...], ...],
 ) -> list[Any]:
-    """由最内层叶子向上应用 CSR offsets，恢复唯一根 group。"""
+    """由最内层叶子向上应用 CSR offsets，恢复唯一根 nested group。"""
 
     nodes: list[Any] = leaves
     for offsets in reversed(offsets_by_level):
@@ -163,7 +171,7 @@ def restore_group(
             for index in range(len(offsets) - 1)
         ]
     if len(nodes) != 1:
-        raise ValueError("GroupLayout does not have one root")
+        raise ValueError("NestedGroupLayout does not have one root")
     return nodes[0]
 
 
@@ -174,16 +182,17 @@ __all__ = [
     "DispatchFailure",
     "DispatchFailureKind",
     "ExpandedRows",
-    "GroupInput",
+    "GroupFailure",
+    "NestedGroupInput",
     "CallInputLayout",
     "GrainInput",
-    "GrainPlan",
+    "GrainInvocation",
     "MissingInput",
     "CallOutputLayout",
-    "OutputReport",
+    "PortOutputReport",
     "RecordFailure",
     "RowBinding",
     "WorkerReport",
-    "WorkerResult",
-    "restore_group",
+    "WorkerDispatchResult",
+    "restore_nested_group",
 ]

@@ -15,18 +15,19 @@ from ..protocol import (
     DispatchFailure,
     DispatchFailureKind,
     ExpandedRows,
-    GroupInput,
+    GroupFailure,
+    NestedGroupInput,
     CallInputLayout,
     GrainInput,
-    GrainPlan,
+    GrainInvocation,
     MissingInput,
     CallOutputLayout,
-    OutputReport,
+    PortOutputReport,
     RecordFailure,
     RowBinding,
     WorkerReport,
-    WorkerResult,
-    restore_group,
+    WorkerDispatchResult,
+    restore_nested_group,
 )
 
 
@@ -77,14 +78,14 @@ class Worker:
 
     def execute(
         self,
-        grain_plans: tuple[GrainPlan, ...],
+        invocations: tuple[GrainInvocation, ...],
         layouts: tuple[CallOutputLayout, ...],
         store: BlockStore,
-    ) -> WorkerResult:
+    ) -> WorkerDispatchResult:
         """执行一批 Grain，并让业务失败严格停留在对应记录。"""
 
         try:
-            return self._execute(grain_plans, layouts, store)
+            return self._execute(invocations, layouts, store)
         except WorkerContractError as error:
             return self._dispatch_failure(
                 DispatchFailureKind.CONTRACT_ERROR,
@@ -93,16 +94,16 @@ class Worker:
 
     def _execute(
         self,
-        grain_plans: tuple[GrainPlan, ...],
+        invocations: tuple[GrainInvocation, ...],
         layouts: tuple[CallOutputLayout, ...],
         store: BlockStore,
-    ) -> WorkerResult:
+    ) -> WorkerDispatchResult:
         """Execute after the public boundary has installed contract capture."""
 
-        if not grain_plans:
+        if not invocations:
             return ()
         self.calls += 1
-        columns = self._input_columns(grain_plans, store)
+        columns = self._input_columns(invocations, store)
         layout = self.input_layout
         if layout.input_count != len(columns):
             raise WorkerContractError(
@@ -116,17 +117,23 @@ class Worker:
             raw = getattr(self.udf, "run", self.udf)(*positional, **keywords)
         except Exception as error:
             return self._dispatch_failure(DispatchFailureKind.UDF_ERROR, error)
-        normalized = self._normalize_outputs(raw, layouts, len(grain_plans))
+        normalized = self._normalize_outputs(raw, layouts, len(invocations))
 
-        # 任一输出列把某个位置标为 RecordFailure 时，该 Grain 的所有输出都
-        # 不可见；这保持 multi-output Call 的逐 Grain 原子性。
-        failures: list[RecordFailure | None] = [None] * len(grain_plans)
+        # 同一位置的所有输出属于一个原子 Grain。GroupFailure 比
+        # RecordFailure 强；cause 则取编译期 output layout 顺序中的第一个
+        # 最高优先级 sentinel，使结果不依赖 dict 或物理 block 布局。
+        failures: list[RecordFailure | GroupFailure | None] = [
+            None
+        ] * len(invocations)
         for values in normalized:
             for index, value in enumerate(values):
-                if isinstance(value, RecordFailure) and failures[index] is None:
+                if isinstance(value, GroupFailure):
+                    if not isinstance(failures[index], GroupFailure):
+                        failures[index] = value
+                elif isinstance(value, RecordFailure) and failures[index] is None:
                     failures[index] = value
 
-        reports = [dict() for _ in grain_plans]
+        reports = [dict() for _ in invocations]
         for layout, values in zip(layouts, normalized):
             live_values = tuple(
                 value for index, value in enumerate(values)
@@ -157,7 +164,7 @@ class Worker:
                         for row in range(offset, offset + len(group))
                     )
                     offset += len(group)
-                    reports[index][layout.port] = OutputReport(
+                    reports[index][layout.port] = PortOutputReport(
                         layout.port,
                         expansions=tuple(
                             ExpandedRows(
@@ -188,27 +195,28 @@ class Worker:
                     raise WorkerContractError(
                         f"output {layout.port!r} cannot contain MISSING"
                     )
-                reports[index][layout.port] = OutputReport(
+                reports[index][layout.port] = PortOutputReport(
                     layout.port,
                     scalar=RowBinding(block, index),
                     control=value if requires_control else None,
                 )
 
         results: list[WorkerReport] = []
-        for grain_plan, report, failure in zip(grain_plans, reports, failures):
+        for invocation, report, failure in zip(invocations, reports, failures):
             if failure is not None:
                 results.append(
                     GrainFailureReport(
-                        grain_plan.grain,
-                        grain_plan.generation,
+                        invocation.grain,
+                        invocation.generation,
                         failure.cause,
+                        suppress_siblings=isinstance(failure, GroupFailure),
                     )
                 )
             else:
                 results.append(
                     GrainReport(
-                        grain_plan.grain,
-                        grain_plan.generation,
+                        invocation.grain,
+                        invocation.generation,
                         tuple(report[layout.port] for layout in layouts),
                     )
                 )
@@ -257,25 +265,25 @@ class Worker:
     @classmethod
     def _input_columns(
         cls,
-        grain_plans: tuple[GrainPlan, ...],
+        invocations: tuple[GrainInvocation, ...],
         store: BlockStore,
     ) -> tuple[list[Any], ...]:
-        width = len(grain_plans[0].inputs)
-        if any(len(plan.inputs) != width for plan in grain_plans):
+        width = len(invocations[0].inputs)
+        if any(len(invocation.inputs) != width for invocation in invocations):
             raise WorkerContractError("Grain input arity changed inside batch")
         columns: list[list[Any]] = [[] for _ in range(width)]
-        for grain_plan in grain_plans:
-            for index, grain_input in enumerate(grain_plan.inputs):
+        for invocation in invocations:
+            for index, grain_input in enumerate(invocation.inputs):
                 if isinstance(grain_input, MissingInput):
                     columns[index].append(MISSING)
                 elif isinstance(grain_input, RowBinding):
                     columns[index].append(store.get(grain_input))
-                elif isinstance(grain_input, GroupInput):
+                elif isinstance(grain_input, NestedGroupInput):
                     leaves = [
                         store.get(binding) for binding in grain_input.bindings
                     ]
                     try:
-                        group = restore_group(
+                        group = restore_nested_group(
                             leaves,
                             grain_input.offsets_by_level,
                         )

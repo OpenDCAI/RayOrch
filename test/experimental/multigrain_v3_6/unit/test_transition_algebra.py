@@ -44,6 +44,7 @@ def test_runtime_records_contain_only_authoritative_state():
         "phase",
         "generation",
         "infra_failures",
+        "parent_anchor",
     )
     assert tuple(field.name for field in fields(ExpansionRecord)) == (
         "outcome",
@@ -57,6 +58,7 @@ def test_grain_phase_event_cartesian_product_is_closed():
         (None, GrainEvent.INPUTS_READY): GrainPhase.READY,
         (None, GrainEvent.INPUTS_TERMINAL): GrainPhase.SEALED,
         (GrainPhase.READY, GrainEvent.RESERVE): GrainPhase.IN_FLIGHT,
+        (GrainPhase.READY, GrainEvent.SUPPRESS): GrainPhase.SEALED,
         (GrainPhase.IN_FLIGHT, GrainEvent.RETRY): GrainPhase.READY,
         (GrainPhase.IN_FLIGHT, GrainEvent.REPORT): GrainPhase.SEALED,
     }

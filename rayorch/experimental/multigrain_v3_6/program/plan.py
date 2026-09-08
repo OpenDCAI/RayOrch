@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Mapping, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, Mapping, TypeAlias
 
 from ..model import CallRef, DomainRef, PortRef
 from ..protocol import CallInputLayout, CallOutputLayout
@@ -59,11 +59,16 @@ class ExpandEffect:
 
 @dataclass(frozen=True, slots=True)
 class ActorPoolSpec:
-    """一个 Call 唯一的强类型 actor-pool 执行合同。"""
+    """One Call's actor-pool and physical dispatch-packing contract.
+
+    ``any_parent`` packs READY Grains from any parent anchor in the Call.
+    ``single_parent`` restricts each DispatchBatch to one parent anchor.
+    This option changes only RPC packing, never lineage or failure scope.
+    """
 
     replicas: int = 1
     batch_size: int = 1
-    batch_scope: str = "elastic"
+    batching_policy: Literal["any_parent", "single_parent"] = "any_parent"
     recovery: RecoveryPolicy = DEFAULT_RECOVERY_POLICY
     ray_options: tuple[tuple[str, Any], ...] = ()
 
@@ -72,11 +77,11 @@ class ActorPoolSpec:
             raise ValueError("replicas must be a positive integer")
         if type(self.batch_size) is not int or self.batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
-        if not isinstance(self.batch_scope, str) or self.batch_scope not in {
-            "elastic",
-            "parent_bound",
+        if not isinstance(self.batching_policy, str) or self.batching_policy not in {
+            "any_parent",
+            "single_parent",
         }:
-            raise ValueError("batch_scope must be 'elastic' or 'parent_bound'")
+            raise ValueError("batching_policy must be 'any_parent' or 'single_parent'")
         if not isinstance(self.recovery, RecoveryPolicy):
             raise TypeError("recovery must be a RecoveryPolicy")
 

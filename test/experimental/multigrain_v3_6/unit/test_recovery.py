@@ -33,6 +33,22 @@ def _grains(count: int) -> tuple[GrainRef, ...]:
     )
 
 
+def _reserve_without_barriers(
+    dispatch: DispatchState,
+    call: CallRef,
+    *,
+    max_size: int,
+    pack_by_parent: bool,
+) -> DispatchBatch | None:
+    batch, suppressed = dispatch.reserve_with_barriers(
+        call,
+        max_size=max_size,
+        pack_by_parent=pack_by_parent,
+    )
+    assert not suppressed
+    return batch
+
+
 def test_normal_queues_preserve_call_fifo_and_do_not_scan_other_calls():
     dispatch = DispatchState()
     domain = DomainRef(0)
@@ -58,10 +74,11 @@ def test_normal_queues_preserve_call_fifo_and_do_not_scan_other_calls():
         return original_is_ready(grain)
 
     dispatch._is_ready = counted_is_ready
-    selected = dispatch.reserve(
+    selected = _reserve_without_barriers(
+        dispatch,
         second_call,
         max_size=4,
-        parent_bound=False,
+        pack_by_parent=False,
     )
 
     assert selected is not None
@@ -72,7 +89,71 @@ def test_normal_queues_preserve_call_fifo_and_do_not_scan_other_calls():
     assert dispatch.priority(second_call) == 1
 
 
-def test_parent_bound_queue_preserves_parent_and_relative_fifo_order():
+def test_unordered_ready_index_is_not_fifo_but_preserves_lineage_membership():
+    dispatch = DispatchState(ready_fifo=False)
+    call = CallRef(0)
+    child_domain = DomainRef(1)
+    parent_domain = DomainRef(0)
+    grains = tuple(
+        GrainRef(call, EntityRef(child_domain, ordinal))
+        for ordinal in range(6)
+    )
+    parents = (
+        EntityRef(parent_domain, 0),
+        EntityRef(parent_domain, 1),
+        EntityRef(parent_domain, 0),
+        EntityRef(parent_domain, 1),
+        EntityRef(parent_domain, 0),
+        EntityRef(parent_domain, 1),
+    )
+    for grain, parent in zip(grains, parents):
+        dispatch.inputs_ready(grain, parent)
+
+    first = _reserve_without_barriers(
+        dispatch, call, max_size=3, pack_by_parent=True
+    )
+    second = _reserve_without_barriers(
+        dispatch, call, max_size=3, pack_by_parent=True
+    )
+
+    assert first is not None and second is not None
+    assert len({dispatch.parent_anchor(grain) for grain in first.grains}) == 1
+    assert len({dispatch.parent_anchor(grain) for grain in second.grains}) == 1
+    assert set(first.grains) | set(second.grains) == set(grains)
+    assert dispatch.ready_count == 0
+
+
+def test_unordered_ready_index_applies_suppression_barrier_without_cross_call_queue():
+    dispatch = DispatchState(ready_fifo=False)
+    call = CallRef(0)
+    child_domain = DomainRef(1)
+    parent_domain = DomainRef(0)
+    barriered_parent = EntityRef(parent_domain, 0)
+    live_parent = EntityRef(parent_domain, 1)
+    grains = tuple(
+        GrainRef(call, EntityRef(child_domain, ordinal))
+        for ordinal in range(4)
+    )
+    for grain, parent in zip(
+        grains,
+        (barriered_parent, live_parent, barriered_parent, live_parent),
+    ):
+        dispatch.inputs_ready(grain, parent)
+
+    batch, suppressed = dispatch.reserve_with_barriers(
+        call,
+        max_size=4,
+        pack_by_parent=False,
+        barriered_anchors={barriered_parent},
+    )
+
+    assert batch is not None
+    assert set(batch.grains) == {grains[1], grains[3]}
+    assert set(suppressed) == {grains[0], grains[2]}
+    assert dispatch.ready_count == 0
+
+
+def test_single_parent_packing_preserves_parent_and_relative_fifo_order():
     dispatch = DispatchState()
     call = CallRef(0)
     child_domain = DomainRef(1)
@@ -90,14 +171,109 @@ def test_parent_bound_queue_preserves_parent_and_relative_fifo_order():
     for grain, parent in zip(grains, parents):
         dispatch.inputs_ready(grain, parent)
 
-    first = dispatch.reserve(call, max_size=3, parent_bound=True)
-    second = dispatch.reserve(call, max_size=3, parent_bound=True)
+    first = _reserve_without_barriers(
+        dispatch, call, max_size=3, pack_by_parent=True
+    )
+    second = _reserve_without_barriers(
+        dispatch, call, max_size=3, pack_by_parent=True
+    )
 
     assert first is not None
     assert second is not None
     assert first.grains == (grains[0], grains[2])
     assert second.grains == (grains[1], grains[3])
     assert dispatch.ready_count == 0
+
+
+def test_barriered_reserve_seals_only_barriered_parents_and_preserves_fifo():
+    dispatch = DispatchState()
+    call = CallRef(0)
+    child_domain = DomainRef(1)
+    parent_domain = DomainRef(0)
+    grains = tuple(
+        GrainRef(call, EntityRef(child_domain, ordinal))
+        for ordinal in range(4)
+    )
+    barriered_parent = EntityRef(parent_domain, 0)
+    live_parent = EntityRef(parent_domain, 1)
+    parents = (
+        barriered_parent,
+        barriered_parent,
+        live_parent,
+        barriered_parent,
+    )
+    for grain, parent in zip(grains, parents):
+        dispatch.inputs_ready(grain, parent)
+
+    original_is_ready = dispatch._is_ready
+    visits = 0
+
+    def counted_is_ready(grain):
+        nonlocal visits
+        visits += 1
+        return original_is_ready(grain)
+
+    dispatch._is_ready = counted_is_ready
+
+    batch, suppressed = dispatch.reserve_with_barriers(
+        call,
+        max_size=4,
+        pack_by_parent=False,
+        barriered_anchors={barriered_parent},
+    )
+
+    assert batch is not None
+    assert batch.grains == (grains[2],)
+    assert suppressed == (grains[0], grains[1], grains[3])
+    snapshots = dispatch.snapshots()
+    assert snapshots[grains[2]].phase is GrainPhase.IN_FLIGHT
+    assert {
+        snapshots[grain].phase for grain in suppressed
+    } == {GrainPhase.SEALED}
+    assert dispatch.ready_count == 0
+    assert visits == len(grains)
+
+
+@pytest.mark.parametrize(
+    "action",
+    [RecoveryAction.RETRY_IMMEDIATE, RecoveryAction.RETRY_TAIL],
+)
+def test_barriered_recovery_partitions_exact_batch_without_resetting_budget(action):
+    dispatch = DispatchState()
+    call = CallRef(0)
+    child_domain = DomainRef(1)
+    parent_domain = DomainRef(0)
+    grains = tuple(
+        GrainRef(call, EntityRef(child_domain, ordinal))
+        for ordinal in range(4)
+    )
+    barriered_parent = EntityRef(parent_domain, 0)
+    live_parent = EntityRef(parent_domain, 1)
+    for grain, parent in zip(
+        grains,
+        (barriered_parent, live_parent, barriered_parent, live_parent),
+    ):
+        dispatch.inputs_ready(grain, parent)
+
+    initial = _reserve_without_barriers(
+        dispatch, call, max_size=4, pack_by_parent=False
+    )
+    assert initial is not None
+    dispatch.recover_udf(initial, action)
+    live, suppressed = dispatch.reserve_with_barriers(
+        call,
+        max_size=4,
+        pack_by_parent=False,
+        barriered_anchors={barriered_parent},
+    )
+
+    assert live is not None
+    assert live.grains == (grains[1], grains[3])
+    assert live.udf_retries == 1
+    assert suppressed == (grains[0], grains[2])
+    assert {
+        dispatch.snapshot(grain).generation for grain in grains
+    } == {1}
 
 
 def test_dispatch_snapshots_do_not_leak_mutable_grain_authority():
@@ -112,7 +288,9 @@ def test_dispatch_snapshots_do_not_leak_mutable_grain_authority():
     with pytest.raises(FrozenInstanceError):
         setattr(original, "generation", 1)
 
-    assert state.reserve(grain.call, max_size=1, parent_bound=False) is not None
+    assert _reserve_without_barriers(
+        state, grain.call, max_size=1, pack_by_parent=False
+    ) is not None
     assert original.phase is GrainPhase.READY
     assert state.snapshot(grain).phase is GrainPhase.IN_FLIGHT
 
@@ -208,16 +386,17 @@ def _reserve(
     *,
     max_size: int,
 ):
-    selection = dispatch.reserve(
+    selection = _reserve_without_barriers(
+        dispatch,
         CallRef(0),
         max_size=max_size,
-        parent_bound=False,
+        pack_by_parent=False,
     )
     assert selection is not None
     return selection
 
 
-def test_immediate_recovery_precedes_normal_work_and_preserves_exact_group():
+def test_immediate_recovery_precedes_ready_work_and_preserves_exact_batch():
     dispatch, _ = _dispatch_with_four_ready()
     failed = _reserve(dispatch, max_size=2)
 
@@ -235,7 +414,7 @@ def test_immediate_recovery_precedes_normal_work_and_preserves_exact_group():
     assert {snapshots[grain].infra_failures for grain in failed.grains} == {0}
 
 
-def test_tail_recovery_yields_to_normal_work_then_preserves_exact_group():
+def test_retry_tail_yields_to_ready_work_then_preserves_exact_batch():
     dispatch, _ = _dispatch_with_four_ready()
     failed = _reserve(dispatch, max_size=2)
 
@@ -245,10 +424,10 @@ def test_tail_recovery_yields_to_normal_work_then_preserves_exact_group():
     )
 
     assert dispatch.priority(CallRef(0)) == 1
-    normal = _reserve(dispatch, max_size=4)
-    assert normal.udf_retries == 0
-    assert normal.grains != failed.grains
-    assert len(normal.grains) == 2
+    ready_batch = _reserve(dispatch, max_size=4)
+    assert ready_batch.udf_retries == 0
+    assert ready_batch.grains != failed.grains
+    assert len(ready_batch.grains) == 2
     assert dispatch.priority(CallRef(0)) == 2
     retried = _reserve(dispatch, max_size=4)
     assert retried.grains == failed.grains

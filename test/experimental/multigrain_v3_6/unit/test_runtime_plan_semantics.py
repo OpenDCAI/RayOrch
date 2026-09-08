@@ -24,21 +24,28 @@ from rayorch.experimental.multigrain_v3_6.model import (
 from rayorch.experimental.multigrain_v3_6.program.plan import BroadcastEffect, ReduceEffect
 from rayorch.experimental.multigrain_v3_6.protocol import (
     BlockRef,
+    GrainFailureReport,
     GrainReport,
     DispatchFailure,
     DispatchFailureKind,
     ExpandedRows,
+    GroupFailure,
     CallInputLayout,
-    GrainPlan,
+    GrainInvocation,
     CallOutputLayout,
-    OutputReport,
+    PortOutputReport,
     RecordFailure,
     RowBinding,
 )
-from rayorch.experimental.multigrain_v3_6.runtime import CommitError, MicrobatchEngine
+from rayorch.experimental.multigrain_v3_6.recovery import RecoveryAction
+from rayorch.experimental.multigrain_v3_6.runtime import (
+    CommitError,
+    DispatchBatch,
+    MicrobatchEngine,
+)
 from rayorch.experimental.multigrain_v3_6.runtime.state import (
     EntityParent,
-    GroupBinding,
+    NestedGroupBinding,
     ExpansionRef,
 )
 from rayorch.experimental.multigrain_v3_6.execution.worker import (
@@ -83,13 +90,13 @@ def test_worker_observation_is_scalar_and_read_only():
 
 def _execute_one(worker_target, store: MemoryStore) -> DispatchFailure:
     block = store.put((1,))
-    grain_plan = GrainPlan(
+    invocation = GrainInvocation(
         GrainRef(CallRef(0), EntityRef(DomainRef(0), 0)),
         0,
         (RowBinding(block, 0),),
     )
     result = Worker(worker_target, input_layout=CallInputLayout(1)).execute(
-        (grain_plan,),
+        (invocation,),
         (CallOutputLayout(PortRef(0)),),
         store,
     )
@@ -128,6 +135,41 @@ def test_udf_raising_contract_error_name_is_still_a_udf_failure():
 
     assert failure.kind is DispatchFailureKind.UDF_ERROR
     assert "not an ABI violation" in failure.message
+
+
+def test_worker_group_failure_dominates_record_failure_per_grain():
+    class MixedFailures:
+        def run(self, values):
+            assert values == [0, 1]
+            return (
+                [RecordFailure("record-0"), GroupFailure("group-1")],
+                [GroupFailure("group-0"), RecordFailure("record-1")],
+            )
+
+    store = MemoryStore()
+    block = store.put((0, 1))
+    plans = tuple(
+        GrainInvocation(
+            GrainRef(CallRef(0), EntityRef(DomainRef(0), index)),
+            0,
+            (RowBinding(block, index),),
+        )
+        for index in range(2)
+    )
+    result = Worker(MixedFailures, input_layout=CallInputLayout(1)).execute(
+        plans,
+        (
+            CallOutputLayout(PortRef(0)),
+            CallOutputLayout(PortRef(1)),
+        ),
+        store,
+    )
+
+    assert not isinstance(result, DispatchFailure)
+    assert all(isinstance(report, GrainFailureReport) for report in result)
+    assert [report.cause for report in result] == ["group-0", "group-1"]
+    assert all(report.suppress_siblings for report in result)
+    assert mg.GroupFailure is GroupFailure
 
 
 def test_executor_submits_all_worker_observations_before_waiting():
@@ -239,15 +281,19 @@ def run_sync(pipeline: mg.Pipeline, *columns, optimize: bool = True):
             call for call in plan.calls
             if engine.dispatch_priority(call) is not None
         )
-        grains = engine.reserve_dispatch(call, max_size=64).grains
-        grain_plans = tuple(engine.grain_plan(grain) for grain in grains)
+        selection = engine.reserve_dispatch(call, max_size=64)
+        if selection is None:
+            continue
+        invocations = tuple(
+            engine.grain_invocation(grain) for grain in selection.grains
+        )
         reports = workers[call].execute(
-            grain_plans,
+            invocations,
             plan.output_layouts_by_call[call],
             store,
         )
-        for report in reports:
-            engine.commit_report(report)
+        assert not isinstance(reports, DispatchFailure)
+        engine.commit_reports(selection, reports)
     assert engine.is_complete()
     return materialize_tree(plan, engine, store), compiled, engine
 
@@ -463,6 +509,58 @@ def test_call_failure_dominates_required_drop_independent_of_arrival_order():
     assert outputs == [ItemOutcome.SUPPRESSED, ItemOutcome.SUPPRESSED]
 
 
+def test_record_and_group_failure_have_distinct_no_reduce_semantics():
+    class RenderPages:
+        def run(self, documents):
+            return [
+                [(document, ordinal) for ordinal in range(3)]
+                for document in documents
+            ]
+
+    class FailOneRecord:
+        def run(self, pages):
+            return [
+                RecordFailure("bad page") if page == (1, 1) else page
+                for page in pages
+            ]
+
+    class FailOneGroup:
+        def run(self, pages):
+            return [
+                GroupFailure("bad document") if page == (1, 1) else page
+                for page in pages
+            ]
+
+    class PagePipeline(mg.Pipeline):
+        def __init__(self, failure_type) -> None:
+            self.render = mg.RayModule(RenderPages)
+            self.transform = mg.RayModule(failure_type)
+
+        def forward(self, documents):
+            pages = mg.F.expand(self.render(documents))
+            return self.transform(pages)
+
+    record, _, _ = run_sync(PagePipeline(FailOneRecord), [0, 1])
+    group, _, _ = run_sync(PagePipeline(FailOneGroup), [0, 1])
+
+    assert record == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        ItemOutcome.FAILED,
+        (1, 2),
+    ]
+    assert group == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        ItemOutcome.SUPPRESSED,
+        ItemOutcome.FAILED,
+        ItemOutcome.SUPPRESSED,
+    ]
+
+
 def test_nested_expand_reduce_preserves_empty_groups():
     @mg.function
     def pages(documents):
@@ -552,11 +650,11 @@ def test_broadcast_fact_order_reaches_the_same_fixed_point():
 
         assert engine.item_outcome(target) is ItemOutcome.PRESENT
         assert engine.value_binding(target) == binding
-        assert not engine._facts
+        assert not engine._fact_queue
         engine._publish_item(source, ItemOutcome.PRESENT, binding=binding)
-        assert not engine._facts
+        assert not engine._fact_queue
         engine._publish_entity(child, EntityParent(root, 0))
-        assert not engine._facts
+        assert not engine._fact_queue
         return engine.item_outcome(target), engine.value_binding(target)
 
     assert reach_fixed_point(source_first=True) == reach_fixed_point(
@@ -614,15 +712,15 @@ def test_group_fact_order_reaches_the_same_fixed_point():
 
         assert engine.item_outcome(target) is ItemOutcome.PRESENT
         group = engine.value_binding(target)
-        assert isinstance(group, GroupBinding)
+        assert isinstance(group, NestedGroupBinding)
         assert group.flat_items == (value,)
-        assert not engine._facts
+        assert not engine._fact_queue
         engine._publish_expansion(
             expansion,
             ExpansionOutcome.SUCCEEDED,
             children=(child,),
         )
-        assert not engine._facts
+        assert not engine._fact_queue
         return engine.item_outcome(target), group
 
     assert reach_fixed_point(expansion_first=True) == reach_fixed_point(
@@ -649,6 +747,400 @@ def test_progress_summary_uses_expansion_vocabulary():
     assert engine.progress_summary() == (
         "pending=0, ready=0, grains=0, expansions=0"
     )
+
+
+def test_group_barrier_linearizes_same_batch_and_late_in_flight_success():
+    class RenderThree:
+        pass
+
+    class Transform:
+        pass
+
+    class Pages(mg.Pipeline):
+        def __init__(self) -> None:
+            self.render = mg.RayModule(RenderThree)
+            self.transform = mg.RayModule(Transform)
+
+        def forward(self, documents):
+            pages = mg.F.expand(self.render(documents))
+            return self.transform(pages)
+
+    def execute(*, commit_early_success: bool):
+        compiled = Pages().compile()
+        plan = compiled.plan
+        store = MemoryStore()
+        engine = MicrobatchEngine(plan)
+        source = store.put(("document",))
+        engine.admit_sources(
+            {plan.source_ports[0]: (RowBinding(source, 0),)}
+        )
+        engine.close_admission()
+
+        render_call = next(
+            call for call in plan.calls
+            if engine.dispatch_priority(call) is not None
+        )
+        render = engine.reserve_dispatch(render_call, max_size=1)
+        assert render is not None
+        render_grain = render.grains[0]
+        render_output = plan.outputs_by_call[render_call][0]
+        expanded = next(
+            port
+            for port, spec in compiled.logical.ports.items()
+            if isinstance(spec.origin, ExpandOrigin)
+        )
+        page_block = store.put(("page0", "page1", "page2"))
+        engine.commit_reports(
+            render,
+            (
+                GrainReport(
+                    render_grain,
+                    0,
+                    (
+                        PortOutputReport(
+                            render_output,
+                            expansions=(
+                                ExpandedRows(
+                                    expanded,
+                                    tuple(
+                                        RowBinding(page_block, index)
+                                        for index in range(3)
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        transform_call = next(
+            call for call in plan.calls
+            if engine.dispatch_priority(call) is not None
+        )
+        first = engine.reserve_dispatch(transform_call, max_size=1)
+        second = engine.reserve_dispatch(transform_call, max_size=2)
+        assert first is not None and second is not None
+        transform_output = plan.outputs_by_call[transform_call][0]
+        result_block = store.put(("page0", "page2"))
+        first_success = GrainReport(
+            first.grains[0],
+            0,
+            (PortOutputReport(transform_output, scalar=RowBinding(result_block, 0)),),
+        )
+        group_failure = GrainFailureReport(
+            second.grains[0],
+            0,
+            "bad document",
+            suppress_siblings=True,
+        )
+        second_success = GrainReport(
+            second.grains[1],
+            0,
+            (PortOutputReport(transform_output, scalar=RowBinding(result_block, 1)),),
+        )
+
+        if commit_early_success:
+            engine.commit_reports(first, (first_success,))
+        # Deliberately reverse report order: success precedes the
+        # GroupFailure in the tuple, but the whole result is pre-scanned.
+        engine.commit_reports(second, (second_success, group_failure))
+        if not commit_early_success:
+            engine.commit_reports(
+                DispatchBatch((first_success.grain,)),
+                (first_success,),
+            )
+
+        assert engine.is_complete()
+        return materialize_tree(plan, engine, store)
+
+    assert execute(commit_early_success=False) == [
+        ItemOutcome.SUPPRESSED,
+        ItemOutcome.FAILED,
+        ItemOutcome.SUPPRESSED,
+    ]
+    assert execute(commit_early_success=True) == [
+        "page0",
+        ItemOutcome.FAILED,
+        ItemOutcome.SUPPRESSED,
+    ]
+
+
+@pytest.mark.parametrize("failure_kind", ["udf", "infrastructure"])
+def test_group_barrier_partitions_late_failed_lease_before_recovery(failure_kind):
+    class Render:
+        pass
+
+    class Transform:
+        pass
+
+    class Pages(mg.Pipeline):
+        def __init__(self) -> None:
+            self.render = mg.RayModule(Render)
+            self.transform = mg.RayModule(Transform)
+
+        def forward(self, documents):
+            return self.transform(mg.F.expand(self.render(documents)))
+
+    compiled = Pages().compile()
+    plan = compiled.plan
+    store = MemoryStore()
+    engine = MicrobatchEngine(plan)
+    sources = store.put(("doc0", "doc1"))
+    engine.admit_sources(
+        {
+            plan.source_ports[0]: (
+                RowBinding(sources, 0),
+                RowBinding(sources, 1),
+            )
+        }
+    )
+    engine.close_admission()
+    calls = {spec.udf.target: call for call, spec in plan.calls.items()}
+
+    render = engine.reserve_dispatch(calls[Render], max_size=2)
+    assert render is not None
+    render_output = plan.outputs_by_call[calls[Render]][0]
+    expanded = next(
+        port
+        for port, spec in compiled.logical.ports.items()
+        if isinstance(spec.origin, ExpandOrigin)
+    )
+    pages = store.put(("a0", "a1", "b0", "b1"))
+    engine.commit_reports(
+        render,
+        tuple(
+            GrainReport(
+                grain,
+                0,
+                (
+                    PortOutputReport(
+                        render_output,
+                        expansions=(
+                            ExpandedRows(
+                                expanded,
+                                (
+                                    RowBinding(pages, root_index * 2),
+                                    RowBinding(pages, root_index * 2 + 1),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            for root_index, grain in enumerate(render.grains)
+        ),
+    )
+
+    poison = engine.reserve_dispatch(calls[Transform], max_size=1)
+    late = engine.reserve_dispatch(calls[Transform], max_size=3)
+    assert poison is not None and late is not None
+    transform_output = plan.outputs_by_call[calls[Transform]][0]
+    engine.commit_reports(
+        poison,
+        (
+            GrainFailureReport(
+                poison.grains[0],
+                0,
+                "bad document",
+                suppress_siblings=True,
+            ),
+        ),
+    )
+
+    if failure_kind == "udf":
+        retried = engine.apply_udf_recovery(
+            late,
+            RecoveryAction.RETRY_TAIL,
+            RuntimeError("opaque UDF failure"),
+        )
+    else:
+        retried = engine.retry_infrastructure_dispatch(
+            late,
+            mg.RecoveryPolicy.abort(infra_retries=1),
+        )
+    assert retried == 2
+    blocked, *live = late.grains
+    assert engine.grain_snapshot(blocked).phase is GrainPhase.SEALED
+    assert engine.grain_snapshot(blocked).generation == 0
+    assert {engine.grain_snapshot(grain).generation for grain in live} == {1}
+    expected_infra = 1 if failure_kind == "infrastructure" else 0
+    assert {
+        engine.grain_snapshot(grain).infra_failures for grain in live
+    } == {expected_infra}
+
+    retry = engine.reserve_dispatch(calls[Transform], max_size=3)
+    assert retry is not None
+    assert retry.grains == tuple(live)
+    assert retry.udf_retries == (1 if failure_kind == "udf" else 0)
+    results = store.put(("B0", "B1"))
+    engine.commit_reports(
+        retry,
+        tuple(
+            GrainReport(
+                grain,
+                1,
+                (
+                    PortOutputReport(
+                        transform_output,
+                        scalar=RowBinding(results, index),
+                    ),
+                ),
+            )
+            for index, grain in enumerate(retry.grains)
+        ),
+    )
+
+    assert engine.is_complete()
+    assert materialize_tree(plan, engine, store) == [
+        ItemOutcome.FAILED,
+        ItemOutcome.SUPPRESSED,
+        "B0",
+        "B1",
+    ]
+
+
+def test_group_barrier_closes_waiting_sibling_at_input_admission():
+    class Render:
+        pass
+
+    class Left:
+        pass
+
+    class Right:
+        pass
+
+    class Combine:
+        pass
+
+    class WaitingSibling(mg.Pipeline):
+        def __init__(self) -> None:
+            self.render = mg.RayModule(Render)
+            self.left = mg.RayModule(Left)
+            self.right = mg.RayModule(Right)
+            self.combine = mg.RayModule(Combine)
+
+        def forward(self, documents):
+            pages = mg.F.expand(self.render(documents))
+            return self.combine(self.left(pages), self.right(pages))
+
+    compiled = WaitingSibling().compile()
+    plan = compiled.plan
+    store = MemoryStore()
+    engine = MicrobatchEngine(plan)
+    source = store.put(("document",))
+    engine.admit_sources({plan.source_ports[0]: (RowBinding(source, 0),)})
+    engine.close_admission()
+    calls = {
+        spec.udf.target: call for call, spec in plan.calls.items()
+    }
+
+    render = engine.reserve_dispatch(calls[Render], max_size=1)
+    assert render is not None
+    render_output = plan.outputs_by_call[calls[Render]][0]
+    expanded = next(
+        port
+        for port, spec in compiled.logical.ports.items()
+        if isinstance(spec.origin, ExpandOrigin)
+    )
+    pages = store.put(("page0", "page1"))
+    engine.commit_reports(
+        render,
+        (
+            GrainReport(
+                render.grains[0],
+                0,
+                (
+                    PortOutputReport(
+                        render_output,
+                        expansions=(
+                            ExpandedRows(
+                                expanded,
+                                (RowBinding(pages, 0), RowBinding(pages, 1)),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    left = engine.reserve_dispatch(calls[Left], max_size=2)
+    right_first = engine.reserve_dispatch(calls[Right], max_size=1)
+    right_second = engine.reserve_dispatch(calls[Right], max_size=1)
+    assert left is not None and right_first is not None and right_second is not None
+    left_output = plan.outputs_by_call[calls[Left]][0]
+    right_output = plan.outputs_by_call[calls[Right]][0]
+    left_values = store.put(("left0", "left1"))
+    right_values = store.put(("right0", "right1"))
+    engine.commit_reports(
+        left,
+        tuple(
+            GrainReport(
+                grain,
+                0,
+                (
+                    PortOutputReport(
+                        left_output,
+                        scalar=RowBinding(left_values, index),
+                    ),
+                ),
+            )
+            for index, grain in enumerate(left.grains)
+        ),
+    )
+    engine.commit_reports(
+        right_first,
+        (
+            GrainReport(
+                right_first.grains[0],
+                0,
+                (
+                    PortOutputReport(
+                        right_output,
+                        scalar=RowBinding(right_values, 0),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    combine = engine.reserve_dispatch(calls[Combine], max_size=1)
+    assert combine is not None
+    engine.commit_reports(
+        combine,
+        (
+            GrainFailureReport(
+                combine.grains[0],
+                0,
+                "parent invalid",
+                suppress_siblings=True,
+            ),
+        ),
+    )
+    engine.commit_reports(
+        right_second,
+        (
+            GrainReport(
+                right_second.grains[0],
+                0,
+                (
+                    PortOutputReport(
+                        right_output,
+                        scalar=RowBinding(right_values, 1),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    assert engine.is_complete()
+    assert materialize_tree(plan, engine, store) == [
+        ItemOutcome.FAILED,
+        ItemOutcome.SUPPRESSED,
+    ]
+    waiting = GrainRef(calls[Combine], right_second.grains[0].entity)
+    assert engine.grain_snapshot(waiting).phase is GrainPhase.SEALED
 
 
 def _start_manual():
@@ -682,23 +1174,22 @@ def test_retry_keeps_grain_identity_and_generation_fences_stale_report():
     selection = engine.reserve_dispatch(
         grain.call,
         max_size=1,
-        parent_bound=False,
+        pack_by_parent=False,
     )
     assert selection.grains == (grain,)
     stale = GrainReport(
         grain,
         0,
-        (OutputReport(output, expansions=(ExpandedRows(expanded, ()),)),),
+        (PortOutputReport(output, expansions=(ExpandedRows(expanded, ()),)),),
     )
     with pytest.raises(CommitError, match="stale generation"):
-        engine.commit_success(stale)
-    engine.commit_success(
-        GrainReport(
-            grain,
-            1,
-            (OutputReport(output, expansions=(ExpandedRows(expanded, ()),)),),
-        )
+        engine.commit_reports(DispatchBatch((stale.grain,)), (stale,))
+    current = GrainReport(
+        grain,
+        1,
+        (PortOutputReport(output, expansions=(ExpandedRows(expanded, ()),)),),
     )
+    engine.commit_reports(DispatchBatch((current.grain,)), (current,))
     assert engine.grain_snapshot(grain).phase is GrainPhase.SEALED
     assert engine.item_outcome(ItemRef(output, root)) is ItemOutcome.PRESENT
     assert compiled.plan is engine.plan
@@ -731,35 +1222,77 @@ def test_aligned_expand_mismatch_has_no_partial_publication():
     )
     rows = store.put((1, 2, 3))
 
-    with pytest.raises(CommitError, match="cardinality mismatch"):
-        engine.commit_success(
-            GrainReport(
-                grain,
-                0,
-                (
-                    OutputReport(
-                        left_group,
-                        expansions=(
-                            ExpandedRows(
-                                expanded[0],
-                                (RowBinding(rows, 0), RowBinding(rows, 1)),
-                            ),
-                        ),
-                    ),
-                    OutputReport(
-                        right_group,
-                        expansions=(
-                            ExpandedRows(
-                                expanded[1],
-                                tuple(RowBinding(rows, index) for index in range(3)),
-                            ),
-                        ),
+    malformed = GrainReport(
+        grain,
+        0,
+        (
+            PortOutputReport(
+                left_group,
+                expansions=(
+                    ExpandedRows(
+                        expanded[0],
+                        (RowBinding(rows, 0), RowBinding(rows, 1)),
                     ),
                 ),
-            )
+            ),
+            PortOutputReport(
+                right_group,
+                expansions=(
+                    ExpandedRows(
+                        expanded[1],
+                        tuple(RowBinding(rows, index) for index in range(3)),
+                    ),
+                ),
+            ),
         )
+    )
+    with pytest.raises(CommitError, match="cardinality mismatch"):
+        engine.commit_reports(DispatchBatch((malformed.grain,)), (malformed,))
 
     assert engine.grain_snapshot(grain).phase is GrainPhase.IN_FLIGHT
     assert engine.expansion_count == 0
     assert engine.entities(plan.port_domain(expanded[0])) == ()
     assert root in engine.entities(root.domain)
+
+
+def test_group_batch_payload_preflight_installs_no_partial_barrier():
+    class Identity:
+        pass
+
+    class Pair(mg.Pipeline):
+        def __init__(self) -> None:
+            self.identity = mg.RayModule(Identity)
+
+        def forward(self, values):
+            return self.identity(values)
+
+    plan = Pair().compile().plan
+    store = MemoryStore()
+    block = store.put((1, 2))
+    engine = MicrobatchEngine(plan)
+    engine.admit_sources(
+        {
+            plan.source_ports[0]: tuple(
+                RowBinding(block, index) for index in range(2)
+            )
+        }
+    )
+    call = next(iter(plan.calls))
+    selection = engine.reserve_dispatch(call, max_size=2)
+    assert selection is not None
+
+    malformed = GrainReport(selection.grains[0], 0, ())
+    group_failure = GrainFailureReport(
+        selection.grains[1],
+        0,
+        "must not leak",
+        suppress_siblings=True,
+    )
+    with pytest.raises(CommitError, match="exactly match Call outputs"):
+        engine.commit_reports(selection, (group_failure, malformed))
+
+    assert {
+        engine.grain_snapshot(grain).phase for grain in selection.grains
+    } == {GrainPhase.IN_FLIGHT}
+    assert not engine._suppression_barriers.anchors_for(call)
+    assert engine.item_count == 2  # source Items only

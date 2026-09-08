@@ -8,7 +8,7 @@ from ..protocol import (
     BlockRef,
     CallInputLayout,
     CallOutputLayout,
-    GrainPlan,
+    GrainInvocation,
     RowBinding,
 )
 from .worker import Worker, WorkerSnapshot
@@ -74,14 +74,14 @@ class _RayWorkerActor:
 
     def execute(
         self,
-        grain_plans: tuple[GrainPlan, ...],
+        invocations: tuple[GrainInvocation, ...],
         layouts: tuple[CallOutputLayout, ...],
     ):
         """Execute one batch without reading Program or RuntimeState."""
 
         self._store.clear_cache()
         try:
-            return self._worker.execute(grain_plans, layouts, self._store)
+            return self._worker.execute(invocations, layouts, self._store)
         finally:
             # Input blocks must not leak across actor RPCs. Output bindings are
             # returned to the driver and then owned by a microbatch lifecycle.

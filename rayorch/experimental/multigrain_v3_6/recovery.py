@@ -1,8 +1,8 @@
 """Call-scoped recovery configuration and its pure decision algebra.
 
-This module is deliberately Ray-free and runtime-free.  It never stores an
-attempt, Grain group, queue or generation; callers provide immutable facts and
-receive one action from a closed set.
+This module is deliberately Ray-free and runtime-free. It never stores an
+attempt, DispatchBatch, queue, or generation; callers provide immutable facts
+and receive one action from a closed set.
 """
 
 from __future__ import annotations
@@ -60,11 +60,14 @@ class RecoveryPolicy:
         elif self.udf_mode is UdfRecoveryMode.ISOLATE_TAIL:
             if self.udf_attempts != 1:
                 raise ValueError(
-                    "isolate_tail performs exactly one whole-group tail retry"
+                    "isolate_tail performs exactly one whole-DispatchBatch "
+                    "deferred retry"
                 )
 
     @classmethod
     def abort(cls, *, infra_retries: int = 1) -> "RecoveryPolicy":
+        """Abort the run after any opaque UDF dispatch failure."""
+
         return cls(UdfRecoveryMode.ABORT, 0, infra_retries)
 
     @classmethod
@@ -74,6 +77,8 @@ class RecoveryPolicy:
         attempts: int = 1,
         infra_retries: int = 1,
     ) -> "RecoveryPolicy":
+        """Retry the same DispatchBatch through the immediate-retry queue."""
+
         return cls(UdfRecoveryMode.RETRY_BATCH, attempts, infra_retries)
 
     @classmethod
@@ -83,10 +88,14 @@ class RecoveryPolicy:
         attempts: int = 1,
         infra_retries: int = 1,
     ) -> "RecoveryPolicy":
+        """Retry the same DispatchBatch through the deferred-recovery queue."""
+
         return cls(UdfRecoveryMode.RETRY_TAIL, attempts, infra_retries)
 
     @classmethod
     def isolate_tail(cls, *, infra_retries: int = 1) -> "RecoveryPolicy":
+        """Defer one retry, then split a still-failing DispatchBatch to singletons."""
+
         return cls(UdfRecoveryMode.ISOLATE_TAIL, 1, infra_retries)
 
     def decide_udf(
@@ -100,7 +109,7 @@ class RecoveryPolicy:
         if type(completed_retries) is not int or completed_retries < 0:
             raise ValueError("completed_retries must be a non-negative integer")
         if type(grain_count) is not int or grain_count <= 0:
-            raise ValueError("UDF recovery requires a non-empty dispatch group")
+            raise ValueError("UDF recovery requires a non-empty DispatchBatch")
         match self.udf_mode:
             case UdfRecoveryMode.ABORT:
                 return RecoveryAction.ABORT
@@ -125,10 +134,12 @@ class RecoveryPolicy:
         self,
         completed_retries: tuple[int, ...],
     ) -> bool:
-        """Return whether every Grain in one exact group retains retry budget."""
+        """Return whether every Grain in one DispatchBatch retains retry budget."""
 
         if not completed_retries:
-            raise ValueError("infrastructure recovery requires a non-empty group")
+            raise ValueError(
+                "infrastructure recovery requires a non-empty DispatchBatch"
+            )
         if any(type(count) is not int or count < 0 for count in completed_retries):
             raise ValueError("infrastructure retry counts must be non-negative integers")
         return all(count < self.infra_retries for count in completed_retries)

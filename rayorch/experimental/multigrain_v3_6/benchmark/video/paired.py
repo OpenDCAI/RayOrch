@@ -235,7 +235,7 @@ def run_paired(args: argparse.Namespace) -> dict[str, Any]:
         "reduce_replicas": args.reduce_replicas,
         "transform_replicas": args.transform_replicas,
         "transform_batch_size": args.transform_batch_size,
-        "batch_scope": args.batch_scope,
+        "batching_policy": args.batching_policy,
         "transform_backend": args.transform_backend,
         "torch_num_threads": args.torch_num_threads,
         "model_path": args.model_path,
@@ -351,9 +351,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transform-replicas", type=int, default=4)
     parser.add_argument("--transform-batch-size", type=int, default=64)
     parser.add_argument(
-        "--batch-scope",
-        choices=("elastic", "parent_bound"),
-        default="elastic",
+        "--batching-policy",
+        choices=("any_parent", "single_parent"),
+        default="any_parent",
     )
     parser.add_argument(
         "--transform-backend",

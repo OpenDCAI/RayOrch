@@ -11,7 +11,7 @@ from .model import (
     MISSING,
 )
 from .program.plan import CompiledProgram
-from .protocol import RecordFailure
+from .protocol import GroupFailure, RecordFailure
 from .recovery import RecoveryPolicy
 
 __all__ = [
@@ -20,6 +20,7 @@ __all__ = [
     "Executor",
     "ExecutionError",
     "F",
+    "GroupFailure",
     "ItemOutcome",
     "MISSING",
     "Pipeline",

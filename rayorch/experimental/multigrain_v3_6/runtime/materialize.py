@@ -10,9 +10,9 @@ from typing import Any, Protocol
 
 from ..model import ItemOutcome, ItemRef, PortRef
 from ..program.plan import RuntimePlan
-from ..protocol import RowBinding, restore_group
+from ..protocol import RowBinding, restore_nested_group
 from .engine import MicrobatchEngine
-from .state import GroupBinding
+from .state import NestedGroupBinding
 
 
 class ReadableStore(Protocol):
@@ -59,10 +59,10 @@ def _materialize_item(
     binding = engine.value_binding(item)
     if isinstance(binding, RowBinding):
         return store.get(binding)
-    if not isinstance(binding, GroupBinding):  # pragma: no cover - 防御分支
+    if not isinstance(binding, NestedGroupBinding):  # pragma: no cover - 防御分支
         raise RuntimeError(f"unsupported ValueBinding: {binding!r}")
-    leaves = [store.get(row) for row in engine.group_rows(binding)]
-    return restore_group(leaves, binding.layout.offsets_by_level)
+    leaves = [store.get(row) for row in engine.nested_group_rows(binding)]
+    return restore_nested_group(leaves, binding.layout.offsets_by_level)
 
 
 __all__ = ["ReadableStore", "materialize_tree"]

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Mapping, TypeAlias, assert_never
+from typing import AbstractSet, Mapping, TypeAlias, assert_never
 
 from ..model import (
     CallRef,
@@ -46,10 +46,10 @@ from ..program.plan import (
 from ..protocol import (
     GrainFailureReport,
     GrainReport,
-    GroupInput,
-    GrainPlan,
+    NestedGroupInput,
+    GrainInvocation,
     MissingInput,
-    OutputReport,
+    PortOutputReport,
     RowBinding,
     WorkerReport,
 )
@@ -58,8 +58,8 @@ from .dispatch import DispatchBatch, DispatchState, GrainSnapshot
 from .state import (
     CommitError,
     EntityParent,
-    GroupBinding,
-    GroupLayout,
+    NestedGroupBinding,
+    NestedGroupLayout,
     ItemRecord,
     PendingGrain,
     RuntimeState,
@@ -78,6 +78,41 @@ class _ExpandedOutputCommit:
     controls: tuple[bool, ...] | None
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedGrainSuccess:
+    report: GrainReport
+    scalar_commits: tuple[tuple[ItemRef, PortOutputReport], ...]
+    expansion_commits: tuple[_ExpandedOutputCommit, ...]
+
+
+class _SuppressionBarrierIndex:
+    """Microbatch-local index of monotonic ``(Call, parent anchor)`` barriers."""
+
+    def __init__(self) -> None:
+        self._causes_by_call: dict[
+            CallRef,
+            dict[EntityRef, object | None],
+        ] = {}
+
+    def establish(
+        self,
+        call: CallRef,
+        parent_anchor: EntityRef,
+        cause: object | None,
+    ) -> None:
+        self._causes_by_call.setdefault(call, {}).setdefault(parent_anchor, cause)
+
+    def is_barriered(self, call: CallRef, parent_anchor: EntityRef) -> bool:
+        return parent_anchor in self._causes_by_call.get(call, {})
+
+    def cause(self, call: CallRef, parent_anchor: EntityRef) -> object | None:
+        return self._causes_by_call[call][parent_anchor]
+
+    def anchors_for(self, call: CallRef) -> AbstractSet[EntityRef]:
+        causes = self._causes_by_call.get(call)
+        return frozenset() if causes is None else causes.keys()
+
+
 _FactEvent: TypeAlias = ItemRef | ExpansionRef | EntityRef
 
 
@@ -91,11 +126,14 @@ class MicrobatchEngine:
     def __init__(
         self,
         plan: RuntimePlan,
+        *,
+        ready_fifo: bool = True,
     ) -> None:
         self.plan = plan
         self._state = RuntimeState()
-        self._dispatch = DispatchState()
-        self._facts: deque[_FactEvent] = deque()
+        self._dispatch = DispatchState(ready_fifo=ready_fifo)
+        self._suppression_barriers = _SuppressionBarrierIndex()
+        self._fact_queue: deque[_FactEvent] = deque()
         self._entities_by_domain: dict[
             DomainRef, dict[EntityRef, None]
         ] = defaultdict(dict)
@@ -144,7 +182,7 @@ class MicrobatchEngine:
         return self._dispatch.snapshots()
 
     def dispatch_priority(self, call: CallRef) -> int | None:
-        """Return immediate/normal/tail priority for one Call, if runnable."""
+        """Return immediate-retry/ready/deferred-recovery priority, if runnable."""
 
         return self._dispatch.priority(call)
 
@@ -153,16 +191,20 @@ class MicrobatchEngine:
         call: CallRef,
         *,
         max_size: int,
-        parent_bound: bool = False,
-    ) -> DispatchBatch:
-        """Reserve immediate recovery, normal work, then deferred recovery."""
+        pack_by_parent: bool = False,
+    ) -> DispatchBatch | None:
+        """Reserve live work and publish lazy parent suppression in one turn."""
 
-        batch = self._dispatch.reserve(
+        batch, suppressed = self._dispatch.reserve_with_barriers(
             call,
             max_size=max_size,
-            parent_bound=parent_bound,
+            pack_by_parent=pack_by_parent,
+            barriered_anchors=self._suppression_barriers.anchors_for(call),
         )
-        if batch is None:
+        if suppressed:
+            self._publish_parent_suppression(suppressed)
+            self.advance()
+        if batch is None and not suppressed:
             raise LookupError(f"no READY dispatch for {call!r}")
         return batch
 
@@ -177,7 +219,7 @@ class MicrobatchEngine:
         if not self._admission_closed:
             return False
         if (
-            self._facts
+            self._fact_queue
             or self._state.pending_grains
             or not self._dispatch.is_idle
         ):
@@ -199,7 +241,9 @@ class MicrobatchEngine:
             )
         raise CommitError("invalid Program.output_tree")
 
-    def _batch_parent(self, entity: EntityRef) -> EntityRef:
+    def _parent_anchor(self, entity: EntityRef) -> EntityRef:
+        """Return the direct parent, or the root Entity itself when parentless."""
+
         parent = self._parent_of(entity)
         return entity if parent is None else parent
 
@@ -208,7 +252,7 @@ class MicrobatchEngine:
 
         return tuple(self._entities_by_domain.get(domain, ()))
 
-    def grain_plan(self, grain: GrainRef) -> GrainPlan:
+    def grain_invocation(self, grain: GrainRef) -> GrainInvocation:
         """把语义事实投影为 Worker 可消费的纯物理输入计划。"""
 
         call = self.plan.call(grain.call)
@@ -226,19 +270,21 @@ class MicrobatchEngine:
             if isinstance(binding, RowBinding):
                 inputs.append(binding)
                 continue
-            if isinstance(binding, GroupBinding):
+            if isinstance(binding, NestedGroupBinding):
                 rows = tuple(self._state.values[leaf] for leaf in binding.flat_items)
                 if not all(isinstance(row, RowBinding) for row in rows):
-                    raise CommitError("canonical group leaves must resolve to rows")
+                    raise CommitError(
+                        "canonical nested-group leaves must resolve to rows"
+                    )
                 inputs.append(
-                    GroupInput(
+                    NestedGroupInput(
                         tuple(row for row in rows if isinstance(row, RowBinding)),
                         binding.layout.offsets_by_level,
                     )
                 )
                 continue
             raise CommitError(f"unsupported ValueBinding: {binding!r}")
-        return GrainPlan(
+        return GrainInvocation(
             grain,
             self._dispatch.generation(grain),
             tuple(inputs),
@@ -264,12 +310,15 @@ class MicrobatchEngine:
 
         return self._state.values[item]
 
-    def group_rows(self, binding: GroupBinding) -> tuple[RowBinding, ...]:
-        """把 canonical group 叶子解析为行引用，不读取业务 payload。"""
+    def nested_group_rows(
+        self,
+        binding: NestedGroupBinding,
+    ) -> tuple[RowBinding, ...]:
+        """把 canonical nested-group 叶子解析为行引用，不读取业务 payload。"""
 
         rows = tuple(self._state.values[leaf] for leaf in binding.flat_items)
         if not all(isinstance(row, RowBinding) for row in rows):
-            raise CommitError("canonical group leaves must resolve to rows")
+            raise CommitError("canonical nested-group leaves must resolve to rows")
         return tuple(row for row in rows if isinstance(row, RowBinding))
 
     def entity_coordinate(self, entity: EntityRef) -> tuple[int, ...]:
@@ -349,8 +398,8 @@ class MicrobatchEngine:
     def advance(self) -> None:
         """消费封闭 FactEvent 联合，直到结构传播达到局部不动点。"""
 
-        while self._facts:
-            fact = self._facts.popleft()
+        while self._fact_queue:
+            fact = self._fact_queue.popleft()
             match fact:
                 case ItemRef():
                     for effect in self.plan.item_effects_by_source.get(
@@ -389,20 +438,70 @@ class MicrobatchEngine:
 
     # ── Worker report preflight and commit boundary ─────────────────────
 
-    def commit_report(self, report: WorkerReport) -> None:
-        """按报告类型进入唯一的成功/失败语义提交路径。"""
+    def commit_reports(
+        self,
+        dispatch_batch: DispatchBatch,
+        reports: tuple[WorkerReport, ...],
+    ) -> None:
+        """Preflight all reports for one DispatchBatch before ordered publication."""
 
-        if isinstance(report, GrainFailureReport):
-            self.commit_failure(
-                report.grain,
-                report.cause,
-                generation=report.generation,
-            )
-        else:
-            self.commit_success(report)
+        if len(reports) != len(dispatch_batch.grains):
+            raise CommitError("Worker reports must exactly cover the dispatch batch")
+        by_grain: dict[GrainRef, WorkerReport] = {}
+        for report in reports:
+            if not isinstance(report, (GrainReport, GrainFailureReport)):
+                raise CommitError("unsupported Worker report")
+            if report.grain in by_grain:
+                raise CommitError("duplicate Grain report")
+            by_grain[report.grain] = report
+        if set(by_grain) != set(dispatch_batch.grains):
+            raise CommitError("Worker reports must exactly cover the dispatch batch")
 
-    def commit_success(self, report: GrainReport) -> None:
-        """校验并发布一个成功 Grain 的全部输出、Expansion 与 child Entities。"""
+        ordered = tuple(by_grain[grain] for grain in dispatch_batch.grains)
+        for report in ordered:
+            self._dispatch.validate_in_flight(report.grain, report.generation)
+
+        # Discover every new barrier before preparing any success. Stable
+        # DispatchBatch order, not report tuple order, chooses the canonical cause.
+        pending_barriers: dict[tuple[CallRef, EntityRef], object] = {}
+        for report in ordered:
+            if isinstance(report, GrainFailureReport) and report.suppress_siblings:
+                key = (report.grain.call, self._dispatch.parent_anchor(report.grain))
+                pending_barriers.setdefault(key, report.cause)
+
+        prepared: dict[GrainRef, _PreparedGrainSuccess] = {}
+        for report in ordered:
+            if not isinstance(report, GrainReport):
+                continue
+            key = (report.grain.call, self._dispatch.parent_anchor(report.grain))
+            if key in pending_barriers or self._suppression_barriers.is_barriered(*key):
+                continue
+            prepared[report.grain] = self._prepare_success(report)
+
+        # Mutation frontier: identities and every live success payload are now
+        # valid. Explicit failures remain FAILED even when their parent is barriered.
+        for (call, parent_anchor), cause in pending_barriers.items():
+            self._suppression_barriers.establish(call, parent_anchor, cause)
+        for report in ordered:
+            if isinstance(report, GrainFailureReport):
+                self._apply_failure(
+                    report.grain,
+                    report.cause,
+                    generation=report.generation,
+                )
+                continue
+            if self._is_parent_barriered(report.grain):
+                self._apply_suppression(
+                    report.grain,
+                    self._barrier_cause(report.grain),
+                    generation=report.generation,
+                )
+                continue
+            self._apply_success(prepared[report.grain])
+        self.advance()
+
+    def _prepare_success(self, report: GrainReport) -> _PreparedGrainSuccess:
+        """Validate one success and freeze publication intents without mutation."""
 
         grain = report.grain
         self._dispatch.validate_in_flight(grain, report.generation)
@@ -414,7 +513,7 @@ class MicrobatchEngine:
         if len(by_port) != len(report.outputs) or set(by_port) != set(expected_outputs):
             raise CommitError("report outputs must exactly match Call outputs")
 
-        scalar_commits: list[tuple[ItemRef, OutputReport]] = []
+        scalar_commits: list[tuple[ItemRef, PortOutputReport]] = []
         expansion_commits: list[_ExpandedOutputCommit] = []
         counts_by_expansion: dict[ExpansionRef, list[int]] = defaultdict(list)
         reporters_by_expansion: dict[ExpansionRef, set[PortRef]] = defaultdict(set)
@@ -483,9 +582,19 @@ class MicrobatchEngine:
                 raise CommitError("aligned expansion reporters are incomplete")
             if expansion in self._state.expansions:
                 raise CommitError("Expansion has already been published")
-        # Mutation frontier: all report, control, Expansion and cardinality
-        # checks are complete. Everything below is one indivisible semantic
-        # turn from the state machine's perspective.
+        return _PreparedGrainSuccess(
+            report,
+            tuple(scalar_commits),
+            tuple(expansion_commits),
+        )
+
+    def _apply_success(self, prepared: _PreparedGrainSuccess) -> None:
+        """Apply one previously validated success without running advance()."""
+
+        report = prepared.report
+        grain = report.grain
+        scalar_commits = prepared.scalar_commits
+        expansion_commits = prepared.expansion_commits
         self._dispatch.seal(grain, report.generation)
 
         commits_by_expansion: dict[
@@ -496,8 +605,8 @@ class MicrobatchEngine:
                 ExpansionRef(commit.child_domain, grain.entity)
             ].append(commit)
 
-        # Phase 3: publish Expansion -> child Entity -> child/parent Item in
-        # dependency order, then run one fact-propagation fixed point.
+        # Publish Expansion -> child Entity -> child/parent Item in dependency
+        # order. The caller owns the single fact-propagation fixed point.
         for expansion, commits in commits_by_expansion.items():
             count = len(commits[0].rows)
             children = self._create_children(expansion, count)
@@ -522,8 +631,8 @@ class MicrobatchEngine:
                 self._publish_item(
                     parent_item,
                     ItemOutcome.PRESENT,
-                    binding=GroupBinding(
-                        GroupLayout.one_level(count),
+                    binding=NestedGroupBinding(
+                        NestedGroupLayout.one_level(count),
                         tuple(leaves),
                     ),
                 )
@@ -538,74 +647,151 @@ class MicrobatchEngine:
                 binding=output.scalar,
                 control=output.control,
             )
-        self.advance()
 
     # ── Failure/recovery handoff to the sole DispatchState ──────────────
 
-    def commit_failure(
+    def _apply_failure(
         self,
         grain: GrainRef,
         cause: object,
         *,
         generation: int | None = None,
     ) -> None:
-        """发布计算失败；fan-out 前失败以 unknown cardinality 封闭 Expansion。"""
+        """Seal and publish one explicit failure without running advance()."""
 
-        self._dispatch.validate_in_flight(grain, generation)
-
-        outputs = self.plan.outputs_by_call[grain.call]
         self._dispatch.seal(grain, generation)
-        for output in outputs:
-            self._publish_item(
-                ItemRef(output, grain.entity),
-                ItemOutcome.FAILED,
-                cause=cause,
+        self._publish_call_outputs(grain, ItemOutcome.FAILED, cause)
+
+    def _apply_suppression(
+        self,
+        grain: GrainRef,
+        cause: object | None,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        """Seal one in-flight sibling and publish no successful payload."""
+
+        self._dispatch.seal(grain, generation)
+        self._publish_call_outputs(grain, ItemOutcome.SUPPRESSED, cause)
+
+    def _publish_parent_suppression(
+        self,
+        grains: tuple[GrainRef, ...],
+    ) -> None:
+        """Publish READY/in-flight grains already sealed by DispatchState."""
+
+        for grain in grains:
+            self._publish_call_outputs(
+                grain,
+                ItemOutcome.SUPPRESSED,
+                self._barrier_cause(grain),
             )
-            for expansion in self.plan.expand_effects_by_source.get(output, ()):
-                expansion_ref = ExpansionRef(expansion.child_domain, grain.entity)
-                if expansion_ref not in self._state.expansions:
-                    self._publish_expansion(
-                        expansion_ref,
-                        ExpansionOutcome.FAILED,
-                        cause=cause,
-                    )
-        self.advance()
+
+    def _is_parent_barriered(self, grain: GrainRef) -> bool:
+        return self._suppression_barriers.is_barriered(
+            grain.call,
+            self._dispatch.parent_anchor(grain),
+        )
+
+    def _barrier_cause(self, grain: GrainRef) -> object | None:
+        return self._suppression_barriers.cause(
+            grain.call,
+            self._dispatch.parent_anchor(grain),
+        )
 
     def apply_udf_recovery(
         self,
-        selection: DispatchBatch,
+        dispatch_batch: DispatchBatch,
         action: RecoveryAction,
         cause: object,
     ) -> int:
-        """Apply one policy action at the physical/semantic ownership boundary."""
+        """Suppress barriered peers, then apply one action to the exact live subset."""
+
+        live, barriered = self._partition_in_flight(dispatch_batch)
+        if action is RecoveryAction.ABORT:
+            raise CommitError("ABORT is terminal and cannot mutate a microbatch")
+        if live is None:
+            self._seal_and_publish_suppressed(barriered)
+            self.advance()
+            return 0
+        if action is RecoveryAction.FAIL_SINGLETON and len(live.grains) != 1:
+            raise CommitError("FAIL_SINGLETON requires one live Grain")
+        if action is RecoveryAction.SPLIT_TAIL and (
+            live.udf_retries == 0 or len(live.grains) <= 1
+        ):
+            raise CommitError("split requires one failed live recovery batch")
+
+        self._seal_and_publish_suppressed(barriered)
 
         match action:
             case RecoveryAction.FAIL_SINGLETON:
-                if len(selection.grains) != 1:
-                    raise CommitError("FAIL_SINGLETON requires one Grain")
-                self.commit_failure(selection.grains[0], cause)
-                return 0
+                self._apply_failure(live.grains[0], cause)
+                retried = 0
             case (
                 RecoveryAction.RETRY_IMMEDIATE
                 | RecoveryAction.RETRY_TAIL
                 | RecoveryAction.SPLIT_TAIL
             ):
-                return self._dispatch.recover_udf(selection, action)
+                retried = self._dispatch.recover_udf(live, action)
             case RecoveryAction.ABORT:
-                raise CommitError("ABORT is terminal and cannot mutate a microbatch")
+                raise AssertionError("ABORT was rejected before mutation")
+        if barriered or action is RecoveryAction.FAIL_SINGLETON:
+            self.advance()
+        return retried
+
+    def live_recovery_batch(
+        self,
+        dispatch_batch: DispatchBatch,
+    ) -> DispatchBatch | None:
+        """Return the current live subset for a pure RecoveryPolicy decision."""
+
+        live, _ = self._partition_in_flight(dispatch_batch)
+        return live
+
+    def suppress_barriered_batch(self, dispatch_batch: DispatchBatch) -> None:
+        """Suppress an in-flight batch whose every Grain is behind a barrier."""
+
+        live, barriered = self._partition_in_flight(dispatch_batch)
+        if live is not None:
+            raise CommitError("dispatch still contains live Grains")
+        self._seal_and_publish_suppressed(barriered)
+        self.advance()
 
     def retry_infrastructure_dispatch(
         self,
-        selection: DispatchBatch,
+        dispatch_batch: DispatchBatch,
         policy: RecoveryPolicy,
-    ) -> bool:
-        """Pure-policy preflight followed by one atomic physical requeue."""
+    ) -> int | None:
+        """Return retried live Grains, or None when the live budget is exhausted."""
 
-        failures = self._dispatch.infrastructure_failures(selection)
-        if not policy.allows_infrastructure_retry(failures):
-            return False
-        self._dispatch.recover_infrastructure(selection)
-        return True
+        live, barriered = self._partition_in_flight(dispatch_batch)
+        if live is not None:
+            failures = self._dispatch.infrastructure_failures(live)
+            if not policy.allows_infrastructure_retry(failures):
+                return None
+            self._seal_and_publish_suppressed(barriered)
+        retried = (
+            0 if live is None else self._dispatch.recover_infrastructure(live)
+        )
+        if barriered:
+            self.advance()
+        return retried
+
+    def _partition_in_flight(
+        self,
+        dispatch_batch: DispatchBatch,
+    ) -> tuple[DispatchBatch | None, tuple[GrainRef, ...]]:
+        return self._dispatch.partition_in_flight(
+            dispatch_batch,
+            self._suppression_barriers.anchors_for(dispatch_batch.grains[0].call),
+        )
+
+    def _seal_and_publish_suppressed(
+        self,
+        barriered: tuple[GrainRef, ...],
+    ) -> None:
+        self._dispatch.seal_in_flight(barriered)
+        self._publish_parent_suppression(barriered)
 
     # ── Canonical Item and Expansion publication gateways ───────────────
 
@@ -647,7 +833,7 @@ class MicrobatchEngine:
         self._state.items[item] = record
         if binding is not None:
             self._state.values[item] = binding
-        self._facts.append(item)
+        self._fact_queue.append(item)
 
     def _publish_expansion(
         self,
@@ -675,7 +861,7 @@ class MicrobatchEngine:
                 )
             return
         self._state.expansions[expansion] = record
-        self._facts.append(expansion)
+        self._fact_queue.append(expansion)
 
     # ── Call input algebra and structural Effect interpreters ───────────
 
@@ -686,15 +872,15 @@ class MicrobatchEngine:
         grain = GrainRef(effect.call, item.entity)
         if self._dispatch.contains(grain):
             return
-        pending = self._state.pending_grains.setdefault(
+        pending_grain = self._state.pending_grains.setdefault(
             grain,
             PendingGrain([None] * len(call.ordered_inputs)),
         )
-        current = pending.slots[effect.input_index]
+        current = pending_grain.slots[effect.input_index]
         if current is not None and current != item:
             raise CommitError("Call input slot received conflicting Items")
-        pending.slots[effect.input_index] = item
-        if self._classify_call(grain, tuple(pending.slots)):
+        pending_grain.slots[effect.input_index] = item
+        if self._classify_call(grain, tuple(pending_grain.slots)):
             del self._state.pending_grains[grain]
 
     def _classify_call(
@@ -705,6 +891,15 @@ class MicrobatchEngine:
         """按纯输入代数封闭 Grain；返回是否已离开 WAITING。"""
 
         call = self.plan.call(grain.call)
+        parent_anchor = self._parent_anchor(grain.entity)
+        if self._suppression_barriers.is_barriered(grain.call, parent_anchor):
+            self._dispatch.inputs_terminal(grain)
+            self._publish_call_outputs(
+                grain,
+                ItemOutcome.SUPPRESSED,
+                self._suppression_barriers.cause(grain.call, parent_anchor),
+            )
+            return True
         outcomes = tuple(
             None if item is None else self._state.items[item].outcome
             for item in inputs
@@ -716,7 +911,7 @@ class MicrobatchEngine:
         if decision.action is CallAction.WAIT:
             return False
         if decision.action is CallAction.READY:
-            self._dispatch.inputs_ready(grain, self._batch_parent(grain.entity))
+            self._dispatch.inputs_ready(grain, self._parent_anchor(grain.entity))
             return True
 
         assert decision.decisive_input is not None
@@ -807,7 +1002,7 @@ class MicrobatchEngine:
         )
 
     def _try_reduce(self, effect: ReduceEffect, parent: EntityRef) -> None:
-        """Restore one parent group after Expansion, membership and values settle."""
+        """Restore one parent nested-group value after its facts settle."""
 
         target = ItemRef(effect.target_port, parent)
         if target in self._state.items:
@@ -853,19 +1048,19 @@ class MicrobatchEngine:
         survivor_items = tuple(value_items[index] for index in decision.survivors)
 
         bindings = tuple(self._state.values[item] for item in survivor_items)
-        # 一层 reduce 收集 RowBinding；多层 reduce 则拼接子 GroupLayout，
+        # 一层 reduce 收集 RowBinding；多层 reduce 则拼接子 NestedGroupLayout，
         # 最终仍保持一个规范 CSR layout 和一份扁平叶子引用。
         value_depth = effect.value_depth
         if not bindings and value_depth > 0:
-            group_layout = GroupLayout.nest((), child_depth=value_depth)
+            group_layout = NestedGroupLayout.nest((), child_depth=value_depth)
             flat_items = ()
         elif not bindings or all(isinstance(value, RowBinding) for value in bindings):
-            group_layout = GroupLayout.one_level(len(bindings))
+            group_layout = NestedGroupLayout.one_level(len(bindings))
             flat_items = survivor_items
-        elif all(isinstance(value, GroupBinding) for value in bindings):
-            groups = tuple(value for value in bindings if isinstance(value, GroupBinding))
+        elif all(isinstance(value, NestedGroupBinding) for value in bindings):
+            groups = tuple(value for value in bindings if isinstance(value, NestedGroupBinding))
             depth = groups[0].layout.depth if groups else effect.value_depth
-            group_layout = GroupLayout.nest(
+            group_layout = NestedGroupLayout.nest(
                 tuple(group.layout for group in groups),
                 child_depth=depth,
             )
@@ -873,12 +1068,14 @@ class MicrobatchEngine:
                 item for group in groups for item in group.flat_items
             )
         else:
-            raise CommitError("group values mix scalar and grouped realizations")
+            raise CommitError(
+                "nested-group values mix scalar and grouped realizations"
+            )
 
         self._publish_item(
             target,
             ItemOutcome.PRESENT,
-            binding=GroupBinding(group_layout, flat_items),
+            binding=NestedGroupBinding(group_layout, flat_items),
         )
 
     def _try_broadcast_from_source(
@@ -959,7 +1156,7 @@ class MicrobatchEngine:
         if origin is not None:
             self._state.entity_lineage[entity] = origin
         entities[entity] = None
-        self._facts.append(entity)
+        self._fact_queue.append(entity)
 
     def _parent_of(self, entity: EntityRef) -> EntityRef | None:
         origin = self._state.entity_lineage.get(entity)

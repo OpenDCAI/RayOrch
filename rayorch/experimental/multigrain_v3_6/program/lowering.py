@@ -173,7 +173,7 @@ def _lower(
             match use.role:
                 case InputRole.EXPAND_GROUP:
                     # Expanded Worker layouts are committed atomically by
-                    # MicrobatchEngine.commit_success, not an Item event.
+                    # MicrobatchEngine.commit_reports, not an Item event.
                     pass
                 case InputRole.REDUCE_VALUE | InputRole.REDUCE_MEMBERS:
                     effect = structural_effects_by_target.get(use.port)
@@ -289,12 +289,17 @@ def _compile_pool_spec(
         raise CompileError(
             "max_retries is ambiguous; use recovery=RecoveryPolicy(...)"
         )
+    if "batch_scope" in raw:
+        raise CompileError(
+            "batch_scope was replaced by batching_policy; use "
+            "'any_parent' or 'single_parent'"
+        )
 
     try:
         return ActorPoolSpec(
             replicas=cast(Any, raw.pop("replicas", 1)),
             batch_size=cast(Any, raw.pop("batch_size", 1)),
-            batch_scope=cast(Any, raw.pop("batch_scope", "elastic")),
+            batching_policy=cast(Any, raw.pop("batching_policy", "any_parent")),
             recovery=cast(Any, raw.pop("recovery", DEFAULT_RECOVERY_POLICY)),
             ray_options=tuple(raw.items()),
         )

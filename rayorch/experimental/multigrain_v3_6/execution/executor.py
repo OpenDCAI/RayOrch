@@ -60,18 +60,18 @@ class _MicrobatchSlot:
 
 
 @dataclass(frozen=True, slots=True)
-class _DispatchLease:
-    """pending ObjectRef 对应的 generation-fenced dispatch lease。"""
+class _PendingRpc:
+    """One pending worker RPC and the state needed to finalize it exactly once."""
 
     microbatch_index: int
     actor: _ActorSlot
-    batch: DispatchBatch
+    dispatch_batch: DispatchBatch
 
 
 class Executor:
     """Call-only actor pools 与多 microbatch overlap 的参考执行器。
 
-    Executor 独占 actor capacity、pending RPC lease 和 run-local counters；
+    Executor 独占 actor capacity、pending RPC records 和 run-local counters；
     primitive 传播、Entity lineage 与 Grain phase 仍分别归 Engine/DispatchState。
     """
 
@@ -81,8 +81,12 @@ class Executor:
         *,
         address: str | None = None,
         ray_init_kwargs: dict[str, Any] | None = None,
+        ready_queue_order: str = "fifo",
     ) -> None:
         """编译 Pipeline、连接 Ray，并按 Call 创建持久 actor pools。"""
+
+        if ready_queue_order not in {"fifo", "unordered"}:
+            raise ValueError("ready_queue_order must be fifo or unordered")
 
         import ray  # pyright: ignore[reportMissingImports]
 
@@ -91,6 +95,7 @@ class Executor:
             pipeline if isinstance(pipeline, CompiledProgram) else pipeline.compile()
         )
         self.plan = self.compiled.plan
+        self._ready_fifo = ready_queue_order == "fifo"
         self._owns_ray = not ray.is_initialized()
         if self._owns_ray:
             init_kwargs = dict(ray_init_kwargs or {})
@@ -159,7 +164,7 @@ class Executor:
         metrics_by_microbatch: list[MicrobatchMetrics | None] = [None] * len(slices)
         active: dict[int, _MicrobatchSlot] = {}
         completed: dict[int, object] = {}
-        pending: dict[Any, _DispatchLease] = {}
+        pending_rpcs: dict[Any, _PendingRpc] = {}
         next_microbatch = 0
         execution_started = False
         high_watermark = 0
@@ -167,9 +172,9 @@ class Executor:
 
         # Event-loop invariants:
         # 1. active[index] uniquely owns that microbatch's Engine;
-        # 2. every pending ObjectRef maps to exactly one fenced lease;
-        # 3. a busy actor has one such lease and is released in finally;
-        # 4. materialization requires both no pending lease and Engine complete.
+        # 2. every pending ObjectRef maps to exactly one _PendingRpc;
+        # 3. a busy actor has one such RPC and is released in finally;
+        # 4. materialization requires both no pending RPC and Engine complete.
         try:
             while len(completed) < len(slices):
                 while (
@@ -185,11 +190,11 @@ class Executor:
                     next_microbatch += 1
                     high_watermark = max(high_watermark, len(active))
 
-                self._dispatch_ready(active, pending)
+                made_progress = self._dispatch_ready(active, pending_rpcs)
 
-                # 只有没有 pending lease 的 microbatch 才能离开 active 集合。
+                # 只有没有 pending RPC 的 microbatch 才能离开 active 集合。
                 pending_microbatches = {
-                    lease.microbatch_index for lease in pending.values()
+                    rpc.microbatch_index for rpc in pending_rpcs.values()
                 }
                 for index, slot in tuple(active.items()):
                     if (
@@ -219,33 +224,36 @@ class Executor:
 
                 if len(completed) == len(slices):
                     break
-                if not pending and next_microbatch < len(slices):
+                if not pending_rpcs and next_microbatch < len(slices):
                     # 当前 active microbatch 已完成，但仍有尚未 admission 的 source
                     # slice；下一 turn 会填充空出的 credit，这不是 deadlock。
                     continue
-                if not pending:
+                if not pending_rpcs and made_progress:
+                    # A cleanup-only reservation can publish SUPPRESSED facts
+                    # and expose work for a Call whose actor loop already ran.
+                    continue
+                if not pending_rpcs:
                     summaries = ", ".join(
                         f"microbatch[{index}] {slot.engine.progress_summary()}"
                         for index, slot in sorted(active.items())
                     )
                     raise RuntimeError(f"v3.6 Ray runtime deadlocked: {summaries}")
 
-                ready, _ = self.ray.wait(list(pending), num_returns=1)
+                ready, _ = self.ray.wait(list(pending_rpcs), num_returns=1)
                 result_ref = ready[0]
-                lease = pending.pop(result_ref)
-                engine = active[lease.microbatch_index].engine
+                pending_rpc = pending_rpcs.pop(result_ref)
+                engine = active[pending_rpc.microbatch_index].engine
                 try:
                     result = self.ray.get(result_ref)
                 except Exception as error:  # Ray 对用户异常和 actor 异常统一在 get 抛出
-                    self._handle_infrastructure_failure(engine, lease, error)
+                    self._handle_infrastructure_failure(engine, pending_rpc, error)
                 else:
                     if isinstance(result, DispatchFailure):
-                        self._handle_dispatch_failure(engine, lease, result)
+                        self._handle_dispatch_failure(engine, pending_rpc, result)
                     else:
-                        for report in result:
-                            engine.commit_report(report)
+                        engine.commit_reports(pending_rpc.dispatch_batch, result)
                 finally:
-                    lease.actor.busy = False
+                    pending_rpc.actor.busy = False
 
             elapsed_s = time.perf_counter() - started
             worker_snapshots = self._observe_workers()
@@ -297,7 +305,7 @@ class Executor:
             call: [None] * len(actors)
             for call, actors in self._actors.items()
         }
-        pending = {}
+        pending_observations = {}
         for call, actors in self._actors.items():
             for index, actor in enumerate(actors):
                 try:
@@ -310,11 +318,11 @@ class Executor:
                         error=repr(error),
                     )
                 else:
-                    pending[reference] = (call, index)
-        while pending:
-            ready, _ = self.ray.wait(list(pending), num_returns=1)
+                    pending_observations[reference] = (call, index)
+        while pending_observations:
+            ready, _ = self.ray.wait(list(pending_observations), num_returns=1)
             reference = ready[0]
-            call, index = pending.pop(reference)
+            call, index = pending_observations.pop(reference)
             try:
                 result[call][index] = self.ray.get(reference)
             except Exception as error:
@@ -390,7 +398,7 @@ class Executor:
     ) -> MicrobatchEngine:
         """把一个 source slice 原子接纳为独立 microbatch 状态机。"""
 
-        engine = MicrobatchEngine(self.plan)
+        engine = MicrobatchEngine(self.plan, ready_fifo=self._ready_fifo)
         bindings = {}
         controls = {}
         for port, values in zip(self.plan.source_ports, columns):
@@ -407,10 +415,11 @@ class Executor:
     def _dispatch_ready(
         self,
         active: dict[int, _MicrobatchSlot],
-        pending: dict[Any, _DispatchLease],
-    ) -> None:
+        pending_rpcs: dict[Any, _PendingRpc],
+    ) -> bool:
         """把 READY Grain 分配给空闲 actor；每批严格属于一个 microbatch。"""
 
+        made_progress = False
         for call, actors in self._actors.items():
             for actor in actors:
                 if actor.busy:
@@ -429,16 +438,19 @@ class Executor:
                 batch = candidate.engine.reserve_dispatch(
                     call,
                     max_size=pool.batch_size,
-                    parent_bound=pool.batch_scope == "parent_bound",
+                    pack_by_parent=pool.batching_policy == "single_parent",
                 )
-                grain_plans = tuple(
-                    candidate.engine.grain_plan(grain)
+                if batch is None:
+                    made_progress = True
+                    continue
+                invocations = tuple(
+                    candidate.engine.grain_invocation(grain)
                     for grain in batch.grains
                 )
                 layouts = self.plan.output_layouts_by_call[call]
-                result_ref = actor.handle.execute.remote(grain_plans, layouts)
+                result_ref = actor.handle.execute.remote(invocations, layouts)
                 actor.busy = True
-                pending[result_ref] = _DispatchLease(
+                pending_rpcs[result_ref] = _PendingRpc(
                     candidate.index,
                     actor,
                     batch,
@@ -447,32 +459,38 @@ class Executor:
                 counters.rpcs += 1
                 counters.grains += len(batch.grains)
                 counters.batch_sizes.append(len(batch.grains))
+                made_progress = True
+        return made_progress
 
     # ── Typed failure classification and recovery handoff ───────────────
 
     def _handle_dispatch_failure(
         self,
         engine: MicrobatchEngine,
-        lease: _DispatchLease,
+        pending_rpc: _PendingRpc,
         failure: DispatchFailure,
     ) -> None:
         """Map one typed Worker failure to an exhaustive recovery action."""
 
         if failure.kind is DispatchFailureKind.CONTRACT_ERROR:
-            raise self._execution_error(engine, lease, failure)
+            raise self._execution_error(engine, pending_rpc, failure)
         if failure.kind is not DispatchFailureKind.UDF_ERROR:
             raise AssertionError(
                 f"unsupported DispatchFailureKind: {failure.kind!r}"
             )
-        policy = self._pool(lease.actor.call).recovery
+        policy = self._pool(pending_rpc.actor.call).recovery
+        live = engine.live_recovery_batch(pending_rpc.dispatch_batch)
+        if live is None:
+            engine.suppress_barriered_batch(pending_rpc.dispatch_batch)
+            return
         action = policy.decide_udf(
-            completed_retries=lease.batch.udf_retries,
-            grain_count=len(lease.batch.grains),
+            completed_retries=live.udf_retries,
+            grain_count=len(live.grains),
         )
         if action is RecoveryAction.ABORT:
-            raise self._execution_error(engine, lease, failure)
-        self._counters[lease.actor.call].retries += engine.apply_udf_recovery(
-            lease.batch,
+            raise self._execution_error(engine, pending_rpc, failure)
+        self._counters[pending_rpc.actor.call].retries += engine.apply_udf_recovery(
+            pending_rpc.dispatch_batch,
             action,
             failure,
         )
@@ -480,20 +498,20 @@ class Executor:
     def _handle_infrastructure_failure(
         self,
         engine: MicrobatchEngine,
-        lease: _DispatchLease,
+        pending_rpc: _PendingRpc,
         error: Exception,
     ) -> None:
         """Replace an untrusted actor and retry without data-failure fiction."""
 
-        policy = self._pool(lease.actor.call).recovery
-        accepted = engine.retry_infrastructure_dispatch(
-            lease.batch,
+        policy = self._pool(pending_rpc.actor.call).recovery
+        retried = engine.retry_infrastructure_dispatch(
+            pending_rpc.dispatch_batch,
             policy,
         )
-        if not accepted:
-            raise self._execution_error(engine, lease, error) from error
-        self._replace_actor(lease.actor)
-        self._counters[lease.actor.call].retries += len(lease.batch.grains)
+        if retried is None:
+            raise self._execution_error(engine, pending_rpc, error) from error
+        self._replace_actor(pending_rpc.actor)
+        self._counters[pending_rpc.actor.call].retries += retried
 
     def _replace_actor(self, actor: _ActorSlot) -> None:
         """Discard one untrusted handle and install a fresh actor instance."""
@@ -508,17 +526,17 @@ class Executor:
     def _execution_error(
         self,
         engine: MicrobatchEngine,
-        lease: _DispatchLease,
+        pending_rpc: _PendingRpc,
         failure: DispatchFailure | Exception,
     ) -> ExecutionError:
         """Join wire details with Call and generation context owned by driver."""
 
-        call = lease.actor.call
+        call = pending_rpc.actor.call
         target = self.plan.call(call).udf.target
         name = self._udf_name(target)
         grains = ", ".join(
             f"{grain!r}@generation={engine.grain_snapshot(grain).generation}"
-            for grain in lease.batch.grains
+            for grain in pending_rpc.dispatch_batch.grains
         )
         if isinstance(failure, DispatchFailure):
             detail = (

@@ -69,19 +69,19 @@ class ExpansionRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class GroupLayout:
+class NestedGroupLayout:
     """从一个隐式根到有序叶子的 CSR 风格层级 offsets。"""
 
     offsets_by_level: tuple[tuple[int, ...], ...]
 
     def __post_init__(self) -> None:
         if not self.offsets_by_level:
-            raise ValueError("GroupLayout requires at least one level")
+            raise ValueError("NestedGroupLayout requires at least one level")
         for offsets in self.offsets_by_level:
             if not offsets or offsets[0] != 0:
-                raise ValueError("every GroupLayout level must start at zero")
+                raise ValueError("every NestedGroupLayout level must start at zero")
             if any(left > right for left, right in zip(offsets, offsets[1:])):
-                raise ValueError("GroupLayout offsets must be monotonic")
+                raise ValueError("NestedGroupLayout offsets must be monotonic")
 
     @property
     def depth(self) -> int:
@@ -90,7 +90,7 @@ class GroupLayout:
         return len(self.offsets_by_level)
 
     @classmethod
-    def one_level(cls, count: int) -> GroupLayout:
+    def one_level(cls, count: int) -> NestedGroupLayout:
         """构造包含 ``count`` 个有序叶子的一层 group。"""
 
         if count < 0:
@@ -98,7 +98,12 @@ class GroupLayout:
         return cls(((0, count),))
 
     @classmethod
-    def nest(cls, children: tuple[GroupLayout, ...], *, child_depth: int) -> GroupLayout:
+    def nest(
+        cls,
+        children: tuple[NestedGroupLayout, ...],
+        *,
+        child_depth: int,
+    ) -> NestedGroupLayout:
         """把同深度 child layouts 拼成更高一级；空 group 也保留完整层数。"""
 
         if child_depth <= 0:
@@ -124,18 +129,18 @@ class GroupLayout:
 
 
 @dataclass(frozen=True, slots=True)
-class GroupBinding:
+class NestedGroupBinding:
     """规范化层级 layout 与扁平叶子 Item 的纯引用绑定。"""
 
-    layout: GroupLayout
+    layout: NestedGroupLayout
     flat_items: tuple[ItemRef, ...]
 
     def __post_init__(self) -> None:
         if self.layout.offsets_by_level[-1][-1] != len(self.flat_items):
-            raise ValueError("GroupLayout leaf count does not match flat_items")
+            raise ValueError("NestedGroupLayout leaf count does not match flat_items")
 
 
-ValueBinding: TypeAlias = RowBinding | GroupBinding
+ValueBinding: TypeAlias = RowBinding | NestedGroupBinding
 
 
 @dataclass(slots=True)
@@ -159,8 +164,8 @@ class RuntimeState:
 __all__ = [
     "CommitError",
     "EntityParent",
-    "GroupBinding",
-    "GroupLayout",
+    "NestedGroupBinding",
+    "NestedGroupLayout",
     "ItemRecord",
     "PendingGrain",
     "RuntimeState",

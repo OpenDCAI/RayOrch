@@ -24,7 +24,7 @@ class VideoMultimodalV36Pipeline(Pipeline):
         *,
         whisper_model_path: str,
         vit_model_path: str,
-        batch_scope: str = "elastic",
+        batching_policy: str = "any_parent",
         audio_chunk_seconds: float = 4.0,
         audio_decode_replicas: int = 2,
         asr_replicas: int = 1,
@@ -41,8 +41,8 @@ class VideoMultimodalV36Pipeline(Pipeline):
     ) -> None:
         if not whisper_model_path or not vit_model_path:
             raise ValueError("both model paths must be non-empty")
-        if batch_scope not in {"elastic", "parent_bound"}:
-            raise ValueError("batch_scope must be elastic or parent_bound")
+        if batching_policy not in {"any_parent", "single_parent"}:
+            raise ValueError("batching_policy must be any_parent or single_parent")
         if audio_chunk_seconds <= 0:
             raise ValueError("audio_chunk_seconds must be positive")
         if frame_stride <= 0:
@@ -81,7 +81,7 @@ class VideoMultimodalV36Pipeline(Pipeline):
             .ray_options(
                 replicas=asr_replicas,
                 batch_size=asr_batch_size,
-                batch_scope=batch_scope,
+                batching_policy=batching_policy,
                 num_cpus=1,
                 num_gpus=asr_num_gpus,
                 recovery=recovery,
@@ -110,7 +110,7 @@ class VideoMultimodalV36Pipeline(Pipeline):
             .ray_options(
                 replicas=frame_model_replicas,
                 batch_size=frame_batch_size,
-                batch_scope=batch_scope,
+                batching_policy=batching_policy,
                 num_cpus=1,
                 num_gpus=frame_num_gpus,
                 recovery=recovery,

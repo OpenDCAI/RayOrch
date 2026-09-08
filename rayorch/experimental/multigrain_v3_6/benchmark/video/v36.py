@@ -30,7 +30,7 @@ class VideoV36Pipeline(Pipeline):
         reduce_replicas: int,
         transform_replicas: int,
         transform_batch_size: int,
-        batch_scope: str,
+        batching_policy: str,
         transform_backend: str = "opencv",
         torch_num_threads: int = 1,
         model_path: str | None = None,
@@ -42,8 +42,8 @@ class VideoV36Pipeline(Pipeline):
             raise ValueError("stride must be positive")
         if max_frames is not None and max_frames <= 0:
             raise ValueError("max_frames must be positive when provided")
-        if batch_scope not in {"elastic", "parent_bound"}:
-            raise ValueError("batch_scope must be elastic or parent_bound")
+        if batching_policy not in {"any_parent", "single_parent"}:
+            raise ValueError("batching_policy must be any_parent or single_parent")
         if min(decode_replicas, reduce_replicas, transform_replicas) <= 0:
             raise ValueError("all replica counts must be positive")
         if transform_batch_size <= 0:
@@ -79,7 +79,7 @@ class VideoV36Pipeline(Pipeline):
             .ray_options(
                 replicas=transform_replicas,
                 batch_size=transform_batch_size,
-                batch_scope=batch_scope,
+                batching_policy=batching_policy,
                 num_cpus=max(1, torch_num_threads),
                 num_gpus=transform_num_gpus,
                 recovery=recovery,

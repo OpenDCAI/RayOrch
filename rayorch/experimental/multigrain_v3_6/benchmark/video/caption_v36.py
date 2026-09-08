@@ -22,7 +22,7 @@ class VideoCaptionV36Pipeline(Pipeline):
         model_path: str,
         stride: int,
         max_frames: int | None,
-        batch_scope: str,
+        batching_policy: str,
         caption_batch_size: int = 16,
         caption_replicas: int = 1,
         decode_replicas: int = 4,
@@ -36,8 +36,8 @@ class VideoCaptionV36Pipeline(Pipeline):
             raise ValueError("stride must be positive")
         if max_frames is not None and max_frames <= 0:
             raise ValueError("max_frames must be positive when provided")
-        if batch_scope not in {"elastic", "parent_bound"}:
-            raise ValueError("batch_scope must be elastic or parent_bound")
+        if batching_policy not in {"any_parent", "single_parent"}:
+            raise ValueError("batching_policy must be any_parent or single_parent")
         if min(caption_replicas, decode_replicas, reduce_replicas) <= 0:
             raise ValueError("all replica counts must be positive")
         if caption_batch_size <= 0:
@@ -67,7 +67,7 @@ class VideoCaptionV36Pipeline(Pipeline):
             .ray_options(
                 replicas=caption_replicas,
                 batch_size=caption_batch_size,
-                batch_scope=batch_scope,
+                batching_policy=batching_policy,
                 num_cpus=1,
                 num_gpus=1,
                 recovery=recovery,

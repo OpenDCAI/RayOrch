@@ -57,7 +57,7 @@ def _fake_v36_result(outputs, *, rpc_count: int, grains: int):
     )
 
 
-def _feature_pipeline(batch_scope: str = "elastic") -> VideoV36Pipeline:
+def _feature_pipeline(batching_policy: str = "any_parent") -> VideoV36Pipeline:
     return VideoV36Pipeline(
         stride=3,
         max_frames=8,
@@ -65,16 +65,16 @@ def _feature_pipeline(batch_scope: str = "elastic") -> VideoV36Pipeline:
         reduce_replicas=1,
         transform_replicas=4,
         transform_batch_size=16,
-        batch_scope=batch_scope,
+        batching_policy=batching_policy,
     )
 
 
-def _caption_pipeline(batch_scope: str = "elastic") -> VideoCaptionV36Pipeline:
+def _caption_pipeline(batching_policy: str = "any_parent") -> VideoCaptionV36Pipeline:
     return VideoCaptionV36Pipeline(
         model_path="model",
         stride=3,
         max_frames=8,
-        batch_scope=batch_scope,
+        batching_policy=batching_policy,
     )
 
 
@@ -151,21 +151,21 @@ def test_multimodal_video_has_two_sibling_relations_and_root_merge(optimize):
 
 
 @pytest.mark.parametrize("factory", [_feature_pipeline, _caption_pipeline])
-def test_video_batch_scope_only_changes_heavy_compute_pool(factory):
-    elastic = factory("elastic").compile()
-    parent = factory("parent_bound").compile()
+def test_video_batching_policy_only_changes_heavy_compute_pool(factory):
+    any_parent = factory("any_parent").compile()
+    parent = factory("single_parent").compile()
 
-    assert elastic.logical.calls == parent.logical.calls
+    assert any_parent.logical.calls == parent.logical.calls
     changed = []
     for left, right in zip(
-        elastic.plan.actor_pools_by_call.values(),
+        any_parent.plan.actor_pools_by_call.values(),
         parent.plan.actor_pools_by_call.values(),
     ):
         if left != right:
             changed.append((left, right))
     assert len(changed) == 1
-    assert changed[0][0].batch_scope == "elastic"
-    assert changed[0][1].batch_scope == "parent_bound"
+    assert changed[0][0].batching_policy == "any_parent"
+    assert changed[0][1].batching_policy == "single_parent"
 
 
 @pytest.mark.parametrize(
@@ -173,7 +173,7 @@ def test_video_batch_scope_only_changes_heavy_compute_pool(factory):
     [
         {"stride": 0},
         {"max_frames": 0},
-        {"batch_scope": "unknown"},
+        {"batching_policy": "unknown"},
         {"transform_replicas": 0},
         {"transform_batch_size": 0},
         {"infra_retries": -1},
@@ -187,7 +187,7 @@ def test_feature_video_rejects_invalid_physical_options(option):
         "reduce_replicas": 1,
         "transform_replicas": 4,
         "transform_batch_size": 16,
-        "batch_scope": "elastic",
+        "batching_policy": "any_parent",
     }
     values.update(option)
     with pytest.raises(ValueError):

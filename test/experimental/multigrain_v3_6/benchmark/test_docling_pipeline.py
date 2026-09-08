@@ -89,32 +89,32 @@ def test_docling_v36_is_exactly_document_page_table_job_graph(
     assert domains[2].parent == domains[1].ref
 
 
-def test_docling_v36_only_batch_scope_changes_cross_parent_pools():
-    elastic = DoclingTableFormerV1BatchV36Pipeline(
-        batch_scope="elastic"
+def test_docling_v36_only_batching_policy_changes_cross_parent_pools():
+    any_parent = DoclingTableFormerV1BatchV36Pipeline(
+        batching_policy="any_parent"
     ).compile()
     parent = DoclingTableFormerV1BatchV36Pipeline(
-        batch_scope="parent_bound"
+        batching_policy="single_parent"
     ).compile()
 
-    assert elastic.logical.calls == parent.logical.calls
+    assert any_parent.logical.calls == parent.logical.calls
     changed = []
     for left, right in zip(
-        elastic.plan.actor_pools_by_call.values(),
+        any_parent.plan.actor_pools_by_call.values(),
         parent.plan.actor_pools_by_call.values(),
     ):
         if left != right:
             changed.append((left, right))
 
     assert len(changed) == 5
-    assert all(left.batch_scope == "elastic" for left, _ in changed)
-    assert all(right.batch_scope == "parent_bound" for _, right in changed)
+    assert all(left.batching_policy == "any_parent" for left, _ in changed)
+    assert all(right.batching_policy == "single_parent" for _, right in changed)
 
 
 @pytest.mark.parametrize(
     ("option", "message"),
     [
-        ({"batch_scope": "unknown"}, "batch_scope"),
+        ({"batching_policy": "unknown"}, "batching_policy"),
         ({"ocr_batch_mode": "unknown"}, "ocr_batch_mode"),
         ({"table_batch_mode": "unknown"}, "table_batch_mode"),
         ({"table_batch_max_jobs": 0}, "table_batch_max_jobs"),
@@ -146,10 +146,10 @@ def test_docling_paired_projection_drops_only_explicit_v3_scheduler_options():
         max_inflight_arenas=4,
     )
 
-    old, new = paired._arm_options(368, config, "elastic")
+    old, new = paired._arm_options(368, config, "any_parent")
 
     assert set(old) - set(new) == paired._V3_ONLY_OPTIONS
-    assert new["batch_scope"] == "elastic"
+    assert new["batching_policy"] == "any_parent"
     assert new["table_batch_mode"] == "v1_batch"
     assert new["table_core_batch_size"] == 4
     assert new["reduce_replicas"] == 4
