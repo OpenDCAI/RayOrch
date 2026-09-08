@@ -74,6 +74,11 @@ def test_daft_control_modes_are_explicit_and_default_to_natural_baseline():
 
     assert natural.regroup_mode == "full_value"
     assert natural.assemble_mode == "full"
+    assert natural.poison_count == 0
+    assert natural.poison_policy == "skip_page"
+    assert natural.poison_pdf_index is None
+    assert natural.input_manifest is None
+    assert _args("--poison-policy", "drop_parent").poison_policy == "drop_parent"
     assert reference.regroup_mode == "reference_only"
     assert reference.assemble_mode == "metadata_only"
 
@@ -99,6 +104,28 @@ def test_full_value_packaging_preserves_one_payload_per_input_row():
     assert all(isinstance(value, _ContentPayload) for value in packaged)
     assert [value.value for value in packaged] == ["left", "right"]
     assert [value.batch_size for value in packaged] == [2, 2]
+
+
+def test_full_value_packaging_preserves_poison_flags():
+    pages = [
+        _PagePayload({"page_id": 0}),
+        _PagePayload({"page_id": 1}),
+    ]
+
+    packaged = _package_ocr_batch(
+        pages=pages,
+        contents=["left", None],
+        parent_ids=[0, 0],
+        stores=(),
+        batch_token="batch",
+        actor_init_started_s=1.0,
+        actor_ready_s=2.0,
+        batch_started_s=3.0,
+        batch_finished_s=4.0,
+        poisoned=[False, True],
+    )
+
+    assert [value.poisoned for value in packaged] == [False, True]
 
 
 def _group_input_passthrough(plan: str) -> str:

@@ -44,6 +44,15 @@ from ...multigrain_v3.benchmark.mineru import (
     ResourceSampler,
     _runtime_env,
 )
+from .mineru_poison import (
+    DEFAULT_POISON_SEED,
+    PoisonPage,
+    gpu_memory_peaks,
+    load_pdf_manifest,
+    pdf_page_counts,
+    select_poison_pages,
+    worker_resource_options,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +78,7 @@ class _ContentPayload:
     payload_publish_started_s: float = 0.0
     payload_publish_finished_s: float = 0.0
     payload_block_bytes: int = 0
+    poisoned: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +98,7 @@ class _ReferenceManifest:
     payload_publish_started_s: float = 0.0
     payload_publish_finished_s: float = 0.0
     payload_block_bytes: int = 0
+    poisoned: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,12 +233,16 @@ def _package_ocr_batch(
     actor_ready_s: float,
     batch_started_s: float,
     batch_finished_s: float,
+    poisoned: list[bool] | None = None,
 ) -> list[_ContentPayload] | list[_ReferenceManifest]:
     """Apply the single controlled variable at the regroup boundary."""
 
     if not (len(pages) == len(contents) == len(parent_ids)):
         raise ValueError("OCR pages, contents, and parent ids must align")
     size = len(pages)
+    poison_flags = poisoned if poisoned is not None else [False] * size
+    if len(poison_flags) != size:
+        raise ValueError("OCR poison flags must align with input rows")
     if not stores:
         return [
             _ContentPayload(
@@ -238,8 +253,9 @@ def _package_ocr_batch(
                 actor_ready_s=actor_ready_s,
                 batch_started_s=batch_started_s,
                 batch_finished_s=batch_finished_s,
+                poisoned=poison_flags[row],
             )
-            for content in contents
+            for row, content in enumerate(contents)
         ]
 
     import ray  # pyright: ignore[reportMissingImports]
@@ -268,6 +284,7 @@ def _package_ocr_batch(
             payload_publish_started_s=publish_started_s,
             payload_publish_finished_s=publish_finished_s,
             payload_block_bytes=int(block_bytes),
+            poisoned=poison_flags[row],
         )
         for row, page in enumerate(pages)
     ]
@@ -277,14 +294,23 @@ def _build_dataframe(
     args: argparse.Namespace,
     pdfs: list[str],
     stores: tuple[Any, ...] = (),
+    poison_manifest: tuple[PoisonPage, ...] = (),
 ):
     """Build one Daft plan whose only variable is regroup representation."""
 
     reference_only = args.regroup_mode == "reference_only"
     if reference_only != bool(stores):
         raise ValueError("reference_only mode requires payload stores")
+    poison_pages = {
+        (os.path.abspath(entry.pdf_path), entry.page_id)
+        for entry in poison_manifest
+    }
 
-    @daft.cls(cpus=1, max_concurrency=args.render_replicas)
+    @daft.cls(
+        cpus=1,
+        max_concurrency=args.render_replicas,
+        ray_options=worker_resource_options(args.cpu_worker_resource),
+    )
     class RenderPdf:
         def __init__(self, dpi: int) -> None:
             self.renderer = MinerUPdfToPages(dpi=dpi)
@@ -301,7 +327,11 @@ def _build_dataframe(
 
     if args.smoke_no_model:
 
-        @daft.cls(cpus=1, max_concurrency=args.replicas)
+        @daft.cls(
+            cpus=1,
+            max_concurrency=args.replicas,
+            ray_options=worker_resource_options(args.cpu_worker_resource),
+        )
         class SmokeOcrPages:
             def __init__(self) -> None:
                 self.actor_init_started_s = time.time()
@@ -320,6 +350,16 @@ def _build_dataframe(
             ) -> list[Any]:
                 values = pages.to_pylist()
                 parents = [int(value) for value in parent_ids.to_pylist()]
+                poisoned = [
+                    (
+                        os.path.abspath(str(page.value["pdf_path"])),
+                        int(page.value["page_id"]),
+                    )
+                    in poison_pages
+                    for page in values
+                ]
+                if args.poison_policy == "raise" and any(poisoned):
+                    raise ValueError("injected deterministic poison page")
                 token = f"{self.actor_token}-{self.calls}"
                 self.calls += 1
                 started = time.time()
@@ -327,7 +367,8 @@ def _build_dataframe(
                 return _package_ocr_batch(
                     pages=values,
                     contents=[
-                        int(page.value["page_id"]) for page in values
+                        None if bad else int(page.value["page_id"])
+                        for page, bad in zip(values, poisoned, strict=True)
                     ],
                     parent_ids=parents,
                     stores=stores,
@@ -336,6 +377,7 @@ def _build_dataframe(
                     actor_ready_s=self.actor_ready_s,
                     batch_started_s=started,
                     batch_finished_s=finished,
+                    poisoned=poisoned,
                 )
 
         ocr = SmokeOcrPages()
@@ -345,6 +387,7 @@ def _build_dataframe(
             cpus=1,
             gpus=1,
             max_concurrency=args.replicas,
+            ray_options=worker_resource_options(args.gpu_worker_resource),
         )
         class GpuOcrPages:
             def __init__(
@@ -372,8 +415,34 @@ def _build_dataframe(
             ) -> list[Any]:
                 values = pages.to_pylist()
                 parents = [int(value) for value in parent_ids.to_pylist()]
+                poisoned = [
+                    (
+                        os.path.abspath(str(page.value["pdf_path"])),
+                        int(page.value["page_id"]),
+                    )
+                    in poison_pages
+                    for page in values
+                ]
+                if args.poison_policy == "raise" and any(poisoned):
+                    raise ValueError("injected deterministic poison page")
                 started = time.time()
-                contents = self.ocr.run([page.value for page in values])
+                live_indices = [
+                    index for index, bad in enumerate(poisoned) if not bad
+                ]
+                live_contents = (
+                    self.ocr.run(
+                        [values[index].value for index in live_indices]
+                    )
+                    if live_indices
+                    else []
+                )
+                by_index = dict(
+                    zip(live_indices, live_contents, strict=True)
+                )
+                contents = [
+                    None if bad else by_index[index]
+                    for index, bad in enumerate(poisoned)
+                ]
                 finished = time.time()
                 if len(contents) != len(values):
                     raise ValueError(
@@ -391,14 +460,25 @@ def _build_dataframe(
                     actor_ready_s=self.actor_ready_s,
                     batch_started_s=started,
                     batch_finished_s=finished,
+                    poisoned=poisoned,
                 )
 
         ocr = GpuOcrPages(args.model, args.gpu_memory_utilization)
 
-    @daft.cls(cpus=1, max_concurrency=args.reduce_replicas)
+    @daft.cls(
+        cpus=1,
+        max_concurrency=args.reduce_replicas,
+        ray_options=worker_resource_options(args.cpu_worker_resource),
+    )
     class AssemblePdf:
-        def __init__(self, output_dir: str, metadata_only: bool) -> None:
+        def __init__(
+            self,
+            output_dir: str,
+            metadata_only: bool,
+            poison_policy: str,
+        ) -> None:
             self.metadata_only = metadata_only
+            self.poison_policy = poison_policy
             self.assembler = (
                 None
                 if metadata_only
@@ -423,23 +503,54 @@ def _build_dataframe(
             )
             if not rows:
                 raise ValueError("Daft emitted an empty PDF group")
-            page_values = [page.value for page, _, _ in rows]
-            content_values = [content.value for _, content, _ in rows]
             path = str(rows[0][2])
             if any(str(row_path) != path for _, _, row_path in rows):
                 raise ValueError("Daft parent group mixes multiple PDFs")
-            page_ids = tuple(
-                int(page["page_id"]) for page in page_values
+            input_page_ids = tuple(
+                int(page.value["page_id"]) for page, _, _ in rows
             )
-            if page_ids != tuple(range(len(page_ids))):
+            if input_page_ids != tuple(range(len(input_page_ids))):
                 raise ValueError(
-                    f"non-contiguous or duplicate page ordinals: {page_ids}"
+                    "non-contiguous or duplicate page ordinals: "
+                    f"{input_page_ids}"
                 )
-            if self.metadata_only:
+            poison_page_ids = tuple(
+                int(page.value["page_id"])
+                for page, content, _ in rows
+                if content.poisoned
+            )
+            drop_parent = (
+                bool(poison_page_ids)
+                and self.poison_policy == "drop_parent"
+            )
+            live = [row for row in rows if not row[1].poisoned]
+            if not live and not drop_parent:
+                raise ValueError("cannot assemble a PDF when every page is poisoned")
+            page_values = [page.value for page, _, _ in live]
+            content_values = [content.value for _, content, _ in live]
+            page_ids = (
+                ()
+                if drop_parent
+                else tuple(int(page["page_id"]) for page in page_values)
+            )
+            if drop_parent:
+                output = {
+                    "pdf": Path(path).stem,
+                    "pages": 0,
+                    "page_ids": (),
+                    "input_pages": len(input_page_ids),
+                    "poisoned_pages": len(poison_page_ids),
+                    "poison_page_ids": poison_page_ids,
+                    "dropped_parent": True,
+                }
+            elif self.metadata_only:
                 output = {
                     "pdf": Path(path).stem,
                     "pages": len(page_values),
                     "page_ids": page_ids,
+                    "input_pages": len(input_page_ids),
+                    "poisoned_pages": len(poison_page_ids),
+                    "poison_page_ids": poison_page_ids,
                 }
             else:
                 assert self.assembler is not None
@@ -448,6 +559,11 @@ def _build_dataframe(
                     [page_values],
                     [Path(path).stem],
                 )[0]
+                output.update(
+                    input_pages=len(input_page_ids),
+                    poisoned_pages=len(poison_page_ids),
+                    poison_page_ids=list(poison_page_ids),
+                )
             assemble_finished_s = time.time()
             return [
                 _DocumentPayload(
@@ -495,10 +611,20 @@ def _build_dataframe(
                 )
             ]
 
-    @daft.cls(cpus=1, max_concurrency=args.reduce_replicas)
+    @daft.cls(
+        cpus=1,
+        max_concurrency=args.reduce_replicas,
+        ray_options=worker_resource_options(args.cpu_worker_resource),
+    )
     class AssembleReferencePdf:
-        def __init__(self, output_dir: str, metadata_only: bool) -> None:
+        def __init__(
+            self,
+            output_dir: str,
+            metadata_only: bool,
+            poison_policy: str,
+        ) -> None:
             self.metadata_only = metadata_only
+            self.poison_policy = poison_policy
             self.assembler = (
                 None
                 if metadata_only
@@ -523,10 +649,13 @@ def _build_dataframe(
             path = str(rows[0][1])
             if any(str(row_path) != path for _, row_path in rows):
                 raise ValueError("Daft parent group mixes multiple PDFs")
-            page_ids = tuple(int(manifest.page_ordinal) for manifest, _ in rows)
-            if page_ids != tuple(range(len(page_ids))):
+            input_page_ids = tuple(
+                int(manifest.page_ordinal) for manifest, _ in rows
+            )
+            if input_page_ids != tuple(range(len(input_page_ids))):
                 raise ValueError(
-                    f"non-contiguous or duplicate page ordinals: {page_ids}"
+                    "non-contiguous or duplicate page ordinals: "
+                    f"{input_page_ids}"
                 )
 
             blocks: dict[tuple[int, int], tuple[Any, ...]] = {}
@@ -540,13 +669,49 @@ def _build_dataframe(
                     blocks[key][int(manifest.payload_row)]
                 )
             page_payloads = [value[0] for value in pages_and_contents]
-            page_values = [page.value for page in page_payloads]
-            content_values = [value[1] for value in pages_and_contents]
-            if self.metadata_only:
+            poison_page_ids = tuple(
+                int(manifest.page_ordinal)
+                for manifest, _ in rows
+                if manifest.poisoned
+            )
+            drop_parent = (
+                bool(poison_page_ids)
+                and self.poison_policy == "drop_parent"
+            )
+            live = [
+                (payload, value[1])
+                for (manifest, _), payload, value in zip(
+                    rows, page_payloads, pages_and_contents, strict=True
+                )
+                if not manifest.poisoned
+            ]
+            if not live and not drop_parent:
+                raise ValueError("cannot assemble a PDF when every page is poisoned")
+            page_values = [page.value for page, _ in live]
+            content_values = [content for _, content in live]
+            page_ids = (
+                ()
+                if drop_parent
+                else tuple(int(page["page_id"]) for page in page_values)
+            )
+            if drop_parent:
+                output = {
+                    "pdf": Path(path).stem,
+                    "pages": 0,
+                    "page_ids": (),
+                    "input_pages": len(input_page_ids),
+                    "poisoned_pages": len(poison_page_ids),
+                    "poison_page_ids": poison_page_ids,
+                    "dropped_parent": True,
+                }
+            elif self.metadata_only:
                 output = {
                     "pdf": Path(path).stem,
                     "pages": len(page_values),
                     "page_ids": page_ids,
+                    "input_pages": len(input_page_ids),
+                    "poisoned_pages": len(poison_page_ids),
+                    "poison_page_ids": poison_page_ids,
                 }
             else:
                 assert self.assembler is not None
@@ -555,6 +720,11 @@ def _build_dataframe(
                     [page_values],
                     [Path(path).stem],
                 )[0]
+                output.update(
+                    input_pages=len(input_page_ids),
+                    poisoned_pages=len(poison_page_ids),
+                    poison_page_ids=list(poison_page_ids),
+                )
             ray.get(
                 [
                     stores[store_slot].release.remote(block_id)
@@ -610,10 +780,13 @@ def _build_dataframe(
     source = daft.from_pydict(
         {
             "parent_id": list(range(len(pdfs))),
-            "pdf_path": pdfs,
+            # ``load_pdf_manifest`` deliberately returns an immutable tuple,
+            # while Daft 0.7.x accepts column inputs as lists rather than
+            # arbitrary Sequences.
+            "pdf_path": list(pdfs),
         }
     ).into_partitions(source_partitions)
-    renderer = RenderPdf(200)
+    renderer = RenderPdf(args.render_dpi)
     pages = source.with_column(
         "page",
         renderer.run(source["pdf_path"]),
@@ -630,6 +803,7 @@ def _build_dataframe(
                 args.smoke_no_model
                 or args.assemble_mode == "metadata_only"
             ),
+            args.poison_policy,
         )
         return manifest.groupby("parent_id").map_groups(
             assembler.run(manifest["content"], manifest["pdf_path"])
@@ -637,6 +811,7 @@ def _build_dataframe(
     assembler = AssemblePdf(
         os.path.abspath(args.output_dir),
         bool(args.smoke_no_model or args.assemble_mode == "metadata_only"),
+        args.poison_policy,
     )
     return contents.groupby("parent_id").map_groups(
         assembler.run(
@@ -660,9 +835,28 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     import ray  # pyright: ignore[reportMissingImports]
 
     flash_repo = os.path.abspath(args.flash_repo)
-    pdfs = sorted(glob.glob(os.path.join(flash_repo, "*.pdf")))[: args.limit]
-    if not pdfs:
-        raise FileNotFoundError(f"no PDFs found under {flash_repo}")
+    if args.input_manifest:
+        pdfs, page_counts = load_pdf_manifest(
+            args.input_manifest,
+            limit=args.limit,
+        )
+    else:
+        pdfs = tuple(
+            sorted(glob.glob(os.path.join(flash_repo, "*.pdf")))[: args.limit]
+        )
+        if not pdfs:
+            raise FileNotFoundError(f"no PDFs found under {flash_repo}")
+        page_counts = pdf_page_counts(pdfs)
+    poison_manifest = select_poison_pages(
+        pdfs,
+        page_counts,
+        count=args.poison_count,
+        page_id=args.poison_page_id,
+        seed=args.poison_seed,
+        exact_indices=(
+            () if args.poison_pdf_index is None else (args.poison_pdf_index,)
+        ),
+    )
     runtime_env = _runtime_env(flash_repo)
     os.environ.update(runtime_env["env_vars"])
     started_ray_here = not ray.is_initialized()
@@ -686,10 +880,13 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("payload_stores must be positive")
         store_class = _get_payload_store_class()
         stores = tuple(
-            store_class.options(num_cpus=0).remote()
+            store_class.options(
+                num_cpus=0,
+                **worker_resource_options(args.cpu_worker_resource),
+            ).remote()
             for _ in range(args.payload_stores)
         )
-    dataframe = _build_dataframe(args, pdfs, stores)
+    dataframe = _build_dataframe(args, pdfs, stores, poison_manifest)
     plan = _explain(dataframe)
     sampler = ResourceSampler(args.rss_interval_s)
     sampler.start()
@@ -722,7 +919,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     if not all(isinstance(value, _DocumentPayload) for value in documents):
         raise TypeError("Daft output did not preserve document payloads")
     outputs = [value.value for value in documents]
+    successful_outputs = [
+        output for output in outputs if not output.get("dropped_parent", False)
+    ]
     pages = sum(len(value.page_ids) for value in documents)
+    input_pages = sum(page_counts)
+    poison_observed = sum(
+        int(output.get("poisoned_pages", 0)) for output in outputs
+    )
+    poisoned_parent_pages = sum(entry.pdf_pages for entry in poison_manifest)
+    drop_parent = args.poison_policy == "drop_parent"
     batches: dict[
         str,
         tuple[int, float, float, float, float, float, float, int],
@@ -754,6 +960,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             if previous != observation:
                 raise ValueError(f"conflicting Daft batch size for {token}")
     batch_sizes = tuple(value[0] for value in batches.values())
+    dispatched_pages = sum(batch_sizes)
     histogram = {
         str(size): batch_sizes.count(size)
         for size in sorted(set(batch_sizes))
@@ -781,9 +988,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     assemble_finished = tuple(
         document.assemble_finished_s for document in documents
     )
-    gpu_peak = tuple(
-        max((sample.memory_used[index] for sample in gpu_samples), default=0)
-        for index in range(args.replicas)
+    gpu_peak = (
+        ()
+        if args.smoke_no_model
+        else gpu_memory_peaks(gpu_samples, args.replicas)
     )
     payload = {
         "engine": f"daft_{args.regroup_mode}",
@@ -794,10 +1002,38 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "n_pdf": len(pdfs),
         "pages": pages,
+        "input_pages": input_pages,
         "docs": len(outputs),
+        "successful_docs": len(successful_outputs),
+        "poison_policy": args.poison_policy,
+        "poison_seed": args.poison_seed,
+        "poison_injected": len(poison_manifest),
+        "poison_observed": poison_observed,
+        "poison_manifest": [entry.as_dict() for entry in poison_manifest],
+        "poisoned_parent_pages": poisoned_parent_pages,
+        "expected_successful_docs": (
+            len(pdfs) - len(poison_manifest) if drop_parent else len(pdfs)
+        ),
+        "expected_output_pages": (
+            input_pages - poisoned_parent_pages
+            if drop_parent
+            else input_pages - len(poison_manifest)
+        ),
+        "poison_report_contract_passed": (
+            poison_observed == len(poison_manifest)
+            and len(successful_outputs)
+            == (len(pdfs) - len(poison_manifest) if drop_parent else len(pdfs))
+            and pages
+            == (
+                input_pages - poisoned_parent_pages
+                if drop_parent
+                else input_pages - len(poison_manifest)
+            )
+        ),
         "batch_size": args.batch_size,
         "replicas": args.replicas,
         "render_replicas": args.render_replicas,
+        "render_dpi": args.render_dpi,
         "reduce_replicas": args.reduce_replicas,
         "source_partitions": _effective_source_partitions(args, len(pdfs)),
         "regroup_mode": args.regroup_mode,
@@ -812,11 +1048,18 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         },
         "pages_per_s": round(pages / max(wall, 1e-9), 4),
         "ocr_rpc_count": len(batches),
+        "ocr_dispatched_pages": dispatched_pages,
+        "ocr_model_pages": dispatched_pages - poison_observed,
+        "ocr_model_pages_saved_vs_baseline": (
+            input_pages - dispatched_pages + poison_observed
+        ),
         "ocr_grains_per_rpc": (
-            pages / len(batches) if batches else 0.0
+            dispatched_pages / len(batches) if batches else 0.0
         ),
         "ocr_batch_fill_ratio": (
-            pages / (len(batches) * args.batch_size) if batches else 0.0
+            dispatched_pages / (len(batches) * args.batch_size)
+            if batches
+            else 0.0
         ),
         "ocr_batch_histogram": histogram,
         "timeline_s": {
@@ -897,6 +1140,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "payload_store_stats": payload_store_stats,
         "global_output_sort": "* Sort" in plan,
         "output_dir": os.path.abspath(args.output_dir),
+        "cpu_worker_resource": args.cpu_worker_resource,
+        "gpu_worker_resource": args.gpu_worker_resource,
     }
 
     artifact_dir = Path(args.artifact_dir)
@@ -904,6 +1149,15 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     (artifact_dir / "daft_plan.txt").write_text(plan, encoding="utf-8")
     (artifact_dir / "summary.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (artifact_dir / "poison_manifest.json").write_text(
+        json.dumps(
+            [entry.as_dict() for entry in poison_manifest],
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
     (artifact_dir / "outputs.json").write_text(
@@ -931,6 +1185,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--render-replicas", type=int, default=4)
+    parser.add_argument("--render-dpi", type=int, default=200)
     parser.add_argument("--reduce-replicas", type=int, default=4)
     parser.add_argument(
         "--regroup-mode",
@@ -963,7 +1218,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-cpus", type=int, default=32)
     parser.add_argument("--object-store-gb", type=float, default=100)
     parser.add_argument("--rss-interval-s", type=float, default=1)
+    parser.add_argument("--poison-count", type=int, default=0)
+    parser.add_argument("--poison-pdf-index", type=int, default=None)
+    parser.add_argument("--poison-page-id", type=int, default=0)
+    parser.add_argument(
+        "--poison-policy",
+        choices=("skip_page", "drop_parent", "raise"),
+        default="skip_page",
+    )
+    parser.add_argument("--poison-seed", default=DEFAULT_POISON_SEED)
     parser.add_argument("--ray-address", default=None)
+    parser.add_argument("--cpu-worker-resource", default=None)
+    parser.add_argument("--gpu-worker-resource", default=None)
+    parser.add_argument("--input-manifest", default=None)
     parser.add_argument("--smoke-no-model", action="store_true")
     parser.add_argument("--flash-repo", default=DEFAULT_FLASH_REPO)
     parser.add_argument("--model", default=DEFAULT_MODEL)
