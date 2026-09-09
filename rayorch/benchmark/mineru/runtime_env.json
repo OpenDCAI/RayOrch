@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "pip": {
+    "packages": [
+      "beautifulsoup4",
+      "loguru",
+      "magika",
+      "mineru-vl-utils==1.0.5",
+      "nvidia-ml-py",
+      "opencv-python-headless",
+      "pillow",
+      "psutil",
+      "pypdf",
+      "pypdfium2==5.11.0",
+      "six",
+      "vllm==0.10.1.1"
+    ],
+    "pip_check": false
+  },
+  "env_vars": {
+    "RAYORCH_PACKAGED_RUNTIME": "1",
+    "TOKENIZERS_PARALLELISM": "false"
+  }
+}
