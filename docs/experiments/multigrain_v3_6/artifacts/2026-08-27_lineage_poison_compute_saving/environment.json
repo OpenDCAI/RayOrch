@@ -1,0 +1,23 @@
+{
+  "date": "2026-08-27",
+  "git_head": "ff3a1b865765133846066e6548a261a73f77e84f",
+  "worktree_was_dirty": true,
+  "python": "3.12.11",
+  "ray": "2.50.0",
+  "daft": "0.7.21",
+  "torch": "2.7.1",
+  "gpu_count": 4,
+  "gpu": "NVIDIA H20 97871 MiB",
+  "driver": "535.247.01",
+  "cuda_reported_by_nvidia_smi": "12.9",
+  "cpu": "2 sockets, AMD EPYC 9K84 96-Core Processor, 384 logical CPUs",
+  "linux": "5.4.241-1-tlinux4-0017.7 x86_64",
+  "source_sha256": {
+    "mineru_cardinality.py": "b93b40e92bade8ef0f40fdd05d4598400937d344c0779237fdc2ad0a7bb75787",
+    "mineru_cardinality_matrix.py": "5919d865afae2d22296aca451f9c3ac8e81619cb9508c23d57912adc49cda678",
+    "runtime/dispatch.py": "5d7eb1be8eadc5cbdd9c0a0af90210f21151134b15bbd66d0bd8f8e4361be1e4",
+    "runtime/engine.py": "9ca22145c88e91c880d101d5e0c77b9e693e6b144b54e7d7b8881fe9d292c863",
+    "execution/executor.py": "2b4e50d1ecb1498119fc63a0f0eb2d013fe55b12c4c27c0223b5b7b3151805b3",
+    "protocol.py": "b1bc087b69b0f8662a672d9471237ad5dde8e7e0dc3afc9611201eb7f1c32729"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "experiment_id": "2026-08-27-lineage-poison-compute-saving-formal-v2",
+  "status": "complete",
+  "input_manifest": "../2026-08-27_large_pdf_poison/corpus/largest_8_manifest.jsonl",
+  "input_manifest_sha256": "280e27b5e3258305efa7f39c8e4176d175cc4ebfdcf0326127296d5ac1dab27f",
+  "documents": 8,
+  "pages": 2928,
+  "page_counts": [427, 395, 390, 376, 374, 334, 322, 310],
+  "engines": ["multigrain_v3_6", "ray_data_2.50.0", "daft_0.7.21"],
+  "poison_arms": {
+    "p0": "no poisoned parent",
+    "p1": "page 0 of the largest 427-page parent is poisoned"
+  },
+  "repetitions": 5,
+  "replicas": 4,
+  "batch_size": 64,
+  "work_ms_per_healthy_page": 100.0,
+  "v36_input_mode": "8 parents; timed parent-to-page expand; microbatch_size=8; max_active_microbatches=1",
+  "competitor_input_mode": "2928 pre-expanded page records, balanced into 16 blocks before the timed region",
+  "competitor_parent_failure": "drop the complete parent after groupby",
+  "expand_replicas": 4,
+  "reduce_replicas": 4,
+  "primary_wall_metric": "framework_wall_s",
+  "timing_scope": "Ray is initialized before timing; every arm uses a fresh process and Ray runtime; framework actor creation, execution, regroup, terminal collection and V3.6 Executor close are timed; ray.init and ray.shutdown are excluded",
+  "order": [
+    ["v36-p0", "ray_data-p0", "daft-p0", "v36-p1", "ray_data-p1", "daft-p1"],
+    ["ray_data-p0", "daft-p0", "v36-p1", "ray_data-p1", "daft-p1", "v36-p0"],
+    ["daft-p0", "v36-p1", "ray_data-p1", "daft-p1", "v36-p0", "ray_data-p0"],
+    ["v36-p1", "ray_data-p1", "daft-p1", "v36-p0", "ray_data-p0", "daft-p0"],
+    ["ray_data-p1", "daft-p1", "v36-p0", "ray_data-p0", "daft-p0", "v36-p1"]
+  ],
+  "original_tmp_protocol_sha256": "b270de567de188fd2b030e637ee42db4a3ead270ed14227dc0f2bf5b4ed56abd",
+  "original_tmp_results_jsonl_sha256": "437461decc6387662379132af54e9ca8415f029e96b5b8f3670a449a659271c0"
+}

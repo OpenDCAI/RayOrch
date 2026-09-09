@@ -1,0 +1,70 @@
+{
+  "engine": "multigrain_v3_6",
+  "mode": "elastic",
+  "assemble_mode": "metadata_only",
+  "n_pdf": 2,
+  "pages": 2,
+  "input_pages": 3,
+  "docs": 2,
+  "successful_docs": 1,
+  "output_outcomes": {
+    "PRESENT": 1,
+    "DROPPED": 0,
+    "FAILED": 0,
+    "SUPPRESSED": 1
+  },
+  "poison_policy": "group_failure",
+  "poison_seed": "rayorch-mineru-poison-v1",
+  "poison_injected": 1,
+  "poison_observed": 1,
+  "poison_manifest": [
+    {
+      "pdf_index": 0,
+      "pdf_path": "<rayorch-run-root>/inputs/public-pdfs-2000/cond-mat__9608153v1.pdf",
+      "page_id": 0,
+      "pdf_pages": 1,
+      "cause": "poisoned PDF cond-mat__9608153v1.pdf at page 0",
+      "pdf_name": "cond-mat__9608153v1.pdf"
+    }
+  ],
+  "poisoned_parent_pages": 1,
+  "expected_successful_docs": 1,
+  "expected_output_pages": 2,
+  "poison_report_contract_passed": true,
+  "batch_size": 4,
+  "replicas": 1,
+  "microbatch_size": 2,
+  "max_active_microbatches": 2,
+  "batch_policy": "immediate_work_conserving",
+  "startup_s": 62.583,
+  "measured_wall_s": 4.558,
+  "end_to_end_wall_s": 67.177,
+  "pages_per_s": 0.4388,
+  "rpc_count": 6,
+  "ocr_rpc_count": 2,
+  "ocr_grains": 3,
+  "ocr_model_pages": 2,
+  "ocr_model_pages_saved_vs_baseline": 1,
+  "group_sibling_pages_not_dispatched": 0,
+  "group_sibling_pages_computed_but_discarded": 0,
+  "ocr_retries": 0,
+  "ocr_grains_per_rpc": 1.5,
+  "ocr_batch_fill_ratio": 0.375,
+  "ocr_batch_histogram": {
+    "1": 1,
+    "2": 1
+  },
+  "active_arenas_high_watermark": 1,
+  "actor_count": 4,
+  "released_values": 14,
+  "driver_rss_start": 612986880,
+  "driver_rss_peak": 654819328,
+  "gpu_memory_peak": [
+    0
+  ],
+  "ratio_vs_v3_golden": null,
+  "within_v3_golden_5_percent": null,
+  "output_dir": "<rayorch-run-root>/outputs/2026-08-27-large-pdf-poison/preflight-v36",
+  "cpu_worker_resource": "worker_0_group",
+  "gpu_worker_resource": "worker_1_group"
+}

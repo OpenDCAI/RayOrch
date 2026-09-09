@@ -1,0 +1,17 @@
+{
+  "manifest": "mixed_p99_plus_127_manifest.jsonl",
+  "selection": {
+    "poison_parent": "first row of page_heavy_8_manifest.jsonl",
+    "healthy_parents": "first 127 non-poison rows in corpus_manifest.jsonl with corpus=public-pdfs-2000, 8 <= pages <= 64, and bytes <= 50000000",
+    "order": "poison parent first, followed by frozen corpus manifest order"
+  },
+  "documents": 128,
+  "pages": 2758,
+  "bytes": 73966227,
+  "maximum_parent_pages": 293,
+  "poison_pdf_index": 0,
+  "poison_page_id": 0,
+  "render_dpi": 200,
+  "render_replicas": 128,
+  "sha256": "16b9951e2370ce8ca06492da20027bb24a5d74cca77711a7d18e6a9721b2a2d3"
+}

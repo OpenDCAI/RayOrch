@@ -1,0 +1,64 @@
+{
+  "date": "2026-08-27",
+  "benchmark": "cardinality-faithful long-tail parent-poison wall-time matrix",
+  "reported_repetitions": 3,
+  "launcher_repetition_cap": 5,
+  "reporting_rule": "Use the first three complete cyclically rotated repetitions. Repetition 3 was interrupted before producing a summary; no partial arm is included.",
+  "input_manifest": "../../2026-08-27_large_pdf_poison/corpus/corpus_manifest.jsonl",
+  "input_manifest_sha256": "f743373af9ff9a54944796060cdd423271dae0a41de36abca371aef271b641b7",
+  "selection": {
+    "rule": "retain the 99 largest valid PDFs plus every other valid PDF with pages <= 23; preserve frozen manifest order",
+    "selection_largest": 99,
+    "healthy_max_pages": 23,
+    "path_sequence_sha256": "2d66cc79c2144f33b5e83a26ccf9d389ea4ce68dff40fc4c2585121ae429c9e1",
+    "documents": 1885,
+    "pages": 45507,
+    "source_pdf_bytes": 284341340395,
+    "warning": "The benchmark reads the manifest, not the PDF bytes. source_pdf_bytes describes the selected source files and is not processed-byte throughput."
+  },
+  "conditions": {
+    "healthy": 0,
+    "poison": 99,
+    "poison_rule": "page 0 of each retained top-99 PDF",
+    "poisoned_parent_pages": 23613,
+    "poisoned_document_fraction": 0.0525198939
+  },
+  "nominal_opportunity": {
+    "formula": "sum(max(parent_pages - replicas * batch_size, 0))",
+    "replicas_times_batch_size": 192,
+    "ready_pages": 4605,
+    "fraction_of_all_pages": 0.101193223,
+    "warning": "R*B is a workload-design heuristic, not a strict global inflight bound."
+  },
+  "resources": {
+    "gpus": 4,
+    "gpu_model": "NVIDIA H20",
+    "replicas": 4,
+    "batch_size": 48,
+    "work_ms_per_non_poison_page": 50,
+    "expand_replicas": 4,
+    "reduce_replicas": 4,
+    "source_blocks": 128,
+    "page_partitions_for_controls": 128,
+    "microbatch_size_v36": 32,
+    "max_active_microbatches_v36": 8
+  },
+  "timing": {
+    "primary_metric": "framework_wall_s",
+    "ray_startup_excluded": true,
+    "v36_input": "parent records; timed Parent->Page expansion, expensive work, and parent reduce",
+    "ray_data_and_daft_input": "balanced pre-expanded page records constructed outside the timed region",
+    "interpretation": "The competitor input accommodation is deliberately conservative in their favor."
+  },
+  "workload_scope": {
+    "expensive_udf": "50 ms sleep per non-poison page while a one-GPU actor allocation is held",
+    "does_measure": "scheduler wall time, physical UDF admissions, READY suppression, and late-commit isolation",
+    "does_not_measure": "GPU SM utilization, energy, PDF rasterization, or real MinerU OCR throughput"
+  },
+  "order": [
+    ["v36-p0", "ray_data-p0", "daft-p0", "v36-p99", "ray_data-p99", "daft-p99"],
+    ["ray_data-p0", "daft-p0", "v36-p99", "ray_data-p99", "daft-p99", "v36-p0"],
+    ["daft-p0", "v36-p99", "ray_data-p99", "daft-p99", "v36-p0", "ray_data-p0"]
+  ],
+  "raw_results_jsonl_sha256": "7400c23ced564a80c25840de7db39fd579defaa6f2cec8c6406e61e31cc93662"
+}

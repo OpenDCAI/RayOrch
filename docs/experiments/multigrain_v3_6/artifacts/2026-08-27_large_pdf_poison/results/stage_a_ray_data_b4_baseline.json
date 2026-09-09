@@ -1,0 +1,1018 @@
+{
+  "engine": "ray_data_reference_only",
+  "ray_version": "2.51.1",
+  "backend": "mineru_vllm",
+  "assemble_mode": "metadata_only",
+  "n_pdf": 128,
+  "pages": 2758,
+  "input_pages": 2758,
+  "docs": 128,
+  "successful_docs": 128,
+  "poison_policy": "skip_page",
+  "poison_seed": "rayorch-mineru-poison-v1",
+  "poison_injected": 0,
+  "poison_observed": 0,
+  "poison_manifest": [],
+  "poisoned_parent_pages": 0,
+  "expected_successful_docs": 128,
+  "expected_output_pages": 2758,
+  "poison_report_contract_passed": true,
+  "batch_size": 4,
+  "replicas": 32,
+  "render_replicas": 128,
+  "reduce_replicas": 32,
+  "source_blocks": 128,
+  "regroup_mode": "reference_only",
+  "shuffle_strategy": "sort",
+  "render_dpi": 200,
+  "run_wall_s": 178.384,
+  "measured_wall_s": 178.384,
+  "end_to_end_wall_s": 178.384,
+  "timing_scope": {
+    "ray_init_included": false,
+    "actor_model_startup_included": true,
+    "ray_shutdown_included": false,
+    "driver_correctness_sort_included": false
+  },
+  "pages_per_s": 15.461,
+  "ocr_batch_call_count": 730,
+  "ocr_dispatched_pages": 2758,
+  "ocr_model_pages": 2758,
+  "ocr_model_pages_saved_vs_baseline": 0,
+  "ocr_pages_per_batch_call": 3.778082191780822,
+  "ocr_remote_task_count": 258,
+  "ocr_batch_fill_ratio": 0.9445205479452055,
+  "ocr_batch_histogram": {
+    "1": 26,
+    "2": 32,
+    "3": 20,
+    "4": 652
+  },
+  "timeline_s": {
+    "first_render_start": 25.91075086593628,
+    "last_render_finish": 32.11620092391968,
+    "first_ocr_actor_init": 20.60779857635498,
+    "all_ocr_actors_ready": 96.28404974937439,
+    "first_ocr_batch_start": 63.002753019332886,
+    "last_ocr_batch_finish": 122.20279812812805,
+    "post_ocr_to_collect_end": 56.181302070617676,
+    "first_payload_publish_start": 65.52457237243652,
+    "last_payload_publish_finish": 122.36590647697449,
+    "first_assemble_start": 139.14697265625,
+    "last_assemble_finish": 167.25398707389832,
+    "post_assemble_to_collect_end": 11.130113124847412
+  },
+  "driver_rss_start": 742588416,
+  "driver_rss_peak": 1538621440,
+  "gpu_memory_peak": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "explicit_lineage_columns": [
+    "parent_id",
+    "page_ordinal"
+  ],
+  "page_representation": "Arrow-compatible uint8 image_rgb tensor",
+  "regroup_operator": "Ray Data sort groupby",
+  "shuffle_observation": {
+    "operator_wall_s": null,
+    "map_output_bytes": null,
+    "finalize_output_bytes": null
+  },
+  "full_value_regroup": false,
+  "payload_block_count": 730,
+  "payload_object_bytes": 31160774074,
+  "payload_store_stats": [
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 90,
+      "peak_rows": 353,
+      "peak_payload_bytes": 4071847822,
+      "total_blocks": 90,
+      "total_consumers": 91,
+      "total_rows": 353,
+      "total_payload_bytes": 4071847822
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 19,
+      "peak_rows": 71,
+      "peak_payload_bytes": 796642515,
+      "total_blocks": 19,
+      "total_consumers": 20,
+      "total_rows": 71,
+      "total_payload_bytes": 796642515
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 14,
+      "peak_rows": 51,
+      "peak_payload_bytes": 572236255,
+      "total_blocks": 14,
+      "total_consumers": 15,
+      "total_rows": 51,
+      "total_payload_bytes": 572236255
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 17,
+      "peak_rows": 63,
+      "peak_payload_bytes": 706880012,
+      "total_blocks": 17,
+      "total_consumers": 18,
+      "total_rows": 63,
+      "total_payload_bytes": 706880012
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 16,
+      "peak_rows": 62,
+      "peak_payload_bytes": 695659523,
+      "total_blocks": 16,
+      "total_consumers": 18,
+      "total_rows": 62,
+      "total_payload_bytes": 695659523
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 26,
+      "peak_rows": 100,
+      "peak_payload_bytes": 1140228382,
+      "total_blocks": 26,
+      "total_consumers": 26,
+      "total_rows": 100,
+      "total_payload_bytes": 1140228382
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 22,
+      "peak_rows": 83,
+      "peak_payload_bytes": 944554806,
+      "total_blocks": 22,
+      "total_consumers": 23,
+      "total_rows": 83,
+      "total_payload_bytes": 944554806
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 20,
+      "peak_rows": 72,
+      "peak_payload_bytes": 807863004,
+      "total_blocks": 20,
+      "total_consumers": 20,
+      "total_rows": 72,
+      "total_payload_bytes": 807863004
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 20,
+      "peak_rows": 77,
+      "peak_payload_bytes": 877232811,
+      "total_blocks": 20,
+      "total_consumers": 20,
+      "total_rows": 77,
+      "total_payload_bytes": 877232811
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 22,
+      "peak_rows": 82,
+      "peak_payload_bytes": 947859680,
+      "total_blocks": 22,
+      "total_consumers": 22,
+      "total_rows": 82,
+      "total_payload_bytes": 947859680
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 29,
+      "peak_rows": 111,
+      "peak_payload_bytes": 1242872783,
+      "total_blocks": 29,
+      "total_consumers": 29,
+      "total_rows": 111,
+      "total_payload_bytes": 1242872783
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 28,
+      "peak_rows": 107,
+      "peak_payload_bytes": 1200573784,
+      "total_blocks": 28,
+      "total_consumers": 30,
+      "total_rows": 107,
+      "total_payload_bytes": 1200573784
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 23,
+      "peak_rows": 88,
+      "peak_payload_bytes": 987387778,
+      "total_blocks": 23,
+      "total_consumers": 26,
+      "total_rows": 88,
+      "total_payload_bytes": 987387778
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 14,
+      "peak_rows": 47,
+      "peak_payload_bytes": 527355238,
+      "total_blocks": 14,
+      "total_consumers": 15,
+      "total_rows": 47,
+      "total_payload_bytes": 527355238
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 15,
+      "peak_rows": 53,
+      "peak_payload_bytes": 599605312,
+      "total_blocks": 15,
+      "total_consumers": 16,
+      "total_rows": 53,
+      "total_payload_bytes": 599605312
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 18,
+      "peak_rows": 65,
+      "peak_payload_bytes": 735386371,
+      "total_blocks": 18,
+      "total_consumers": 18,
+      "total_rows": 65,
+      "total_payload_bytes": 735386371
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 25,
+      "peak_rows": 96,
+      "peak_payload_bytes": 1083594999,
+      "total_blocks": 25,
+      "total_consumers": 27,
+      "total_rows": 96,
+      "total_payload_bytes": 1083594999
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 19,
+      "peak_rows": 71,
+      "peak_payload_bytes": 796642515,
+      "total_blocks": 19,
+      "total_consumers": 20,
+      "total_rows": 71,
+      "total_payload_bytes": 796642515
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 15,
+      "peak_rows": 54,
+      "peak_payload_bytes": 605897253,
+      "total_blocks": 15,
+      "total_consumers": 15,
+      "total_rows": 54,
+      "total_payload_bytes": 605897253
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 17,
+      "peak_rows": 65,
+      "peak_payload_bytes": 729320520,
+      "total_blocks": 17,
+      "total_consumers": 17,
+      "total_rows": 65,
+      "total_payload_bytes": 729320520
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 19,
+      "peak_rows": 70,
+      "peak_payload_bytes": 785422261,
+      "total_blocks": 19,
+      "total_consumers": 20,
+      "total_rows": 70,
+      "total_payload_bytes": 785422261
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 15,
+      "peak_rows": 54,
+      "peak_payload_bytes": 609309162,
+      "total_blocks": 15,
+      "total_consumers": 15,
+      "total_rows": 54,
+      "total_payload_bytes": 609309162
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 21,
+      "peak_rows": 82,
+      "peak_payload_bytes": 920065783,
+      "total_blocks": 21,
+      "total_consumers": 22,
+      "total_rows": 82,
+      "total_payload_bytes": 920065783
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 31,
+      "peak_rows": 117,
+      "peak_payload_bytes": 1312777031,
+      "total_blocks": 31,
+      "total_consumers": 32,
+      "total_rows": 117,
+      "total_payload_bytes": 1312777031
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 14,
+      "peak_rows": 53,
+      "peak_payload_bytes": 594676765,
+      "total_blocks": 14,
+      "total_consumers": 15,
+      "total_rows": 53,
+      "total_payload_bytes": 594676765
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 25,
+      "peak_rows": 98,
+      "peak_payload_bytes": 1099590791,
+      "total_blocks": 25,
+      "total_consumers": 25,
+      "total_rows": 98,
+      "total_payload_bytes": 1099590791
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 35,
+      "peak_rows": 134,
+      "peak_payload_bytes": 1503522294,
+      "total_blocks": 35,
+      "total_consumers": 36,
+      "total_rows": 134,
+      "total_payload_bytes": 1503522294
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 29,
+      "peak_rows": 114,
+      "peak_payload_bytes": 1280253102,
+      "total_blocks": 29,
+      "total_consumers": 32,
+      "total_rows": 114,
+      "total_payload_bytes": 1280253102
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 22,
+      "peak_rows": 80,
+      "peak_payload_bytes": 909756740,
+      "total_blocks": 22,
+      "total_consumers": 24,
+      "total_rows": 80,
+      "total_payload_bytes": 909756740
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 18,
+      "peak_rows": 67,
+      "peak_payload_bytes": 751761263,
+      "total_blocks": 18,
+      "total_consumers": 18,
+      "total_rows": 67,
+      "total_payload_bytes": 751761263
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 17,
+      "peak_rows": 63,
+      "peak_payload_bytes": 706880011,
+      "total_blocks": 17,
+      "total_consumers": 17,
+      "total_rows": 63,
+      "total_payload_bytes": 706880011
+    },
+    {
+      "live_blocks": 0,
+      "live_rows": 0,
+      "live_payload_bytes": 0,
+      "peak_blocks": 15,
+      "peak_rows": 55,
+      "peak_payload_bytes": 617117508,
+      "total_blocks": 15,
+      "total_consumers": 16,
+      "total_rows": 55,
+      "total_payload_bytes": 617117508
+    }
+  ],
+  "output_dir": "<rayorch-run-root>/outputs/2026-08-27-large-pdf-poison/ray-data-stage-a-r4-b4-baseline",
+  "cpu_worker_resource": "worker_1_group",
+  "gpu_worker_resource": "worker_1_group",
+  "output_signatures": [
+    {
+      "pdf": "1110.6703v1",
+      "pages": 293
+    },
+    {
+      "pdf": "0704.1044v1",
+      "pages": 11
+    },
+    {
+      "pdf": "0704.2000v1",
+      "pages": 8
+    },
+    {
+      "pdf": "0704.2557v1",
+      "pages": 17
+    },
+    {
+      "pdf": "0705.1499v1",
+      "pages": 15
+    },
+    {
+      "pdf": "0705.3116v1",
+      "pages": 16
+    },
+    {
+      "pdf": "0705.3421v1",
+      "pages": 22
+    },
+    {
+      "pdf": "0706.0051v1",
+      "pages": 31
+    },
+    {
+      "pdf": "0706.3942v1",
+      "pages": 12
+    },
+    {
+      "pdf": "0707.1478v1",
+      "pages": 17
+    },
+    {
+      "pdf": "0707.1539v1",
+      "pages": 30
+    },
+    {
+      "pdf": "0708.1534v1",
+      "pages": 17
+    },
+    {
+      "pdf": "0709.1524v1",
+      "pages": 13
+    },
+    {
+      "pdf": "0709.2329v1",
+      "pages": 12
+    },
+    {
+      "pdf": "0710.1052v1",
+      "pages": 11
+    },
+    {
+      "pdf": "0711.1254v1",
+      "pages": 10
+    },
+    {
+      "pdf": "0711.1330v1",
+      "pages": 23
+    },
+    {
+      "pdf": "0711.1659v1",
+      "pages": 28
+    },
+    {
+      "pdf": "0712.3013v1",
+      "pages": 8
+    },
+    {
+      "pdf": "0801.4569v1",
+      "pages": 19
+    },
+    {
+      "pdf": "0802.1608v1",
+      "pages": 22
+    },
+    {
+      "pdf": "0804.1666v1",
+      "pages": 9
+    },
+    {
+      "pdf": "0805.3672v1",
+      "pages": 16
+    },
+    {
+      "pdf": "0806.0108v1",
+      "pages": 46
+    },
+    {
+      "pdf": "0806.3124v1",
+      "pages": 20
+    },
+    {
+      "pdf": "0806.3465v1",
+      "pages": 24
+    },
+    {
+      "pdf": "0807.0814v1",
+      "pages": 9
+    },
+    {
+      "pdf": "0807.1376v1",
+      "pages": 15
+    },
+    {
+      "pdf": "0807.2199v1",
+      "pages": 25
+    },
+    {
+      "pdf": "0808.0736v1",
+      "pages": 32
+    },
+    {
+      "pdf": "0809.1117v1",
+      "pages": 19
+    },
+    {
+      "pdf": "0809.3208v1",
+      "pages": 13
+    },
+    {
+      "pdf": "0811.3422v1",
+      "pages": 12
+    },
+    {
+      "pdf": "0812.0164v1",
+      "pages": 27
+    },
+    {
+      "pdf": "0812.0394v1",
+      "pages": 14
+    },
+    {
+      "pdf": "0812.1227v1",
+      "pages": 10
+    },
+    {
+      "pdf": "0812.2882v1",
+      "pages": 16
+    },
+    {
+      "pdf": "0812.3697v1",
+      "pages": 28
+    },
+    {
+      "pdf": "0812.4359v1",
+      "pages": 13
+    },
+    {
+      "pdf": "0901.2767v1",
+      "pages": 12
+    },
+    {
+      "pdf": "0901.4503v1",
+      "pages": 10
+    },
+    {
+      "pdf": "0902.2334v1",
+      "pages": 40
+    },
+    {
+      "pdf": "0902.2503v1",
+      "pages": 16
+    },
+    {
+      "pdf": "0903.0502v1",
+      "pages": 63
+    },
+    {
+      "pdf": "0903.1850v1",
+      "pages": 14
+    },
+    {
+      "pdf": "0904.0661v1",
+      "pages": 18
+    },
+    {
+      "pdf": "0904.2704v1",
+      "pages": 13
+    },
+    {
+      "pdf": "0904.3325v1",
+      "pages": 22
+    },
+    {
+      "pdf": "0905.1562v1",
+      "pages": 15
+    },
+    {
+      "pdf": "0906.3284v1",
+      "pages": 12
+    },
+    {
+      "pdf": "0906.5286v1",
+      "pages": 8
+    },
+    {
+      "pdf": "0907.0595v1",
+      "pages": 8
+    },
+    {
+      "pdf": "0907.4139v1",
+      "pages": 22
+    },
+    {
+      "pdf": "0907.4759v1",
+      "pages": 23
+    },
+    {
+      "pdf": "0907.5484v1",
+      "pages": 14
+    },
+    {
+      "pdf": "0908.0354v1",
+      "pages": 15
+    },
+    {
+      "pdf": "0908.2042v1",
+      "pages": 10
+    },
+    {
+      "pdf": "0909.0181v1",
+      "pages": 12
+    },
+    {
+      "pdf": "0909.2651v1",
+      "pages": 38
+    },
+    {
+      "pdf": "0910.0506v1",
+      "pages": 20
+    },
+    {
+      "pdf": "0910.2152v1",
+      "pages": 20
+    },
+    {
+      "pdf": "0910.4070v1",
+      "pages": 19
+    },
+    {
+      "pdf": "0912.0311v1",
+      "pages": 17
+    },
+    {
+      "pdf": "1001.1245v1",
+      "pages": 10
+    },
+    {
+      "pdf": "1001.3426v1",
+      "pages": 38
+    },
+    {
+      "pdf": "1001.4850v1",
+      "pages": 16
+    },
+    {
+      "pdf": "1002.3239v1",
+      "pages": 18
+    },
+    {
+      "pdf": "1003.0053v1",
+      "pages": 10
+    },
+    {
+      "pdf": "1003.5051v1",
+      "pages": 16
+    },
+    {
+      "pdf": "1003.5798v1",
+      "pages": 48
+    },
+    {
+      "pdf": "1004.2233v1",
+      "pages": 10
+    },
+    {
+      "pdf": "1004.2517v1",
+      "pages": 11
+    },
+    {
+      "pdf": "1004.2659v1",
+      "pages": 20
+    },
+    {
+      "pdf": "1004.3365v1",
+      "pages": 9
+    },
+    {
+      "pdf": "1005.1756v1",
+      "pages": 9
+    },
+    {
+      "pdf": "1005.2058v1",
+      "pages": 10
+    },
+    {
+      "pdf": "1005.2422v1",
+      "pages": 32
+    },
+    {
+      "pdf": "1006.0453v1",
+      "pages": 14
+    },
+    {
+      "pdf": "1006.0536v1",
+      "pages": 11
+    },
+    {
+      "pdf": "1006.0713v1",
+      "pages": 16
+    },
+    {
+      "pdf": "1006.1627v1",
+      "pages": 38
+    },
+    {
+      "pdf": "1006.3994v1",
+      "pages": 18
+    },
+    {
+      "pdf": "1006.5239v1",
+      "pages": 21
+    },
+    {
+      "pdf": "1007.0863v1",
+      "pages": 20
+    },
+    {
+      "pdf": "1007.4303v1",
+      "pages": 10
+    },
+    {
+      "pdf": "1008.2589v1",
+      "pages": 8
+    },
+    {
+      "pdf": "1008.3504v1",
+      "pages": 10
+    },
+    {
+      "pdf": "1008.4947v1",
+      "pages": 40
+    },
+    {
+      "pdf": "1009.1250v1",
+      "pages": 8
+    },
+    {
+      "pdf": "1009.1879v1",
+      "pages": 40
+    },
+    {
+      "pdf": "1010.0632v1",
+      "pages": 32
+    },
+    {
+      "pdf": "1010.1748v1",
+      "pages": 25
+    },
+    {
+      "pdf": "1010.2769v1",
+      "pages": 15
+    },
+    {
+      "pdf": "1010.5482v1",
+      "pages": 9
+    },
+    {
+      "pdf": "1010.6130v1",
+      "pages": 16
+    },
+    {
+      "pdf": "1011.0196v1",
+      "pages": 17
+    },
+    {
+      "pdf": "1011.0569v1",
+      "pages": 11
+    },
+    {
+      "pdf": "1011.1754v1",
+      "pages": 18
+    },
+    {
+      "pdf": "1011.3856v1",
+      "pages": 10
+    },
+    {
+      "pdf": "1011.4591v1",
+      "pages": 26
+    },
+    {
+      "pdf": "1012.0706v1",
+      "pages": 14
+    },
+    {
+      "pdf": "1012.2774v1",
+      "pages": 11
+    },
+    {
+      "pdf": "1101.4908v1",
+      "pages": 35
+    },
+    {
+      "pdf": "1102.0497v1",
+      "pages": 21
+    },
+    {
+      "pdf": "1102.0843v1",
+      "pages": 35
+    },
+    {
+      "pdf": "1103.0612v1",
+      "pages": 16
+    },
+    {
+      "pdf": "1103.0628v1",
+      "pages": 56
+    },
+    {
+      "pdf": "1103.0631v1",
+      "pages": 13
+    },
+    {
+      "pdf": "1103.0742v1",
+      "pages": 25
+    },
+    {
+      "pdf": "1103.1638v1",
+      "pages": 9
+    },
+    {
+      "pdf": "1103.1794v1",
+      "pages": 17
+    },
+    {
+      "pdf": "1103.2459v1",
+      "pages": 20
+    },
+    {
+      "pdf": "1103.5845v1",
+      "pages": 17
+    },
+    {
+      "pdf": "1104.2226v1",
+      "pages": 15
+    },
+    {
+      "pdf": "1105.0782v1",
+      "pages": 18
+    },
+    {
+      "pdf": "1105.1918v1",
+      "pages": 18
+    },
+    {
+      "pdf": "1105.4384v1",
+      "pages": 14
+    },
+    {
+      "pdf": "1105.5019v1",
+      "pages": 16
+    },
+    {
+      "pdf": "1105.5396v1",
+      "pages": 40
+    },
+    {
+      "pdf": "1106.2047v1",
+      "pages": 17
+    },
+    {
+      "pdf": "1106.3989v1",
+      "pages": 14
+    },
+    {
+      "pdf": "1106.6308v1",
+      "pages": 24
+    },
+    {
+      "pdf": "1107.1029v1",
+      "pages": 53
+    },
+    {
+      "pdf": "1107.3416v1",
+      "pages": 50
+    },
+    {
+      "pdf": "1107.3550v1",
+      "pages": 22
+    },
+    {
+      "pdf": "1107.3677v1",
+      "pages": 11
+    },
+    {
+      "pdf": "1107.4329v1",
+      "pages": 11
+    },
+    {
+      "pdf": "1107.4833v1",
+      "pages": 12
+    }
+  ]
+}

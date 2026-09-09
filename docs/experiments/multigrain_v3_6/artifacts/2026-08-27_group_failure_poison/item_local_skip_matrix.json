@@ -1,0 +1,69 @@
+{
+  "experiment": "controlled_b64_item_local_skip_matrix",
+  "date": "2026-08-27",
+  "input_pdfs": 160,
+  "input_pages": 3584,
+  "poison_counts": [0, 4, 16, 64, 80],
+  "poison_page_id": 0,
+  "poison_seed": "rayorch-mineru-poison-v1",
+  "gpu_actors": 4,
+  "ocr_batch_cap": 64,
+  "poison_policy": "skip_page",
+  "expected_semantics": "Keep all 160 PDFs and omit only the N poisoned pages, yielding 3584-N output pages.",
+  "timing": "post-ray.init through output collection, including actor/model startup",
+  "source_results": {
+    "path": "/tmp/rayorch_poison_skip_matrix_160/results.jsonl",
+    "rows": 12,
+    "sha256": "cdff090f8c0d726782f8d6f516be4692532fb3f98ca21e3870a3e002468703b9"
+  },
+  "baseline_reuse": {
+    "artifact": "controlled_b64_matrix.json",
+    "reason": "The poison-free arm is policy-independent and was not rerun.",
+    "rows": 3
+  },
+  "validation": {
+    "matrix_contract": "PASS",
+    "cross_engine_poison_manifest_identity": "PASS",
+    "successful_rows": 12,
+    "successful_contract_failures": 0,
+    "successful_runner_fatal_errors": 0,
+    "rayorch_ocr_retries": 0
+  },
+  "failed_attempts": [
+    {
+      "engine": "ray_data_full_value",
+      "poison_pdfs": 16,
+      "attempt": 1,
+      "stage": "shuffle/assemble tail",
+      "exception": "ObjectFreedError",
+      "driver_message": "Attempting to recover 18 lost objects by resubmitting their tasks or setting a new primary location from existing copies.",
+      "summary_written": false,
+      "classification": "framework object-lifetime/recovery failure, not a poison UDF exception",
+      "rerun": "Attempt 2 used identical workload and parameters and passed."
+    }
+  ],
+  "notes": {
+    "isolation_scope": "Application-level item marker for all three engines; this matrix does not exercise GroupFailure parent suppression.",
+    "automatic_isolation": "Ray Data and Daft do not interpret the marker as a typed runtime control value; their benchmark UDF and reducer explicitly carry and consume it.",
+    "dispatch_saving": "Only poisoned pages skip model invocation. All 3584 pages enter the OCR stage, so no sibling dispatch pruning is claimed.",
+    "retry_visibility": "RayOrch exposes ocr_retries. Ray Data and Daft do not expose a directly comparable internal retry counter in these summaries.",
+    "ray_data_pressure": "Successful runs processed approximately 40.64 GB of full-value shuffle data and emitted task-memory warnings; warnings are not counted as failed attempts."
+  },
+  "rows": [
+    {"engine":"multigrain_v3_6","poison_pdfs":0,"successful_docs":160,"output_pages":3584,"wall_s":307.134,"execution_wall_s":263.879,"ocr_dispatched_pages":3584,"ocr_model_pages":3584,"ocr_batch_count":62,"ocr_batch_fill_ratio":0.903226,"ocr_retries":0,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"multigrain_v3_6","poison_pdfs":4,"successful_docs":160,"output_pages":3580,"wall_s":305.017,"execution_wall_s":261.396,"ocr_dispatched_pages":3584,"ocr_model_pages":3580,"ocr_batch_count":62,"ocr_batch_fill_ratio":0.903226,"ocr_retries":0,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"multigrain_v3_6","poison_pdfs":16,"successful_docs":160,"output_pages":3568,"wall_s":306.457,"execution_wall_s":262.566,"ocr_dispatched_pages":3584,"ocr_model_pages":3568,"ocr_batch_count":62,"ocr_batch_fill_ratio":0.903226,"ocr_retries":0,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"multigrain_v3_6","poison_pdfs":64,"successful_docs":160,"output_pages":3520,"wall_s":302.866,"execution_wall_s":260.718,"ocr_dispatched_pages":3584,"ocr_model_pages":3520,"ocr_batch_count":62,"ocr_batch_fill_ratio":0.903226,"ocr_retries":0,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"multigrain_v3_6","poison_pdfs":80,"successful_docs":160,"output_pages":3504,"wall_s":305.556,"execution_wall_s":261.935,"ocr_dispatched_pages":3584,"ocr_model_pages":3504,"ocr_batch_count":62,"ocr_batch_fill_ratio":0.903226,"ocr_retries":0,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"ray_data_full_value","poison_pdfs":0,"successful_docs":160,"output_pages":3584,"wall_s":463.258,"execution_wall_s":463.258,"ocr_dispatched_pages":3584,"ocr_model_pages":3584,"ocr_batch_count":98,"ocr_batch_fill_ratio":0.571429,"ocr_retries":null,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"ray_data_full_value","poison_pdfs":4,"successful_docs":160,"output_pages":3580,"wall_s":456.246,"execution_wall_s":456.246,"ocr_dispatched_pages":3584,"ocr_model_pages":3580,"ocr_batch_count":98,"ocr_batch_fill_ratio":0.571429,"ocr_retries":null,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"ray_data_full_value","poison_pdfs":16,"successful_docs":160,"output_pages":3568,"wall_s":482.366,"execution_wall_s":482.366,"ocr_dispatched_pages":3584,"ocr_model_pages":3568,"ocr_batch_count":98,"ocr_batch_fill_ratio":0.571429,"ocr_retries":null,"attempts":2,"failed_attempts":1,"runner_fatal_errors":1,"contract_failures":0},
+    {"engine":"ray_data_full_value","poison_pdfs":64,"successful_docs":160,"output_pages":3520,"wall_s":458.860,"execution_wall_s":458.860,"ocr_dispatched_pages":3584,"ocr_model_pages":3520,"ocr_batch_count":98,"ocr_batch_fill_ratio":0.571429,"ocr_retries":null,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"ray_data_full_value","poison_pdfs":80,"successful_docs":160,"output_pages":3504,"wall_s":469.664,"execution_wall_s":469.664,"ocr_dispatched_pages":3584,"ocr_model_pages":3504,"ocr_batch_count":98,"ocr_batch_fill_ratio":0.571429,"ocr_retries":null,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"daft_full_value","poison_pdfs":0,"successful_docs":160,"output_pages":3584,"wall_s":435.289,"execution_wall_s":435.289,"ocr_dispatched_pages":3584,"ocr_model_pages":3584,"ocr_batch_count":61,"ocr_batch_fill_ratio":0.918033,"ocr_retries":null,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"daft_full_value","poison_pdfs":4,"successful_docs":160,"output_pages":3580,"wall_s":433.436,"execution_wall_s":433.436,"ocr_dispatched_pages":3584,"ocr_model_pages":3580,"ocr_batch_count":61,"ocr_batch_fill_ratio":0.918033,"ocr_retries":null,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"daft_full_value","poison_pdfs":16,"successful_docs":160,"output_pages":3568,"wall_s":422.470,"execution_wall_s":422.470,"ocr_dispatched_pages":3584,"ocr_model_pages":3568,"ocr_batch_count":61,"ocr_batch_fill_ratio":0.918033,"ocr_retries":null,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"daft_full_value","poison_pdfs":64,"successful_docs":160,"output_pages":3520,"wall_s":422.775,"execution_wall_s":422.775,"ocr_dispatched_pages":3584,"ocr_model_pages":3520,"ocr_batch_count":61,"ocr_batch_fill_ratio":0.918033,"ocr_retries":null,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0},
+    {"engine":"daft_full_value","poison_pdfs":80,"successful_docs":160,"output_pages":3504,"wall_s":422.430,"execution_wall_s":422.430,"ocr_dispatched_pages":3584,"ocr_model_pages":3504,"ocr_batch_count":61,"ocr_batch_fill_ratio":0.918033,"ocr_retries":null,"attempts":1,"failed_attempts":0,"runner_fatal_errors":0,"contract_failures":0}
+  ]
+}

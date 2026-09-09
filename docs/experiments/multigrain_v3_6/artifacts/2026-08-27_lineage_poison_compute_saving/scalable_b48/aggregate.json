@@ -1,0 +1,94 @@
+{
+  "reported_repetitions": 3,
+  "rows": 18,
+  "contracts_passed": 18,
+  "output_identity_passed": 18,
+  "suppression_accounting_closed": 18,
+  "dataset": {
+    "documents": 1885,
+    "pages": 45507,
+    "poisoned_documents": 99,
+    "poisoned_parent_pages": 23613,
+    "nominal_ready_opportunity_pages": 4605,
+    "nominal_ready_opportunity_fraction": 0.101193223
+  },
+  "arms": {
+    "multigrain_v3_6_healthy": {
+      "wall_s": [580.512696, 582.920528, 580.723151],
+      "wall_mean_s": 581.385458,
+      "wall_sd_s": 1.333567,
+      "wall_median_s": 580.723151,
+      "physical_model_pages": [45507, 45507, 45507],
+      "ready_siblings_not_dispatched": [0, 0, 0]
+    },
+    "multigrain_v3_6_poison": {
+      "wall_s": [493.969769, 494.097018, 495.644755],
+      "wall_mean_s": 494.570514,
+      "wall_sd_s": 0.932493,
+      "wall_median_s": 494.097018,
+      "physical_model_pages": [39115, 39135, 39251],
+      "ready_siblings_not_dispatched": [6293, 6273, 6157],
+      "inflight_siblings_computed_but_discarded": [17221, 17241, 17357]
+    },
+    "ray_data_healthy": {
+      "wall_s": [571.424127, 571.337424, 571.274263],
+      "wall_mean_s": 571.345271,
+      "wall_sd_s": 0.075240,
+      "wall_median_s": 571.337424,
+      "physical_model_pages": [45507, 45507, 45507],
+      "ready_siblings_not_dispatched": [0, 0, 0]
+    },
+    "ray_data_poison": {
+      "wall_s": [570.185565, 570.438042, 570.339899],
+      "wall_mean_s": 570.321169,
+      "wall_sd_s": 0.127276,
+      "wall_median_s": 570.339899,
+      "physical_model_pages": [45408, 45408, 45408],
+      "ready_siblings_not_dispatched": [0, 0, 0]
+    },
+    "daft_healthy": {
+      "wall_s": [671.254801, 657.835152, 666.684029],
+      "wall_mean_s": 665.257994,
+      "wall_sd_s": 6.822531,
+      "wall_median_s": 666.684029,
+      "physical_model_pages": [45507, 45507, 45507],
+      "ready_siblings_not_dispatched": [0, 0, 0]
+    },
+    "daft_poison": {
+      "wall_s": [663.287535, 658.878668, 666.343430],
+      "wall_mean_s": 662.836544,
+      "wall_sd_s": 3.752761,
+      "wall_median_s": 663.287535,
+      "physical_model_pages": [45408, 45408, 45408],
+      "ready_siblings_not_dispatched": [0, 0, 0]
+    }
+  },
+  "paired_healthy_minus_poison": {
+    "multigrain_v3_6": {
+      "seconds": [86.542927, 88.823510, 85.078396],
+      "mean_seconds": 86.814944,
+      "sd_seconds": 1.887317,
+      "descriptive_95pct_t_interval_seconds": [82.126589, 91.503299],
+      "percent": [14.908016, 15.237671, 14.650423],
+      "mean_percent": 14.932036
+    },
+    "ray_data": {
+      "seconds": [1.238562, 0.899382, 0.934364],
+      "mean_seconds": 1.024103,
+      "sd_seconds": 0.186549,
+      "descriptive_95pct_t_interval_seconds": [0.560689, 1.487516],
+      "percent": [0.216750, 0.157417, 0.163558],
+      "mean_percent": 0.179242,
+      "interpretation": "This is consistent with skipping only 99 poison triggers; the ideal trigger-only saving is 1.2375 seconds."
+    },
+    "daft": {
+      "seconds": [7.967266, -1.043516, 0.340599],
+      "mean_seconds": 2.421450,
+      "sd_seconds": 4.852422,
+      "descriptive_95pct_t_interval_seconds": [-9.632636, 14.475535],
+      "percent": [1.186921, -0.158629, 0.051089],
+      "mean_percent": 0.359794,
+      "interpretation": "Direction changes across repetitions; no stable wall-time benefit is observed."
+    }
+  }
+}

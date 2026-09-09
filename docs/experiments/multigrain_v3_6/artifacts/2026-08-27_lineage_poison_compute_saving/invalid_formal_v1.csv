@@ -1,0 +1,8 @@
+repetition,order_index,arm,framework_wall_s,contract_passed,disposition
+0,0,v36-p0,80.158625,true,excluded_with_entire_formal_v1
+0,1,ray_data-p0,81.174865,true,excluded_with_entire_formal_v1
+0,2,daft-p0,84.941235,true,excluded_with_entire_formal_v1
+0,3,v36-p1,73.870078,true,excluded_with_entire_formal_v1
+0,4,ray_data-p1,81.070021,true,excluded_with_entire_formal_v1
+0,5,daft-p1,85.071127,true,excluded_with_entire_formal_v1
+1,0,ray_data-p0,159.901623,true,triggered_pre_registered_redesign_due_parent_block_skew

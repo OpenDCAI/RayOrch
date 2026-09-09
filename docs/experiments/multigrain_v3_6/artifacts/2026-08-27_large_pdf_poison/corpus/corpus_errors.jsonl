@@ -1,0 +1,1 @@
+{"corpus": "sampled-pdfs-1690", "path": "<rayorch-run-root>/inputs/sampled-pdfs-1690/d05db017-91bd-495c-b700-fe0bc6af49ab.pdf", "source_path": "<private-corpus-root>/aidata_pdf_300k_sample/pdfs/d05db017-91bd-495c-b700-fe0bc6af49ab.pdf", "bytes": 480247808, "status": "error", "error_type": "PdfiumError", "error": "Failed to load document (PDFium: Data format error)."}

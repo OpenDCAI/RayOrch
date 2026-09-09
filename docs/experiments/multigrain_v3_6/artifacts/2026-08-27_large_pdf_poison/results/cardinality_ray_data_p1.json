@@ -1,0 +1,35 @@
+{
+  "engine": "ray_data",
+  "benchmark": "full_corpus_cardinality_probe",
+  "input_manifest": "<ray-working-dir>/corpus_manifest.jsonl",
+  "documents": 3689,
+  "pages": 174744,
+  "poisoned_documents": 1,
+  "poisoned_parent_pages": 427,
+  "healthy_documents": 3688,
+  "healthy_pages": 174317,
+  "poisoned_parent_indices": [
+    1341
+  ],
+  "poisoned_parent_page_counts": [
+    427
+  ],
+  "poison_policy": "drop_parent_after_groupby",
+  "poison_observed": 1,
+  "successful_documents": 3688,
+  "output_pages": 174317,
+  "output_identity_passed": true,
+  "contract_passed": true,
+  "replicas": 32,
+  "batch_size": 8,
+  "work_ms": 10.0,
+  "shuffle_strategy": "sort",
+  "measured_wall_s": 103.644995,
+  "end_to_end_wall_s": 103.644995,
+  "work_dispatched_pages": 174744,
+  "physical_model_pages": 174743,
+  "ready_siblings_not_dispatched": 0,
+  "inflight_siblings_computed_but_discarded": 426,
+  "suppression_accounting_closed": true,
+  "source_blocks": 128
+}

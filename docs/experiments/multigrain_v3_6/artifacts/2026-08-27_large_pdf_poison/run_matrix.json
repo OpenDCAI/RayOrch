@@ -1,0 +1,149 @@
+{
+  "schema_version": 2,
+  "frozen_at": "2026-08-27",
+  "execution_status": "completed_except_daft_topology_gate_and_real_full_ocr",
+  "compute_cleanup": [
+    {
+      "purpose": "primary_matrix",
+      "compute_id": "8a2b635e-b9a0-4d12-972b-b92980b82a6c",
+      "deprovision_confirmed": true,
+      "delete_confirmed": true,
+      "verification": "get-compute returned 404"
+    },
+    {
+      "purpose": "batch_64_followup",
+      "compute_id": "3a49cf00-d7da-4ace-8b4c-2ba92b336701",
+      "deprovision_confirmed": true,
+      "delete_confirmed": true,
+      "verification": "get-compute returned 404"
+    }
+  ],
+  "shared": {
+    "gpu_nodes": 4,
+    "gpus_per_node": 8,
+    "gpu_type": "H20",
+    "ocr_replicas": 32,
+    "ocr_batch_sizes": [4, 8, 16, 64],
+    "render_replicas": 128,
+    "render_dpi": 200,
+    "reduce_replicas": 32,
+    "assemble_mode": "metadata_only",
+    "benchmark_driver_resource": "worker_0_group",
+    "cpu_worker_resource": "worker_1_group",
+    "gpu_worker_resource": "worker_1_group",
+    "execution": "one arm at a time on one compute"
+  },
+  "stage_a": {
+    "execution_status": "completed",
+    "manifest": "corpus/mixed_p99_plus_127_manifest.jsonl",
+    "manifest_sha256": "16b9951e2370ce8ca06492da20027bb24a5d74cca77711a7d18e6a9721b2a2d3",
+    "documents": 128,
+    "pages": 2758,
+    "poison_pdf_index": 0,
+    "poison_page_id": 0,
+    "poison_parent_pages": 293,
+    "rayorch": {
+      "mode": "elastic",
+      "batch_sizes": [4, 8, 16, 64],
+      "microbatch_size": 32,
+      "max_active_microbatches": 4,
+      "poison_policy": "group_failure"
+    },
+    "ray_data": {
+      "source_blocks": 128,
+      "batch_sizes": [4, 64],
+      "shuffle_strategy": "sort",
+      "regroup_mode": "reference_only",
+      "payload_stores": 32,
+      "poison_policy": "drop_parent"
+    },
+    "daft": {
+      "source_partitions": 128,
+      "regroup_mode": "reference_only",
+      "payload_stores": 32,
+      "poison_policy": "drop_parent",
+      "gate": "run only after the 3-page HashAggregate compatibility probe completes"
+    },
+    "paired_arms": [
+      "baseline",
+      "poison"
+    ]
+  },
+  "stage_b_real_full": {
+    "execution_status": "not_run",
+    "reason": "eager whole-PDF 200-DPI rasterization would primarily benchmark storage/decode/object-store boundaries; real OCR is covered by stage A and full lineage cardinality by stage B2",
+    "manifest": "corpus/corpus_manifest.jsonl",
+    "manifest_sha256": "f743373af9ff9a54944796060cdd423271dae0a41de36abca371aef271b641b7",
+    "documents": 3689,
+    "pages": 174744,
+    "poison_pdf_index": 1341,
+    "poison_page_id": 0,
+    "poison_parent_pages": 427,
+    "rayorch": {
+      "mode": "elastic",
+      "microbatch_size": 32,
+      "max_active_microbatches": 4,
+      "poison_policy": "group_failure"
+    },
+    "ray_data": {
+      "source_blocks": 128,
+      "shuffle_strategy": "sort",
+      "regroup_mode": "reference_only",
+      "payload_stores": 32,
+      "poison_policy": "drop_parent"
+    },
+    "daft": {
+      "source_partitions": 128,
+      "regroup_mode": "reference_only",
+      "payload_stores": 32,
+      "poison_policy": "drop_parent",
+      "gate": "stage A must complete first"
+    },
+    "paired_arms": [
+      "baseline",
+      "poison"
+    ],
+    "boundedness": "at most 128 admitted PDF parents; the full corpus advances in waves"
+  },
+  "stage_b2_cardinality": {
+    "execution_status": "completed",
+    "manifest": "corpus/corpus_manifest.jsonl",
+    "engines": [
+      "multigrain_v3_6",
+      "ray_data"
+    ],
+    "poison_largest": [
+      0,
+      1,
+      16
+    ],
+    "replicas": 32,
+    "primary_batch_size": 8,
+    "work_ms": 10,
+    "expand_replicas": 32,
+    "reduce_replicas": 32,
+    "source_blocks": 128,
+    "microbatch_size": 32,
+    "max_active_microbatches": 8,
+    "batch_64_followup": {
+      "engine": "multigrain_v3_6",
+      "poison_largest": [0, 1, 16],
+      "batch_size": 64,
+      "execution_status": "completed",
+      "ray_data_not_repeated_reason": "real OCR batch-64 poison already proves reference-only drop-parent saves only the trigger; the prior full-cardinality reference establishes exact identity and accounting"
+    },
+    "interpretation": "scheduler and work-accounting control; not real OCR throughput"
+  },
+  "daft": {
+    "execution_status": "compatibility_gate_failed",
+    "reason": "Daft RemoteFlotillaRunner remained on the Ray head while HashAggregate ran on GPU workers; GPU-to-head Ray data ports were unreachable on this compute topology",
+    "performance_claim_allowed": false
+  },
+  "release_gates": [
+    "one integer root ObjectRef reaches one identity actor",
+    "all worker nodes can read shared-filesystem corpus and model paths",
+    "no experiment job is RUNNING or PENDING before the next arm",
+    "output identity and poison accounting contracts pass",
+    "RayOrch suppression accounting closes exactly"
+  ]
+}

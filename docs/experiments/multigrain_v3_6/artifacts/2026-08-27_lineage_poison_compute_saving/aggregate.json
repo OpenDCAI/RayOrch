@@ -1,0 +1,25 @@
+{
+  "completed_runs": 30,
+  "contract_passed": 30,
+  "suppression_accounting_closed": 30,
+  "arms": {
+    "v36-p0": {"median_wall_s": 80.222454, "mean_wall_s": 80.352505, "sd_wall_s": 0.253870, "min_wall_s": 80.124218, "max_wall_s": 80.628920, "median_physical_model_pages": 2928},
+    "v36-p1": {"median_wall_s": 74.047353, "mean_wall_s": 74.196100, "sd_wall_s": 0.398001, "min_wall_s": 73.791151, "max_wall_s": 74.713275, "median_physical_model_pages": 2750, "median_ready_siblings_not_dispatched": 177, "min_ready_siblings_not_dispatched": 171, "max_ready_siblings_not_dispatched": 192, "median_inflight_siblings_discarded": 249},
+    "ray_data-p0": {"median_wall_s": 74.417183, "mean_wall_s": 74.450222, "sd_wall_s": 0.104853, "min_wall_s": 74.323120, "max_wall_s": 74.573913, "median_physical_model_pages": 2928},
+    "ray_data-p1": {"median_wall_s": 74.360954, "mean_wall_s": 74.355550, "sd_wall_s": 0.054695, "min_wall_s": 74.269327, "max_wall_s": 74.421409, "median_physical_model_pages": 2927, "median_ready_siblings_not_dispatched": 0, "median_inflight_siblings_discarded": 426},
+    "daft-p0": {"median_wall_s": 88.531142, "mean_wall_s": 88.287554, "sd_wall_s": 0.490282, "min_wall_s": 87.573493, "max_wall_s": 88.764336, "median_physical_model_pages": 2928},
+    "daft-p1": {"median_wall_s": 88.113613, "mean_wall_s": 87.850497, "sd_wall_s": 0.835583, "min_wall_s": 86.404828, "max_wall_s": 88.522670, "median_physical_model_pages": 2927, "median_ready_siblings_not_dispatched": 0, "median_inflight_siblings_discarded": 426}
+  },
+  "paired_p0_minus_p1": {
+    "v36": {"deltas_s": [5.915645, 6.175101, 5.646165, 6.209336, 6.835779], "median_delta_s": 6.175101, "mean_delta_s": 6.156405, "sd_delta_s": 0.442439, "mean_95pct_t_ci_s": [5.607044, 6.705766], "median_percent": 7.697472},
+    "ray_data": {"deltas_s": [0.048990, 0.120407, 0.212959, -0.034747, 0.125749], "median_delta_s": 0.120407, "mean_delta_s": 0.094672, "sd_delta_s": 0.092812, "mean_95pct_t_ci_s": [-0.020569, 0.209912], "median_percent": 0.161529},
+    "daft": {"deltas_s": [0.585995, 0.305353, 0.241666, 1.592389, -0.540120], "median_delta_s": 0.305353, "mean_delta_s": 0.437057, "sd_delta_s": 0.769313, "mean_95pct_t_ci_s": [-0.518172, 1.392285], "median_percent": 0.344753}
+  },
+  "lineage_specific_median_savings": {
+    "model_page_equivalents_vs_competitors_p1": 177,
+    "fraction_of_poisoned_siblings": 0.415493,
+    "fraction_of_total_pages": 0.060451,
+    "reserved_gpu_actor_seconds_at_100ms_per_page": 17.7,
+    "ideal_four_actor_wall_seconds": 4.425
+  }
+}

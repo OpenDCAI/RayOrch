@@ -1,0 +1,51 @@
+{
+  "engine": "multigrain_v3_6",
+  "benchmark": "full_corpus_cardinality_probe",
+  "input_manifest": "<ray-working-dir>/corpus_manifest.jsonl",
+  "documents": 3689,
+  "pages": 174744,
+  "poisoned_documents": 1,
+  "poisoned_parent_pages": 427,
+  "healthy_documents": 3688,
+  "healthy_pages": 174317,
+  "poisoned_parent_indices": [
+    1341
+  ],
+  "poisoned_parent_page_counts": [
+    427
+  ],
+  "poison_policy": "group_failure",
+  "poison_observed": 1,
+  "successful_documents": 3688,
+  "output_pages": 174317,
+  "output_identity_passed": true,
+  "contract_passed": true,
+  "replicas": 32,
+  "batch_size": 8,
+  "work_ms": 10.0,
+  "microbatch_size": 32,
+  "max_active_microbatches": 8,
+  "measured_wall_s": 426.755562,
+  "end_to_end_wall_s": 435.051432,
+  "rpc_count": 28919,
+  "work_rpc_count": 21893,
+  "work_dispatched_pages": 174744,
+  "physical_model_pages": 174743,
+  "ready_siblings_not_dispatched": 0,
+  "inflight_siblings_computed_but_discarded": 426,
+  "suppression_accounting_closed": true,
+  "work_batch_fill_ratio": 0.9977161649842415,
+  "work_batch_histogram": {
+    "1": 15,
+    "2": 18,
+    "3": 11,
+    "4": 7,
+    "5": 21,
+    "6": 13,
+    "7": 15,
+    "8": 21793
+  },
+  "work_retries": 0,
+  "actor_count": 97,
+  "peak_active_microbatches": 8
+}

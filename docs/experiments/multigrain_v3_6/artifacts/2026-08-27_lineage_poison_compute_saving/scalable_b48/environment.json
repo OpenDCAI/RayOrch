@@ -1,0 +1,17 @@
+{
+  "date": "2026-08-27",
+  "git_head": "ff3a1b865765133846066e6548a261a73f77e84f",
+  "git_note": "The benchmark and parent-failure implementation were uncommitted worktree changes; exact source hashes are recorded below.",
+  "python": "3.12.11",
+  "ray": "2.50.0",
+  "daft": "0.7.21",
+  "torch": "2.7.1",
+  "gpu_count": 4,
+  "gpu_model": "NVIDIA H20",
+  "gpu_memory_mib_each": 97871,
+  "driver": "535.247.01",
+  "source_sha256": {
+    "mineru_cardinality.py": "a66120ae5d9533fb27f6ad53e2e8f1d02f46a34199428c134a9715baa1e63022",
+    "mineru_cardinality_matrix.py": "68ed00023a76de8dc39e6c9576e098be6da3e48d99848d9d5b95d04f128f4ca2"
+  }
+}

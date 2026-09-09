@@ -1,0 +1,45 @@
+{
+  "experiment": "controlled_b64_parent_poison_matrix",
+  "date": "2026-08-27",
+  "input_pdfs": 160,
+  "input_pages": 3584,
+  "poison_counts": [0, 4, 16, 64, 80],
+  "poison_page_id": 0,
+  "poison_seed": "rayorch-mineru-poison-v1",
+  "gpu_actors": 4,
+  "ocr_batch_cap": 64,
+  "timing": "post-ray.init through output collection, including actor/model startup",
+  "source_results": {
+    "rayorch": {
+      "path": "/tmp/rayorch_poison_matrix_160/results.jsonl",
+      "sha256": "e09c99c9d3c7a3d03e21321762d52f0a758b9e453748ca64fe9648e6d8e42d39"
+    },
+    "competitors": {
+      "path": "/tmp/rayorch_poison_compare_160/results.jsonl",
+      "sha256": "40796d4a00bde5da6e44f71c956f4ce2aa3bac04773328d27f611193cbd62bfd"
+    }
+  },
+  "notes": {
+    "runner_fatal_errors": "Zero for every completed arm.",
+    "ocr_retries": "RayOrch exposes zero; Ray Data and Daft do not expose a comparable internal retry counter, represented as null.",
+    "sibling_computed_discarded": "For competitor drop_parent arms this is the parent-page work retained until regroup, not a runtime suppression metric.",
+    "shuffle_map_output_gb": "Ray Data local shuffle block bytes, not network-interface bytes."
+  },
+  "rows": [
+    {"engine":"multigrain_v3_6","poison_pdfs":0,"poisoned_parent_pages":0,"successful_docs":160,"output_pages":3584,"wall_s":307.134,"execution_wall_s":263.879,"ocr_dispatched_pages":3584,"ocr_model_pages":3584,"sibling_not_dispatched":0,"sibling_computed_discarded":0,"ocr_batch_count":62,"ocr_batch_fill_ratio":0.903226,"ocr_retries":0,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":721.898,"gpu_peak_gib":77.661,"shuffle_map_output_gb":null},
+    {"engine":"multigrain_v3_6","poison_pdfs":4,"poisoned_parent_pages":112,"successful_docs":156,"output_pages":3472,"wall_s":306.560,"execution_wall_s":264.619,"ocr_dispatched_pages":3584,"ocr_model_pages":3580,"sibling_not_dispatched":0,"sibling_computed_discarded":108,"ocr_batch_count":62,"ocr_batch_fill_ratio":0.903226,"ocr_retries":0,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":723.168,"gpu_peak_gib":77.663,"shuffle_map_output_gb":null},
+    {"engine":"multigrain_v3_6","poison_pdfs":16,"poisoned_parent_pages":338,"successful_docs":144,"output_pages":3246,"wall_s":300.794,"execution_wall_s":259.454,"ocr_dispatched_pages":3584,"ocr_model_pages":3568,"sibling_not_dispatched":0,"sibling_computed_discarded":322,"ocr_batch_count":62,"ocr_batch_fill_ratio":0.903226,"ocr_retries":0,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":721.973,"gpu_peak_gib":77.659,"shuffle_map_output_gb":null},
+    {"engine":"multigrain_v3_6","poison_pdfs":64,"poisoned_parent_pages":1308,"successful_docs":96,"output_pages":2276,"wall_s":301.414,"execution_wall_s":258.381,"ocr_dispatched_pages":3584,"ocr_model_pages":3520,"sibling_not_dispatched":0,"sibling_computed_discarded":1244,"ocr_batch_count":62,"ocr_batch_fill_ratio":0.903226,"ocr_retries":0,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":721.613,"gpu_peak_gib":77.661,"shuffle_map_output_gb":null},
+    {"engine":"multigrain_v3_6","poison_pdfs":80,"poisoned_parent_pages":1642,"successful_docs":80,"output_pages":1942,"wall_s":304.961,"execution_wall_s":261.570,"ocr_dispatched_pages":3584,"ocr_model_pages":3504,"sibling_not_dispatched":0,"sibling_computed_discarded":1562,"ocr_batch_count":62,"ocr_batch_fill_ratio":0.903226,"ocr_retries":0,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":722.324,"gpu_peak_gib":77.659,"shuffle_map_output_gb":null},
+    {"engine":"ray_data_full_value","poison_pdfs":0,"poisoned_parent_pages":0,"successful_docs":160,"output_pages":3584,"wall_s":463.258,"execution_wall_s":463.258,"ocr_dispatched_pages":3584,"ocr_model_pages":3584,"sibling_not_dispatched":0,"sibling_computed_discarded":0,"ocr_batch_count":98,"ocr_batch_fill_ratio":0.571429,"ocr_retries":null,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":791.055,"gpu_peak_gib":77.653,"shuffle_map_output_gb":40.644371},
+    {"engine":"ray_data_full_value","poison_pdfs":4,"poisoned_parent_pages":112,"successful_docs":156,"output_pages":3472,"wall_s":485.077,"execution_wall_s":485.077,"ocr_dispatched_pages":3584,"ocr_model_pages":3580,"sibling_not_dispatched":0,"sibling_computed_discarded":108,"ocr_batch_count":98,"ocr_batch_fill_ratio":0.571429,"ocr_retries":null,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":790.891,"gpu_peak_gib":77.657,"shuffle_map_output_gb":40.644402},
+    {"engine":"ray_data_full_value","poison_pdfs":16,"poisoned_parent_pages":338,"successful_docs":144,"output_pages":3246,"wall_s":483.973,"execution_wall_s":483.973,"ocr_dispatched_pages":3584,"ocr_model_pages":3568,"sibling_not_dispatched":0,"sibling_computed_discarded":322,"ocr_batch_count":98,"ocr_batch_fill_ratio":0.571429,"ocr_retries":null,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":792.832,"gpu_peak_gib":77.651,"shuffle_map_output_gb":40.644349},
+    {"engine":"ray_data_full_value","poison_pdfs":64,"poisoned_parent_pages":1308,"successful_docs":96,"output_pages":2276,"wall_s":480.645,"execution_wall_s":480.645,"ocr_dispatched_pages":3584,"ocr_model_pages":3520,"sibling_not_dispatched":0,"sibling_computed_discarded":1244,"ocr_batch_count":98,"ocr_batch_fill_ratio":0.571429,"ocr_retries":null,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":791.020,"gpu_peak_gib":77.646,"shuffle_map_output_gb":40.644095},
+    {"engine":"ray_data_full_value","poison_pdfs":80,"poisoned_parent_pages":1642,"successful_docs":80,"output_pages":1942,"wall_s":463.734,"execution_wall_s":463.734,"ocr_dispatched_pages":3584,"ocr_model_pages":3504,"sibling_not_dispatched":0,"sibling_computed_discarded":1562,"ocr_batch_count":98,"ocr_batch_fill_ratio":0.571429,"ocr_retries":null,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":792.578,"gpu_peak_gib":77.659,"shuffle_map_output_gb":40.644021},
+    {"engine":"daft_full_value","poison_pdfs":0,"poisoned_parent_pages":0,"successful_docs":160,"output_pages":3584,"wall_s":435.289,"execution_wall_s":435.289,"ocr_dispatched_pages":3584,"ocr_model_pages":3584,"sibling_not_dispatched":0,"sibling_computed_discarded":0,"ocr_batch_count":61,"ocr_batch_fill_ratio":0.918033,"ocr_retries":null,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":719.301,"gpu_peak_gib":77.661,"shuffle_map_output_gb":null},
+    {"engine":"daft_full_value","poison_pdfs":4,"poisoned_parent_pages":112,"successful_docs":156,"output_pages":3472,"wall_s":419.086,"execution_wall_s":419.086,"ocr_dispatched_pages":3584,"ocr_model_pages":3580,"sibling_not_dispatched":0,"sibling_computed_discarded":108,"ocr_batch_count":61,"ocr_batch_fill_ratio":0.918033,"ocr_retries":null,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":719.371,"gpu_peak_gib":77.661,"shuffle_map_output_gb":null},
+    {"engine":"daft_full_value","poison_pdfs":16,"poisoned_parent_pages":338,"successful_docs":144,"output_pages":3246,"wall_s":418.669,"execution_wall_s":418.669,"ocr_dispatched_pages":3584,"ocr_model_pages":3568,"sibling_not_dispatched":0,"sibling_computed_discarded":322,"ocr_batch_count":61,"ocr_batch_fill_ratio":0.918033,"ocr_retries":null,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":661.699,"gpu_peak_gib":77.659,"shuffle_map_output_gb":null},
+    {"engine":"daft_full_value","poison_pdfs":64,"poisoned_parent_pages":1308,"successful_docs":96,"output_pages":2276,"wall_s":419.368,"execution_wall_s":419.368,"ocr_dispatched_pages":3584,"ocr_model_pages":3520,"sibling_not_dispatched":0,"sibling_computed_discarded":1244,"ocr_batch_count":61,"ocr_batch_fill_ratio":0.918033,"ocr_retries":null,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":718.758,"gpu_peak_gib":77.659,"shuffle_map_output_gb":null},
+    {"engine":"daft_full_value","poison_pdfs":80,"poisoned_parent_pages":1642,"successful_docs":80,"output_pages":1942,"wall_s":408.379,"execution_wall_s":408.379,"ocr_dispatched_pages":3584,"ocr_model_pages":3504,"sibling_not_dispatched":0,"sibling_computed_discarded":1562,"ocr_batch_count":61,"ocr_batch_fill_ratio":0.918033,"ocr_retries":null,"runner_fatal_errors":0,"contract_failures":0,"driver_rss_peak_mib":717.379,"gpu_peak_gib":77.661,"shuffle_map_output_gb":null}
+  ]
+}
