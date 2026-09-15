@@ -53,6 +53,7 @@ def test_mineru_plugin_metadata_and_runtime_env_are_lightweight():
     assert available() == ("mineru",)
     plugin = get_plugin("mineru")
     assert plugin.name == "mineru"
+    assert plugin.runner_module == "rayorch.benchmark.mineru.runner"
     assert "vllm" not in sys.modules
 
     first = load_runtime_env(plugin)
@@ -62,6 +63,12 @@ def test_mineru_plugin_metadata_and_runtime_env_are_lightweight():
     assert "numpy==2.2.6" in first.value["pip"]["packages"]
     assert "transformers>=4.57.3,<5.0.0" in first.value["pip"]["packages"]
     assert len(first.digest) == 64
+
+
+def test_benchmark_attribute_uses_the_registry_as_its_single_source():
+    import rayorch.benchmark as benchmark
+
+    assert benchmark.mineru.__name__ == "rayorch.benchmark.mineru"
 
 
 def test_registry_supports_lazy_explicit_registration(tmp_path: Path, monkeypatch):

@@ -13,7 +13,7 @@ import os
 import pytest
 
 from rayorch import Executor, F, Pipeline, Port, RayModule
-from rayorch.multigrain.program.logical import ExpandOrigin, ReduceOrigin
+from rayorch._program.logical import ExpandOrigin, ReduceOrigin
 
 
 @pytest.fixture(scope="module", autouse=True)

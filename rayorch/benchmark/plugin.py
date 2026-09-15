@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib import import_module, util
-from typing import Any
+from importlib import import_module
+from types import ModuleType
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,15 +15,11 @@ class BenchmarkPlugin:
     runner_module: str
     runtime_package: str
     runtime_resource: str = "runtime_env.json"
-    required_modules: tuple[str, ...] = ()
 
-    def load_runner(self) -> Any:
+    def load_runner(self) -> ModuleType:
+        """Import the heavy runner only when execution is requested."""
+
         return import_module(self.runner_module)
-
-    def missing_dependencies(self) -> tuple[str, ...]:
-        return tuple(
-            name for name in self.required_modules if util.find_spec(name) is None
-        )
 
 
 __all__ = ["BenchmarkPlugin"]

@@ -7,11 +7,14 @@ from importlib import import_module
 from typing import Any
 
 _MODULES = {
+    "job": "rayorch.benchmark.mineru.job",
     "pipeline": "rayorch.benchmark.mineru.pipeline",
     "plugin": "rayorch.benchmark.mineru.plugin",
+    "runner": "rayorch.benchmark.mineru.runner",
     "udfs": "rayorch.benchmark.mineru.udfs",
+    "validate": "rayorch.benchmark.mineru.validate",
 }
-__all__ = ["pipeline", "plugin", "udfs"]
+__all__ = list(_MODULES)
 
 
 def __getattr__(name: str) -> Any:

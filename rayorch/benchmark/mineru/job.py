@@ -117,7 +117,7 @@ def create_bundle(
     if "--ray-address" not in forwarded:
         forwarded.extend(("--ray-address", "auto"))
     entrypoint = shlex.join(
-        ["python", "-m", "rayorch.benchmark.mineru.pipeline", *forwarded]
+        ["python", "-m", "rayorch.benchmark.mineru.runner", *forwarded]
     )
     return JobBundle(entrypoint, runtime_env, wheels)
 

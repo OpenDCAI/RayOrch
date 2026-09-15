@@ -27,6 +27,9 @@ pip install -r requirements-dev.txt
 - Recovery, failure attribution, and output reconstruction operate on stable
   logical Grain and Entity identities.
 
+Compiler, scheduler, and Ray actor internals live in private modules. Application
+and benchmark code should import only from `rayorch` and `rayorch.benchmark`.
+
 ## Lazy benchmark plugins
 
 Benchmark workloads live below `rayorch.benchmark` and are imported only when
@@ -79,15 +82,20 @@ class Pipe(ro.Pipeline):
         return self.b(self.a(values))
 
 
-with ro.Executor(Pipe()) as executor:
-    result = executor.run(
-        [1, 2, 3],
-        microbatch_size=2,
-        max_active_microbatches=2,
-    )
+result = ro.run(
+    Pipe(),
+    [1, 2, 3],
+    microbatch_size=2,
+    max_active_microbatches=2,
+)
 
 print(result.outputs)  # [3, 4, 5]
 ```
+
+Use `Executor` directly when several runs should reuse the same persistent actor
+pools. A UDF may return `RecordFailure` or `GroupFailure`, and receives `MISSING`
+for a missing input declared with `F.optional`; these values are also available
+from the package root.
 
 ## License
 

@@ -5,14 +5,20 @@ The built-in layout is:
 
 ```text
 rayorch/
-  multigrain/                 # promoted compiler and execution runtime
+  api.py                      # stable Pipeline and RayModule authoring API
+  functional.py               # expand/reduce/filter/broadcast relationships
+  _program/                   # private compiler and immutable plans
+  _runtime/                   # private dataflow state and dispatch engine
+  _execution/                 # private Ray actor and RPC implementation
   benchmark/
     plugin.py                 # dependency-free metadata contract
     registry.py               # lazy name -> plugin module lookup
     runtime.py                # runtime_env loading and deterministic digest
     mineru/
       udfs.py                 # business kernels usable by RayModule
-      pipeline.py             # released RayOrch graph and regression runner
+      pipeline.py             # declarative RayOrch graph only
+      validate.py             # input identity and performance comparability
+      runner.py               # execution, metrics, artifacts, and CLI
       plugin.py               # lightweight registration metadata
       runtime_env.json        # one shared environment for this UDF group
       job.py                  # wheel staging and Ray Jobs submission
@@ -30,9 +36,13 @@ module path with `register_plugin(name, module)`, and provide a versioned
 `registry.py`. Keep these boundaries:
 
 - `udfs.py`: framework-independent business kernels and data contracts.
-- `pipeline.py`: the production graph and its output/performance regression.
-- `plugin.py`: names, runner module, environment resource, and dependency hints;
-  it must not import workload dependencies.
+- `pipeline.py`: the production graph; physical stage options are passed as
+  mappings and forwarded with `**options` rather than enumerated by generic code.
+- `validate.py`: input identity and historical performance comparability. Output
+  quality gates can be added here without changing the graph or runner.
+- `runner.py`: workload execution, observation metrics, artifact output, and CLI.
+- `plugin.py`: name, runner module, and environment resource; it must not import
+  workload dependencies. `runtime_env.json` is the sole pip dependency manifest.
 
 Comparison adapters and ablation runners belong in experiment branches or
 separate benchmark artifacts, not in the release package.
