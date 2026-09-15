@@ -1,8 +1,9 @@
-"""固定、Ray-free 的 multigrain 静态编译流水线。
+"""Fixed, Ray-free static compiler pipeline.
 
-这不是可插拔 PassManager。编排顺序是唯一合同：
-verify logical -> analyze -> optional canonicalize -> lower -> verify plan。
-关闭 canonicalization 时仍经过同一 analysis、lowering 和最终 verifier。
+This is not a pluggable pass manager. The only supported order is:
+verify logical -> analyze -> optional canonicalize -> lower -> verify plan.
+Disabling canonicalization retains the same analysis, lowering, and final
+verification phases.
 """
 
 from __future__ import annotations

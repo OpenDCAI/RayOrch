@@ -18,5 +18,9 @@ Structural primitives describe relationships and never create actors. Only a
 generation-fenced reports, atomic multi-output commit, and a microbatch-local
 parent barrier for `GroupFailure`.
 
-The package is the promoted implementation of the v3.6 experimental runtime;
-older experimental versions are not runtime dependencies.
+Each Call owns one completion-ordered READY queue. Committing an upstream Grain
+immediately publishes its facts and may make downstream Grains dispatchable;
+execution never waits for an entire stage or input domain to drain. READY
+Grains from different parent entities may share a bounded worker batch. Parent
+identity remains part of runtime state only for lineage and `GroupFailure`
+isolation, not as a batching policy.

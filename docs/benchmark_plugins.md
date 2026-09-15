@@ -12,29 +12,30 @@ rayorch/
     runtime.py                # runtime_env loading and deterministic digest
     mineru/
       udfs.py                 # business kernels usable by RayModule
-      adapters/               # Ray Data, Daft, and control runners
-      pipeline.py             # RayOrch graph and validation gates
+      pipeline.py             # released RayOrch graph and regression runner
       plugin.py               # lightweight registration metadata
       runtime_env.json        # one shared environment for this UDF group
       job.py                  # wheel staging and Ray Jobs submission
 ```
 
 `rayorch.benchmark.registry` imports only a plugin's lightweight `plugin.py`.
-Heavy packages stay inside UDF methods or adapter modules, so importing RayOrch
-does not require every benchmark environment to be installed.
+Heavy packages stay inside UDF methods or runner entrypoints, so importing
+RayOrch does not require every benchmark environment to be installed.
 
 ## Add a UDF group
 
-Create `rayorch/benchmark/<name>/plugin.py` with a `BenchmarkPlugin`, add its
-module path to `_PLUGIN_MODULES` in `registry.py`, and provide a versioned
-`runtime_env.json`. Keep these boundaries:
+Create a lightweight module containing a `BenchmarkPlugin`, register that
+module path with `register_plugin(name, module)`, and provide a versioned
+`runtime_env.json`. Built-in groups may also be listed statically in
+`registry.py`. Keep these boundaries:
 
 - `udfs.py`: framework-independent business kernels and data contracts.
-- `adapters/`: graph/execution bindings for RayOrch, Ray Data, Daft, or native
-  execution when comparison code is useful.
-- `pipeline.py` or `validate.py`: output equivalence, digests, and quality gates.
+- `pipeline.py`: the production graph and its output/performance regression.
 - `plugin.py`: names, runner module, environment resource, and dependency hints;
   it must not import workload dependencies.
+
+Comparison adapters and ablation runners belong in experiment branches or
+separate benchmark artifacts, not in the release package.
 
 One UDF group has one environment by default. This is the useful isolation unit:
 groups can pin conflicting stacks, while all actors in a benchmark reuse the

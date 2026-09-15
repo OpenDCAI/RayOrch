@@ -1,6 +1,6 @@
-"""Multigrain 的纯逻辑身份与终态。
+"""Ray-free logical identities and terminal states.
 
-本模块刻意不依赖 Ray、编译器或运行时。
+This module deliberately depends on neither Ray nor compiler/runtime state.
 """
 
 from __future__ import annotations
@@ -10,16 +10,16 @@ from enum import Enum, auto
 
 
 class CompileError(ValueError):
-    """符号 Program 违反了编译期不变量。"""
+    """The symbolic Program violates a compile-time invariant."""
 
 
 class ExecutionError(RuntimeError):
-    """一次 Call dispatch 无法按照编译后的执行合同继续。"""
+    """A Call dispatch cannot continue under the compiled execution contract."""
 
 
 @dataclass(frozen=True, slots=True, order=True)
 class CallRef:
-    """静态 Program 中一个计算调用点的紧凑身份。"""
+    """Compact identity of one compute call site in a static Program."""
 
     value: int
 
@@ -30,7 +30,7 @@ class CallRef:
 
 @dataclass(frozen=True, slots=True, order=True)
 class PortRef:
-    """静态 Program 中一个逻辑数据端口的紧凑身份。"""
+    """Compact identity of one logical data Port in a static Program."""
 
     value: int
 
@@ -41,7 +41,7 @@ class PortRef:
 
 @dataclass(frozen=True, slots=True, order=True)
 class DomainRef:
-    """一个实体粒度层级的身份；不同 Domain 的整数不参与对齐。"""
+    """Identity of an entity-granularity level; values are local to a Domain."""
 
     value: int
 
@@ -52,10 +52,10 @@ class DomainRef:
 
 @dataclass(frozen=True, slots=True, order=True)
 class EntityRef:
-    """一个 Domain 中的一次逻辑 occurrence。
+    """One logical occurrence inside a Domain.
 
-    ``value`` 仅在一个 MicrobatchEngine 内有效；Domain 本身属于身份的一部分，
-    因此无关坐标不会仅因整数相同而意外对齐。
+    ``value`` is local to one MicrobatchEngine. The Domain is part of identity,
+    preventing unrelated coordinates with equal integers from aligning.
     """
 
     domain: DomainRef
@@ -68,7 +68,7 @@ class EntityRef:
 
 @dataclass(frozen=True, slots=True, order=True)
 class ItemRef:
-    """Port 与 Entity 的交点，表示一次逻辑数据 occurrence。"""
+    """The intersection of a Port and Entity: one logical data occurrence."""
 
     port: PortRef
     entity: EntityRef
@@ -76,21 +76,21 @@ class ItemRef:
 
 @dataclass(frozen=True, slots=True, order=True)
 class GrainRef:
-    """Call 与执行 Domain 中 Entity 的交点，表示一次逻辑调用。"""
+    """The intersection of a Call and Entity: one logical invocation."""
 
     call: CallRef
     entity: EntityRef
 
 
 class InputMode(Enum):
-    """Call 输入在上游非 PRESENT 时的传播策略。"""
+    """Propagation policy when a Call input is not PRESENT."""
 
     REQUIRED = auto()
     OPTIONAL = auto()
 
 
 class ItemOutcome(Enum):
-    """Item 的互斥终态；PRESENT 才允许关联 ValueBinding。"""
+    """Mutually exclusive terminal Item states; only PRESENT carries a value."""
 
     PRESENT = auto()
     DROPPED = auto()
@@ -99,7 +99,7 @@ class ItemOutcome(Enum):
 
 
 class GrainPhase(Enum):
-    """Grain 从可调度到执行中再到封闭的生命周期阶段。"""
+    """Lifecycle phases from runnable through in-flight to sealed."""
 
     READY = auto()
     IN_FLIGHT = auto()
@@ -107,7 +107,7 @@ class GrainPhase(Enum):
 
 
 class ExpansionOutcome(Enum):
-    """一次 fan-out Expansion 的终态及其 cardinality 可知性。"""
+    """Terminal state and cardinality availability of one fan-out Expansion."""
 
     SUCCEEDED = auto()
     DROPPED = auto()

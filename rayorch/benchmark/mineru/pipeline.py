@@ -1,13 +1,10 @@
-"""使用 RayOrch multigrain runtime 回归真实 Flash-MinerU workload。
-
-业务 UDF 与 V3 runner 完全复用；本模块只替换 ``RayModule + F.*`` authoring、
-compiler 和 executor。这样性能差异只来自框架，而不是 render、VLM 或 assemble 内核。
-"""
+"""Run the real MinerU workload on the released RayOrch runtime."""
 
 from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import time
@@ -28,178 +25,145 @@ from .udfs import (
 from ...multigrain import (
     F,
     Executor,
-    GroupFailure,
-    ItemOutcome,
     Pipeline,
     Port,
     RayModule,
 )
-from .poison import (
-    DEFAULT_POISON_SEED,
-    PoisonPage,
-    PoisonedPage,
-    gpu_memory_peaks,
-    load_pdf_manifest,
-    pdf_page_counts,
-    select_poison_pages,
-    worker_resource_options,
-)
+
+MINERU_GOLDEN_MEASURED_S = 587.781
+MINERU_GOLDEN_PDFS = 368
+MINERU_GOLDEN_PAGES = 7_072
 
 
-V3_GOLDEN_MEASURED_S = 587.781
+def _worker_resource_options(name: str | None) -> dict[str, Any]:
+    """Return an optional custom Ray resource requirement for one actor."""
+
+    return {} if not name else {"resources": {name: 0.001}}
 
 
-class PoisoningMinerUVlmOcrPage(MinerUVlmOcrPage):
-    """Real OCR wrapper that never sends designated bad pages to the model."""
+def _gpu_memory_peaks(samples: Iterable[Any], count: int) -> tuple[int, ...]:
+    """Compute per-device peak memory without assuming driver-side GPUs."""
 
-    def __init__(
-        self,
-        *,
-        model: str,
-        gpu_memory_utilization: float,
-        poison_pages: tuple[tuple[str, int, str], ...],
-        poison_policy: str,
-    ) -> None:
-        super().__init__(
-            model=model,
-            gpu_memory_utilization=gpu_memory_utilization,
-        )
-        if poison_policy not in {"group_failure", "skip_page"}:
-            raise ValueError("unsupported poison policy")
-        self.poison_pages = {
-            (os.path.abspath(path), int(page_id)): cause
-            for path, page_id, cause in poison_pages
-        }
-        self.poison_policy = poison_policy
-
-    def run(self, pages: list[dict[str, Any]]) -> list[Any]:
-        poisoned = {
-            index: self.poison_pages[key]
-            for index, page in enumerate(pages)
-            if (
-                key := (
-                    os.path.abspath(page["pdf_path"]),
-                    int(page["page_id"]),
-                )
-            )
-            in self.poison_pages
-        }
-        if not poisoned:
-            return super().run(pages)
-
-        live_indices = tuple(
-            index for index in range(len(pages)) if index not in poisoned
-        )
-        live_results = (
-            super().run([pages[index] for index in live_indices])
-            if live_indices
-            else []
-        )
-        by_index = dict(zip(live_indices, live_results, strict=True))
-        return [
+    samples = tuple(samples)
+    return tuple(
+        max(
             (
-                GroupFailure(poisoned[index])
-                if self.poison_policy == "group_failure"
-                else PoisonedPage(poisoned[index])
-            )
-            if index in poisoned
-            else by_index[index]
-            for index in range(len(pages))
+                sample.memory_used[index]
+                for sample in samples
+                if index < len(sample.memory_used)
+            ),
+            default=0,
+        )
+        for index in range(count)
+    )
+
+
+def _load_pdf_paths(
+    manifest_path: str,
+    *,
+    limit: int | None = None,
+) -> tuple[str, ...]:
+    """Load ordered PDF paths from a JSON array or JSONL manifest."""
+
+    raw_text = Path(manifest_path).read_text(encoding="utf-8")
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        entries = [
+            json.loads(line)
+            for line in raw_text.splitlines()
+            if line.strip()
         ]
+    else:
+        entries = parsed if isinstance(parsed, list) else [parsed]
+
+    paths: list[str] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict) or "path" not in entry:
+            raise ValueError(f"manifest entry {index} must contain a path")
+        path = os.path.abspath(str(entry["path"]))
+        if path in seen:
+            raise ValueError(f"manifest entry {index} duplicates {path}")
+        seen.add(path)
+        paths.append(path)
+        if limit is not None and limit > 0 and len(paths) >= limit:
+            break
+    if not paths:
+        raise ValueError("PDF manifest is empty")
+    return tuple(paths)
 
 
-class PoisonTolerantMinerUAssembleDoc(MinerUAssembleDoc):
-    """Assemble a document after explicitly removing bad page/content pairs."""
+def _validate_inputs(
+    pdfs: tuple[str, ...],
+    *,
+    flash_repo: str,
+    model: str,
+    packaged_runtime: bool = False,
+) -> None:
+    """Fail before Ray startup when required local workload inputs are absent."""
 
-    def run(
-        self,
-        grouped_contents: list[list[Any]],
-        grouped_pages: list[list[dict[str, Any]]],
-        stems: list[str],
-    ) -> list[dict[str, Any]]:
-        clean_contents = []
-        clean_pages = []
-        poison_ids = []
-        for contents, pages in zip(grouped_contents, grouped_pages, strict=True):
-            if len(contents) != len(pages):
-                raise ValueError("MinerU content/page groups must align")
-            live = [
-                (content, page)
-                for content, page in zip(contents, pages, strict=True)
-                if not isinstance(content, PoisonedPage)
-            ]
-            if not live:
-                raise ValueError("cannot assemble a PDF when every page is poisoned")
-            clean_contents.append([content for content, _ in live])
-            clean_pages.append([page for _, page in live])
-            poison_ids.append(
-                [
-                    int(page["page_id"])
-                    for content, page in zip(contents, pages, strict=True)
-                    if isinstance(content, PoisonedPage)
-                ]
-            )
-        outputs = super().run(clean_contents, clean_pages, stems)
-        for output, original, page_ids in zip(
-            outputs, grouped_pages, poison_ids, strict=True
-        ):
-            output.update(
-                input_pages=len(original),
-                poisoned_pages=len(page_ids),
-                poison_page_ids=page_ids,
-            )
-        return outputs
+    missing_pdfs = [path for path in pdfs if not Path(path).is_file()]
+    if missing_pdfs:
+        preview = ", ".join(missing_pdfs[:3])
+        suffix = "" if len(missing_pdfs) <= 3 else ", ..."
+        raise FileNotFoundError(f"PDF inputs do not exist: {preview}{suffix}")
+    if not packaged_runtime and not Path(flash_repo).is_dir():
+        raise FileNotFoundError(f"Flash-MinerU repository does not exist: {flash_repo}")
+    if not Path(model).exists():
+        raise FileNotFoundError(f"MinerU model does not exist: {model}")
+    stems = [Path(path).stem for path in pdfs]
+    if len(stems) != len(set(stems)):
+        raise ValueError("PDF filenames must have unique stems")
 
 
-class MetadataOnlyMinerUAssembleDoc:
-    """Validate exact document membership without formatting Markdown/layout."""
+def _corpus_digest(pdfs: Iterable[str]) -> str:
+    """Hash ordered PDF names and content without depending on mount paths."""
 
-    def run(
-        self,
-        grouped_contents: list[list[Any]],
-        grouped_pages: list[list[dict[str, Any]]],
-        stems: list[str],
-    ) -> list[dict[str, Any]]:
-        outputs = []
-        for contents, pages, stem in zip(
-            grouped_contents, grouped_pages, stems, strict=True
-        ):
-            if len(contents) != len(pages):
-                raise ValueError("MinerU content/page groups must align")
-            live_pages = [
-                page
-                for content, page in zip(contents, pages, strict=True)
-                if not isinstance(content, PoisonedPage)
-            ]
-            poison_ids = [
-                int(page["page_id"])
-                for content, page in zip(contents, pages, strict=True)
-                if isinstance(content, PoisonedPage)
-            ]
-            if not live_pages:
-                raise ValueError("cannot assemble a PDF when every page is poisoned")
-            page_ids = [int(page["page_id"]) for page in live_pages]
-            outputs.append(
-                {
-                    "pdf": stem,
-                    "pages": len(live_pages),
-                    "page_ids": page_ids,
-                    "input_pages": len(pages),
-                    "poisoned_pages": len(poison_ids),
-                    "poison_page_ids": poison_ids,
-                }
-            )
-        return outputs
+    digest = hashlib.sha256()
+    for path in pdfs:
+        absolute = os.path.abspath(path)
+        digest.update(Path(absolute).name.encode("utf-8"))
+        digest.update(b"\0")
+        content = hashlib.sha256()
+        with open(absolute, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                content.update(chunk)
+        digest.update(content.digest())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _golden_comparable(
+    *,
+    corpus_digest: str,
+    expected_digest: str | None,
+    pdf_count: int,
+    page_count: int,
+) -> bool:
+    """Return whether a run is comparable with the recorded MinerU baseline."""
+
+    if expected_digest is None:
+        return False
+    expected = expected_digest.lower()
+    if len(expected) != 64 or any(
+        character not in "0123456789abcdef" for character in expected
+    ):
+        raise ValueError("--golden-corpus-sha256 must be a 64-character hex digest")
+    return (
+        corpus_digest == expected
+        and pdf_count == MINERU_GOLDEN_PDFS
+        and page_count == MINERU_GOLDEN_PAGES
+    )
 
 
 class MinerUPipeline(Pipeline):
-    """显式建模 PDF→Page→OCR→Document 的真实 MinerU Pipeline。"""
+    """Model the real PDF -> page -> OCR -> document MinerU pipeline."""
 
     def __init__(
         self,
         *,
         output_dir: str,
-        batching_policy: str,
         model: str,
         replicas: int,
         batch_size: int,
@@ -208,24 +172,11 @@ class MinerUPipeline(Pipeline):
         reduce_replicas: int,
         runtime_env: dict[str, Any],
         render_dpi: int = 200,
-        assemble_mode: str = "full",
-        poison_manifest: tuple[PoisonPage, ...] = (),
-        poison_policy: str = "group_failure",
-        ready_queue_order: str = "fifo",
         cpu_worker_resource: str | None = None,
         gpu_worker_resource: str | None = None,
     ) -> None:
-        """冻结四个计算 Call 的 actor、batch 和资源配置。"""
+        """Freeze actor, batch, and resource settings for the four Calls."""
 
-        if batching_policy not in {"any_parent", "single_parent"}:
-            raise ValueError(
-                "batching_policy must be any_parent or single_parent"
-            )
-        if ready_queue_order not in {"fifo", "unordered"}:
-            raise ValueError("ready_queue_order must be fifo or unordered")
-        if assemble_mode not in {"full", "metadata_only"}:
-            raise ValueError("assemble_mode must be full or metadata_only")
-        self.ready_queue_order = ready_queue_order
         self.render = (
             RayModule(MinerUPdfToPages)
             .pre_init(dpi=render_dpi)
@@ -234,36 +185,22 @@ class MinerUPipeline(Pipeline):
                 batch_size=1,
                 num_cpus=1,
                 runtime_env=runtime_env,
-                **worker_resource_options(cpu_worker_resource),
+                **_worker_resource_options(cpu_worker_resource),
             )
         )
-        ocr = RayModule(
-            MinerUVlmOcrPage
-            if not poison_manifest
-            else PoisoningMinerUVlmOcrPage
-        )
-        init_kwargs: dict[str, Any] = {
-            "model": model,
-            "gpu_memory_utilization": gpu_memory_utilization,
-        }
-        if poison_manifest:
-            init_kwargs.update(
-                poison_pages=tuple(
-                    (entry.pdf_path, entry.page_id, entry.cause)
-                    for entry in poison_manifest
-                ),
-                poison_policy=poison_policy,
-            )
         self.ocr = (
-            ocr.pre_init(**init_kwargs)
+            RayModule(MinerUVlmOcrPage)
+            .pre_init(
+                model=model,
+                gpu_memory_utilization=gpu_memory_utilization,
+            )
             .ray_options(
                 replicas=replicas,
                 batch_size=batch_size,
-                batching_policy=batching_policy,
                 num_gpus=1.0,
                 num_cpus=1,
                 runtime_env=runtime_env,
-                **worker_resource_options(gpu_worker_resource),
+                **_worker_resource_options(gpu_worker_resource),
             )
         )
         self.metadata = RayModule(PdfMetadata).ray_options(
@@ -271,28 +208,17 @@ class MinerUPipeline(Pipeline):
             batch_size=32,
             num_cpus=1,
             runtime_env=runtime_env,
-            **worker_resource_options(cpu_worker_resource),
+            **_worker_resource_options(cpu_worker_resource),
         )
-        assemble_target = (
-            MetadataOnlyMinerUAssembleDoc
-            if assemble_mode == "metadata_only"
-            else (
-                PoisonTolerantMinerUAssembleDoc
-                if poison_manifest and poison_policy == "skip_page"
-                else MinerUAssembleDoc
-            )
-        )
-        assemble = RayModule(assemble_target)
-        if assemble_mode == "full":
-            assemble = assemble.pre_init(output_dir=output_dir)
         self.assemble = (
-            assemble
+            RayModule(MinerUAssembleDoc)
+            .pre_init(output_dir=output_dir)
             .ray_options(
                 replicas=reduce_replicas,
                 batch_size=4,
                 num_cpus=1,
                 runtime_env=runtime_env,
-                **worker_resource_options(cpu_worker_resource),
+                **_worker_resource_options(cpu_worker_resource),
             )
         )
 
@@ -300,7 +226,7 @@ class MinerUPipeline(Pipeline):
         self,
         pdfs: Port,
     ):
-        """以 Port 关系声明 1:M、跨 parent page compute 和 ordered M:1。"""
+        """Declare 1:M page work and ordered M:1 document reconstruction."""
 
         pages = F.expand(cast(Port, self.render(pdfs)))
         contents = cast(Port, self.ocr(pages))
@@ -314,13 +240,13 @@ class MinerUPipeline(Pipeline):
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
-    """运行一次 MinerU gate，并写入摘要和 GPU samples。"""
+    """Run one MinerU regression and persist its summary and GPU samples."""
 
     import ray  # pyright: ignore[reportMissingImports]
 
     flash_repo = os.path.abspath(args.flash_repo)
     if args.input_manifest:
-        pdfs, page_counts = load_pdf_manifest(
+        pdfs = _load_pdf_paths(
             args.input_manifest,
             limit=args.limit,
         )
@@ -330,22 +256,17 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         )
         if not pdfs:
             raise FileNotFoundError(f"no PDFs found under {flash_repo}")
-        page_counts = pdf_page_counts(pdfs)
-    poison_manifest = select_poison_pages(
+    _validate_inputs(
         pdfs,
-        page_counts,
-        count=args.poison_count,
-        page_id=args.poison_page_id,
-        seed=args.poison_seed,
-        exact_indices=(
-            () if args.poison_pdf_index is None else (args.poison_pdf_index,)
-        ),
+        flash_repo=flash_repo,
+        model=args.model,
+        packaged_runtime=os.environ.get("RAYORCH_PACKAGED_RUNTIME") == "1",
     )
+    corpus_digest = _corpus_digest(pdfs)
 
     runtime_env = _runtime_env(flash_repo)
     pipeline = MinerUPipeline(
         output_dir=os.path.abspath(args.output_dir),
-        batching_policy=args.batching_policy,
         model=args.model,
         replicas=args.replicas,
         batch_size=args.batch_size,
@@ -354,12 +275,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         reduce_replicas=args.reduce_replicas,
         runtime_env=runtime_env,
         render_dpi=args.render_dpi,
-        poison_manifest=poison_manifest,
-        poison_policy=args.poison_policy,
-        assemble_mode=args.assemble_mode,
         cpu_worker_resource=args.cpu_worker_resource,
         gpu_worker_resource=args.gpu_worker_resource,
-        ready_queue_order=args.ready_queue_order,
     )
     compiled = pipeline.compile()
     ocr_call = next(
@@ -388,10 +305,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     result = None
     end_to_end = 0.0
     try:
-        with Executor(
-            compiled,
-            ready_queue_order=args.ready_queue_order,
-        ) as executor:
+        with Executor(compiled) as executor:
             startup_s = time.perf_counter() - started
             result = executor.run(
                 pdfs,
@@ -406,79 +320,36 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     if result is None:  # pragma: no cover - exception path exits in the try block
         raise RuntimeError("MinerU run produced no result")
 
-    outputs = list(cast(Iterable[dict[str, Any] | ItemOutcome], result.outputs))
-    successful_outputs = [
-        output for output in outputs if isinstance(output, dict)
-    ]
-    pages = sum(int(output["pages"]) for output in successful_outputs)
-    output_outcomes = {
-        outcome.name: (
-            len(successful_outputs)
-            if outcome is ItemOutcome.PRESENT
-            else sum(output is outcome for output in outputs)
-        )
-        for outcome in ItemOutcome
-    }
+    outputs = list(cast(Iterable[dict[str, Any]], result.outputs))
+    if not all(isinstance(output, dict) for output in outputs):
+        raise RuntimeError("MinerU regression produced a non-document outcome")
+    pages = sum(int(output["pages"]) for output in outputs)
     heavy = next(
         metrics for metrics in result.calls
         if metrics.call_index == ocr_call.value
     )
-    gpu_peak = gpu_memory_peaks(gpu_samples, args.replicas)
+    gpu_peak = _gpu_memory_peaks(gpu_samples, args.replicas)
     measured = result.elapsed_s
-    total_pages = sum(page_counts)
-    injected = len(poison_manifest)
-    poisoned_parent_pages = sum(entry.pdf_pages for entry in poison_manifest)
-    observed = (
-        output_outcomes[ItemOutcome.SUPPRESSED.name]
-        if args.poison_policy == "group_failure"
-        else sum(int(output.get("poisoned_pages", 0)) for output in successful_outputs)
-    )
-    expected_docs = (
-        len(pdfs) - injected
-        if args.poison_policy == "group_failure"
-        else len(pdfs)
-    )
-    expected_pages = (
-        total_pages - poisoned_parent_pages
-        if args.poison_policy == "group_failure"
-        else total_pages - injected
-    )
-    physical_model_pages = heavy.grains - observed
-    sibling_not_dispatched = (
-        total_pages - heavy.grains
-        if args.poison_policy == "group_failure"
-        else 0
+    expected_digest = args.golden_corpus_sha256
+    golden_comparable = _golden_comparable(
+        corpus_digest=corpus_digest,
+        expected_digest=expected_digest,
+        pdf_count=len(pdfs),
+        page_count=pages,
     )
     payload = {
         "engine": "rayorch_multigrain",
-        "batching_policy": args.batching_policy,
-        "ready_queue_order": args.ready_queue_order,
-        "assemble_mode": args.assemble_mode,
         "n_pdf": len(pdfs),
+        "corpus_sha256": corpus_digest,
+        "model": os.path.abspath(args.model),
         "pages": pages,
-        "input_pages": total_pages,
         "docs": len(outputs),
-        "successful_docs": len(successful_outputs),
-        "output_outcomes": output_outcomes,
-        "poison_policy": args.poison_policy,
-        "poison_seed": args.poison_seed,
-        "poison_injected": injected,
-        "poison_observed": observed,
-        "poison_manifest": [entry.as_dict() for entry in poison_manifest],
-        "poisoned_parent_pages": poisoned_parent_pages,
-        "expected_successful_docs": expected_docs,
-        "expected_output_pages": expected_pages,
-        "poison_report_contract_passed": (
-            observed == injected
-            and len(successful_outputs) == expected_docs
-            and pages == expected_pages
-        ),
         "batch_size": args.batch_size,
         "render_dpi": args.render_dpi,
         "replicas": args.replicas,
         "microbatch_size": args.microbatch_size,
         "max_active_microbatches": args.max_active_microbatches,
-        "batch_policy": "immediate_work_conserving",
+        "scheduler": "completion_driven_ready_queue",
         "startup_s": round(startup_s, 3),
         "measured_wall_s": round(measured, 3),
         "end_to_end_wall_s": round(end_to_end, 3),
@@ -486,17 +357,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "rpc_count": result.rpc_count,
         "ocr_rpc_count": heavy.rpcs,
         "ocr_grains": heavy.grains,
-        "ocr_model_pages": physical_model_pages,
-        "ocr_model_pages_saved_vs_baseline": total_pages - physical_model_pages,
-        "group_sibling_pages_not_dispatched": sibling_not_dispatched,
-        "group_sibling_pages_computed_but_discarded": (
-            max(
-                0,
-                poisoned_parent_pages - injected - sibling_not_dispatched,
-            )
-            if args.poison_policy == "group_failure"
-            else 0
-        ),
         "ocr_retries": heavy.retries,
         "ocr_grains_per_rpc": heavy.average_batch,
         "ocr_batch_fill_ratio": heavy.average_batch / args.batch_size,
@@ -510,12 +370,18 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "driver_rss_start": driver_start,
         "driver_rss_peak": driver_peak,
         "gpu_memory_peak": gpu_peak,
-        "ratio_vs_v3_golden": (
-            measured / V3_GOLDEN_MEASURED_S if len(pdfs) == 368 else None
+        "golden_corpus_match": (
+            None
+            if expected_digest is None
+            else corpus_digest == expected_digest.lower()
         ),
-        "within_v3_golden_5_percent": (
-            measured <= V3_GOLDEN_MEASURED_S * 1.05
-            if len(pdfs) == 368
+        "golden_comparable": golden_comparable,
+        "ratio_vs_mineru_golden": (
+            measured / MINERU_GOLDEN_MEASURED_S if golden_comparable else None
+        ),
+        "within_mineru_golden_5_percent": (
+            measured <= MINERU_GOLDEN_MEASURED_S * 1.05
+            if golden_comparable
             else None
         ),
         "output_dir": os.path.abspath(args.output_dir),
@@ -534,15 +400,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    (artifact_root / "poison_manifest.json").write_text(
-        json.dumps(
-            [entry.as_dict() for entry in poison_manifest],
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
     result_path = Path(args.result_jsonl)
     result_path.parent.mkdir(parents=True, exist_ok=True)
     with result_path.open("a", encoding="utf-8") as handle:
@@ -551,20 +408,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """构造 MinerU 4/48/368 通用 CLI。"""
+    """Build the shared 4/48/368-document MinerU regression CLI."""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--batching-policy",
-        choices=("any_parent", "single_parent"),
-        default="any_parent",
-    )
-    parser.add_argument(
-        "--ready-queue-order",
-        choices=("fifo", "unordered"),
-        default="fifo",
-        help="per-Call READY ordering; unordered is the FIFO ablation",
-    )
     parser.add_argument("--limit", type=int, default=4)
     parser.add_argument("--replicas", type=int, default=4)
     parser.add_argument("--microbatch-size", type=int, default=24)
@@ -574,27 +420,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--render-replicas", type=int, default=4)
     parser.add_argument("--render-dpi", type=int, default=200)
     parser.add_argument("--reduce-replicas", type=int, default=4)
-    parser.add_argument(
-        "--assemble-mode",
-        choices=("full", "metadata_only"),
-        default="full",
-    )
     parser.add_argument("--num-cpus", type=int, default=32)
     parser.add_argument("--object-store-gb", type=float, default=100)
     parser.add_argument("--rss-interval-s", type=float, default=1)
-    parser.add_argument("--poison-pdf-index", type=int, default=None)
-    parser.add_argument("--poison-count", type=int, default=0)
-    parser.add_argument("--poison-page-id", type=int, default=0)
-    parser.add_argument(
-        "--poison-policy",
-        choices=("group_failure", "skip_page"),
-        default="group_failure",
-    )
-    parser.add_argument("--poison-seed", default=DEFAULT_POISON_SEED)
     parser.add_argument("--ray-address", default=None)
     parser.add_argument("--cpu-worker-resource", default=None)
     parser.add_argument("--gpu-worker-resource", default=None)
     parser.add_argument("--input-manifest", default=None)
+    parser.add_argument(
+        "--golden-corpus-sha256",
+        default=None,
+        help=(
+            "expected corpus digest; the historical 368-PDF performance gate "
+            "is evaluated only when this digest and the 7,072-page shape match"
+        ),
+    )
     parser.add_argument("--flash-repo", default=DEFAULT_FLASH_REPO)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--output-dir", required=True)
@@ -604,27 +444,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """解析参数、执行 gate，并打印摘要 JSON。"""
+    """Parse arguments, run the regression, and print its JSON summary."""
 
     args = build_parser().parse_args(argv)
     print(json.dumps(run_benchmark(args), ensure_ascii=False, indent=2))
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI 入口
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
     raise SystemExit(main())
-
-
-# Temporary source-compatibility alias for experiment scripts written before the
-# runtime was promoted out of ``experimental``.
-MinerUV36Pipeline = MinerUPipeline
 
 
 __all__ = [
     "MinerUPipeline",
-    "MinerUV36Pipeline",
-    "PoisoningMinerUVlmOcrPage",
-    "PoisonTolerantMinerUAssembleDoc",
     "build_parser",
     "run_benchmark",
 ]

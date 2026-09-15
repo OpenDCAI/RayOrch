@@ -1,4 +1,4 @@
-"""v3.6 动态状态代数的笛卡尔积完备性回归。"""
+"""Exhaustive Cartesian-product tests for the runtime transition algebra."""
 
 from __future__ import annotations
 

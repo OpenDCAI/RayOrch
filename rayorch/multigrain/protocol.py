@@ -1,4 +1,4 @@
-"""运行时、执行器与 Worker 共用的稳定 DTO；本模块不依赖 Ray。"""
+"""Stable Ray-free DTOs shared by the runtime, executor, and Worker."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ from .model import GrainRef, PortRef
 
 @dataclass(frozen=True, slots=True)
 class BlockRef:
-    """粗粒度不可变块的透明句柄；行选择由 RowBinding 单独表达。"""
+    """Opaque handle to an immutable coarse block; RowBinding selects a row."""
     handle: Any
 
 
 @dataclass(frozen=True, slots=True)
 class RowBinding:
-    """数据块内一行的物理定位，不携带业务 payload。"""
+    """Physical location of one row without carrying its business payload."""
 
     block: BlockRef
     row: int
@@ -29,7 +29,7 @@ class RowBinding:
 
 @dataclass(frozen=True, slots=True)
 class ExpandedRows:
-    """一个 Expand Port 的有序行及可选逐行控制面副本。"""
+    """Ordered rows and optional per-row control values for an expanded Port."""
 
     port: PortRef
     rows: tuple[RowBinding, ...]
@@ -48,7 +48,7 @@ class PortOutputReport:
 
 @dataclass(frozen=True, slots=True)
 class GrainReport:
-    """Worker 对单个 Grain 的原子完成报告。"""
+    """Atomic Worker completion report for one Grain."""
 
     grain: GrainRef
     generation: int
@@ -65,7 +65,7 @@ class NestedGroupInput:
 
 @dataclass(frozen=True, slots=True)
 class MissingInput:
-    """Optional+DROPPED 输入；Worker 中重建为唯一 MISSING 哨兵。"""
+    """Optional+DROPPED input reconstructed as the singleton MISSING value."""
 
 
 GrainInput = RowBinding | NestedGroupInput | MissingInput
@@ -82,21 +82,21 @@ class GrainInvocation:
 
 @dataclass(frozen=True, slots=True)
 class RecordFailure:
-    """UDF 在 batch 内标记单个 Grain 业务失败的值哨兵。"""
+    """Value sentinel marking one Grain as a business failure."""
 
     cause: Any
 
 
 @dataclass(frozen=True, slots=True)
 class GroupFailure:
-    """UDF 标记当前 Grain 失败，并隔离同 Call、同直接父级兄弟。"""
+    """Fail one Grain and suppress siblings with the same Call and direct parent."""
 
     cause: Any
 
 
 @dataclass(frozen=True, slots=True)
 class GrainFailureReport:
-    """Worker 对单个 Grain 的 generation-fenced 失败报告。"""
+    """Generation-fenced Worker failure report for one Grain."""
 
     grain: GrainRef
     generation: int
@@ -129,7 +129,7 @@ WorkerDispatchResult = tuple[WorkerReport, ...] | DispatchFailure
 
 @dataclass(frozen=True, slots=True)
 class CallInputLayout:
-    """一个 Call 的稳定 positional/keyword Worker 调用布局。"""
+    """Stable positional and keyword Worker invocation layout for one Call."""
 
     positional_count: int
     keyword_names: tuple[str, ...] = ()
@@ -144,14 +144,14 @@ class CallInputLayout:
 
     @property
     def input_count(self) -> int:
-        """返回布局覆盖的全部逻辑输入槽数。"""
+        """Return the number of logical input slots covered by this layout."""
 
         return self.positional_count + len(self.keyword_names)
 
 
 @dataclass(frozen=True, slots=True)
 class CallOutputLayout:
-    """编译器生成的输出布局及 control manifest 需求。"""
+    """Compiler-generated output layout and control-manifest requirements."""
 
     port: PortRef
     expanded_ports: tuple[PortRef, ...] = ()
@@ -162,7 +162,7 @@ def restore_nested_group(
     leaves: list[Any],
     offsets_by_level: tuple[tuple[int, ...], ...],
 ) -> list[Any]:
-    """由最内层叶子向上应用 CSR offsets，恢复唯一根 nested group。"""
+    """Apply CSR offsets from leaves upward to restore one rooted nested group."""
 
     nodes: list[Any] = leaves
     for offsets in reversed(offsets_by_level):

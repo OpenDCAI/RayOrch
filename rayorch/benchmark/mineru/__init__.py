@@ -1,5 +1,5 @@
 # pyright: reportUnsupportedDunderAll=false
-"""MinerU UDF group with lazy pipeline and adapter imports."""
+"""MinerU UDF group with lazy runtime imports."""
 
 from __future__ import annotations
 
@@ -7,13 +7,11 @@ from importlib import import_module
 from typing import Any
 
 _MODULES = {
-    "adapters": "rayorch.benchmark.mineru.adapters",
     "pipeline": "rayorch.benchmark.mineru.pipeline",
     "plugin": "rayorch.benchmark.mineru.plugin",
-    "poison": "rayorch.benchmark.mineru.poison",
     "udfs": "rayorch.benchmark.mineru.udfs",
 }
-__all__ = ["adapters", "pipeline", "plugin", "poison", "udfs"]
+__all__ = ["pipeline", "plugin", "udfs"]
 
 
 def __getattr__(name: str) -> Any:

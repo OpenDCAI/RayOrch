@@ -192,7 +192,7 @@ class CrashPipeline(mg.Pipeline):
 
 
 def test_actor_crash_replaces_actor_and_replays_same_grains(tmp_path):
-    marker = tmp_path / "v36-crash-once"
+    marker = tmp_path / "crash-once"
     with Executor(CrashPipeline(str(marker))) as executor:
         result = executor.run(range(4), microbatch_size=4)
 
@@ -537,7 +537,7 @@ class ContractPipeline(mg.Pipeline):
 
 
 def test_worker_contract_error_is_readable_and_never_retried(tmp_path):
-    marker = tmp_path / "v36-contract-calls"
+    marker = tmp_path / "contract-calls"
     with pytest.raises(mg.ExecutionError) as captured:
         with Executor(ContractPipeline(str(marker))) as executor:
             executor.run(range(4))
@@ -581,7 +581,7 @@ class ExhaustedInfrastructurePipeline(mg.Pipeline):
 
 
 def test_exhausted_infrastructure_budget_aborts_without_data_failure(tmp_path):
-    marker = tmp_path / "v36-always-crash"
+    marker = tmp_path / "always-crash"
     with pytest.raises(mg.ExecutionError) as captured:
         with Executor(ExhaustedInfrastructurePipeline(str(marker))) as executor:
             executor.run(range(4))

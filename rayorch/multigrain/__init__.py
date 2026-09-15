@@ -1,4 +1,4 @@
-"""Multigrain 的精简公开编程接口。"""
+"""Public authoring and execution API for the multigrain runtime."""
 
 from . import functional as F
 from .api import Pipeline, Port, RayModule, function

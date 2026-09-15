@@ -1,4 +1,4 @@
-"""与执行环境解耦的 Worker ABI；本模块本身不依赖 Ray。"""
+"""Execution-environment-independent Worker ABI with no Ray dependency."""
 
 from __future__ import annotations
 
@@ -32,12 +32,12 @@ from ..protocol import (
 
 
 class WorkerContractError(RuntimeError):
-    """UDF 返回值不满足已编译 Worker ABI。"""
+    """A UDF result violates the compiled Worker ABI."""
 
 
 @dataclass(frozen=True, slots=True)
 class WorkerSnapshot:
-    """一次只读 Worker 快照；不参与执行语义或调度决策。"""
+    """Read-only Worker snapshot with no scheduling authority."""
 
     lifetime_calls: int
     pid: int
@@ -47,21 +47,21 @@ class WorkerSnapshot:
 
 
 class BlockStore(Protocol):
-    """Worker 所需的最小块存储接口。"""
+    """Minimal block-storage interface required by a Worker."""
 
     def get(self, binding: RowBinding) -> Any:
-        """读取一个物理行绑定对应的业务值。"""
+        """Read the business value referenced by one physical row binding."""
 
         ...
 
     def put(self, values: tuple[Any, ...]) -> BlockRef:
-        """写入一个粗粒度值块并返回逻辑块引用。"""
+        """Store one coarse value block and return its opaque reference."""
 
         ...
 
 
 class Worker:
-    """持久 UDF 实例；对外只暴露 value-only、列式批处理 ABI。"""
+    """Persistent UDF instance exposing only a value-oriented columnar batch ABI."""
 
     def __init__(
         self,
@@ -82,7 +82,7 @@ class Worker:
         layouts: tuple[CallOutputLayout, ...],
         store: BlockStore,
     ) -> WorkerDispatchResult:
-        """执行一批 Grain，并让业务失败严格停留在对应记录。"""
+        """Execute one Grain batch while keeping business failures row-local."""
 
         try:
             return self._execute(invocations, layouts, store)
@@ -119,9 +119,9 @@ class Worker:
             return self._dispatch_failure(DispatchFailureKind.UDF_ERROR, error)
         normalized = self._normalize_outputs(raw, layouts, len(invocations))
 
-        # 同一位置的所有输出属于一个原子 Grain。GroupFailure 比
-        # RecordFailure 强；cause 则取编译期 output layout 顺序中的第一个
-        # 最高优先级 sentinel，使结果不依赖 dict 或物理 block 布局。
+        # All outputs at one row belong to one atomic Grain. GroupFailure takes
+        # precedence over RecordFailure; the first highest-priority sentinel in
+        # compiled layout order wins, independent of dict or block layout.
         failures: list[RecordFailure | GroupFailure | None] = [
             None
         ] * len(invocations)
@@ -145,7 +145,8 @@ class Worker:
                     else self._sequence(value, "expanded value")
                     for index, value in enumerate(values)
                 )
-                # 同一逻辑输出只扁平化一次；失败位置不产生 provisional rows。
+                # Flatten each logical output once; failed rows create no
+                # provisional bindings.
                 flat = tuple(value for group in groups for value in group)
                 control_expansions = layout.control_ports.intersection(
                     layout.expanded_ports
@@ -185,8 +186,8 @@ class Worker:
                     f"output {layout.port!r} control rows must contain bool values"
                 )
 
-            # 保留原 batch 行号，使每个成功 Grain 的 RowBinding 稳定对应 UDF
-            # 返回位置；失败行虽然位于粗块中，但不会被任何 ItemRef 引用。
+            # Preserve batch row numbers so each successful Grain maps to its
+            # UDF result position. Failed rows remain unreferenced in the block.
             block = store.put(values)
             for index, value in enumerate(values):
                 if failures[index] is not None:
@@ -237,7 +238,7 @@ class Worker:
         )
 
     def observe(self) -> WorkerSnapshot:
-        """读取小型标量 audit；业务状态不会反向影响 Worker ABI。"""
+        """Read small scalar diagnostics without exposing business state."""
 
         audit: dict[str, int | float | str] = {}
         batch_audit = getattr(self.udf, "batch_audit", None)
@@ -290,7 +291,7 @@ class Worker:
                     except ValueError as error:
                         raise WorkerContractError(str(error)) from error
                     columns[index].append(group)
-                else:  # pragma: no cover - 封闭联合类型的防御分支
+                else:  # pragma: no cover - defensive closed-union branch
                     raise WorkerContractError(
                         f"unsupported GrainInput: {grain_input!r}"
                     )

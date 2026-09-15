@@ -741,6 +741,85 @@ class ExpandReduce(mg.Pipeline):
         return mg.F.reduce(rows)
 
 
+def test_downstream_grain_becomes_dispatchable_before_upstream_stage_finishes():
+    """A completed upstream Grain must release downstream work immediately."""
+
+    class Render:
+        pass
+
+    class Transform:
+        pass
+
+    class StreamingPipeline(mg.Pipeline):
+        def __init__(self) -> None:
+            self.render = mg.RayModule(Render)
+            self.transform = mg.RayModule(Transform)
+
+        def forward(self, documents):
+            pages = mg.F.expand(self.render(documents))
+            return self.transform(pages)
+
+    compiled = StreamingPipeline().compile()
+    plan = compiled.plan
+    calls = {
+        spec.udf.target: call
+        for call, spec in compiled.logical.calls.items()
+    }
+    expanded_port = next(
+        port
+        for port, spec in compiled.logical.ports.items()
+        if isinstance(spec.origin, ExpandOrigin)
+    )
+    store = MemoryStore()
+    engine = MicrobatchEngine(plan)
+    documents = store.put(("doc-0", "doc-1"))
+    engine.admit_sources(
+        {
+            plan.source_ports[0]: (
+                RowBinding(documents, 0),
+                RowBinding(documents, 1),
+            )
+        }
+    )
+    engine.close_admission()
+
+    first_render = engine.reserve_dispatch(calls[Render], max_size=1)
+    assert first_render is not None
+    assert engine.dispatch_priority(calls[Render]) is not None
+    assert engine.dispatch_priority(calls[Transform]) is None
+
+    pages = store.put(("page-0",))
+    render_output = plan.outputs_by_call[calls[Render]][0]
+    engine.commit_reports(
+        first_render,
+        (
+            GrainReport(
+                first_render.grains[0],
+                0,
+                (
+                    PortOutputReport(
+                        render_output,
+                        expansions=(
+                            ExpandedRows(
+                                expanded_port,
+                                (RowBinding(pages, 0),),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    # The second Render Grain is still READY, but the first completed document
+    # has already released page work to the next stage.
+    assert engine.dispatch_priority(calls[Render]) is not None
+    downstream = engine.reserve_dispatch(calls[Transform], max_size=1)
+    assert downstream is not None
+    assert len(downstream.grains) == 1
+    assert store.get(engine.grain_invocation(downstream.grains[0]).inputs[0]) == "page-0"
+
+
 def test_progress_summary_uses_expansion_vocabulary():
     engine = MicrobatchEngine(ExpandReduce().compile().plan)
 
@@ -1174,7 +1253,6 @@ def test_retry_keeps_grain_identity_and_generation_fences_stale_report():
     selection = engine.reserve_dispatch(
         grain.call,
         max_size=1,
-        pack_by_parent=False,
     )
     assert selection.grains == (grain,)
     stale = GrainReport(

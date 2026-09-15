@@ -1,4 +1,4 @@
-"""MinerU UDF definitions shared by every benchmark adapter.
+"""MinerU UDFs used by the released RayOrch regression.
 
 Heavy optional packages stay behind method calls, so importing the benchmark
 registry does not import Flash-MinerU, vLLM, Pillow, or NVML.
@@ -23,15 +23,15 @@ DEFAULT_MODEL = os.environ.get(
 
 
 class MinerUPdfToPages:
-    """在 CPU actor 中把每个 PDF 渲染为 first-class page records。"""
+    """Render each PDF into ordered, first-class page records on a CPU actor."""
 
     def __init__(self, dpi: int = 200) -> None:
-        """保存 PDF 渲染分辨率。"""
+        """Store the PDF rendering resolution."""
 
         self.dpi = dpi
 
     def run(self, pdf_paths: list[str]) -> list[list[dict[str, Any]]]:
-        """逐 PDF 读取字节并返回按 page ordinal 排列的页面记录。"""
+        """Read each PDF and return page records in document order."""
 
         from flash_mineru.mineru_core.utils.pdf_image_tools import (  # pyright: ignore[reportMissingImports]
             load_images_from_pdf,
@@ -62,14 +62,14 @@ class MinerUPdfToPages:
 
 
 class MinerUVlmOcrPage:
-    """在单个 GPU persistent actor 中运行真实 MinerU vLLM 页面抽取。"""
+    """Run MinerU's vLLM page extraction in one persistent GPU actor."""
 
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
         gpu_memory_utilization: float = 0.8,
     ) -> None:
-        """加载 vLLM 模型并创建 MinerUClient；每个 actor 只初始化一次。"""
+        """Load the model and create one MinerU client per actor."""
 
         from mineru_vl_utils import MinerUClient  # pyright: ignore[reportMissingImports]
         from vllm import LLM  # pyright: ignore[reportMissingImports]
@@ -84,7 +84,7 @@ class MinerUVlmOcrPage:
         )
 
     def run(self, pages: list[dict[str, Any]]) -> list[Any]:
-        """对一个 logical page batch 执行两阶段 VLM extraction。"""
+        """Execute MinerU's two-step extraction for one logical page batch."""
 
         return list(
             self.client.batch_two_step_extract(
@@ -94,19 +94,19 @@ class MinerUVlmOcrPage:
 
 
 class PdfMetadata:
-    """生成 Reduce UDF 所需的轻量 parent context，避免传输 PDF anchor payload。"""
+    """Create lightweight parent context without forwarding PDF payloads."""
 
     def run(self, paths: list[str]) -> list[str]:
-        """把 PDF path 转为用于输出目录命名的 stem。"""
+        """Convert PDF paths to stems used for output directory names."""
 
         return [Path(path).stem for path in paths]
 
 
 class MinerUAssembleDoc:
-    """在不接收 PDF anchor payload 的情况下组装有序页面结果。"""
+    """Assemble ordered page results without receiving the source PDF bytes."""
 
     def __init__(self, output_dir: str, parse_method: str = "vlm") -> None:
-        """保存输出根目录和 MinerU parse method。"""
+        """Store the output root and MinerU parse method."""
 
         self.output_dir = output_dir
         self.parse_method = parse_method
@@ -117,7 +117,7 @@ class MinerUAssembleDoc:
         grouped_pages: list[list[dict[str, Any]]],
         stems: list[str],
     ) -> list[dict[str, Any]]:
-        """把 ordered OCR/page GROUPs 写成 Markdown、layout JSON 和摘要。"""
+        """Write ordered OCR/page groups as Markdown, layout JSON, and metadata."""
 
         from flash_mineru.mineru_core.data.data_reader_writer import (  # pyright: ignore[reportMissingImports]
             FileBasedDataWriter,
@@ -135,7 +135,10 @@ class MinerUAssembleDoc:
             grouped_contents,
             grouped_pages,
             stems,
+            strict=True,
         ):
+            if len(contents) != len(pages):
+                raise ValueError("MinerU content and page groups must align")
             markdown_dir = Path(self.output_dir) / stem / self.parse_method
             image_dir = markdown_dir / "images"
             image_dir.mkdir(parents=True, exist_ok=True)
@@ -168,20 +171,20 @@ class MinerUAssembleDoc:
             )
         return outputs
 
-
-
 @dataclass(frozen=True, slots=True)
 class GpuSample:
-    """只用于观测的 GPU utilization 与 memory sample。"""
+    """One observation-only GPU utilization and memory sample."""
+
     monotonic_s: float
     utilization: tuple[int | None, ...]
     memory_used: tuple[int, ...]
 
 
 class ResourceSampler:
-    """后台采集 driver RSS/GPU 指标，不拥有任何调度 authority。"""
+    """Collect driver RSS and GPU metrics without affecting scheduling."""
+
     def __init__(self, interval_s: float) -> None:
-        """初始化采样间隔、driver process 和后台线程。"""
+        """Initialize the sampling interval, process handle, and daemon thread."""
 
         import psutil  # pyright: ignore[reportMissingModuleSource]
 
@@ -194,12 +197,12 @@ class ResourceSampler:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
-        """启动 daemon observation thread。"""
+        """Start the observation thread."""
 
         self._thread.start()
 
     def stop(self) -> tuple[int, int, tuple[GpuSample, ...]]:
-        """停止采样并返回 driver RSS 起点/峰值和 GPU samples。"""
+        """Stop sampling and return driver RSS bounds and GPU samples."""
 
         self._stop.set()
         self._thread.join(timeout=max(2, self.interval_s * 2))
@@ -210,7 +213,7 @@ class ResourceSampler:
         )
 
     def _run(self) -> None:
-        """按固定间隔采集 driver RSS 与 GPU 状态，失败时跳过本次样本。"""
+        """Sample process and GPU state, skipping unavailable observations."""
 
         while not self._stop.wait(self.interval_s):
             try:
@@ -224,7 +227,7 @@ class ResourceSampler:
 
 
 def _gpu_sample() -> GpuSample:
-    """best-effort 采集所有可见 GPU 的 utilization 和 used memory。"""
+    """Best-effort sample of utilization and memory for every visible GPU."""
 
     try:
         import pynvml  # pyright: ignore[reportMissingImports]
@@ -248,7 +251,7 @@ def _gpu_sample() -> GpuSample:
 
 
 def _runtime_env(flash_repo: str) -> dict[str, Any]:
-    """构造让 Ray actors 能导入 Flash-MinerU 与当前仓库的 runtime_env。"""
+    """Build the local-development import environment for Ray actors."""
 
     if os.environ.get("RAYORCH_PACKAGED_RUNTIME") == "1":
         return {}

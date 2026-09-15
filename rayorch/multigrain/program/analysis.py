@@ -1,4 +1,4 @@
-"""LogicalProgram 上的纯派生事实；不包含 runtime state 或 actor 配置。"""
+"""Pure derived facts for a LogicalProgram, without runtime or actor state."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ LogicalUse: TypeAlias = CallUse | PrimitiveUse
 
 @dataclass(frozen=True, slots=True)
 class ProgramAnalysis:
-    """可丢弃、可重算的 compiler analysis 结果。"""
+    """Disposable, reproducible compiler-analysis result."""
 
     semantics_by_port: Mapping[PortRef, PrimitiveSemantics] = field(repr=False)
     consumers_by_port: Mapping[PortRef, tuple[LogicalUse, ...]] = field(repr=False)
@@ -40,7 +40,7 @@ class ProgramAnalysis:
 
 
 def analyze(logical: LogicalProgram) -> ProgramAnalysis:
-    """一次性计算所有 derived facts，control demand 走统一语义表。"""
+    """Compute all derived facts using the shared primitive semantics table."""
 
     semantics = {
         port: describe_origin(spec.origin) for port, spec in logical.ports.items()

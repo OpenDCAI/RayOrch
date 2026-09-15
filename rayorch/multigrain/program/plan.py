@@ -1,9 +1,9 @@
-"""Compiler 产出的完整 RuntimePlan 与 logical→physical explanation。"""
+"""The compiler's complete RuntimePlan and logical-to-physical explanation."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Mapping, TypeAlias
+from typing import TYPE_CHECKING, Any, Mapping, TypeAlias
 
 from ..model import CallRef, DomainRef, PortRef
 from ..protocol import CallInputLayout, CallOutputLayout
@@ -59,16 +59,10 @@ class ExpandEffect:
 
 @dataclass(frozen=True, slots=True)
 class ActorPoolSpec:
-    """One Call's actor-pool and physical dispatch-packing contract.
-
-    ``any_parent`` packs READY Grains from any parent anchor in the Call.
-    ``single_parent`` restricts each DispatchBatch to one parent anchor.
-    This option changes only RPC packing, never lineage or failure scope.
-    """
+    """The immutable execution contract for one Call's actor pool."""
 
     replicas: int = 1
     batch_size: int = 1
-    batching_policy: Literal["any_parent", "single_parent"] = "any_parent"
     recovery: RecoveryPolicy = DEFAULT_RECOVERY_POLICY
     ray_options: tuple[tuple[str, Any], ...] = ()
 
@@ -77,11 +71,6 @@ class ActorPoolSpec:
             raise ValueError("replicas must be a positive integer")
         if type(self.batch_size) is not int or self.batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
-        if not isinstance(self.batching_policy, str) or self.batching_policy not in {
-            "any_parent",
-            "single_parent",
-        }:
-            raise ValueError("batching_policy must be 'any_parent' or 'single_parent'")
         if not isinstance(self.recovery, RecoveryPolicy):
             raise TypeError("recovery must be a RecoveryPolicy")
 
@@ -112,7 +101,7 @@ class ProgramExplanation:
     rewrites: tuple[CanonicalRewrite, ...] = ()
 
     def format(self) -> str:
-        """返回稳定、适合测试和诊断的逐 Port 映射。"""
+        """Return a stable per-Port mapping for tests and diagnostics."""
 
         mode = "optimized" if self.optimized else "unoptimized"
         lines = [f"RuntimePlan[{mode}]"]
@@ -133,9 +122,10 @@ class ProgramExplanation:
 
 @dataclass(frozen=True, slots=True)
 class RuntimePlan:
-    """MicrobatchEngine、Executor、Worker 所需的全部静态执行接线。
+    """All immutable wiring required by the engine, executor, and workers.
 
-    RuntimePlan 不含 PortOrigin，运行时无需导入或解释逻辑 provenance。
+    The plan contains no PortOrigin values, so runtime components never import
+    or reinterpret logical provenance.
     """
 
     calls: Mapping[CallRef, CallSpec] = field(repr=False)
@@ -187,7 +177,7 @@ class RuntimePlan:
         return self.port_domains[ref]
 
     def pool(self, call: CallRef) -> ActorPoolSpec:
-        """返回一个 Call 唯一的物理 actor-pool 合同。"""
+        """Return the sole physical actor-pool contract for a Call."""
 
         return self.actor_pools_by_call[call]
 

@@ -1,4 +1,4 @@
-"""Keep the V3.6 directory layout as an enforced dependency architecture."""
+"""Enforce the dependency boundaries of the released runtime package."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ PACKAGE_NAME = ("rayorch", "multigrain")
 
 
 def _local_imports(path: Path) -> tuple[tuple[str, ...], ...]:
-    """Resolve local absolute/relative imports to paths below multigrain_v3_6."""
+    """Resolve local absolute and relative imports below ``multigrain``."""
 
     relative = path.relative_to(PACKAGE).with_suffix("")
     package = (*PACKAGE_NAME, *relative.parts[:-1])
@@ -34,7 +34,7 @@ def _local_imports(path: Path) -> tuple[tuple[str, ...], ...]:
     return tuple(targets)
 
 
-def test_v36_package_dependency_boundaries() -> None:
+def test_package_dependency_boundaries() -> None:
     violations: list[str] = []
     foundation = {"model.py", "protocol.py", "recovery.py"}
     upper_layers = {"api", "functional", "program", "runtime", "execution"}

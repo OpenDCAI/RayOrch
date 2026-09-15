@@ -15,7 +15,7 @@ from .state import CommitError
 
 @dataclass(slots=True)
 class GrainRecord:
-    """DispatchState 私有的可变 Grain 执行记录。"""
+    """Mutable Grain execution state private to ``DispatchState``."""
 
     phase: GrainPhase
     generation: int = 0
@@ -25,7 +25,7 @@ class GrainRecord:
 
 @dataclass(frozen=True, slots=True)
 class GrainSnapshot:
-    """跨组件诊断可见的不可变 Grain 状态副本。"""
+    """Immutable Grain state exposed for cross-component diagnostics."""
 
     phase: GrainPhase
     generation: int
@@ -49,32 +49,26 @@ class DispatchBatch:
 
 
 class DispatchState:
-    """The sole owner of runnable queues and mutable Grain execution state."""
+    """Own runnable queues and every mutable Grain execution record.
 
-    def __init__(self, *, ready_fifo: bool = True) -> None:
+    A Grain enters its Call's READY queue as soon as the engine observes all
+    required inputs. Reserving directly from these queues makes dispatch
+    completion-driven: downstream work need not wait for an upstream stage or
+    input domain to finish globally.
+    """
+
+    def __init__(self) -> None:
         self._records: dict[GrainRef, GrainRecord] = {}
-        self._ready_fifo = ready_fifo
-        # READY work is selected by Call.  A single microbatch-wide deque made
-        # every reservation scan READY grains belonging to every other Call;
-        # large fan-out microbatches therefore paid O(total_ready) for each
-        # actor batch.  Per-Call FIFO queues preserve the same ordering and
-        # single-parent packing semantics while making any-parent reservation
-        # O(batch_size).
-        self._ready_fifo_by_call: dict[CallRef, deque[GrainRef]] = defaultdict(deque)
-        self._ready_set_by_call: dict[CallRef, set[GrainRef]] = defaultdict(set)
+        # Per-Call queues avoid scanning unrelated fan-out while preserving the
+        # order in which dependency completion made Grains runnable.
+        self._ready_by_call: dict[CallRef, deque[GrainRef]] = defaultdict(deque)
         self._immediate_retry_queue: deque[DispatchBatch] = deque()
         self._deferred_recovery_queue: deque[DispatchBatch] = deque()
 
     @property
     def ready_count(self) -> int:
-        ready_by_call = (
-            self._ready_fifo_by_call
-            if self._ready_fifo
-            else self._ready_set_by_call
-        )
-        ready_count = sum(len(queue) for queue in ready_by_call.values())
         return (
-            ready_count
+            sum(len(queue) for queue in self._ready_by_call.values())
             + sum(len(batch.grains) for batch in self._immediate_retry_queue)
             + sum(len(batch.grains) for batch in self._deferred_recovery_queue)
         )
@@ -86,14 +80,7 @@ class DispatchState:
     @property
     def is_idle(self) -> bool:
         return not (
-            any(
-                (
-                    self._ready_fifo_by_call
-                    if self._ready_fifo
-                    else self._ready_set_by_call
-                )
-                .values()
-            )
+            any(self._ready_by_call.values())
             or self._immediate_retry_queue
             or self._deferred_recovery_queue
         )
@@ -141,14 +128,11 @@ class DispatchState:
         )
 
     def inputs_ready(self, grain: GrainRef, parent_anchor: EntityRef) -> None:
-        """Create one READY Grain and enqueue it exactly once."""
+        """Create one READY Grain and append it to its Call queue exactly once."""
 
         self._create(grain, GrainEvent.INPUTS_READY)
         self._record(grain).parent_anchor = parent_anchor
-        if self._ready_fifo:
-            self._ready_fifo_by_call[grain.call].append(grain)
-        else:
-            self._ready_set_by_call[grain.call].add(grain)
+        self._ready_by_call[grain.call].append(grain)
 
     def inputs_terminal(self, grain: GrainRef) -> None:
         """Create one dependency-terminal Grain directly as SEALED."""
@@ -172,11 +156,7 @@ class DispatchState:
             for batch in self._immediate_retry_queue
         ):
             return 0
-        if (
-            self._ready_fifo_by_call.get(call)
-            if self._ready_fifo
-            else self._ready_set_by_call.get(call)
-        ):
+        if self._ready_by_call.get(call):
             return 1
         if any(
             batch.grains[0].call == call
@@ -190,7 +170,6 @@ class DispatchState:
         call: CallRef,
         *,
         max_size: int,
-        pack_by_parent: bool,
         barriered_anchors: AbstractSet[EntityRef] = frozenset(),
     ) -> tuple[DispatchBatch | None, tuple[GrainRef, ...]]:
         """Reserve live work and atomically seal encountered barriered READY work."""
@@ -207,7 +186,6 @@ class DispatchState:
         grains, barriered = self._reserve_ready(
             call,
             max_size=max_size,
-            pack_by_parent=pack_by_parent,
             barriered_anchors=barriered_anchors,
         )
         suppressed.extend(barriered)
@@ -228,118 +206,28 @@ class DispatchState:
         call: CallRef,
         *,
         max_size: int,
-        pack_by_parent: bool,
         barriered_anchors: AbstractSet[EntityRef],
     ) -> tuple[tuple[GrainRef, ...], tuple[GrainRef, ...]]:
-        if not self._ready_fifo:
-            return self._reserve_ready_unordered(
-                call,
-                max_size=max_size,
-                pack_by_parent=pack_by_parent,
-                barriered_anchors=barriered_anchors,
-            )
-
         if max_size <= 0:
             raise ValueError("max_size must be positive")
-        queue = self._ready_fifo_by_call.get(call)
+        queue = self._ready_by_call.get(call)
         if not queue:
             return (), ()
 
         selected: list[GrainRef] = []
         suppressed: list[GrainRef] = []
-        if not pack_by_parent:
-            while queue and len(selected) < max_size:
-                grain = queue.popleft()
-                if not self._is_ready(grain):
-                    continue
-                if self.parent_anchor(grain) in barriered_anchors:
-                    self._suppress_ready((grain,))
-                    suppressed.append(grain)
-                    continue
-                self._reserve_exact((grain,))
-                selected.append(grain)
-            if not queue:
-                self._ready_fifo_by_call.pop(call, None)
-            return tuple(selected), tuple(suppressed)
-
-        # pack_by_parent must retain the historical behavior: choose the first
-        # ready parent, collect up to max_size siblings from the whole Call
-        # queue, and preserve the relative order of every unselected entry.
-        remaining: deque[GrainRef] = deque()
-        selected_anchor: EntityRef | None = None
-        while queue:
+        while queue and len(selected) < max_size:
             grain = queue.popleft()
             if not self._is_ready(grain):
                 continue
-            candidate_anchor = self.parent_anchor(grain)
-            if candidate_anchor in barriered_anchors:
+            if self.parent_anchor(grain) in barriered_anchors:
                 self._suppress_ready((grain,))
                 suppressed.append(grain)
                 continue
-            if len(selected) >= max_size:
-                remaining.append(grain)
-                continue
-            if selected_anchor is not None and candidate_anchor != selected_anchor:
-                remaining.append(grain)
-                continue
-            if selected_anchor is None:
-                selected_anchor = candidate_anchor
             self._reserve_exact((grain,))
             selected.append(grain)
-        if remaining:
-            self._ready_fifo_by_call[call] = remaining
-        else:
-            self._ready_fifo_by_call.pop(call, None)
-        return tuple(selected), tuple(suppressed)
-
-    def _reserve_ready_unordered(
-        self,
-        call: CallRef,
-        *,
-        max_size: int,
-        pack_by_parent: bool,
-        barriered_anchors: AbstractSet[EntityRef],
-    ) -> tuple[tuple[GrainRef, ...], tuple[GrainRef, ...]]:
-        """Reserve from a per-Call unordered READY index.
-
-        This is the FIFO ablation from the paper: Call partitioning, lineage,
-        recovery queues, and parent suppression barriers stay intact; only dequeue order is
-        removed. Reconstruction order still comes from child ordinals.
-        """
-
-        if max_size <= 0:
-            raise ValueError("max_size must be positive")
-        selected: list[GrainRef] = []
-        suppressed: list[GrainRef] = []
-        queue = self._ready_set_by_call.get(call)
         if not queue:
-            return (), ()
-        remaining: set[GrainRef] = set()
-        selected_anchor: EntityRef | None = None
-        while queue:
-            grain = queue.pop()
-            if not self._is_ready(grain):
-                continue
-            candidate_anchor = self.parent_anchor(grain)
-            if candidate_anchor in barriered_anchors:
-                self._suppress_ready((grain,))
-                suppressed.append(grain)
-                continue
-            if len(selected) >= max_size:
-                remaining.add(grain)
-                continue
-            if pack_by_parent:
-                if selected_anchor is not None and candidate_anchor != selected_anchor:
-                    remaining.add(grain)
-                    continue
-                if selected_anchor is None:
-                    selected_anchor = candidate_anchor
-            self._reserve_exact((grain,))
-            selected.append(grain)
-        if remaining:
-            self._ready_set_by_call[call] = remaining
-        else:
-            self._ready_set_by_call.pop(call, None)
+            self._ready_by_call.pop(call, None)
         return tuple(selected), tuple(suppressed)
 
     def _reserve_recovery(

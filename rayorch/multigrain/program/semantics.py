@@ -1,7 +1,7 @@
-"""Port primitive 的封闭、穷尽语义表。
+"""Closed and exhaustive semantics table for Port primitives.
 
-所有 compiler stage 都先调用 :func:`describe_origin`，而不是各自重新猜测
-PortOrigin。新增 primitive 若未在这里登记，会立即落入 assert_never。
+Every compiler phase calls :func:`describe_origin` instead of independently
+interpreting PortOrigin. An unregistered primitive reaches ``assert_never``.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ class PrimitiveInput:
 
 @dataclass(frozen=True, slots=True)
 class PrimitiveSemantics:
-    """一个 origin 对 analysis/lowering 暴露的完整静态合同。"""
+    """Complete static contract exposed to analysis and lowering."""
 
     kind: PrimitiveKind
     inputs: tuple[PrimitiveInput, ...] = ()
@@ -61,7 +61,7 @@ class PrimitiveSemantics:
 
 
 def describe_origin(origin: PortOrigin) -> PrimitiveSemantics:
-    """把每个 PortOrigin 穷尽翻译成统一语义描述。"""
+    """Translate every PortOrigin into the unified semantic representation."""
 
     match origin:
         case SourceOrigin(source_index=source_index):

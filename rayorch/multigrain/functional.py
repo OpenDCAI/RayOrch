@@ -1,4 +1,4 @@
-"""Multigrain 的纯符号 Port 关系操作。"""
+"""Pure symbolic Port relationship operations for multigrain pipelines."""
 
 from __future__ import annotations
 
@@ -7,19 +7,19 @@ from .model import CompileError
 
 
 def expand(port: Port) -> Port:
-    """把一个 group Port 展开到新建的 child Domain。"""
+    """Expand one grouped Port into a newly created child Domain."""
 
     return active_builder().expand((port,))[0]
 
 
 def expand_aligned(*ports: Port) -> tuple[Port, ...]:
-    """按共同 cardinality 把多个 group Port 展开到同一 child Domain。"""
+    """Expand aligned grouped Ports into one child Domain."""
 
     return active_builder().expand(tuple(ports))
 
 
 def reduce(port: Port, *, members: Port | None = None) -> Port:
-    """沿 Domain parent 回收一级，并保留有序成员关系。"""
+    """Reduce one Domain level while preserving ordered membership."""
 
     return active_builder().reduce((port,), members)[0]
 
@@ -28,25 +28,25 @@ def reduce_aligned(
     *ports: Port,
     members: Port | None = None,
 ) -> tuple[Port, ...]:
-    """按同一成员集合回收多个值 Port。"""
+    """Reduce multiple value Ports over the same member set."""
 
     return active_builder().reduce(ports, members)
 
 
 def broadcast(port: Port, *, like: Port) -> Port:
-    """把祖先 Domain 的 Port 投影到 ``like`` 所在的后代 Domain。"""
+    """Project an ancestor Port into the descendant Domain containing ``like``."""
 
     return active_builder().broadcast(port, like)
 
 
 def filter(port: Port, mask: Port) -> Port:
-    """以布尔 mask 改变成员状态，但不改变 source 的 Domain。"""
+    """Filter membership with a boolean mask without changing the source Domain."""
 
     return active_builder().filter(port, mask)
 
 
 def optional(port: Port) -> OptionalInput:
-    """把 Port 标为 Call 的 optional 输入；不创建结构节点。"""
+    """Mark a Port as an optional Call input without creating a graph node."""
 
     if not isinstance(port, Port):
         raise CompileError("optional requires a Port")

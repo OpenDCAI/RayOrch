@@ -1,4 +1,4 @@
-"""Multigrain 的 RayModule 与符号化 Pipeline 编写 API。"""
+"""RayModule and symbolic Pipeline authoring API."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from .program.plan import CompiledProgram
 
 @dataclass(frozen=True, slots=True)
 class Port:
-    """一个逻辑 Port 的公开符号句柄。"""
+    """Public symbolic handle for one logical Port."""
 
     ref: PortRef
     _owner: int
@@ -39,7 +39,7 @@ class Port:
 
 @dataclass(frozen=True, slots=True)
 class OptionalInput:
-    """仅改变 Call 输入策略的 Port 包装；不创建新 Port。"""
+    """Port wrapper that changes input policy without creating another Port."""
 
     port: Port
 
@@ -51,7 +51,7 @@ _ACTIVE_TRACE: contextvars.ContextVar[_ProgramBuilder | None] = (
 
 
 class RayModule:
-    """声明式 UDF 配方；actor handle 只能存在于执行层。"""
+    """Declarative UDF recipe; actor handles exist only in the execution layer."""
 
     def __init__(self, udf: Any, *, num_outputs: int = 1) -> None:
         if num_outputs <= 0:
@@ -63,7 +63,7 @@ class RayModule:
         self.options: dict[str, Any] = {}
 
     def returns(self, count: int) -> Self:
-        """声明一次 Call 产生的逻辑输出 Port 数。"""
+        """Declare the number of logical output Ports produced by one Call."""
 
         if count <= 0:
             raise ValueError("output count must be positive")
@@ -71,14 +71,14 @@ class RayModule:
         return self
 
     def pre_init(self, *args: Any, **kwargs: Any) -> Self:
-        """记录 actor/UDF 实例化参数，不在编译期执行构造。"""
+        """Record UDF constructor arguments without instantiating it at compile time."""
 
         self.init_args = tuple(args)
         self.init_kwargs = dict(kwargs)
         return self
 
     def ray_options(self, **options: Any) -> Self:
-        """记录该 Call 的物理执行选项并返回自身以便链式配置。"""
+        """Record physical execution options and return this recipe."""
 
         if "num_outputs" in options:
             raise ValueError("use RayModule.returns(...) for logical outputs")
@@ -109,7 +109,7 @@ def function(
     *,
     num_outputs: int = 1,
 ) -> RayModule | Callable[[Callable[..., Any]], RayModule]:
-    """把普通 callable 适配成无状态的 RayModule 配方。"""
+    """Adapt a callable into a stateless RayModule recipe."""
 
     def wrap(target: Callable[..., Any]) -> RayModule:
         return RayModule(target, num_outputs=num_outputs)
@@ -118,18 +118,18 @@ def function(
 
 
 class Pipeline:
-    """用户声明数据流的入口；compile 仅执行一次符号追踪。"""
+    """Base class for declarative dataflows compiled by one symbolic trace."""
 
     def forward(self, *args: Any) -> Any:
-        """声明 Pipeline；子类应只组合 RayModule 与 Port 结构操作。"""
+        """Declare a graph by composing RayModules and structural Port operations."""
 
         raise NotImplementedError
 
     def compile(self, *, optimize: bool = True) -> CompiledProgram:
-        """追踪 forward，并通过固定 compiler pipeline 生成 RuntimePlan。
+        """Trace ``forward`` and produce a RuntimePlan through fixed compiler phases.
 
-        ``optimize=False`` 是语义 correctness baseline；它跳过所有
-        canonicalization，但仍执行同一 verifier、analysis 和 lowering。
+        ``optimize=False`` is the semantic baseline: it skips canonicalization
+        while retaining the same verification, analysis, and lowering phases.
         """
 
         parameters = tuple(inspect.signature(self.forward).parameters.values())
@@ -154,7 +154,7 @@ class Pipeline:
 
 
 class _ProgramBuilder:
-    """只负责 authoring trace；不计算 derived facts 或 runtime Effects。"""
+    """Capture authoring operations without deriving runtime facts or Effects."""
 
     def __init__(self, source_names: tuple[str, ...]) -> None:
         self.owner = next(_TRACE_IDS)
@@ -179,12 +179,12 @@ class _ProgramBuilder:
         self.source_ports = tuple(sources)
 
     def public(self, ref: PortRef) -> Port:
-        """把内部 PortRef 包装为绑定当前 trace 的公开句柄。"""
+        """Wrap an internal PortRef as a handle bound to this trace."""
 
         return Port(ref, self.owner)
 
     def spec(self, port: Port, label: str = "operation") -> PortSpec:
-        """校验 Port 属于当前 trace，并返回对应静态定义。"""
+        """Validate trace ownership and return the Port's static definition."""
 
         if not isinstance(port, Port) or port._owner != self.owner:
             raise CompileError(f"{label} requires a Port from the active Pipeline")
@@ -199,7 +199,7 @@ class _ProgramBuilder:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Port | tuple[Port, ...]:
-        """登记唯一计算边界，并为每个逻辑输出创建独立 Port。"""
+        """Register one compute boundary and create its logical output Ports."""
 
         if not args and not kwargs:
             raise CompileError("RayModule requires at least one Port input")
@@ -253,7 +253,7 @@ class _ProgramBuilder:
         return public[0] if len(public) == 1 else public
 
     def expand(self, ports: tuple[Port, ...]) -> tuple[Port, ...]:
-        """创建 child Domain；aligned 输入共享同一 Expansion。"""
+        """Create a child Domain; aligned inputs share one Expansion."""
 
         specs = self._ports(ports, "expand")
         if len({spec.domain for spec in specs}) != 1:
@@ -311,7 +311,7 @@ class _ProgramBuilder:
         ports: tuple[Port, ...],
         members: Port | None,
     ) -> tuple[Port, ...]:
-        """沿 Domain parent 回收一级，并显式记录成员 Port。"""
+        """Reduce one Domain level and record the explicit membership Port."""
 
         specs = self._ports(ports, "reduce")
         if len({spec.domain for spec in specs}) != 1:
@@ -346,7 +346,7 @@ class _ProgramBuilder:
         return tuple(self.public(ref) for ref in outputs)
 
     def broadcast(self, source: Port, like: Port) -> Port:
-        """把祖先值投影到后代 Domain，不复制 payload。"""
+        """Project an ancestor value into a descendant Domain without copying it."""
 
         source_spec = self.spec(source, "broadcast")
         target_spec = self.spec(like, "broadcast like")
@@ -366,7 +366,7 @@ class _ProgramBuilder:
         return self.public(output)
 
     def filter(self, source: Port, mask: Port) -> Port:
-        """保持 Domain 不变，仅由布尔 mask 改变成员状态。"""
+        """Change membership with a boolean mask while preserving the Domain."""
 
         source_spec = self.spec(source, "filter")
         mask_spec = self.spec(mask, "filter mask")
@@ -384,7 +384,7 @@ class _ProgramBuilder:
         return self.public(output)
 
     def normalize_outputs(self, value: Any) -> object:
-        """把公开 Port 输出树转换为只含 PortRef 的不可变 tuple 树。"""
+        """Normalize the public output tree into immutable PortRef tuples."""
 
         if isinstance(value, Port):
             self.spec(value, "Pipeline output")
@@ -396,7 +396,7 @@ class _ProgramBuilder:
         )
 
     def build(self, output_tree: object, *, optimize: bool) -> CompiledProgram:
-        """冻结 LogicalProgram；其余事实全部交给 compiler stages。"""
+        """Freeze the LogicalProgram and delegate derived facts to the compiler."""
 
         logical = LogicalProgram(
             calls=freeze_mapping(self.calls),
@@ -441,7 +441,7 @@ class _ProgramBuilder:
 
 
 def active_builder() -> _ProgramBuilder:
-    """返回当前符号追踪 builder；离开 ``forward`` 时拒绝 Port 操作。"""
+    """Return the active trace builder and reject Port operations outside forward."""
 
     builder = _ACTIVE_TRACE.get()
     if builder is None:

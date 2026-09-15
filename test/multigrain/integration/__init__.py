@@ -1,1 +1,1 @@
-"""Real-Ray v3.6 integration tests."""
+"""Integration tests against a real local Ray runtime."""

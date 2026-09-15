@@ -1,4 +1,4 @@
-"""被动运行时记录与表；不包含调度策略，也不依赖 Ray。"""
+"""Passive runtime records and tables with no scheduling policy or Ray dependency."""
 
 from __future__ import annotations
 
@@ -17,12 +17,12 @@ from ..protocol import RowBinding
 
 
 class CommitError(RuntimeError):
-    """提交报告与已经发布的不可变运行时事实冲突。"""
+    """A commit conflicts with an already-published immutable runtime fact."""
 
 
 @dataclass(frozen=True, slots=True)
 class ExpansionRef:
-    """一个父 Entity 在指定 child Domain 上的唯一 fan-out 身份。"""
+    """Identity of one parent Entity's fan-out into a child Domain."""
 
     child_domain: DomainRef
     parent_entity: EntityRef
@@ -30,7 +30,7 @@ class ExpansionRef:
 
 @dataclass(frozen=True, slots=True)
 class EntityParent:
-    """子 Entity 的显式父引用与稳定 ordinal。"""
+    """A child Entity's explicit parent reference and stable ordinal."""
 
     parent_entity: EntityRef
     ordinal: int
@@ -38,12 +38,13 @@ class EntityParent:
 
 @dataclass(frozen=True, slots=True)
 class ItemRecord:
-    """一个 Item 的不可变语义事实。
+    """Immutable semantic facts for one Item.
 
-    ``outcome`` 描述成员/计算终态，``cause`` 记录非正常终态的来源；
-    ``control`` 是调度所需的小型控制面副本（当前为 Filter 的布尔值）。
-    业务 payload 仍只存在 ``RuntimeState.values``，MicrobatchEngine 无需读取 payload
-    就能恢复并继续结构传播。
+    ``outcome`` records the terminal membership/computation state, ``cause``
+    records abnormal provenance, and ``control`` stores the small control-plane
+    value required by scheduling (currently a Filter boolean). Business payloads
+    remain only in ``RuntimeState.values``, so the engine can recover and
+    continue structural propagation without reading them.
     """
 
     outcome: ItemOutcome
@@ -53,7 +54,7 @@ class ItemRecord:
 
 @dataclass(frozen=True, slots=True)
 class ExpansionRecord:
-    """一次 expansion 的终态及其唯一有序 children 事实。"""
+    """Terminal state and unique ordered children of one Expansion."""
 
     outcome: ExpansionOutcome
     children: tuple[EntityRef, ...] | None
@@ -70,7 +71,7 @@ class ExpansionRecord:
 
 @dataclass(frozen=True, slots=True)
 class NestedGroupLayout:
-    """从一个隐式根到有序叶子的 CSR 风格层级 offsets。"""
+    """CSR-style level offsets from one implicit root to ordered leaves."""
 
     offsets_by_level: tuple[tuple[int, ...], ...]
 
@@ -85,13 +86,13 @@ class NestedGroupLayout:
 
     @property
     def depth(self) -> int:
-        """返回从隐式根到叶子的结构层数。"""
+        """Return the structural depth from the implicit root to leaves."""
 
         return len(self.offsets_by_level)
 
     @classmethod
     def one_level(cls, count: int) -> NestedGroupLayout:
-        """构造包含 ``count`` 个有序叶子的一层 group。"""
+        """Construct a one-level group containing ``count`` ordered leaves."""
 
         if count < 0:
             raise ValueError("group count must be non-negative")
@@ -104,7 +105,7 @@ class NestedGroupLayout:
         *,
         child_depth: int,
     ) -> NestedGroupLayout:
-        """把同深度 child layouts 拼成更高一级；空 group 也保留完整层数。"""
+        """Nest equal-depth child layouts while preserving empty-group depth."""
 
         if child_depth <= 0:
             raise ValueError("child_depth must be positive")
@@ -130,7 +131,7 @@ class NestedGroupLayout:
 
 @dataclass(frozen=True, slots=True)
 class NestedGroupBinding:
-    """规范化层级 layout 与扁平叶子 Item 的纯引用绑定。"""
+    """Reference-only binding of a canonical layout to flat leaf Items."""
 
     layout: NestedGroupLayout
     flat_items: tuple[ItemRef, ...]
@@ -145,14 +146,14 @@ ValueBinding: TypeAlias = RowBinding | NestedGroupBinding
 
 @dataclass(slots=True)
 class PendingGrain:
-    """尚未凑齐的 Call 输入槽；槽位顺序与 CallSpec 一致。"""
+    """Unresolved Call input slots in CallSpec order."""
 
     slots: list[ItemRef | None]
 
 
 @dataclass(slots=True)
 class RuntimeState:
-    """MicrobatchEngine 独占写入的全部被动语义表。"""
+    """All passive semantic tables exclusively written by MicrobatchEngine."""
 
     items: dict[ItemRef, ItemRecord] = field(default_factory=dict)
     expansions: dict[ExpansionRef, ExpansionRecord] = field(default_factory=dict)

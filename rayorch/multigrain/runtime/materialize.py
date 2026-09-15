@@ -1,7 +1,8 @@
-"""Executor 的输出物化逻辑。
+"""Output materialization for Executor.
 
-该模块只通过 :class:`MicrobatchEngine` 的只读公开接口访问语义状态；执行器不读取
-内部 table，也不解释逻辑 provenance。
+This module accesses semantic state only through MicrobatchEngine's read-only
+interface; the executor neither reads internal tables nor interprets logical
+provenance.
 """
 
 from __future__ import annotations
@@ -16,10 +17,10 @@ from .state import NestedGroupBinding
 
 
 class ReadableStore(Protocol):
-    """结果物化所需的最小块读取接口。"""
+    """Minimal block-reading interface required for result materialization."""
 
     def get(self, binding: RowBinding) -> Any:
-        """读取一个物理行绑定对应的业务值。"""
+        """Read the business value referenced by one physical row binding."""
 
         ...
 
@@ -30,7 +31,7 @@ def materialize_tree(
     store: ReadableStore,
     tree: object | None = None,
 ) -> object:
-    """按稳定 lineage 顺序物化 Program 输出树。"""
+    """Materialize the Program output tree in stable lineage order."""
 
     current = plan.output_tree if tree is None else tree
     if isinstance(current, PortRef):
@@ -51,7 +52,7 @@ def _materialize_item(
     store: ReadableStore,
     item: ItemRef,
 ) -> Any:
-    """物化单个终态 Item；非 PRESENT 结果保留其语义 outcome。"""
+    """Materialize one terminal Item, preserving non-PRESENT outcomes."""
 
     outcome = engine.item_outcome(item)
     if outcome is not ItemOutcome.PRESENT:
@@ -59,7 +60,7 @@ def _materialize_item(
     binding = engine.value_binding(item)
     if isinstance(binding, RowBinding):
         return store.get(binding)
-    if not isinstance(binding, NestedGroupBinding):  # pragma: no cover - 防御分支
+    if not isinstance(binding, NestedGroupBinding):  # pragma: no cover - defensive
         raise RuntimeError(f"unsupported ValueBinding: {binding!r}")
     leaves = [store.get(row) for row in engine.nested_group_rows(binding)]
     return restore_nested_group(leaves, binding.layout.offsets_by_level)

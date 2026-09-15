@@ -1,7 +1,8 @@
-"""ProgramAnalysis -> RuntimePlan 的纯 lowering 与可选 canonicalization。
+"""Pure ProgramAnalysis-to-RuntimePlan lowering and canonicalization.
 
-Lowering 先创建每个 structural Port 唯一的 Effect，再让所有触发索引引用同一对象；
-随后编译 Call pool、Worker ABI 和 explanation，最后一次性冻结 RuntimePlan。
+Lowering first creates one canonical Effect for each structural Port. Trigger
+indexes reference those objects directly; actor-pool contracts, the Worker ABI,
+and explanations are then compiled into one immutable RuntimePlan.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ def _canonicalize(
     *,
     enabled: bool,
 ) -> _CanonicalForm:
-    """只折叠透明 Broadcast 链；不删除 Call，也不融合 Filter。"""
+    """Collapse transparent Broadcast chains without removing Calls or Filters."""
 
     direct: dict[PortRef, PortRef] = {}
     rewrites: list[CanonicalRewrite] = []
@@ -289,17 +290,18 @@ def _compile_pool_spec(
         raise CompileError(
             "max_retries is ambiguous; use recovery=RecoveryPolicy(...)"
         )
-    if "batch_scope" in raw:
+    unsupported = {"batch_scope", "batching_policy"} & raw.keys()
+    if unsupported:
+        option = sorted(unsupported)[0]
         raise CompileError(
-            "batch_scope was replaced by batching_policy; use "
-            "'any_parent' or 'single_parent'"
+            f"{option} is not supported; RayOrch always batches currently "
+            "READY grains across parent boundaries"
         )
 
     try:
         return ActorPoolSpec(
             replicas=cast(Any, raw.pop("replicas", 1)),
             batch_size=cast(Any, raw.pop("batch_size", 1)),
-            batching_policy=cast(Any, raw.pop("batching_policy", "any_parent")),
             recovery=cast(Any, raw.pop("recovery", DEFAULT_RECOVERY_POLICY)),
             ray_options=tuple(raw.items()),
         )

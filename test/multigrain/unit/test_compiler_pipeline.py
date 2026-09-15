@@ -1,4 +1,4 @@
-"""v3.6 compiler boundary, exhaustive semantics, explain and canonicalization."""
+"""Compiler boundaries, exhaustive semantics, explanations, and canonicalization."""
 
 from __future__ import annotations
 
@@ -367,7 +367,6 @@ def test_pool_options_compile_to_one_typed_physical_contract():
             self.call = mg.RayModule(U).ray_options(
                 replicas=3,
                 batch_size=7,
-                batching_policy="single_parent",
                 recovery=recovery,
                 num_cpus=0.25,
             )
@@ -384,7 +383,6 @@ def test_pool_options_compile_to_one_typed_physical_contract():
     assert set(optimized.plan.actor_pools_by_call) == {call}
     assert pool.replicas == 3
     assert pool.batch_size == 7
-    assert pool.batching_policy == "single_parent"
     assert pool.recovery is recovery
     assert pool.ray_options == (("num_cpus", 0.25),)
 
@@ -396,8 +394,8 @@ def test_pool_options_compile_to_one_typed_physical_contract():
         ({"recovery": "retry"}, "RecoveryPolicy"),
         ({"replicas": True}, "replicas"),
         ({"batch_size": 1.5}, "batch_size"),
-        ({"batching_policy": "global"}, "batching_policy"),
-        ({"batch_scope": "elastic"}, "replaced by batching_policy"),
+        ({"batching_policy": "any_parent"}, "not supported"),
+        ({"batch_scope": "elastic"}, "not supported"),
     ],
 )
 def test_compiler_rejects_untyped_or_ambiguous_physical_options(

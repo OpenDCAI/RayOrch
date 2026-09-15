@@ -1,4 +1,4 @@
-"""不依赖 runtime/Ray 的封闭动态状态转移代数。"""
+"""Closed dynamic transition algebra independent of runtime state and Ray."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ from ..model import GrainPhase, InputMode, ItemOutcome, ExpansionOutcome
 
 
 class InvalidTransition(ValueError):
-    """输入事实不满足某个封闭状态机的合同。"""
+    """Input facts violate a closed state-machine contract."""
 
 
 class GrainEvent(Enum):
-    """能够改变一个 Grain phase 的完整事件集合。"""
+    """Exhaustive event set capable of changing a Grain phase."""
 
     INPUTS_READY = auto()
     INPUTS_TERMINAL = auto()
@@ -37,7 +37,7 @@ def grain_transition(
     phase: GrainPhase | None,
     event: GrainEvent,
 ) -> GrainPhase:
-    """执行唯一合法的 Grain phase 转移；非法边直接失败。"""
+    """Apply the sole legal Grain phase transition and reject invalid edges."""
 
     try:
         return _GRAIN_TRANSITIONS[(phase, event)]
@@ -50,7 +50,7 @@ def item_transition(
     current: ItemOutcome | None,
     publication: ItemOutcome,
 ) -> ItemOutcome:
-    """Item 只允许从 UNRESOLVED 进入终态，或幂等重放同一终态。"""
+    """Allow only initial Item publication or idempotent replay."""
 
     if current is None or current is publication:
         return publication
@@ -63,7 +63,7 @@ def expansion_transition(
     current: ExpansionOutcome | None,
     publication: ExpansionOutcome,
 ) -> ExpansionOutcome:
-    """Expansion 与 Item 一样，只接受一次终态 publication。"""
+    """Allow only initial Expansion publication or idempotent replay."""
 
     if current is None or current is publication:
         return publication
@@ -73,7 +73,7 @@ def expansion_transition(
 
 
 class CallAction(Enum):
-    """输入归约对 Grain/outputs 的唯一动作。"""
+    """Exhaustive actions produced by reducing Call input states."""
 
     WAIT = auto()
     READY = auto()
@@ -91,7 +91,7 @@ def call_transition(
     modes: tuple[InputMode, ...],
     outcomes: tuple[ItemOutcome | None, ...],
 ) -> CallTransition:
-    """以 failure > unresolved > required-drop 的交换归约分类 Call。"""
+    """Classify a Call with failure > unresolved > required-drop precedence."""
 
     if not modes or len(modes) != len(outcomes):
         raise InvalidTransition("Call modes/outcomes must be non-empty and aligned")
@@ -123,7 +123,7 @@ def filter_transition(
     mask: ItemOutcome | None,
     mask_control: bool | None,
 ) -> FilterTransition:
-    """按 source gate、再 mask gate 决定 Filter target。"""
+    """Resolve a Filter target through the source gate and then mask gate."""
 
     if source is None:
         return FilterTransition(None)
@@ -141,13 +141,13 @@ def filter_transition(
 
 
 def broadcast_transition(source: ItemOutcome) -> ItemOutcome:
-    """Broadcast 是透明 outcome view。"""
+    """Treat Broadcast as a transparent outcome view."""
 
     return source
 
 
 def expansion_outcome_from_item(output: ItemOutcome) -> ExpansionOutcome:
-    """把 Call output outcome 映射为 Expansion 终态。"""
+    """Map a Call output outcome to an Expansion outcome."""
 
     if output is ItemOutcome.PRESENT:
         return ExpansionOutcome.SUCCEEDED
@@ -175,7 +175,7 @@ def reduce_transition(
     members: tuple[ItemOutcome | None, ...],
     values: tuple[ItemOutcome | None, ...],
 ) -> ReduceTransition:
-    """按 Expansion→members→survivor values 的显式 gate 归约 Reduce。"""
+    """Reduce through explicit Expansion, member, and survivor-value gates."""
 
     if len(members) != len(values):
         raise InvalidTransition("Nested-group members/values must be aligned")

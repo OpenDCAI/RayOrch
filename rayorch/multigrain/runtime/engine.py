@@ -1,8 +1,9 @@
-"""Multigrain 的单写者、事件驱动 microbatch 语义状态机。
+"""Single-writer, event-driven semantic state machine for one microbatch.
 
-Engine 是 RuntimeState、Entity 枚举索引和事实 FIFO 的唯一写入口。纯 outcome/phase
-决策位于 transitions.py，Grain 物理队列位于 dispatch.py；本模块只把编译后的 Effect
-应用到一个 microbatch 的 canonical facts，绝不回读 Logical Origin。
+The engine is the sole writer of RuntimeState, entity indexes, and the fact
+queue. Pure outcome and phase decisions live in ``transitions.py``; physical
+Grain queues live in ``dispatch.py``. This module applies compiled Effects to
+canonical facts and never reinterprets logical origins.
 """
 
 from __future__ import annotations
@@ -117,21 +118,17 @@ _FactEvent: TypeAlias = ItemRef | ExpansionRef | EntityRef
 
 
 class MicrobatchEngine:
-    """拥有一个 source microbatch 的全部语义事实与唯一写入口。
+    """Own every semantic fact and mutation for one source microbatch.
 
-    阅读顺序建议是 admission/advance、Worker report commit、三个 publication
-    gateway，最后再看 Filter/Reduce/Broadcast 的 Effect interpreter。
+    A useful reading order is source admission and ``advance``, Worker report
+    commit, the publication gateways, and finally the structural Effect
+    interpreters.
     """
 
-    def __init__(
-        self,
-        plan: RuntimePlan,
-        *,
-        ready_fifo: bool = True,
-    ) -> None:
+    def __init__(self, plan: RuntimePlan) -> None:
         self.plan = plan
         self._state = RuntimeState()
-        self._dispatch = DispatchState(ready_fifo=ready_fifo)
+        self._dispatch = DispatchState()
         self._suppression_barriers = _SuppressionBarrierIndex()
         self._fact_queue: deque[_FactEvent] = deque()
         self._entities_by_domain: dict[
@@ -143,41 +140,41 @@ class MicrobatchEngine:
 
     @property
     def ready_count(self) -> int:
-        """返回当前可被执行器预留的 Grain 数。"""
+        """Return the number of Grains visible to the executor."""
 
         return self._dispatch.ready_count
 
     @property
     def entity_count(self) -> int:
-        """返回本 microbatch 已创建的 Entity 总数。"""
+        """Return the number of Entities created in this microbatch."""
 
         return sum(len(entities) for entities in self._entities_by_domain.values())
 
     @property
     def item_count(self) -> int:
-        """返回本 microbatch 已终态化的 Item 总数。"""
+        """Return the number of terminal Items in this microbatch."""
 
         return len(self._state.items)
 
     @property
     def expansion_count(self) -> int:
-        """返回本 microbatch 已终态化的 Expansion 总数。"""
+        """Return the number of terminal Expansions in this microbatch."""
 
         return len(self._state.expansions)
 
     @property
     def grain_count(self) -> int:
-        """返回 DispatchState 独占的 Grain 总数。"""
+        """Return the number of Grains owned by DispatchState."""
 
         return self._dispatch.grain_count
 
     def grain_snapshot(self, grain: GrainRef) -> GrainSnapshot:
-        """返回一个 Grain 的不可变物理状态副本。"""
+        """Return an immutable physical-state snapshot for one Grain."""
 
         return self._dispatch.snapshot(grain)
 
     def grain_snapshots(self) -> Mapping[GrainRef, GrainSnapshot]:
-        """返回当前全部 Grain 的不可变 point-in-time snapshot。"""
+        """Return an immutable point-in-time snapshot of every Grain."""
 
         return self._dispatch.snapshots()
 
@@ -191,14 +188,12 @@ class MicrobatchEngine:
         call: CallRef,
         *,
         max_size: int,
-        pack_by_parent: bool = False,
     ) -> DispatchBatch | None:
-        """Reserve live work and publish lazy parent suppression in one turn."""
+        """Reserve visible READY work and publish lazy parent suppression."""
 
         batch, suppressed = self._dispatch.reserve_with_barriers(
             call,
             max_size=max_size,
-            pack_by_parent=pack_by_parent,
             barriered_anchors=self._suppression_barriers.anchors_for(call),
         )
         if suppressed:
@@ -209,12 +204,12 @@ class MicrobatchEngine:
         return batch
 
     def close_admission(self) -> None:
-        """声明本 microbatch 不再接纳 source。"""
+        """Declare that this microbatch will accept no more source rows."""
 
         self._admission_closed = True
 
     def is_complete(self) -> bool:
-        """按完整合同审计 microbatch，而非仅检查 ready queue。"""
+        """Audit the full completion contract, not merely an empty READY queue."""
 
         if not self._admission_closed:
             return False
@@ -248,12 +243,12 @@ class MicrobatchEngine:
         return entity if parent is None else parent
 
     def entities(self, domain: DomainRef) -> tuple[EntityRef, ...]:
-        """返回 Domain 内已经创建的 Entity，顺序只用于审计。"""
+        """Return created Entities in a Domain for diagnostics."""
 
         return tuple(self._entities_by_domain.get(domain, ()))
 
     def grain_invocation(self, grain: GrainRef) -> GrainInvocation:
-        """把语义事实投影为 Worker 可消费的纯物理输入计划。"""
+        """Project semantic facts into the physical inputs consumed by a Worker."""
 
         call = self.plan.call(grain.call)
         inputs = []
@@ -291,7 +286,7 @@ class MicrobatchEngine:
         )
 
     def ordered_items(self, port: PortRef) -> tuple[ItemRef, ...]:
-        """按 source/ordinal coordinate 返回一个 Port 的全部 Item。"""
+        """Return a Port's Items in stable source/ordinal order."""
 
         domain = self.plan.port_domain(port)
         entities = sorted(
@@ -301,12 +296,12 @@ class MicrobatchEngine:
         return tuple(ItemRef(port, entity) for entity in entities)
 
     def item_outcome(self, item: ItemRef) -> ItemOutcome:
-        """读取已经终态化 Item 的 outcome。"""
+        """Read the outcome of a terminal Item."""
 
         return self._state.items[item].outcome
 
     def value_binding(self, item: ItemRef) -> ValueBinding:
-        """读取 PRESENT Item 的物理 binding；调用方不得据此改变语义状态。"""
+        """Read a PRESENT Item's binding without exposing mutation authority."""
 
         return self._state.values[item]
 
@@ -314,7 +309,7 @@ class MicrobatchEngine:
         self,
         binding: NestedGroupBinding,
     ) -> tuple[RowBinding, ...]:
-        """把 canonical nested-group 叶子解析为行引用，不读取业务 payload。"""
+        """Resolve canonical nested-group leaves to rows without reading payloads."""
 
         rows = tuple(self._state.values[leaf] for leaf in binding.flat_items)
         if not all(isinstance(row, RowBinding) for row in rows):
@@ -322,7 +317,7 @@ class MicrobatchEngine:
         return tuple(row for row in rows if isinstance(row, RowBinding))
 
     def entity_coordinate(self, entity: EntityRef) -> tuple[int, ...]:
-        """沿显式 lineage 计算稳定的 root/ordinal path。"""
+        """Return the stable root/ordinal coordinate encoded by explicit lineage."""
 
         path = []
         cursor = entity
@@ -333,7 +328,7 @@ class MicrobatchEngine:
         return (cursor.value, *reversed(path))
 
     def release_values(self) -> int:
-        """完成后释放物理 bindings，同时保留语义计数与 Grain 状态。"""
+        """Release physical bindings after completion while retaining semantics."""
 
         if not self.is_complete():
             raise CommitError("cannot release values before microbatch completion")
@@ -342,7 +337,7 @@ class MicrobatchEngine:
         return released
 
     def progress_summary(self) -> str:
-        """返回不含业务 payload 的死锁诊断摘要。"""
+        """Return a deadlock diagnostic that contains no business payload."""
 
         return (
             f"pending={len(self._state.pending_grains)}, "
@@ -359,7 +354,7 @@ class MicrobatchEngine:
         *,
         controls: Mapping[PortRef, tuple[bool, ...]] | None = None,
     ) -> tuple[EntityRef, ...]:
-        """原子接纳行对齐 source bindings 与所需 control manifests。"""
+        """Atomically admit row-aligned source bindings and control manifests."""
 
         if set(bindings) != set(self.plan.source_ports):
             raise CommitError("source bindings must exactly match Program.source_ports")
@@ -396,7 +391,7 @@ class MicrobatchEngine:
         return entities
 
     def advance(self) -> None:
-        """消费封闭 FactEvent 联合，直到结构传播达到局部不动点。"""
+        """Consume the closed FactEvent union to a local fixed point."""
 
         while self._fact_queue:
             fact = self._fact_queue.popleft()
@@ -420,7 +415,7 @@ class MicrobatchEngine:
                     assert_never(fact)
 
     def _apply_item_effect(self, effect: ItemEffect, item: ItemRef) -> None:
-        """穷尽解释一个由 Item publication 触发的完整编译期 Effect。"""
+        """Exhaustively interpret a compiled Effect triggered by Item publication."""
 
         match effect:
             case CallInputEffect():
@@ -843,7 +838,7 @@ class MicrobatchEngine:
         children: tuple[EntityRef, ...] | None = None,
         cause: object | None = None,
     ) -> None:
-        """单调发布一个 Expansion 终态，并入队唯一的事实传播入口。"""
+        """Publish one terminal Expansion and enqueue its sole fact event."""
 
         record = ExpansionRecord(outcome, children, cause)
         existing = self._state.expansions.get(expansion)
@@ -888,7 +883,7 @@ class MicrobatchEngine:
         grain: GrainRef,
         inputs: tuple[ItemRef | None, ...],
     ) -> bool:
-        """按纯输入代数封闭 Grain；返回是否已离开 WAITING。"""
+        """Classify a Grain from input facts and report whether it left WAITING."""
 
         call = self.plan.call(grain.call)
         parent_anchor = self._parent_anchor(grain.entity)
@@ -1044,12 +1039,13 @@ class MicrobatchEngine:
             self._publish_item(target, decision.outcome, cause=cause)
             return
 
-        # members 决定资格，value 仅为纯状态机选出的 survivors 提供 payload。
+        # Membership determines eligibility; values only provide payload for
+        # survivors selected by the pure reduce transition.
         survivor_items = tuple(value_items[index] for index in decision.survivors)
 
         bindings = tuple(self._state.values[item] for item in survivor_items)
-        # 一层 reduce 收集 RowBinding；多层 reduce 则拼接子 NestedGroupLayout，
-        # 最终仍保持一个规范 CSR layout 和一份扁平叶子引用。
+        # A one-level reduce collects rows. Nested reductions concatenate child
+        # layouts into one canonical CSR layout plus a flat leaf-reference list.
         value_depth = effect.value_depth
         if not bindings and value_depth > 0:
             group_layout = NestedGroupLayout.nest((), child_depth=value_depth)
@@ -1144,7 +1140,7 @@ class MicrobatchEngine:
         entity: EntityRef,
         origin: EntityParent | None = None,
     ) -> None:
-        """单调发布 Entity 事实；root 无 origin，child 显式记录 lineage。"""
+        """Publish an Entity once; roots have no origin and children record lineage."""
 
         entities = self._entities_by_domain[entity.domain]
         if entity in entities:
@@ -1177,7 +1173,7 @@ class MicrobatchEngine:
 
     @staticmethod
     def _pair(left: int, right: int) -> int:
-        """Cantor pairing 让 child identity 与异步完成顺序无关。"""
+        """Use Cantor pairing so child identity is independent of completion order."""
 
         total = left + right
         return total * (total + 1) // 2 + right

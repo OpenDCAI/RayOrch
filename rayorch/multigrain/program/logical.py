@@ -1,7 +1,8 @@
-"""不可变的轻量 multigrain 逻辑程序。
+"""Immutable, lightweight logical program for multigrain.
 
-本模块只描述用户声明的 Call、Port、Domain 与 provenance。反向索引、control
-demand、物理路由和 actor pool 都不属于 LogicalProgram。
+This module describes only user-declared Calls, Ports, Domains, and provenance.
+Reverse indexes, control demand, physical routing, and actor pools do not belong
+to LogicalProgram.
 """
 
 from __future__ import annotations
@@ -80,7 +81,7 @@ class UdfSpec:
 
 @dataclass(frozen=True, slots=True)
 class CallInputSpec:
-    """一个位置或关键字逻辑参数绑定的值部分。"""
+    """Value portion of one positional or keyword logical argument binding."""
 
     port: PortRef
     mode: InputMode = InputMode.REQUIRED
@@ -105,14 +106,14 @@ class CallSpec:
 
     @property
     def ordered_inputs(self) -> tuple[CallInputSpec, ...]:
-        """按 Python 调用顺序返回 compiler/runtime 使用的 dense inputs。"""
+        """Return dense inputs in Python invocation order."""
 
         return self.args + tuple(input_ for _, input_ in self.kwargs)
 
 
 @dataclass(frozen=True, slots=True)
 class LogicalProgram:
-    """不可变逻辑图；字段中不允许混入任何 derived fact。"""
+    """Immutable logical graph containing no derived facts."""
 
     calls: Mapping[CallRef, CallSpec] = field(repr=False)
     ports: Mapping[PortRef, PortSpec] = field(repr=False)
@@ -131,7 +132,7 @@ class LogicalProgram:
 
 
 def freeze_mapping(values: Mapping[Any, Any]) -> Mapping[Any, Any]:
-    """复制并冻结映射，隔离 builder 和 compiler 的可变工作区。"""
+    """Copy and freeze a mapping to isolate builder and compiler workspaces."""
 
     return MappingProxyType(dict(values))
 

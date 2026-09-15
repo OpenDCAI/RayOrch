@@ -1,8 +1,9 @@
-"""基于 Ray actor pools 的执行器与多 microbatch driver。
+"""Ray actor-pool executor with overlapping microbatch admission.
 
-逻辑 Program、MicrobatchEngine 状态机和 Worker ABI 均不依赖 Ray；本模块是唯一持有
-actor handle 与 pending RPC ObjectRef 的 driver。不同 microbatch 共享 actor capacity，但一个 RPC
-不会静默混合多个 microbatch 的 Grain，从而保持与设计文档一致的实验口径。
+The logical program, semantic engine, and Worker ABI are Ray-free. This module
+alone owns actor handles and pending RPC ObjectRefs. Actor capacity is shared
+across microbatches, but a single RPC never mixes Grains from different
+microbatches.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from .worker import WorkerSnapshot
 
 @dataclass(slots=True)
 class _CallCounters:
-    """Executor.run 内部唯一的可变 Call 计数器。"""
+    """Mutable per-Call counters owned by one ``Executor.run``."""
 
     actor_instances: int = 0
     rpcs: int = 0
@@ -44,7 +45,7 @@ class _CallCounters:
 
 @dataclass(slots=True)
 class _ActorSlot:
-    """driver 内部的 actor capacity token。"""
+    """A driver-owned actor-capacity token."""
 
     call: CallRef
     handle: Any
@@ -53,7 +54,7 @@ class _ActorSlot:
 
 @dataclass(slots=True)
 class _MicrobatchSlot:
-    """一个 source microbatch 及其唯一语义状态机。"""
+    """One source microbatch and its sole semantic state machine."""
 
     index: int
     engine: MicrobatchEngine
@@ -69,10 +70,11 @@ class _PendingRpc:
 
 
 class Executor:
-    """Call-only actor pools 与多 microbatch overlap 的参考执行器。
+    """Drive persistent per-Call actor pools across overlapping microbatches.
 
-    Executor 独占 actor capacity、pending RPC records 和 run-local counters；
-    primitive 传播、Entity lineage 与 Grain phase 仍分别归 Engine/DispatchState。
+    The executor owns actor capacity, pending RPCs, and run-local counters.
+    Logical propagation, entity lineage, and Grain lifecycle state remain in
+    :class:`MicrobatchEngine` and :class:`DispatchState`.
     """
 
     def __init__(
@@ -81,12 +83,8 @@ class Executor:
         *,
         address: str | None = None,
         ray_init_kwargs: dict[str, Any] | None = None,
-        ready_queue_order: str = "fifo",
     ) -> None:
-        """编译 Pipeline、连接 Ray，并按 Call 创建持久 actor pools。"""
-
-        if ready_queue_order not in {"fifo", "unordered"}:
-            raise ValueError("ready_queue_order must be fifo or unordered")
+        """Compile the pipeline, connect to Ray, and create persistent actors."""
 
         import ray  # pyright: ignore[reportMissingImports]
 
@@ -95,7 +93,6 @@ class Executor:
             pipeline if isinstance(pipeline, CompiledProgram) else pipeline.compile()
         )
         self.plan = self.compiled.plan
-        self._ready_fifo = ready_queue_order == "fifo"
         self._owns_ray = not ray.is_initialized()
         if self._owns_ray:
             init_kwargs = dict(ray_init_kwargs or {})
@@ -109,12 +106,12 @@ class Executor:
         self._closed = False
         try:
             self._actor_class = ray.remote(_RayWorkerActor)
-            # 先登记可清理容器再逐 actor append；即使第 N 个构造同步失败，
-            # 前 N-1 个 handle 仍属于统一 close 路径。
+            # Register cleanup ownership before actor creation. If construction
+            # fails partway through a pool, close() still sees every prior handle.
             for call in self.plan.calls:
                 self._actors[call] = []
                 self._create_pool(call)
-            # 统一 ready 屏障让 run() 计时不混入 UDF/模型初始化。
+            # Exclude UDF and model initialization from run-time measurements.
             startup_refs = [
                 actor.handle.ready.remote()
                 for actors in self._actors.values()
@@ -122,7 +119,7 @@ class Executor:
             ]
             ray.get(startup_refs)
         except Exception:
-            # 构造失败时对象不会交给调用方，必须在此回收已创建的 actors。
+            # Construction failures never hand the object to the caller.
             self.close()
             raise
 
@@ -134,7 +131,7 @@ class Executor:
         microbatch_size: int | None = None,
         max_active_microbatches: int = 1,
     ) -> RunResult:
-        """执行行对齐的有限 Sequences，并限制同时活跃的 microbatch 数。"""
+        """Execute finite row-aligned sequences with bounded microbatch overlap."""
 
         if self._closed:
             raise RuntimeError("Executor is closed")
@@ -155,7 +152,7 @@ class Executor:
         if not slices:
             slices = [tuple(() for _ in columns)]
 
-        # actor pool 跨 run 持久化，但可变计数器严格按 run 隔离。
+        # Actor pools persist across runs; mutable counters do not.
         self.store.clear_cache()
         self._counters = {
             call: _CallCounters(actor_instances=len(self._actors[call]))
@@ -192,7 +189,7 @@ class Executor:
 
                 made_progress = self._dispatch_ready(active, pending_rpcs)
 
-                # 只有没有 pending RPC 的 microbatch 才能离开 active 集合。
+                # A microbatch cannot retire while one of its RPCs is pending.
                 pending_microbatches = {
                     rpc.microbatch_index for rpc in pending_rpcs.values()
                 }
@@ -206,11 +203,11 @@ class Executor:
                             slot.engine,
                             self.store,
                         )
-                        # materialize 已把最终业务对象复制到 driver output；cache
-                        # 只用于一次粗块去重，不能把所有 microbatch 的 payload 留到 run 结束。
+                        # Materialization copied final values into driver output.
+                        # The cache only deduplicates block reads within one turn.
                         self.store.clear_cache()
-                        # 最终业务值已经复制到 driver 输出；清空 ValueTable 会释放
-                        # page-image 等 ObjectRef；结果只保留不可变计数快照。
+                        # Drop bindings such as page-image ObjectRefs after output
+                        # materialization; results retain immutable metrics only.
                         released = slot.engine.release_values()
                         metrics_by_microbatch[index] = MicrobatchMetrics(
                             index=index,
@@ -225,8 +222,8 @@ class Executor:
                 if len(completed) == len(slices):
                     break
                 if not pending_rpcs and next_microbatch < len(slices):
-                    # 当前 active microbatch 已完成，但仍有尚未 admission 的 source
-                    # slice；下一 turn 会填充空出的 credit，这不是 deadlock。
+                    # Completed microbatches freed admission credit for the next
+                    # source slice; the following turn can make progress.
                     continue
                 if not pending_rpcs and made_progress:
                     # A cleanup-only reservation can publish SUPPRESSED facts
@@ -245,7 +242,7 @@ class Executor:
                 engine = active[pending_rpc.microbatch_index].engine
                 try:
                     result = self.ray.get(result_ref)
-                except Exception as error:  # Ray 对用户异常和 actor 异常统一在 get 抛出
+                except Exception as error:  # Ray surfaces actor failures at get().
                     self._handle_infrastructure_failure(engine, pending_rpc, error)
                 else:
                     if isinstance(result, DispatchFailure):
@@ -279,7 +276,7 @@ class Executor:
             raise
 
     def close(self) -> None:
-        """释放 actors；仅关闭由本 Executor 初始化的 Ray runtime。"""
+        """Release actors and shut down only a Ray runtime owned by this executor."""
 
         if self._closed:
             return
@@ -347,7 +344,7 @@ class Executor:
         self,
         workers: dict[CallRef, tuple[WorkerSnapshot, ...]],
     ) -> tuple[CallMetrics, ...]:
-        """按 CallRef 顺序冻结内部计数，并移除公开 Ref-keyed 映射。"""
+        """Freeze counters in stable CallRef order for the public result."""
 
         snapshots = []
         for call in sorted(self.plan.calls, key=lambda ref: ref.value):
@@ -368,12 +365,12 @@ class Executor:
         return tuple(snapshots)
 
     def __enter__(self):
-        """支持用 context manager 约束 ExecutionPool 生命周期。"""
+        """Enter a context-managed executor lifetime."""
 
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        """离开 context 时释放 actors。"""
+        """Release actors when leaving the context."""
 
         self.close()
 
@@ -396,9 +393,9 @@ class Executor:
         self,
         columns: tuple[tuple[Any, ...], ...],
     ) -> MicrobatchEngine:
-        """把一个 source slice 原子接纳为独立 microbatch 状态机。"""
+        """Admit one source slice into an independent microbatch engine."""
 
-        engine = MicrobatchEngine(self.plan, ready_fifo=self._ready_fifo)
+        engine = MicrobatchEngine(self.plan)
         bindings = {}
         controls = {}
         for port, values in zip(self.plan.source_ports, columns):
@@ -417,7 +414,7 @@ class Executor:
         active: dict[int, _MicrobatchSlot],
         pending_rpcs: dict[Any, _PendingRpc],
     ) -> bool:
-        """把 READY Grain 分配给空闲 actor；每批严格属于一个 microbatch。"""
+        """Assign READY Grains to idle actors without mixing microbatches."""
 
         made_progress = False
         for call, actors in self._actors.items():
@@ -433,12 +430,12 @@ class Executor:
                     break
                 _, _, candidate = min(candidates, key=lambda item: item[:2])
                 pool = self._pool(call)
-                # 参考调度器采用即时、work-conserving 聚批：只要 actor
-                # 空闲就发送当前可见 Grain，不伪装支持定时等待窗口。
+                # Dispatch visible work immediately when an actor is idle. This
+                # completion-driven path is what lets a downstream stage start
+                # before the upstream stage or input domain has fully drained.
                 batch = candidate.engine.reserve_dispatch(
                     call,
                     max_size=pool.batch_size,
-                    pack_by_parent=pool.batching_policy == "single_parent",
                 )
                 if batch is None:
                     made_progress = True
@@ -552,7 +549,7 @@ class Executor:
     # ── Actor-pool lifecycle and small pure helpers ─────────────────────
 
     def _create_pool(self, call: CallRef) -> None:
-        """只为 Call 创建 pool；Port 结构关系没有对应入口。"""
+        """Create actors only for Calls; structural Ports have no workers."""
 
         replicas = self._pool(call).replicas
         for _ in range(replicas):
@@ -561,7 +558,7 @@ class Executor:
             )
 
     def _create_actor(self, call: CallRef) -> Any:
-        """创建或替换一个持久 actor handle。"""
+        """Create a persistent actor handle for one Call."""
 
         spec = self.plan.call(call)
         actor_options = dict(self._pool(call).ray_options)
@@ -576,7 +573,7 @@ class Executor:
 
     @staticmethod
     def _udf_name(target: Any) -> str:
-        """返回稳定的人类可读 UDF 名称。"""
+        """Return a stable human-readable UDF name."""
 
         return getattr(
             target,
@@ -591,7 +588,7 @@ class Executor:
 
     @classmethod
     def _merge_outputs(cls, outputs: list[object]) -> object:
-        """按 microbatch admission 顺序拼接同构输出树。"""
+        """Merge homogeneous output trees in microbatch admission order."""
 
         first = outputs[0]
         if isinstance(first, list):

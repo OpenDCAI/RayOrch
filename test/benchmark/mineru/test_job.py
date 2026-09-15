@@ -57,7 +57,10 @@ def test_create_bundle_builds_two_wheels_and_forwards_auto_address(
     (flash / "pyproject.toml").write_text("[build-system]\n")
 
     def fake_build(source: Path, wheel_dir: Path) -> Path:
-        return wheel_dir / f"{source.name}.whl"
+        wheel_dir.mkdir(parents=True, exist_ok=True)
+        wheel = wheel_dir / f"{source.name}.whl"
+        wheel.write_bytes(source.name.encode())
+        return wheel
 
     monkeypatch.setattr(job, "build_wheel", fake_build)
     bundle = job.create_bundle(
