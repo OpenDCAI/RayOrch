@@ -230,8 +230,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             startup_s = time.perf_counter() - started
             result = executor.run(
                 pdfs,
-                microbatch_size=args.microbatch_size,
-                max_active_microbatches=args.max_active_microbatches,
+                input_batch_size=args.input_batch_size,
+                max_active_input_batches=args.max_active_input_batches,
             )
         end_to_end = time.perf_counter() - started
     finally:
@@ -267,8 +267,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "render_dpi": args.render_dpi,
         "replicas": args.replicas,
-        "microbatch_size": args.microbatch_size,
-        "max_active_microbatches": args.max_active_microbatches,
+        "input_batch_size": args.input_batch_size,
+        "max_active_input_batches": args.max_active_input_batches,
         "scheduler": "completion_driven_ready_queue",
         "startup_s": round(startup_s, 3),
         "measured_wall_s": round(measured, 3),
@@ -276,15 +276,15 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "pages_per_s": round(pages / max(measured, 1e-9), 4),
         "rpc_count": result.rpc_count,
         "ocr_rpc_count": heavy.rpcs,
-        "ocr_grains": heavy.grains,
-        "ocr_retries": heavy.retries,
+        "ocr_grain_dispatches": heavy.grain_dispatches,
+        "ocr_grain_requeues": heavy.grain_requeues,
         "ocr_grains_per_rpc": heavy.average_batch,
         "ocr_batch_fill_ratio": heavy.average_batch / args.batch_size,
         "ocr_batch_histogram": {
             str(size): heavy.batch_sizes.count(size)
             for size in sorted(set(heavy.batch_sizes))
         },
-        "active_arenas_high_watermark": result.peak_active_microbatches,
+        "peak_active_input_batches": result.peak_active_input_batches,
         "actor_count": result.actor_count,
         "released_values": result.released_values,
         "driver_rss_start": driver_start,
@@ -341,8 +341,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=4)
     parser.add_argument("--replicas", type=int, default=4)
-    parser.add_argument("--microbatch-size", type=int, default=24)
-    parser.add_argument("--max-active-microbatches", type=int, default=3)
+    parser.add_argument("--input-batch-size", type=int, default=24)
+    parser.add_argument("--max-active-input-batches", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--render-replicas", type=int, default=4)

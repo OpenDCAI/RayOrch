@@ -1,6 +1,6 @@
 """Output materialization for Executor.
 
-This module accesses semantic state only through MicrobatchEngine's read-only
+This module accesses semantic state only through InputBatchEngine's read-only
 interface; the executor neither reads internal tables nor interprets logical
 provenance.
 """
@@ -11,8 +11,10 @@ from typing import Any, Protocol
 
 from .._model import ItemOutcome, ItemRef, PortRef
 from .._program.plan import RuntimePlan
-from .._protocol import RowBinding, restore_nested_group
-from .engine import MicrobatchEngine
+from .._protocol import DispatchFailure, RowBinding, restore_nested_group
+from ..errors import ExecutionError
+from ..result import OutputIssue
+from .engine import InputBatchEngine
 from .state import NestedGroupBinding
 
 
@@ -27,7 +29,7 @@ class ReadableStore(Protocol):
 
 def materialize_tree(
     plan: RuntimePlan,
-    engine: MicrobatchEngine,
+    engine: InputBatchEngine,
     store: ReadableStore,
     tree: object | None = None,
 ) -> object:
@@ -48,7 +50,7 @@ def materialize_tree(
 
 
 def _materialize_item(
-    engine: MicrobatchEngine,
+    engine: InputBatchEngine,
     store: ReadableStore,
     item: ItemRef,
 ) -> Any:
@@ -56,14 +58,39 @@ def _materialize_item(
 
     outcome = engine.item_outcome(item)
     if outcome is not ItemOutcome.PRESENT:
-        return outcome
+        cause = (
+            None if outcome is ItemOutcome.DROPPED
+            else _cause_text(engine.item_cause(item))
+        )
+        return OutputIssue(outcome, cause)
     binding = engine.value_binding(item)
     if isinstance(binding, RowBinding):
-        return store.get(binding)
+        return _read_value(store, binding)
     if not isinstance(binding, NestedGroupBinding):  # pragma: no cover - defensive
         raise RuntimeError(f"unsupported ValueBinding: {binding!r}")
-    leaves = [store.get(row) for row in engine.nested_group_rows(binding)]
+    leaves = [_read_value(store, row) for row in engine.nested_group_rows(binding)]
     return restore_nested_group(leaves, binding.layout.offsets_by_level)
+
+
+def _read_value(store: ReadableStore, binding: RowBinding) -> Any:
+    value = store.get(binding)
+    if isinstance(value, OutputIssue):
+        raise ExecutionError("OutputIssue is reserved for framework output results")
+    return value
+
+
+def _cause_text(cause: object | None) -> str | None:
+    """Detach readable diagnostics from business objects and Worker reports."""
+
+    if cause is None:
+        return None
+    if isinstance(cause, DispatchFailure):
+        return f"{cause.error_type}: {cause.message}"
+    try:
+        return str(cause)
+    except Exception:
+        # A faulty business __str__ must not hide an already recorded failure.
+        return type(cause).__name__
 
 
 __all__ = ["ReadableStore", "materialize_tree"]

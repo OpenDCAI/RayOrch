@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import traceback
 from typing import Any, Protocol
 
@@ -17,7 +16,6 @@ from .._protocol import (
     ExpandedRows,
     NestedGroupInput,
     CallInputLayout,
-    GrainInput,
     GrainInvocation,
     MissingInput,
     CallOutputLayout,
@@ -27,7 +25,6 @@ from .._protocol import (
     WorkerDispatchResult,
     restore_nested_group,
 )
-from ..result import WorkerSnapshot
 
 
 class WorkerContractError(RuntimeError):
@@ -62,7 +59,6 @@ class Worker:
         kwargs = dict(init_kwargs)
         self.udf = target(*init_args, **kwargs) if isinstance(target, type) else target
         self.input_layout = input_layout
-        self.calls = 0
 
     def execute(
         self,
@@ -90,7 +86,6 @@ class Worker:
 
         if not invocations:
             return ()
-        self.calls += 1
         columns = self._input_columns(invocations, store)
         layout = self.input_layout
         if layout.input_count != len(columns):
@@ -225,32 +220,6 @@ class Worker:
             traceback.format_exc(),
         )
 
-    def observe(self) -> WorkerSnapshot:
-        """Read small scalar diagnostics without exposing business state."""
-
-        audit: dict[str, int | float | str] = {}
-        batch_audit = getattr(self.udf, "batch_audit", None)
-        if callable(batch_audit):
-            value = batch_audit()
-        else:
-            value = getattr(self.udf, "last_batch_audit", None)
-            if value is None:
-                value = getattr(self.udf, "last_table_batch_audit", None)
-            if value is None:
-                value = getattr(self.udf, "last_ocr_batch_audit", None)
-        if isinstance(value, dict):
-            audit.update(
-                (str(key), item)
-                for key, item in value.items()
-                if isinstance(item, (int, float, str))
-            )
-        return WorkerSnapshot(
-            lifetime_calls=self.calls,
-            pid=os.getpid(),
-            rss_bytes=_rss_bytes(),
-            audit=tuple(sorted(audit.items())),
-        )
-
     @classmethod
     def _input_columns(
         cls,
@@ -316,20 +285,8 @@ class Worker:
         return tuple(value)
 
 
-def _rss_bytes() -> int:
-    """Best-effort current process RSS for benchmark diagnostics."""
-
-    try:
-        import psutil  # pyright: ignore[reportMissingModuleSource]
-
-        return int(psutil.Process().memory_info().rss)
-    except Exception:
-        return 0
-
-
 __all__ = [
     "Worker",
-    "WorkerSnapshot",
     "BlockStore",
     "WorkerContractError",
 ]

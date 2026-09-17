@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping, TypeAlias
+from typing import Mapping, TypeAlias, assert_never
 
 from .logical import LogicalProgram
 from .._model import CallRef, DomainRef, PortRef
@@ -88,19 +88,33 @@ def analyze(logical: LogicalProgram) -> ProgramAnalysis:
                 pending.append(predecessor)
 
     depths: dict[PortRef, int] = {}
+    expanded_sources = {
+        source for sources in expansion_sources.values() for source in sources
+    }
 
     def group_depth(port: PortRef, visiting: set[PortRef]) -> int:
+        """Infer structural grouping, not the contents of opaque UDF values."""
+
         known = depths.get(port)
         if known is not None:
             return known
         if port in visiting:
             raise CompileError("logical Port dependency cycle")
         semantic = semantics[port]
-        if semantic.kind is not PrimitiveKind.REDUCE:
-            depths[port] = 0
-            return 0
         visiting.add(port)
-        depth = 1 + group_depth(semantic.inputs[0].port, visiting)
+        match semantic.kind:
+            case PrimitiveKind.SOURCE | PrimitiveKind.EXPAND:
+                # Sources and expanded child rows hold opaque values.
+                depth = 0
+            case PrimitiveKind.CALL_OUTPUT:
+                # Expanded outputs are stored as one group of child rows.
+                depth = 1 if port in expanded_sources else 0
+            case PrimitiveKind.REDUCE:
+                depth = 1 + group_depth(semantic.inputs[0].port, visiting)
+            case PrimitiveKind.FILTER | PrimitiveKind.BROADCAST:
+                depth = group_depth(semantic.inputs[0].port, visiting)
+            case _:
+                assert_never(semantic.kind)
         visiting.remove(port)
         depths[port] = depth
         return depth

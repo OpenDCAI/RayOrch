@@ -1,11 +1,11 @@
 """Ray-free event-driven dataflow runtime."""
 
-from .dispatch import DispatchBatch, GrainSnapshot
-from .engine import CommitError, MicrobatchEngine
+from .dispatch import ExecutionMicrobatch, GrainSnapshot
+from .engine import CommitError, InputBatchEngine
 
 __all__ = [
-    "MicrobatchEngine",
+    "InputBatchEngine",
     "CommitError",
-    "DispatchBatch",
+    "ExecutionMicrobatch",
     "GrainSnapshot",
 ]

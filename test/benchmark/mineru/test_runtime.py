@@ -87,8 +87,8 @@ def test_mineru_topology_runs_end_to_end_on_ray():
     ) as executor:
         result = executor.run(
             [("alpha.pdf", 2), ("beta.pdf", 3)],
-            microbatch_size=2,
-            max_active_microbatches=1,
+            input_batch_size=2,
+            max_active_input_batches=1,
         )
 
     assert result.outputs == [
@@ -106,5 +106,5 @@ def test_mineru_topology_runs_end_to_end_on_ray():
         },
     ]
     ocr = next(metrics for metrics in result.calls if metrics.udf_name.endswith("_Ocr"))
-    assert ocr.grains == 5
+    assert ocr.grain_dispatches == 5
     assert sum(ocr.batch_sizes) == 5

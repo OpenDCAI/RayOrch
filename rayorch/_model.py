@@ -45,7 +45,7 @@ class DomainRef:
 class EntityRef:
     """One logical occurrence inside a Domain.
 
-    ``value`` is local to one MicrobatchEngine. The Domain is part of identity,
+    ``value`` is local to one InputBatchEngine. The Domain is part of identity,
     preventing unrelated coordinates with equal integers from aligning.
     """
 

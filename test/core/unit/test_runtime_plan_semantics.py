@@ -1,4 +1,4 @@
-"""完整 RuntimePlan 驱动的 Ray-free microbatch/Worker 语义回归。"""
+"""完整 RuntimePlan 驱动的 Ray-free input batch/Worker 语义回归。"""
 
 from __future__ import annotations
 
@@ -36,11 +36,10 @@ from rayorch._protocol import (
     PortOutputReport,
     RowBinding,
 )
-from rayorch.recovery import RecoveryAction
 from rayorch._runtime import (
     CommitError,
-    DispatchBatch,
-    MicrobatchEngine,
+    ExecutionMicrobatch,
+    InputBatchEngine,
 )
 from rayorch._runtime.state import (
     EntityParent,
@@ -50,7 +49,6 @@ from rayorch._runtime.state import (
 from rayorch._execution.worker import (
     Worker,
     WorkerContractError,
-    WorkerSnapshot,
 )
 
 
@@ -69,24 +67,6 @@ class MemoryStore:
         return self.blocks[binding.block][binding.row]
 
 
-def test_worker_observation_is_scalar_and_read_only():
-    class Audited:
-        def batch_audit(self):
-            return {
-                "jobs": 7,
-                "mode": "batch",
-                "ignored": object(),
-            }
-
-    worker = Worker(Audited, input_layout=CallInputLayout(1))
-    observation = worker.observe()
-
-    assert observation.lifetime_calls == 0
-    assert observation.pid > 0
-    assert observation.rss_bytes >= 0
-    assert dict(observation.audit) == {"jobs": 7, "mode": "batch"}
-
-
 def _execute_one(worker_target, store: MemoryStore) -> DispatchFailure:
     block = store.put((1,))
     invocation = GrainInvocation(
@@ -94,7 +74,8 @@ def _execute_one(worker_target, store: MemoryStore) -> DispatchFailure:
         0,
         (RowBinding(block, 0),),
     )
-    result = Worker(worker_target, input_layout=CallInputLayout(1)).execute(
+    worker = Worker(worker_target, input_layout=CallInputLayout(1))
+    result = worker.execute(
         (invocation,),
         (CallOutputLayout(PortRef(0)),),
         store,
@@ -171,53 +152,6 @@ def test_worker_group_failure_dominates_record_failure_per_grain():
     assert ro.GroupFailure is GroupFailure
 
 
-def test_executor_submits_all_worker_observations_before_waiting():
-    events = []
-    first_ref, second_ref = object(), object()
-    expected = {
-        first_ref: WorkerSnapshot(lifetime_calls=2, pid=1, rss_bytes=10),
-        second_ref: WorkerSnapshot(lifetime_calls=3, pid=2, rss_bytes=20),
-    }
-
-    def endpoint(name, reference):
-        def remote():
-            events.append(f"submit:{name}")
-            return reference
-
-        return SimpleNamespace(remote=remote)
-
-    class FakeRay:
-        def wait(self, pending, *, num_returns):
-            assert num_returns == 1
-            assert events[:2] == ["submit:first", "submit:second"]
-            events.append("wait")
-            return [pending[0]], pending[1:]
-
-        def get(self, reference):
-            events.append("get")
-            return expected[reference]
-
-    executor = object.__new__(Executor)
-    executor.ray = FakeRay()
-    executor._actors = {
-        CallRef(0): [
-            SimpleNamespace(
-                handle=SimpleNamespace(observe=endpoint("first", first_ref))
-            ),
-            SimpleNamespace(
-                handle=SimpleNamespace(observe=endpoint("second", second_ref))
-            ),
-        ]
-    }
-
-    observations = executor._observe_workers()
-
-    assert observations[CallRef(0)] == (
-        expected[first_ref],
-        expected[second_ref],
-    )
-
-
 @pytest.mark.parametrize(("owns_ray", "expected_shutdowns"), [(False, 0), (True, 1)])
 def test_executor_close_respects_ray_runtime_ownership(
     owns_ray,
@@ -260,7 +194,7 @@ def run_sync(pipeline: ro.Pipeline, *columns, optimize: bool = True):
         if port in plan.control_ports:
             controls[port] = values
 
-    engine = MicrobatchEngine(plan)
+    engine = InputBatchEngine(plan)
     engine.admit_sources(bindings, controls=controls)
     engine.close_admission()
     workers = {
@@ -362,7 +296,7 @@ def test_chained_filter_executes_from_control_fixed_point():
         [True, False, True],
         [True, True, False],
     )
-    assert outputs == [10, ItemOutcome.DROPPED, ItemOutcome.DROPPED]
+    assert outputs == [10, ro.OutputIssue(ItemOutcome.DROPPED), ro.OutputIssue(ItemOutcome.DROPPED)]
 
 
 def test_keyword_only_input_preserves_default_without_identity_driver():
@@ -478,7 +412,7 @@ def test_required_drop_is_symmetric_across_call_inputs():
         [False, True],
         [True, False],
     )
-    assert outputs == [ItemOutcome.DROPPED, ItemOutcome.DROPPED]
+    assert outputs == [ro.OutputIssue(ItemOutcome.DROPPED), ro.OutputIssue(ItemOutcome.DROPPED)]
 
 
 def test_call_failure_dominates_required_drop_independent_of_arrival_order():
@@ -505,7 +439,10 @@ def test_call_failure_dominates_required_drop_independent_of_arrival_order():
         [10, 20],
         [False, False],
     )
-    assert outputs == [ItemOutcome.SUPPRESSED, ItemOutcome.SUPPRESSED]
+    assert outputs == [
+        ro.OutputIssue(ItemOutcome.SUPPRESSED, "bad 10"),
+        ro.OutputIssue(ItemOutcome.SUPPRESSED, "bad 20"),
+    ]
 
 
 def test_record_and_group_failure_have_distinct_no_reduce_semantics():
@@ -547,16 +484,16 @@ def test_record_and_group_failure_have_distinct_no_reduce_semantics():
         (0, 1),
         (0, 2),
         (1, 0),
-        ItemOutcome.FAILED,
+        ro.OutputIssue(ItemOutcome.FAILED, "bad page"),
         (1, 2),
     ]
     assert group == [
         (0, 0),
         (0, 1),
         (0, 2),
-        ItemOutcome.SUPPRESSED,
-        ItemOutcome.FAILED,
-        ItemOutcome.SUPPRESSED,
+        ro.OutputIssue(ItemOutcome.SUPPRESSED, "bad document"),
+        ro.OutputIssue(ItemOutcome.FAILED, "bad document"),
+        ro.OutputIssue(ItemOutcome.SUPPRESSED, "bad document"),
     ]
 
 
@@ -577,6 +514,110 @@ def test_nested_expand_reduce_preserves_empty_groups():
 
     outputs, _compiled, _arena = run_sync(Nested(), [0, 1])
     assert outputs == [[[], [10, 11]], []]
+
+
+
+def _assert_reduce_layouts_match_plan(compiled, engine):
+    for effect in compiled.plan.structural_effects_by_target.values():
+        if not isinstance(effect, ReduceEffect):
+            continue
+        for item in engine.ordered_items(effect.target_port):
+            if engine.item_outcome(item) is ItemOutcome.PRESENT:
+                binding = engine.value_binding(item)
+                assert isinstance(binding, NestedGroupBinding)
+                assert binding.layout.depth == effect.value_depth + 1
+
+
+@pytest.mark.parametrize("optimize", [False, True])
+@pytest.mark.parametrize("keep_pages", [False, True])
+@pytest.mark.parametrize("documents", [
+    [[], [[1]]],
+    [[[]], [[1], [2, 3]]],
+    [[], []],
+])
+def test_nested_filter_preserves_group_shape(documents, keep_pages, optimize):
+    @ro.function
+    def identity(values):
+        return values
+
+    @ro.function
+    def keep(values):
+        return [keep_pages for _ in values]
+
+    class NestedFiltered(ro.Pipeline):
+        def forward(self, roots):
+            documents = ro.F.expand(identity(roots))
+            pages = ro.F.expand(identity(documents))
+            regions = ro.F.expand(identity(pages))
+            grouped = ro.F.reduce(regions)
+            selected = ro.F.filter(grouped, keep(pages))
+            return ro.F.reduce(ro.F.reduce(selected))
+
+    outputs, compiled, engine = run_sync(
+        NestedFiltered(), [documents], optimize=optimize,
+    )
+    assert outputs == [documents if keep_pages else [[] for _ in documents]]
+    assert compiled.analysis.group_depth_by_port[compiled.plan.output_tree] == 3
+    _assert_reduce_layouts_match_plan(compiled, engine)
+
+
+@pytest.mark.parametrize("optimize", [False, True])
+def test_broadcast_preserves_nested_groups_with_empty_parents(optimize):
+    @ro.function
+    def identity(values):
+        return values
+
+    class NestedBroadcast(ro.Pipeline):
+        def forward(self, roots):
+            documents = ro.F.expand(identity(roots))
+            pages = ro.F.expand(identity(documents))
+            regions = ro.F.expand(identity(pages))
+            page_groups = ro.F.reduce(regions)
+            document_groups = ro.F.reduce(page_groups)
+            repeated = ro.F.broadcast(document_groups, like=pages)
+            return ro.F.reduce(ro.F.reduce(repeated))
+
+    documents = [[], [[]], [[1], [2, 3]]]
+    outputs, compiled, engine = run_sync(
+        NestedBroadcast(), [documents], optimize=optimize,
+    )
+    assert outputs == [[
+        [document for _ in document] for document in documents
+    ]]
+    assert compiled.analysis.group_depth_by_port[compiled.plan.output_tree] == 4
+    _assert_reduce_layouts_match_plan(compiled, engine)
+
+
+@pytest.mark.parametrize("optimize", [False, True])
+@pytest.mark.parametrize("expanded", [False, True])
+def test_reduce_call_output_shape_tracks_expansion_contract(expanded, optimize):
+    @ro.function
+    def identity(values):
+        return values
+
+    @ro.function
+    def keep(values):
+        return [True for _ in values]
+
+    class CollectOutputs(ro.Pipeline):
+        def forward(self, roots):
+            documents = ro.F.expand(identity(roots))
+            groups = identity(documents)
+            if expanded:
+                ro.F.expand(groups)
+            selected = ro.F.filter(groups, keep(documents))
+            return ro.F.reduce(selected)
+
+    outputs, compiled, engine = run_sync(
+        CollectOutputs(), [[], [[], [1, 2]]], optimize=optimize,
+    )
+    assert outputs == [[], [[], [1, 2]]]
+    _assert_reduce_layouts_match_plan(compiled, engine)
+    effect = next(
+        effect for effect in compiled.plan.structural_effects_by_target.values()
+        if isinstance(effect, ReduceEffect)
+    )
+    assert effect.value_depth == (1 if expanded else 0)
 
 
 def test_broadcast_chain_optimized_and_baseline_have_exact_outcome_parity():
@@ -604,7 +645,7 @@ def test_broadcast_chain_optimized_and_baseline_have_exact_outcome_parity():
     )
     assert optimized == baseline
     assert optimized[:4] == [10, 11, 20, 21]
-    assert optimized[4:] == [ItemOutcome.DROPPED] * 4
+    assert optimized[4:] == [ro.OutputIssue(ItemOutcome.DROPPED)] * 4
     assert baseline_compiled.explanation.rewrites == ()
     assert len(optimized_compiled.explanation.rewrites) == 1
 
@@ -628,7 +669,7 @@ def test_broadcast_fact_order_reaches_the_same_fixed_point():
     binding = RowBinding(BlockRef("label"), 0)
 
     def reach_fixed_point(*, source_first: bool):
-        engine = MicrobatchEngine(plan)
+        engine = InputBatchEngine(plan)
         root = EntityRef(effect.source_domain, 0)
         child = EntityRef(effect.target_domain, 0)
         source = ItemRef(effect.source_port, root)
@@ -636,13 +677,23 @@ def test_broadcast_fact_order_reaches_the_same_fixed_point():
         engine._publish_entity(root)
         engine.advance()
 
+        def expand():
+            # A real Worker commit publishes both lineage and Expansion facts
+            # before advance() can consume their events.
+            expansion = ExpansionRef(effect.target_domain, root)
+            children = engine._create_children(expansion, 1)
+            assert children == (child,)
+            engine._publish_expansion(
+                expansion, ExpansionOutcome.SUCCEEDED, children=children,
+            )
+
         if source_first:
             engine._publish_item(source, ItemOutcome.PRESENT, binding=binding)
             engine.advance()
-            engine._publish_entity(child, EntityParent(root, 0))
+            expand()
             engine.advance()
         else:
-            engine._publish_entity(child, EntityParent(root, 0))
+            expand()
             engine.advance()
             engine._publish_item(source, ItemOutcome.PRESENT, binding=binding)
             engine.advance()
@@ -680,7 +731,7 @@ def test_group_fact_order_reaches_the_same_fixed_point():
     binding = RowBinding(BlockRef("value"), 0)
 
     def reach_fixed_point(*, expansion_first: bool):
-        engine = MicrobatchEngine(plan)
+        engine = InputBatchEngine(plan)
         root = EntityRef(plan.port_domain(effect.target_port), 0)
         child = EntityRef(effect.child_domain, 0)
         expansion = ExpansionRef(effect.child_domain, root)
@@ -770,7 +821,7 @@ def test_downstream_grain_becomes_dispatchable_before_upstream_stage_finishes():
         if isinstance(spec.origin, ExpandOrigin)
     )
     store = MemoryStore()
-    engine = MicrobatchEngine(plan)
+    engine = InputBatchEngine(plan)
     documents = store.put(("doc-0", "doc-1"))
     engine.admit_sources(
         {
@@ -820,7 +871,7 @@ def test_downstream_grain_becomes_dispatchable_before_upstream_stage_finishes():
 
 
 def test_progress_summary_uses_expansion_vocabulary():
-    engine = MicrobatchEngine(ExpandReduce().compile().plan)
+    engine = InputBatchEngine(ExpandReduce().compile().plan)
 
     assert engine.progress_summary() == (
         "pending=0, ready=0, grains=0, expansions=0"
@@ -847,7 +898,7 @@ def test_group_barrier_linearizes_same_batch_and_late_in_flight_success():
         compiled = Pages().compile()
         plan = compiled.plan
         store = MemoryStore()
-        engine = MicrobatchEngine(plan)
+        engine = InputBatchEngine(plan)
         source = store.put(("document",))
         engine.admit_sources(
             {plan.source_ports[0]: (RowBinding(source, 0),)}
@@ -925,7 +976,7 @@ def test_group_barrier_linearizes_same_batch_and_late_in_flight_success():
         engine.commit_reports(second, (second_success, group_failure))
         if not commit_early_success:
             engine.commit_reports(
-                DispatchBatch((first_success.grain,)),
+                ExecutionMicrobatch((first_success.grain,)),
                 (first_success,),
             )
 
@@ -933,19 +984,30 @@ def test_group_barrier_linearizes_same_batch_and_late_in_flight_success():
         return materialize_tree(plan, engine, store)
 
     assert execute(commit_early_success=False) == [
-        ItemOutcome.SUPPRESSED,
-        ItemOutcome.FAILED,
-        ItemOutcome.SUPPRESSED,
+        ro.OutputIssue(ItemOutcome.SUPPRESSED, "bad document"),
+        ro.OutputIssue(ItemOutcome.FAILED, "bad document"),
+        ro.OutputIssue(ItemOutcome.SUPPRESSED, "bad document"),
     ]
     assert execute(commit_early_success=True) == [
         "page0",
-        ItemOutcome.FAILED,
-        ItemOutcome.SUPPRESSED,
+        ro.OutputIssue(ItemOutcome.FAILED, "bad document"),
+        ro.OutputIssue(ItemOutcome.SUPPRESSED, "bad document"),
     ]
 
 
-@pytest.mark.parametrize("failure_kind", ["udf", "infrastructure"])
-def test_group_barrier_partitions_late_failed_lease_before_recovery(failure_kind):
+@pytest.mark.parametrize(
+    "failure_kind, document_count, infra_retries",
+    [
+        pytest.param("udf", 2, 1, id="udf-mixed"),
+        pytest.param("infrastructure", 2, 1, id="infra-mixed"),
+        pytest.param("infrastructure", 1, 1, id="infra-all-suppressed"),
+        pytest.param("infrastructure", 1, 0, id="infra-all-suppressed-no-budget"),
+        pytest.param("infrastructure", 2, 0, id="infra-mixed-budget-exhausted"),
+    ],
+)
+def test_group_barrier_partitions_late_failed_lease_before_recovery(
+    failure_kind, document_count, infra_retries,
+):
     class Render:
         pass
 
@@ -963,13 +1025,12 @@ def test_group_barrier_partitions_late_failed_lease_before_recovery(failure_kind
     compiled = Pages().compile()
     plan = compiled.plan
     store = MemoryStore()
-    engine = MicrobatchEngine(plan)
-    sources = store.put(("doc0", "doc1"))
+    engine = InputBatchEngine(plan)
+    sources = store.put(tuple(f"doc{index}" for index in range(document_count)))
     engine.admit_sources(
         {
-            plan.source_ports[0]: (
-                RowBinding(sources, 0),
-                RowBinding(sources, 1),
+            plan.source_ports[0]: tuple(
+                RowBinding(sources, index) for index in range(document_count)
             )
         }
     )
@@ -1026,21 +1087,50 @@ def test_group_barrier_partitions_late_failed_lease_before_recovery(failure_kind
         ),
     )
 
+    snapshots_before = tuple(engine.grain_snapshot(grain) for grain in late.grains)
+    items_before = dict(engine._state.items)
+    progress_before = engine.progress_summary()
+    assert all(snapshot.phase is GrainPhase.IN_FLIGHT for snapshot in snapshots_before)
+    assert not engine.is_complete()
+
     if failure_kind == "udf":
         retried = engine.apply_udf_recovery(
             late,
-            RecoveryAction.RETRY_TAIL,
+            ro.RecoveryPolicy.retry_tail(),
             RuntimeError("opaque UDF failure"),
         )
     else:
         retried = engine.retry_infrastructure_dispatch(
             late,
-            ro.RecoveryPolicy.abort(infra_retries=1),
+            ro.RecoveryPolicy.abort(infra_retries=infra_retries),
         )
-    assert retried == 2
+    if failure_kind == "infrastructure" and document_count == 2 and infra_retries == 0:
+        assert retried is None
+        assert tuple(engine.grain_snapshot(grain) for grain in late.grains) == snapshots_before
+        assert engine._state.items == items_before
+        assert engine.progress_summary() == progress_before
+        assert engine.dispatch_priority(calls[Transform]) is None
+        assert not engine.is_complete()
+        return
+
     blocked, *live = late.grains
+    assert retried == len(live)
+    blocked_item = ItemRef(transform_output, blocked.entity)
+    assert engine.item_outcome(blocked_item) is ItemOutcome.SUPPRESSED
+    assert engine._state.items[blocked_item].cause == "bad document"
     assert engine.grain_snapshot(blocked).phase is GrainPhase.SEALED
     assert engine.grain_snapshot(blocked).generation == 0
+    if not live:
+        assert retried == 0
+        assert engine.grain_snapshot(blocked).infra_failures == 0
+        assert engine.dispatch_priority(calls[Transform]) is None
+        assert engine.is_complete()
+        assert materialize_tree(plan, engine, store) == [
+            ro.OutputIssue(ItemOutcome.FAILED, "bad document"),
+            ro.OutputIssue(ItemOutcome.SUPPRESSED, "bad document"),
+        ]
+        return
+
     assert {engine.grain_snapshot(grain).generation for grain in live} == {1}
     expected_infra = 1 if failure_kind == "infrastructure" else 0
     assert {
@@ -1071,8 +1161,8 @@ def test_group_barrier_partitions_late_failed_lease_before_recovery(failure_kind
 
     assert engine.is_complete()
     assert materialize_tree(plan, engine, store) == [
-        ItemOutcome.FAILED,
-        ItemOutcome.SUPPRESSED,
+        ro.OutputIssue(ItemOutcome.FAILED, "bad document"),
+        ro.OutputIssue(ItemOutcome.SUPPRESSED, "bad document"),
         "B0",
         "B1",
     ]
@@ -1105,7 +1195,7 @@ def test_group_barrier_closes_waiting_sibling_at_input_admission():
     compiled = WaitingSibling().compile()
     plan = compiled.plan
     store = MemoryStore()
-    engine = MicrobatchEngine(plan)
+    engine = InputBatchEngine(plan)
     source = store.put(("document",))
     engine.admit_sources({plan.source_ports[0]: (RowBinding(source, 0),)})
     engine.close_admission()
@@ -1214,8 +1304,8 @@ def test_group_barrier_closes_waiting_sibling_at_input_admission():
 
     assert engine.is_complete()
     assert materialize_tree(plan, engine, store) == [
-        ItemOutcome.FAILED,
-        ItemOutcome.SUPPRESSED,
+        ro.OutputIssue(ItemOutcome.FAILED, "parent invalid"),
+        ro.OutputIssue(ItemOutcome.SUPPRESSED, "parent invalid"),
     ]
     waiting = GrainRef(calls[Combine], right_second.grains[0].entity)
     assert engine.grain_snapshot(waiting).phase is GrainPhase.SEALED
@@ -1226,7 +1316,7 @@ def _start_manual():
     plan = compiled.plan
     store = MemoryStore()
     block = store.put(("root",))
-    engine = MicrobatchEngine(plan)
+    engine = InputBatchEngine(plan)
     root = engine.admit_sources(
         {plan.source_ports[0]: (RowBinding(block, 0),)}
     )[0]
@@ -1260,13 +1350,13 @@ def test_retry_keeps_grain_identity_and_generation_fences_stale_report():
         (PortOutputReport(output, expansions=(ExpandedRows(expanded, ()),)),),
     )
     with pytest.raises(CommitError, match="stale generation"):
-        engine.commit_reports(DispatchBatch((stale.grain,)), (stale,))
+        engine.commit_reports(ExecutionMicrobatch((stale.grain,)), (stale,))
     current = GrainReport(
         grain,
         1,
         (PortOutputReport(output, expansions=(ExpandedRows(expanded, ()),)),),
     )
-    engine.commit_reports(DispatchBatch((current.grain,)), (current,))
+    engine.commit_reports(ExecutionMicrobatch((current.grain,)), (current,))
     assert engine.grain_snapshot(grain).phase is GrainPhase.SEALED
     assert engine.item_outcome(ItemRef(output, root)) is ItemOutcome.PRESENT
     assert compiled.plan is engine.plan
@@ -1285,7 +1375,7 @@ def test_aligned_expand_mismatch_has_no_partial_publication():
     plan = compiled.plan
     store = MemoryStore()
     source_block = store.put(("root",))
-    engine = MicrobatchEngine(plan)
+    engine = InputBatchEngine(plan)
     root = engine.admit_sources(
         {plan.source_ports[0]: (RowBinding(source_block, 0),)}
     )[0]
@@ -1324,7 +1414,7 @@ def test_aligned_expand_mismatch_has_no_partial_publication():
         )
     )
     with pytest.raises(CommitError, match="cardinality mismatch"):
-        engine.commit_reports(DispatchBatch((malformed.grain,)), (malformed,))
+        engine.commit_reports(ExecutionMicrobatch((malformed.grain,)), (malformed,))
 
     assert engine.grain_snapshot(grain).phase is GrainPhase.IN_FLIGHT
     assert engine.expansion_count == 0
@@ -1346,7 +1436,7 @@ def test_group_batch_payload_preflight_installs_no_partial_barrier():
     plan = Pair().compile().plan
     store = MemoryStore()
     block = store.put((1, 2))
-    engine = MicrobatchEngine(plan)
+    engine = InputBatchEngine(plan)
     engine.admit_sources(
         {
             plan.source_ports[0]: tuple(

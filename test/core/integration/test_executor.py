@@ -11,7 +11,7 @@ import pytest
 import rayorch as ro
 from rayorch._execution.executor import Executor
 from rayorch._execution.ray_backend import _RayWorkerActor
-from rayorch._model import ItemOutcome
+from rayorch import ItemOutcome, OutputIssue
 from rayorch.failures import RecordFailure
 
 
@@ -50,33 +50,60 @@ class IdentityPipeline(ro.Pipeline):
         return self.identity(values)
 
 
-def test_persistent_actor_is_shared_by_multiple_microbatches():
+def test_persistent_actor_is_shared_by_multiple_input_batches():
     with Executor(IdentityPipeline()) as executor:
-        result = executor.run(range(15), microbatch_size=4, max_active_microbatches=3)
+        result = executor.run(range(15), input_batch_size=4, max_active_input_batches=3)
 
     assert [value for value, _ in result.outputs] == list(range(15))
     assert len({identity for _, identity in result.outputs}) == 1
     assert result.actor_count == 1
-    assert result.peak_active_microbatches == 3
-    assert len(result.microbatches) == 4
-    assert all(microbatch.grain_count > 0 for microbatch in result.microbatches)
+    assert result.peak_active_input_batches == 3
+    assert len(result.input_batches) == 4
+    assert all(input_batch.grain_count > 0 for input_batch in result.input_batches)
     assert result.released_values > 0
     assert executor.store._cache == {}
-    metrics = result.calls[0]
-    assert len(metrics.worker_snapshots) == 1
-    assert metrics.worker_snapshots[0].lifetime_calls == metrics.rpcs
 
 
 def test_run_convenience_manages_one_executor_lifetime():
     result = ro.run(
         IdentityPipeline(),
         [1, 2, 3],
-        microbatch_size=2,
-        max_active_microbatches=2,
+        input_batch_size=2,
+        max_active_input_batches=2,
     )
 
     assert [value for value, _ in result.outputs] == [1, 2, 3]
     assert result.actor_count == 1
+
+
+def test_nested_filtered_groups_reach_downstream_worker_with_empty_parents():
+    class Identity:
+        def run(self, values):
+            return values
+
+    class Keep:
+        def run(self, values):
+            return [True for _ in values]
+
+    class NestedFiltered(ro.Pipeline):
+        def __init__(self):
+            self.identity = ro.RayModule(Identity).ray_options(num_cpus=0)
+            self.keep = ro.RayModule(Keep).ray_options(num_cpus=0)
+
+        def forward(self, roots):
+            documents = ro.F.expand(self.identity(roots))
+            pages = ro.F.expand(self.identity(documents))
+            regions = ro.F.expand(self.identity(pages))
+            selected = ro.F.filter(ro.F.reduce(regions), self.keep(pages))
+            collected = ro.F.reduce(ro.F.reduce(selected))
+            return collected, self.identity(collected)
+
+    roots = [[], [[], [[1]]], [[[]], [[2], [3]]]]
+    result = ro.run(
+        NestedFiltered(), roots, input_batch_size=1, max_active_input_batches=2,
+    )
+
+    assert result.outputs == (roots, roots)
 
 
 def test_empty_input_and_repeated_runs_keep_metrics_scopes_explicit():
@@ -86,13 +113,46 @@ def test_empty_input_and_repeated_runs_keep_metrics_scopes_explicit():
         second = executor.run([3])
 
     assert empty.outputs == []
-    assert empty.microbatches[0].entity_count == 0
+    assert empty.input_batches[0].entity_count == 0
     assert empty.calls[0].rpcs == 0
     assert first.outputs[0][0] == 1
     assert second.outputs[0][0] == 3
     assert first.calls[0].rpcs == 1
     assert second.calls[0].rpcs == 1
-    assert second.calls[0].worker_snapshots[0].lifetime_calls == 2
+    assert first.outputs[0][1] == second.outputs[0][1]
+
+
+def test_run_does_not_probe_udf_diagnostics_between_runs():
+    class BusinessOnly:
+        def __init__(self):
+            self.audit_reads = 0
+
+        def __getattr__(self, name):
+            if name in {
+                "batch_audit", "last_batch_audit",
+                "last_table_batch_audit", "last_ocr_batch_audit",
+            }:
+                self.audit_reads += 1
+            raise AttributeError(name)
+
+        def run(self, values):
+            return [(value, self.audit_reads) for value in values]
+
+    class BusinessPipeline(ro.Pipeline):
+        def __init__(self):
+            self.call = ro.RayModule(BusinessOnly).ray_options(num_cpus=0)
+
+        def forward(self, values):
+            return self.call(values)
+
+    with Executor(BusinessPipeline()) as executor:
+        first = executor.run([1])
+        second = executor.run([2])
+
+    assert first.outputs == [(1, 0)]
+    assert second.outputs == [(2, 0)]
+    assert first.rpc_count == second.rpc_count == 1
+    assert first.actor_count == second.actor_count == 1
 
 
 def test_actor_class_is_wrapped_once_per_executor(monkeypatch):
@@ -206,12 +266,12 @@ class CrashPipeline(ro.Pipeline):
 def test_actor_crash_replaces_actor_and_replays_same_grains(tmp_path):
     marker = tmp_path / "crash-once"
     with Executor(CrashPipeline(str(marker))) as executor:
-        result = executor.run(range(4), microbatch_size=4)
+        result = executor.run(range(4), input_batch_size=4)
 
     metrics = result.calls[0]
     assert result.outputs == [0, 2, 4, 6]
     assert metrics.actor_instances == 2
-    assert metrics.retries == 4
+    assert metrics.grain_requeues == 4
     assert metrics.rpcs == 2
 
 
@@ -253,17 +313,17 @@ class BadLeafPipeline(ro.Pipeline):
 
 def test_record_failure_suppresses_only_its_parent():
     with Executor(BadLeafPipeline()) as executor:
-        result = executor.run([0, 1, 2])
+        result = executor.run([0, 1, 2], input_batch_size=1, max_active_input_batches=2)
 
     assert result.outputs[0] == (0, [(0, 0), (0, 1), (0, 2)])
-    assert result.outputs[1] is ItemOutcome.SUPPRESSED
+    assert result.outputs[1] == OutputIssue(ItemOutcome.SUPPRESSED, "bad leaf (1, 1)")
     assert result.outputs[2] == (2, [(2, 0), (2, 1), (2, 2)])
     transform = next(
         metrics
         for metrics in result.calls
         if metrics.udf_name.endswith("FailOneLeaf")
     )
-    assert transform.grains == 9
+    assert transform.grain_dispatches == 9
 
 
 class FailOneLeafGroup:
@@ -297,9 +357,9 @@ def test_group_failure_suppresses_uncommitted_siblings_without_retry():
         (0, 0),
         (0, 1),
         (0, 2),
-        ItemOutcome.SUPPRESSED,
-        ItemOutcome.FAILED,
-        ItemOutcome.SUPPRESSED,
+        OutputIssue(ItemOutcome.SUPPRESSED, "bad parent for (1, 1)"),
+        OutputIssue(ItemOutcome.FAILED, "bad parent for (1, 1)"),
+        OutputIssue(ItemOutcome.SUPPRESSED, "bad parent for (1, 1)"),
         (2, 0),
         (2, 1),
         (2, 2),
@@ -309,8 +369,8 @@ def test_group_failure_suppresses_uncommitted_siblings_without_retry():
         for metrics in result.calls
         if metrics.udf_name.endswith("FailOneLeafGroup")
     )
-    assert transform.grains == 9
-    assert transform.retries == 0
+    assert transform.grain_dispatches == 9
+    assert transform.grain_requeues == 0
 
 
 def test_group_failure_lazily_skips_ready_sibling_without_deadlock():
@@ -322,8 +382,8 @@ def test_group_failure_lazily_skips_ready_sibling_without_deadlock():
         (0, 1),
         (0, 2),
         (1, 0),  # committed before the barrier; monotonic and not rolled back
-        ItemOutcome.FAILED,
-        ItemOutcome.SUPPRESSED,
+        OutputIssue(ItemOutcome.FAILED, "bad parent for (1, 1)"),
+        OutputIssue(ItemOutcome.SUPPRESSED, "bad parent for (1, 1)"),
         (2, 0),
         (2, 1),
         (2, 2),
@@ -333,8 +393,8 @@ def test_group_failure_lazily_skips_ready_sibling_without_deadlock():
         for metrics in result.calls
         if metrics.udf_name.endswith("FailOneLeafGroup")
     )
-    assert transform.grains == 8
-    assert transform.retries == 0
+    assert transform.grain_dispatches == 8
+    assert transform.grain_requeues == 0
 
 
 class SlowSiblingGroup:
@@ -369,17 +429,17 @@ def test_group_failure_suppresses_success_from_another_in_flight_actor():
         result = executor.run([0])
 
     assert result.outputs == [
-        ItemOutcome.SUPPRESSED,
-        ItemOutcome.FAILED,
-        ItemOutcome.SUPPRESSED,
+        OutputIssue(ItemOutcome.SUPPRESSED, "bad parent"),
+        OutputIssue(ItemOutcome.FAILED, "bad parent"),
+        OutputIssue(ItemOutcome.SUPPRESSED, "bad parent"),
     ]
     transform = next(
         metrics
         for metrics in result.calls
         if metrics.udf_name.endswith("SlowSiblingGroup")
     )
-    assert transform.grains == 2
-    assert transform.retries == 0
+    assert transform.grain_dispatches == 2
+    assert transform.grain_requeues == 0
 
 
 class MultiOutputFail:
@@ -408,8 +468,8 @@ def test_record_failure_makes_all_outputs_of_one_grain_failed():
     with Executor(MultiOutputPipeline()) as executor:
         left, right = executor.run([1, 2, 3]).outputs
 
-    assert left == [10, ItemOutcome.FAILED, 30]
-    assert right == [100, ItemOutcome.FAILED, 300]
+    assert left == [10, OutputIssue(ItemOutcome.FAILED, "second output failed"), 30]
+    assert right == [100, OutputIssue(ItemOutcome.FAILED, "second output failed"), 300]
 
 
 class FailFirstDispatch:
@@ -440,11 +500,11 @@ class RetryPipeline(ro.Pipeline):
     ("recovery", "expected"),
     [
         (
-            ro.RecoveryPolicy.retry_batch(),
+            ro.RecoveryPolicy.retry_batch(max_retries=1),
             [(0, 2), (1, 2), (2, 3), (3, 3)],
         ),
         (
-            ro.RecoveryPolicy.retry_tail(),
+            ro.RecoveryPolicy.retry_tail(max_retries=1),
             [(0, 3), (1, 3), (2, 2), (3, 2)],
         ),
     ],
@@ -456,7 +516,10 @@ def test_udf_retry_policy_controls_immediate_or_tail_order(recovery, expected):
     metrics = result.calls[0]
     assert result.outputs == expected
     assert metrics.rpcs == 3
-    assert metrics.retries == 2
+    assert metrics.batch_sizes == (2, 2, 2)
+    assert result.input_batches[0].grain_count == 4
+    assert metrics.grain_dispatches == 6
+    assert metrics.grain_requeues == 2
     assert metrics.actor_instances == 1
 
 
@@ -484,10 +547,13 @@ def test_isolate_tail_commits_only_the_poison_singleton_as_failed():
         result = executor.run(range(4))
 
     metrics = result.calls[0]
-    assert result.outputs == [0, 10, ItemOutcome.FAILED, 30]
+    assert result.outputs == [
+        0, 10, OutputIssue(ItemOutcome.FAILED, "builtins.ValueError: poison value 2"), 30,
+    ]
     assert metrics.rpcs == 6
-    assert metrics.retries == 10
-    assert result.microbatches[0].grain_count == 4
+    assert metrics.batch_sizes == (4, 4, 2, 2, 1, 1)
+    assert metrics.grain_requeues == 10
+    assert result.input_batches[0].grain_count == 4
 
 
 class AlwaysUdfError:

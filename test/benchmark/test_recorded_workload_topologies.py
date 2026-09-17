@@ -229,8 +229,8 @@ def test_recorded_docling_stages_compile_and_run_with_nested_empty_groups():
                 ("paper-a", (2, 0, 1)),
                 ("paper-b", (0, 3)),
             ],
-            microbatch_size=1,
-            max_active_microbatches=2,
+            input_batch_size=1,
+            max_active_input_batches=2,
         )
 
     assert result.outputs == [
@@ -245,8 +245,8 @@ def test_recorded_docling_stages_compile_and_run_with_nested_empty_groups():
             "tables": ((), (0, 1, 2)),
         },
     ]
-    assert result.peak_active_microbatches == 2
-    assert all(call.retries == 0 for call in result.calls)
+    assert result.peak_active_input_batches == 2
+    assert all(call.grain_requeues == 0 for call in result.calls)
 
 
 class _DecodeFrames:
@@ -320,8 +320,8 @@ def test_recorded_vlm_caption_stages_compile_and_preserve_frame_order():
                 ("video-b", 5, 1),
                 ("video-c", 2, 3),
             ],
-            microbatch_size=1,
-            max_active_microbatches=3,
+            input_batch_size=1,
+            max_active_input_batches=3,
         )
 
     assert [output["video"] for output in result.outputs] == [
@@ -337,8 +337,8 @@ def test_recorded_vlm_caption_stages_compile_and_preserve_frame_order():
     caption = next(
         call for call in result.calls if call.udf_name.endswith("_CaptionFrames")
     )
-    assert caption.grains == 10
-    assert all(call.retries == 0 for call in result.calls)
+    assert caption.grain_dispatches == 10
+    assert all(call.grain_requeues == 0 for call in result.calls)
 
 
 class _DecodeAudio:
@@ -474,8 +474,8 @@ def test_recorded_dual_modality_stages_form_sibling_domains_and_root_join():
                 ("clip-a", 3, 2),
                 ("clip-b", 2, 4),
             ],
-            microbatch_size=1,
-            max_active_microbatches=2,
+            input_batch_size=1,
+            max_active_input_batches=2,
         )
 
     assert result.outputs == [
@@ -490,5 +490,5 @@ def test_recorded_dual_modality_stages_form_sibling_domains_and_root_join():
             "vision": (0, 1),
         },
     ]
-    assert result.peak_active_microbatches == 2
-    assert all(call.retries == 0 for call in result.calls)
+    assert result.peak_active_input_batches == 2
+    assert all(call.grain_requeues == 0 for call in result.calls)

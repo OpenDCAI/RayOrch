@@ -1,4 +1,4 @@
-"""Failure-policy reducer and microbatch-owned recovery queue regression."""
+"""Failure-policy reducer and input batch-owned recovery queue regression."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from rayorch.recovery import (
     UdfRecoveryMode,
 )
 from rayorch._runtime.dispatch import (
-    DispatchBatch,
+    ExecutionMicrobatch,
     DispatchState,
 )
 
@@ -38,7 +38,7 @@ def _reserve_without_barriers(
     call: CallRef,
     *,
     max_size: int,
-) -> DispatchBatch | None:
+) -> ExecutionMicrobatch | None:
     batch, suppressed = dispatch.reserve_with_barriers(
         call,
         max_size=max_size,
@@ -236,14 +236,14 @@ def test_recovery_records_reject_states_outside_the_closed_algebra():
             grain_count=0,
         )
     with pytest.raises(ValueError, match="non-negative integer"):
-        DispatchBatch(_grains(1), -1)
+        ExecutionMicrobatch(_grains(1), -1)
 
 
-def test_retry_policies_have_finite_exact_attempt_budgets():
+def test_retry_policies_limit_extra_retries():
     grains = _grains(3)
     for policy, action in (
-        (RecoveryPolicy.retry_batch(attempts=2), RecoveryAction.RETRY_IMMEDIATE),
-        (RecoveryPolicy.retry_tail(attempts=2), RecoveryAction.RETRY_TAIL),
+        (RecoveryPolicy.retry_batch(max_retries=2), RecoveryAction.RETRY_IMMEDIATE),
+        (RecoveryPolicy.retry_tail(max_retries=2), RecoveryAction.RETRY_TAIL),
     ):
         assert policy.decide_udf(
             completed_retries=0,
@@ -336,6 +336,23 @@ def test_immediate_recovery_precedes_ready_work_and_preserves_exact_batch():
     snapshots = dispatch.snapshots()
     assert {snapshots[grain].generation for grain in failed.grains} == {1}
     assert {snapshots[grain].infra_failures for grain in failed.grains} == {0}
+
+
+def test_empty_queues_can_still_have_in_flight_grains():
+    dispatch, grains = _dispatch_with_four_ready()
+    assert not dispatch.queues_empty
+
+    batch = _reserve(dispatch, max_size=4)
+    assert dispatch.queues_empty
+    assert not dispatch.all_sealed
+    assert all(dispatch.snapshot(grain).phase is GrainPhase.IN_FLIGHT for grain in grains)
+
+    dispatch.recover_infrastructure(batch)
+    assert not dispatch.queues_empty
+    retried = _reserve(dispatch, max_size=4)
+    dispatch.seal_in_flight(retried.grains)
+    assert dispatch.queues_empty
+    assert dispatch.all_sealed
 
 
 def test_retry_tail_yields_to_ready_work_then_preserves_exact_batch():

@@ -14,12 +14,17 @@ from .result import RunResult
 def run(
     pipeline: Pipeline | CompiledProgram,
     *source_columns: Sequence[Any],
-    microbatch_size: int | None = None,
-    max_active_microbatches: int = 1,
+    input_batch_size: int | None = None,
+    max_active_input_batches: int = 1,
     address: str | None = None,
     ray_init_kwargs: dict[str, Any] | None = None,
 ) -> RunResult:
-    """Execute one finite input with an automatically closed Executor."""
+    """Execute one finite input with an automatically closed Executor.
+
+    ``input_batch_size`` counts aligned source rows (None uses the full input);
+    ``max_active_input_batches`` limits overlapping input batch lifecycles.
+    Worker execution microbatch sizes are configured per Call with ``batch_size``.
+    """
 
     with Executor(
         pipeline,
@@ -28,8 +33,8 @@ def run(
     ) as executor:
         return executor.run(
             *source_columns,
-            microbatch_size=microbatch_size,
-            max_active_microbatches=max_active_microbatches,
+            input_batch_size=input_batch_size,
+            max_active_input_batches=max_active_input_batches,
         )
 
 

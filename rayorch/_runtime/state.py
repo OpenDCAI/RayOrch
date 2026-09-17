@@ -153,7 +153,7 @@ class PendingGrain:
 
 @dataclass(slots=True)
 class RuntimeState:
-    """All passive semantic tables exclusively written by MicrobatchEngine."""
+    """All passive semantic tables exclusively written by InputBatchEngine."""
 
     items: dict[ItemRef, ItemRecord] = field(default_factory=dict)
     expansions: dict[ExpansionRef, ExpansionRecord] = field(default_factory=dict)

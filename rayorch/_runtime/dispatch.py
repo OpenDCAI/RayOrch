@@ -1,4 +1,4 @@
-"""Microbatch-owned physical dispatch and Grain lifecycle state machine."""
+"""InputBatch-owned physical dispatch and Grain lifecycle state machine."""
 
 from __future__ import annotations
 
@@ -33,19 +33,23 @@ class GrainSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class DispatchBatch:
-    """One exact READY or recovery batch reserved for a Worker RPC."""
+class ExecutionMicrobatch:
+    """Grains of one Call in one InputBatch, grouped for a Worker RPC.
+
+    Recovery queues preserve the exact group; normal dispatch groups READY Grains.
+    The owning DispatchState supplies the InputBatch scope.
+    """
 
     grains: tuple[GrainRef, ...]
     udf_retries: int = 0
 
     def __post_init__(self) -> None:
         if not self.grains:
-            raise ValueError("DispatchBatch requires at least one Grain")
+            raise ValueError("ExecutionMicrobatch requires at least one Grain")
         if type(self.udf_retries) is not int or self.udf_retries < 0:
             raise ValueError("udf_retries must be a non-negative integer")
         if any(grain.call != self.grains[0].call for grain in self.grains):
-            raise ValueError("one DispatchBatch cannot mix Calls")
+            raise ValueError("one ExecutionMicrobatch cannot mix Calls")
 
 
 class DispatchState:
@@ -62,8 +66,8 @@ class DispatchState:
         # Per-Call queues avoid scanning unrelated fan-out while preserving the
         # order in which dependency completion made Grains runnable.
         self._ready_by_call: dict[CallRef, deque[GrainRef]] = defaultdict(deque)
-        self._immediate_retry_queue: deque[DispatchBatch] = deque()
-        self._deferred_recovery_queue: deque[DispatchBatch] = deque()
+        self._immediate_retry_queue: deque[ExecutionMicrobatch] = deque()
+        self._deferred_recovery_queue: deque[ExecutionMicrobatch] = deque()
 
     @property
     def ready_count(self) -> int:
@@ -78,7 +82,9 @@ class DispatchState:
         return len(self._records)
 
     @property
-    def is_idle(self) -> bool:
+    def queues_empty(self) -> bool:
+        """Return whether no work is queued; in-flight Grains may still exist."""
+
         return not (
             any(self._ready_by_call.values())
             or self._immediate_retry_queue
@@ -171,18 +177,18 @@ class DispatchState:
         *,
         max_size: int,
         barriered_anchors: AbstractSet[EntityRef] = frozenset(),
-    ) -> tuple[DispatchBatch | None, tuple[GrainRef, ...]]:
+    ) -> tuple[ExecutionMicrobatch | None, tuple[GrainRef, ...]]:
         """Reserve live work and atomically seal encountered barriered READY work."""
 
         suppressed: list[GrainRef] = []
-        dispatch_batch, barriered = self._reserve_recovery(
+        execution_microbatch, barriered = self._reserve_recovery(
             self._immediate_retry_queue,
             call,
             barriered_anchors,
         )
         suppressed.extend(barriered)
-        if dispatch_batch is not None:
-            return dispatch_batch, tuple(suppressed)
+        if execution_microbatch is not None:
+            return execution_microbatch, tuple(suppressed)
         grains, barriered = self._reserve_ready(
             call,
             max_size=max_size,
@@ -190,15 +196,15 @@ class DispatchState:
         )
         suppressed.extend(barriered)
         if grains:
-            return DispatchBatch(grains), tuple(suppressed)
-        dispatch_batch, barriered = self._reserve_recovery(
+            return ExecutionMicrobatch(grains), tuple(suppressed)
+        execution_microbatch, barriered = self._reserve_recovery(
             self._deferred_recovery_queue,
             call,
             barriered_anchors,
         )
         suppressed.extend(barriered)
-        if dispatch_batch is not None:
-            return dispatch_batch, tuple(suppressed)
+        if execution_microbatch is not None:
+            return execution_microbatch, tuple(suppressed)
         return None, tuple(suppressed)
 
     def _reserve_ready(
@@ -232,19 +238,19 @@ class DispatchState:
 
     def _reserve_recovery(
         self,
-        queue: deque[DispatchBatch],
+        queue: deque[ExecutionMicrobatch],
         call: CallRef,
         barriered_anchors: AbstractSet[EntityRef],
-    ) -> tuple[DispatchBatch | None, tuple[GrainRef, ...]]:
+    ) -> tuple[ExecutionMicrobatch | None, tuple[GrainRef, ...]]:
         suppressed: list[GrainRef] = []
         index = 0
         while index < len(queue):
-            dispatch_batch = queue[index]
-            if dispatch_batch.grains[0].call != call:
+            execution_microbatch = queue[index]
+            if execution_microbatch.grains[0].call != call:
                 index += 1
                 continue
             del queue[index]
-            live, barriered = self._partition_ready(dispatch_batch, barriered_anchors)
+            live, barriered = self._partition_ready(execution_microbatch, barriered_anchors)
             if barriered:
                 self._suppress_ready(barriered)
                 suppressed.extend(barriered)
@@ -255,11 +261,11 @@ class DispatchState:
 
     def _partition_ready(
         self,
-        dispatch_batch: DispatchBatch,
+        execution_microbatch: ExecutionMicrobatch,
         barriered_anchors: AbstractSet[EntityRef],
-    ) -> tuple[DispatchBatch | None, tuple[GrainRef, ...]]:
+    ) -> tuple[ExecutionMicrobatch | None, tuple[GrainRef, ...]]:
         return self._partition(
-            dispatch_batch,
+            execution_microbatch,
             barriered_anchors,
             expected=GrainPhase.READY,
         )
@@ -296,48 +302,48 @@ class DispatchState:
 
     def partition_in_flight(
         self,
-        dispatch_batch: DispatchBatch,
+        execution_microbatch: ExecutionMicrobatch,
         barriered_anchors: AbstractSet[EntityRef],
-    ) -> tuple[DispatchBatch | None, tuple[GrainRef, ...]]:
+    ) -> tuple[ExecutionMicrobatch | None, tuple[GrainRef, ...]]:
         """Partition an in-flight batch by the current suppression barriers."""
 
         return self._partition(
-            dispatch_batch,
+            execution_microbatch,
             barriered_anchors,
             expected=GrainPhase.IN_FLIGHT,
         )
 
     def _partition(
         self,
-        dispatch_batch: DispatchBatch,
+        execution_microbatch: ExecutionMicrobatch,
         barriered_anchors: AbstractSet[EntityRef],
         *,
         expected: GrainPhase,
-    ) -> tuple[DispatchBatch | None, tuple[GrainRef, ...]]:
-        self._records_in_phase(dispatch_batch.grains, expected)
+    ) -> tuple[ExecutionMicrobatch | None, tuple[GrainRef, ...]]:
+        self._records_in_phase(execution_microbatch.grains, expected)
         live = tuple(
             grain
-            for grain in dispatch_batch.grains
+            for grain in execution_microbatch.grains
             if self.parent_anchor(grain) not in barriered_anchors
         )
         barriered = tuple(
             grain
-            for grain in dispatch_batch.grains
+            for grain in execution_microbatch.grains
             if self.parent_anchor(grain) in barriered_anchors
         )
         return (
-            DispatchBatch(live, dispatch_batch.udf_retries) if live else None,
+            ExecutionMicrobatch(live, execution_microbatch.udf_retries) if live else None,
             barriered,
         )
 
     def recover_udf(
         self,
-        dispatch_batch: DispatchBatch,
+        execution_microbatch: ExecutionMicrobatch,
         action: RecoveryAction,
     ) -> int:
         """Apply one non-terminal UDF recovery decision; return retried Grains."""
 
-        grains = dispatch_batch.grains
+        grains = execution_microbatch.grains
         match action:
             case RecoveryAction.RETRY_IMMEDIATE | RecoveryAction.RETRY_TAIL:
                 self._release(grains, infrastructure=False)
@@ -346,15 +352,15 @@ class DispatchState:
                     if action is RecoveryAction.RETRY_IMMEDIATE
                     else self._deferred_recovery_queue
                 )
-                queue.append(DispatchBatch(grains, dispatch_batch.udf_retries + 1))
+                queue.append(ExecutionMicrobatch(grains, execution_microbatch.udf_retries + 1))
             case RecoveryAction.SPLIT_TAIL:
-                if dispatch_batch.udf_retries == 0 or len(grains) <= 1:
+                if execution_microbatch.udf_retries == 0 or len(grains) <= 1:
                     raise CommitError("split requires one failed recovery batch")
                 self._release(grains, infrastructure=False)
                 midpoint = len(grains) // 2
                 for partition in (grains[:midpoint], grains[midpoint:]):
                     self._deferred_recovery_queue.append(
-                        DispatchBatch(partition, dispatch_batch.udf_retries)
+                        ExecutionMicrobatch(partition, execution_microbatch.udf_retries)
                     )
             case RecoveryAction.ABORT | RecoveryAction.FAIL_SINGLETON:
                 raise CommitError(
@@ -364,22 +370,22 @@ class DispatchState:
 
     def recover_infrastructure(
         self,
-        dispatch_batch: DispatchBatch,
+        execution_microbatch: ExecutionMicrobatch,
     ) -> int:
-        """Requeue an approved DispatchBatch and return its Grain count."""
+        """Requeue an approved ExecutionMicrobatch and return its Grain count."""
 
-        grains = dispatch_batch.grains
+        grains = execution_microbatch.grains
         self._release(grains, infrastructure=True)
-        self._immediate_retry_queue.append(dispatch_batch)
+        self._immediate_retry_queue.append(execution_microbatch)
         return len(grains)
 
     def infrastructure_failures(
         self,
-        dispatch_batch: DispatchBatch,
+        execution_microbatch: ExecutionMicrobatch,
     ) -> tuple[int, ...]:
         """Read the sole physical infra-attempt counters for policy reduction."""
 
-        records = tuple(self._records.get(grain) for grain in dispatch_batch.grains)
+        records = tuple(self._records.get(grain) for grain in execution_microbatch.grains)
         if any(record is None for record in records):
             raise CommitError("infrastructure retry references an unknown Grain")
         return tuple(
@@ -410,10 +416,10 @@ class DispatchState:
         expected: GrainPhase,
         event: GrainEvent,
     ) -> tuple[GrainRecord, ...]:
-        """Preflight then transition every Grain in one exact DispatchBatch."""
+        """Preflight then transition every Grain in one exact ExecutionMicrobatch."""
 
         if not grains:
-            raise CommitError("DispatchBatch must not be empty")
+            raise CommitError("ExecutionMicrobatch must not be empty")
         records = self._records_in_phase(grains, expected)
         for record in records:
             record.phase = grain_transition(record.phase, event)
@@ -425,7 +431,7 @@ class DispatchState:
         expected: GrainPhase,
     ) -> tuple[GrainRecord, ...]:
         if not grains:
-            raise CommitError("DispatchBatch must not be empty")
+            raise CommitError("ExecutionMicrobatch must not be empty")
         optional = tuple(self._records.get(grain) for grain in grains)
         if any(
             record is None or record.phase is not expected
@@ -445,4 +451,4 @@ class DispatchState:
             raise CommitError(f"unknown Grain: {grain!r}") from error
 
 
-__all__ = ["DispatchBatch", "DispatchState", "GrainSnapshot"]
+__all__ = ["ExecutionMicrobatch", "DispatchState", "GrainSnapshot"]

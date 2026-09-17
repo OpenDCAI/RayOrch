@@ -167,7 +167,14 @@ def test_reduce_expansion_member_value_cartesian_product_is_closed():
         TERMINAL_OR_PENDING,
         TERMINAL_OR_PENDING,
     ):
-        decision = reduce_transition(expansion, (member,), (value,))
+        decision = reduce_transition(
+            expansion,
+            pending_members=int(member is None),
+            first_failed_member=(
+                0 if member in {ItemOutcome.FAILED, ItemOutcome.SUPPRESSED} else None
+            ),
+            values=((0, value),) if member is ItemOutcome.PRESENT else (),
+        )
         if expansion is None:
             assert decision.outcome is None
         elif expansion is ExpansionOutcome.DROPPED:
@@ -189,12 +196,10 @@ def test_reduce_expansion_member_value_cartesian_product_is_closed():
             assert decision.outcome is None
         elif member is ItemOutcome.DROPPED:
             assert decision.outcome is ItemOutcome.PRESENT
-            assert decision.survivors == ()
         elif value is None:
             assert decision.outcome is None
         elif value is ItemOutcome.PRESENT:
             assert decision.outcome is ItemOutcome.PRESENT
-            assert decision.survivors == (0,)
         else:
             assert (decision.outcome, decision.cause) == (
                 ItemOutcome.SUPPRESSED,
@@ -205,16 +210,17 @@ def test_reduce_expansion_member_value_cartesian_product_is_closed():
 def test_group_ignores_excluded_values_but_failure_absorbs_pending_members():
     excluded = reduce_transition(
         ExpansionOutcome.SUCCEEDED,
-        (ItemOutcome.DROPPED, ItemOutcome.PRESENT),
-        (ItemOutcome.FAILED, ItemOutcome.PRESENT),
+        pending_members=0,
+        first_failed_member=None,
+        values=((1, ItemOutcome.PRESENT),),
     )
     assert excluded.outcome is ItemOutcome.PRESENT
-    assert excluded.survivors == (1,)
 
     failed = reduce_transition(
         ExpansionOutcome.SUCCEEDED,
-        (None, ItemOutcome.FAILED),
-        (None, None),
+        pending_members=1,
+        first_failed_member=1,
+        values=(),
     )
     assert failed.outcome is ItemOutcome.SUPPRESSED
     assert failed.cause is ReduceCause.MEMBER

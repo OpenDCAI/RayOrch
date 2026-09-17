@@ -1,9 +1,9 @@
-"""Ray actor-pool executor with overlapping microbatch admission.
+"""Ray actor-pool executor with overlapping input batch admission.
 
 The logical program, semantic engine, and Worker ABI are Ray-free. This module
 alone owns actor handles and pending RPC ObjectRefs. Actor capacity is shared
-across microbatches, but a single RPC never mixes Grains from different
-microbatches.
+across input batches, but a single RPC never mixes Grains from different
+input batches.
 """
 
 from __future__ import annotations
@@ -22,11 +22,10 @@ from .._protocol import (
     DispatchFailureKind,
     RowBinding,
 )
-from ..recovery import RecoveryAction
 from ..errors import ExecutionError
-from .._runtime import DispatchBatch, MicrobatchEngine
+from .._runtime import ExecutionMicrobatch, InputBatchEngine
 from .ray_backend import _RayBlockStore, _RayWorkerActor
-from ..result import CallMetrics, MicrobatchMetrics, RunResult, WorkerSnapshot
+from ..result import CallMetrics, InputBatchMetrics, RunResult
 
 
 # ── Driver-local mutable counters and physical ownership records ─────────────
@@ -38,8 +37,8 @@ class _CallCounters:
 
     actor_instances: int = 0
     rpcs: int = 0
-    grains: int = 0
-    retries: int = 0
+    grain_dispatches: int = 0
+    grain_requeues: int = 0
     batch_sizes: list[int] = field(default_factory=list)
 
 
@@ -53,28 +52,28 @@ class _ActorSlot:
 
 
 @dataclass(slots=True)
-class _MicrobatchSlot:
-    """One source microbatch and its sole semantic state machine."""
+class _InputBatchSlot:
+    """One source input batch and its sole semantic state machine."""
 
     index: int
-    engine: MicrobatchEngine
+    engine: InputBatchEngine
 
 
 @dataclass(frozen=True, slots=True)
 class _PendingRpc:
     """One pending worker RPC and the state needed to finalize it exactly once."""
 
-    microbatch_index: int
+    input_batch_index: int
     actor: _ActorSlot
-    dispatch_batch: DispatchBatch
+    execution_microbatch: ExecutionMicrobatch
 
 
 class Executor:
-    """Drive persistent per-Call actor pools across overlapping microbatches.
+    """Drive persistent per-Call actor pools across overlapping input batches.
 
     The executor owns actor capacity, pending RPCs, and run-local counters.
     Logical propagation, entity lineage, and Grain lifecycle state remain in
-    :class:`MicrobatchEngine` and :class:`DispatchState`.
+    :class:`InputBatchEngine` and :class:`DispatchState`.
     """
 
     def __init__(
@@ -128,26 +127,31 @@ class Executor:
     def run(
         self,
         *source_columns: Sequence[Any],
-        microbatch_size: int | None = None,
-        max_active_microbatches: int = 1,
+        input_batch_size: int | None = None,
+        max_active_input_batches: int = 1,
     ) -> RunResult:
-        """Execute finite row-aligned sequences with bounded microbatch overlap."""
+        """Execute finite row-aligned sequences with bounded input batch overlap.
+
+        ``input_batch_size`` counts source rows (None uses the full input).
+        ``max_active_input_batches`` limits overlapping input batch lifecycles.
+        Each Call separately limits its execution microbatches via ``batch_size``.
+        """
 
         if self._closed:
             raise RuntimeError("Executor is closed")
 
         columns = self._normalize_sources(source_columns)
         row_count = len(columns[0])
-        if max_active_microbatches <= 0:
-            raise ValueError("max_active_microbatches must be positive")
-        if microbatch_size is None:
-            microbatch_size = max(1, row_count)
-        if microbatch_size <= 0:
-            raise ValueError("microbatch_size must be positive")
+        if max_active_input_batches <= 0:
+            raise ValueError("max_active_input_batches must be positive")
+        if input_batch_size is None:
+            input_batch_size = max(1, row_count)
+        if input_batch_size <= 0:
+            raise ValueError("input_batch_size must be positive")
 
         slices = [
-            tuple(column[start : start + microbatch_size] for column in columns)
-            for start in range(0, row_count, microbatch_size)
+            tuple(column[start : start + input_batch_size] for column in columns)
+            for start in range(0, row_count, input_batch_size)
         ]
         if not slices:
             slices = [tuple(() for _ in columns)]
@@ -158,44 +162,44 @@ class Executor:
             call: _CallCounters(actor_instances=len(self._actors[call]))
             for call in self.plan.calls
         }
-        metrics_by_microbatch: list[MicrobatchMetrics | None] = [None] * len(slices)
-        active: dict[int, _MicrobatchSlot] = {}
+        metrics_by_input_batch: list[InputBatchMetrics | None] = [None] * len(slices)
+        active: dict[int, _InputBatchSlot] = {}
         completed: dict[int, object] = {}
         pending_rpcs: dict[Any, _PendingRpc] = {}
-        next_microbatch = 0
+        next_input_batch = 0
         execution_started = False
         high_watermark = 0
         started = time.perf_counter()
 
         # Event-loop invariants:
-        # 1. active[index] uniquely owns that microbatch's Engine;
+        # 1. active[index] uniquely owns that input batch's Engine;
         # 2. every pending ObjectRef maps to exactly one _PendingRpc;
         # 3. a busy actor has one such RPC and is released in finally;
         # 4. materialization requires both no pending RPC and Engine complete.
         try:
             while len(completed) < len(slices):
                 while (
-                    next_microbatch < len(slices)
-                    and len(active) < max_active_microbatches
+                    next_input_batch < len(slices)
+                    and len(active) < max_active_input_batches
                 ):
                     execution_started = True
-                    engine = self._admit_microbatch(slices[next_microbatch])
-                    active[next_microbatch] = _MicrobatchSlot(
-                        next_microbatch,
+                    engine = self._admit_input_batch(slices[next_input_batch])
+                    active[next_input_batch] = _InputBatchSlot(
+                        next_input_batch,
                         engine,
                     )
-                    next_microbatch += 1
+                    next_input_batch += 1
                     high_watermark = max(high_watermark, len(active))
 
                 made_progress = self._dispatch_ready(active, pending_rpcs)
 
-                # A microbatch cannot retire while one of its RPCs is pending.
-                pending_microbatches = {
-                    rpc.microbatch_index for rpc in pending_rpcs.values()
+                # An input batch cannot retire while one of its RPCs is pending.
+                pending_input_batches = {
+                    rpc.input_batch_index for rpc in pending_rpcs.values()
                 }
                 for index, slot in tuple(active.items()):
                     if (
-                        index not in pending_microbatches
+                        index not in pending_input_batches
                         and slot.engine.is_complete()
                     ):
                         completed[index] = materialize_tree(
@@ -209,7 +213,7 @@ class Executor:
                         # Drop bindings such as page-image ObjectRefs after output
                         # materialization; results retain immutable metrics only.
                         released = slot.engine.release_values()
-                        metrics_by_microbatch[index] = MicrobatchMetrics(
+                        metrics_by_input_batch[index] = InputBatchMetrics(
                             index=index,
                             entity_count=slot.engine.entity_count,
                             item_count=slot.engine.item_count,
@@ -221,8 +225,8 @@ class Executor:
 
                 if len(completed) == len(slices):
                     break
-                if not pending_rpcs and next_microbatch < len(slices):
-                    # Completed microbatches freed admission credit for the next
+                if not pending_rpcs and next_input_batch < len(slices):
+                    # Completed input batches freed admission credit for the next
                     # source slice; the following turn can make progress.
                     continue
                 if not pending_rpcs and made_progress:
@@ -231,7 +235,7 @@ class Executor:
                     continue
                 if not pending_rpcs:
                     summaries = ", ".join(
-                        f"microbatch[{index}] {slot.engine.progress_summary()}"
+                        f"input_batch[{index}] {slot.engine.progress_summary()}"
                         for index, slot in sorted(active.items())
                     )
                     raise RuntimeError(f"RayOrch runtime deadlocked: {summaries}")
@@ -239,7 +243,7 @@ class Executor:
                 ready, _ = self.ray.wait(list(pending_rpcs), num_returns=1)
                 result_ref = ready[0]
                 pending_rpc = pending_rpcs.pop(result_ref)
-                engine = active[pending_rpc.microbatch_index].engine
+                engine = active[pending_rpc.input_batch_index].engine
                 try:
                     result = self.ray.get(result_ref)
                 except Exception as error:  # Ray surfaces actor failures at get().
@@ -248,20 +252,19 @@ class Executor:
                     if isinstance(result, DispatchFailure):
                         self._handle_dispatch_failure(engine, pending_rpc, result)
                     else:
-                        engine.commit_reports(pending_rpc.dispatch_batch, result)
+                        engine.commit_reports(pending_rpc.execution_microbatch, result)
                 finally:
                     pending_rpc.actor.busy = False
 
             elapsed_s = time.perf_counter() - started
-            worker_snapshots = self._observe_workers()
-            calls = self._freeze_call_metrics(worker_snapshots)
-            if any(metrics is None for metrics in metrics_by_microbatch):
-                raise AssertionError("completed run lost a microbatch metrics snapshot")
+            calls = self._freeze_call_metrics()
+            if any(metrics is None for metrics in metrics_by_input_batch):
+                raise AssertionError("completed run lost an input batch metrics snapshot")
             return RunResult(
                 self._merge_outputs([completed[index] for index in range(len(slices))]),
                 elapsed_s,
                 calls,
-                cast(tuple[MicrobatchMetrics, ...], tuple(metrics_by_microbatch)),
+                cast(tuple[InputBatchMetrics, ...], tuple(metrics_by_input_batch)),
                 high_watermark,
             )
         except BaseException:
@@ -293,57 +296,9 @@ class Executor:
         if self._owns_ray and self.ray.is_initialized():
             self.ray.shutdown()
 
-    # ── Observation and immutable result snapshots ──────────────────────
+    # ── Immutable result snapshots ──────────────────────
 
-    def _observe_workers(self) -> dict[CallRef, tuple[WorkerSnapshot, ...]]:
-        """Best-effort physical diagnostics must not invalidate business output."""
-
-        result: dict[CallRef, list[WorkerSnapshot | None]] = {
-            call: [None] * len(actors)
-            for call, actors in self._actors.items()
-        }
-        pending_observations = {}
-        for call, actors in self._actors.items():
-            for index, actor in enumerate(actors):
-                try:
-                    reference = actor.handle.observe.remote()
-                except Exception as error:
-                    result[call][index] = WorkerSnapshot(
-                        lifetime_calls=0,
-                        pid=0,
-                        rss_bytes=0,
-                        error=repr(error),
-                    )
-                else:
-                    pending_observations[reference] = (call, index)
-        while pending_observations:
-            ready, _ = self.ray.wait(list(pending_observations), num_returns=1)
-            reference = ready[0]
-            call, index = pending_observations.pop(reference)
-            try:
-                result[call][index] = self.ray.get(reference)
-            except Exception as error:
-                result[call][index] = WorkerSnapshot(
-                    lifetime_calls=0,
-                    pid=0,
-                    rss_bytes=0,
-                    error=repr(error),
-                )
-        if any(
-            observation is None
-            for observations in result.values()
-            for observation in observations
-        ):
-            raise AssertionError("worker observation collection lost an actor")
-        return {
-            call: cast(tuple[WorkerSnapshot, ...], tuple(observations))
-            for call, observations in result.items()
-        }
-
-    def _freeze_call_metrics(
-        self,
-        workers: dict[CallRef, tuple[WorkerSnapshot, ...]],
-    ) -> tuple[CallMetrics, ...]:
+    def _freeze_call_metrics(self) -> tuple[CallMetrics, ...]:
         """Freeze counters in stable CallRef order for the public result."""
 
         snapshots = []
@@ -356,10 +311,9 @@ class Executor:
                     udf_name=self._udf_name(target),
                     actor_instances=counters.actor_instances,
                     rpcs=counters.rpcs,
-                    grains=counters.grains,
-                    retries=counters.retries,
+                    grain_dispatches=counters.grain_dispatches,
+                    grain_requeues=counters.grain_requeues,
                     batch_sizes=tuple(counters.batch_sizes),
-                    worker_snapshots=workers[call],
                 )
             )
         return tuple(snapshots)
@@ -389,13 +343,13 @@ class Executor:
             raise ValueError("source columns must be row-aligned")
         return columns
 
-    def _admit_microbatch(
+    def _admit_input_batch(
         self,
         columns: tuple[tuple[Any, ...], ...],
-    ) -> MicrobatchEngine:
-        """Admit one source slice into an independent microbatch engine."""
+    ) -> InputBatchEngine:
+        """Admit one source slice into an independent input batch engine."""
 
-        engine = MicrobatchEngine(self.plan)
+        engine = InputBatchEngine(self.plan)
         bindings = {}
         controls = {}
         for port, values in zip(self.plan.source_ports, columns):
@@ -411,10 +365,10 @@ class Executor:
 
     def _dispatch_ready(
         self,
-        active: dict[int, _MicrobatchSlot],
+        active: dict[int, _InputBatchSlot],
         pending_rpcs: dict[Any, _PendingRpc],
     ) -> bool:
-        """Assign READY Grains to idle actors without mixing microbatches."""
+        """Assign READY Grains to idle actors without mixing input batches."""
 
         made_progress = False
         for call, actors in self._actors.items():
@@ -454,7 +408,7 @@ class Executor:
                 )
                 counters = self._counters[call]
                 counters.rpcs += 1
-                counters.grains += len(batch.grains)
+                counters.grain_dispatches += len(batch.grains)
                 counters.batch_sizes.append(len(batch.grains))
                 made_progress = True
         return made_progress
@@ -463,11 +417,11 @@ class Executor:
 
     def _handle_dispatch_failure(
         self,
-        engine: MicrobatchEngine,
+        engine: InputBatchEngine,
         pending_rpc: _PendingRpc,
         failure: DispatchFailure,
     ) -> None:
-        """Map one typed Worker failure to an exhaustive recovery action."""
+        """Classify a Worker failure and delegate UDF recovery to its Engine."""
 
         if failure.kind is DispatchFailureKind.CONTRACT_ERROR:
             raise self._execution_error(engine, pending_rpc, failure)
@@ -476,25 +430,18 @@ class Executor:
                 f"unsupported DispatchFailureKind: {failure.kind!r}"
             )
         policy = self._pool(pending_rpc.actor.call).recovery
-        live = engine.live_recovery_batch(pending_rpc.dispatch_batch)
-        if live is None:
-            engine.suppress_barriered_batch(pending_rpc.dispatch_batch)
-            return
-        action = policy.decide_udf(
-            completed_retries=live.udf_retries,
-            grain_count=len(live.grains),
-        )
-        if action is RecoveryAction.ABORT:
-            raise self._execution_error(engine, pending_rpc, failure)
-        self._counters[pending_rpc.actor.call].retries += engine.apply_udf_recovery(
-            pending_rpc.dispatch_batch,
-            action,
+        requeued = engine.apply_udf_recovery(
+            pending_rpc.execution_microbatch,
+            policy,
             failure,
         )
+        if requeued is None:
+            raise self._execution_error(engine, pending_rpc, failure)
+        self._counters[pending_rpc.actor.call].grain_requeues += requeued
 
     def _handle_infrastructure_failure(
         self,
-        engine: MicrobatchEngine,
+        engine: InputBatchEngine,
         pending_rpc: _PendingRpc,
         error: Exception,
     ) -> None:
@@ -502,13 +449,13 @@ class Executor:
 
         policy = self._pool(pending_rpc.actor.call).recovery
         retried = engine.retry_infrastructure_dispatch(
-            pending_rpc.dispatch_batch,
+            pending_rpc.execution_microbatch,
             policy,
         )
         if retried is None:
             raise self._execution_error(engine, pending_rpc, error) from error
         self._replace_actor(pending_rpc.actor)
-        self._counters[pending_rpc.actor.call].retries += retried
+        self._counters[pending_rpc.actor.call].grain_requeues += retried
 
     def _replace_actor(self, actor: _ActorSlot) -> None:
         """Discard one untrusted handle and install a fresh actor instance."""
@@ -522,7 +469,7 @@ class Executor:
 
     def _execution_error(
         self,
-        engine: MicrobatchEngine,
+        engine: InputBatchEngine,
         pending_rpc: _PendingRpc,
         failure: DispatchFailure | Exception,
     ) -> ExecutionError:
@@ -533,7 +480,7 @@ class Executor:
         name = self._udf_name(target)
         grains = ", ".join(
             f"{grain!r}@generation={engine.grain_snapshot(grain).generation}"
-            for grain in pending_rpc.dispatch_batch.grains
+            for grain in pending_rpc.execution_microbatch.grains
         )
         if isinstance(failure, DispatchFailure):
             detail = (
@@ -588,7 +535,7 @@ class Executor:
 
     @classmethod
     def _merge_outputs(cls, outputs: list[object]) -> object:
-        """Merge homogeneous output trees in microbatch admission order."""
+        """Merge homogeneous output trees in input batch admission order."""
 
         first = outputs[0]
         if isinstance(first, list):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Iterable
 
 from .._model import GrainPhase, InputMode, ItemOutcome, ExpansionOutcome
 
@@ -165,20 +166,22 @@ class ReduceCause(Enum):
 @dataclass(frozen=True, slots=True)
 class ReduceTransition:
     outcome: ItemOutcome | None
-    survivors: tuple[int, ...] = ()
     cause: ReduceCause | None = None
     cause_index: int | None = None
 
 
 def reduce_transition(
     expansion: ExpansionOutcome | None,
-    members: tuple[ItemOutcome | None, ...],
-    values: tuple[ItemOutcome | None, ...],
+    *,
+    pending_members: int,
+    first_failed_member: int | None,
+    values: Iterable[tuple[int, ItemOutcome | None]],
 ) -> ReduceTransition:
-    """Reduce through explicit Expansion, member, and survivor-value gates."""
+    """Gate a membership summary, then consume survivor values in ordinal order.
 
-    if len(members) != len(values):
-        raise InvalidTransition("Nested-group members/values must be aligned")
+    Values may omit an already-checked PRESENT prefix. Stop at the first gap
+    or failure so an unavailable earlier value still blocks a later failure.
+    """
     if expansion is None:
         return ReduceTransition(None)
     if expansion is ExpansionOutcome.DROPPED:
@@ -186,23 +189,16 @@ def reduce_transition(
     if expansion is ExpansionOutcome.FAILED:
         return ReduceTransition(ItemOutcome.SUPPRESSED, cause=ReduceCause.SHAPE)
 
-    for index, outcome in enumerate(members):
-        if outcome in {ItemOutcome.FAILED, ItemOutcome.SUPPRESSED}:
-            return ReduceTransition(
-                ItemOutcome.SUPPRESSED,
-                cause=ReduceCause.MEMBER,
-                cause_index=index,
-            )
-    if any(outcome is None for outcome in members):
+    if first_failed_member is not None:
+        return ReduceTransition(
+            ItemOutcome.SUPPRESSED,
+            cause=ReduceCause.MEMBER,
+            cause_index=first_failed_member,
+        )
+    if pending_members:
         return ReduceTransition(None)
 
-    survivors = tuple(
-        index
-        for index, outcome in enumerate(members)
-        if outcome is ItemOutcome.PRESENT
-    )
-    for index in survivors:
-        outcome = values[index]
+    for index, outcome in values:
         if outcome is None:
             return ReduceTransition(None)
         if outcome is not ItemOutcome.PRESENT:
@@ -211,7 +207,7 @@ def reduce_transition(
                 cause=ReduceCause.VALUE,
                 cause_index=index,
             )
-    return ReduceTransition(ItemOutcome.PRESENT, survivors)
+    return ReduceTransition(ItemOutcome.PRESENT)
 
 
 __all__ = [

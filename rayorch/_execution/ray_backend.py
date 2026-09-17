@@ -11,7 +11,6 @@ from .._protocol import (
     GrainInvocation,
     RowBinding,
 )
-from ..result import WorkerSnapshot
 from .worker import Worker
 
 
@@ -23,7 +22,7 @@ class _RayBlockStore:
         self._cache: dict[Any, tuple[Any, ...]] = {}
 
     def clear_cache(self) -> None:
-        """Drop dereferenced payloads; the microbatch owns ObjectRef lifetime."""
+        """Drop dereferenced payloads; the input batch owns ObjectRef lifetime."""
 
         self._cache.clear()
 
@@ -85,13 +84,8 @@ class _RayWorkerActor:
             return self._worker.execute(invocations, layouts, self._store)
         finally:
             # Input blocks must not leak across actor RPCs. Output bindings are
-            # returned to the driver and then owned by a microbatch lifecycle.
+            # returned to the driver and then owned by an input batch lifecycle.
             self._store.clear_cache()
-
-    def observe(self) -> WorkerSnapshot:
-        """Return an observation-only snapshot without leaking the UDF."""
-
-        return self._worker.observe()
 
 
 __all__ = ["_RayBlockStore", "_RayWorkerActor"]

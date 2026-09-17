@@ -175,7 +175,7 @@ def _lower(
             match use.role:
                 case InputRole.EXPAND_GROUP:
                     # Expanded Worker layouts are committed atomically by
-                    # MicrobatchEngine.commit_reports, not an Item event.
+                    # InputBatchEngine.commit_reports, not an Item event.
                     pass
                 case InputRole.REDUCE_VALUE | InputRole.REDUCE_MEMBERS:
                     effect = structural_effects_by_target.get(use.port)

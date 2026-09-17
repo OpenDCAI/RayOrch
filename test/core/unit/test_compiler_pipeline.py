@@ -56,6 +56,60 @@ class U:
     pass
 
 
+@pytest.mark.parametrize("call_output", [False, True], ids=["source", "call-output"])
+@pytest.mark.parametrize("check", [
+    pytest.param(bool, id="bool"),
+    pytest.param(lambda port: not port, id="not"),
+    pytest.param(lambda port: port and True, id="and"),
+    pytest.param(lambda port: port or False, id="or"),
+])
+def test_symbolic_truth_checks_are_rejected_during_trace(check, call_output):
+    class Invalid(ro.Pipeline):
+        def __init__(self):
+            self.transform = ro.RayModule(U)
+
+        def forward(self, values):
+            selected = self.transform(values) if call_output else values
+            check(selected)
+            return selected
+
+    with pytest.raises(TypeError, match="symbolic Port.*truth value"):
+        Invalid().compile()
+
+
+def test_if_on_a_port_is_rejected_inside_a_helper():
+    def choose(values):
+        if values:
+            return values
+        raise AssertionError("a symbolic Port must not choose a branch")
+
+    class Invalid(ro.Pipeline):
+        def forward(self, values):
+            return choose(values)
+
+    with pytest.raises(TypeError, match="F.filter.*UDF"):
+        Invalid().compile()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_config_boolean_can_select_a_graph_branch_before_filtering(enabled):
+    class Configured(ro.Pipeline):
+        def __init__(self):
+            self.enabled = enabled
+            self.transform = ro.RayModule(U)
+
+        def forward(self, values, masks):
+            if self.enabled:
+                values = self.transform(values)
+            return ro.F.filter(values, masks)
+
+    compiled = Configured().compile()
+    assert len(compiled.logical.calls) == int(enabled)
+    effect = compiled.plan.structural_effects_by_target[compiled.plan.output_tree]
+    assert isinstance(effect, FilterEffect)
+    assert effect.mask_port == compiled.plan.source_ports[1]
+
+
 def test_root_public_api_is_deliberately_small():
     assert set(ro.__all__) == {
         "CompileError",
@@ -63,7 +117,9 @@ def test_root_public_api_is_deliberately_small():
         "ExecutionError",
         "F",
         "GroupFailure",
+        "ItemOutcome",
         "MISSING",
+        "OutputIssue",
         "Pipeline",
         "Port",
         "RayModule",
@@ -159,7 +215,7 @@ def test_engine_module_has_no_logical_origin_interpreter():
 
 
 def test_engine_has_one_closed_fact_propagation_entry():
-    source = inspect.getsource(engine.MicrobatchEngine)
+    source = inspect.getsource(engine.InputBatchEngine)
 
     assert set(get_args(engine._FactEvent)) == {ItemRef, ExpansionRef, EntityRef}
     assert source.count("self._fact_queue.append(") == 3

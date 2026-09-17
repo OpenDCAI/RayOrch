@@ -18,6 +18,14 @@ class Port:
     ref: PortRef
     _owner: int
 
+    def __bool__(self) -> bool:
+        """Reject data-dependent Python branching while tracing a static graph."""
+
+        raise TypeError(
+            "A symbolic Port has no Python truth value. "
+            "Use F.filter for filtering or put per-item conditions inside a UDF."
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class OptionalInput:

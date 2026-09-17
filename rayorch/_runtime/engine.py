@@ -1,4 +1,4 @@
-"""Single-writer, event-driven semantic state machine for one microbatch.
+"""Single-writer, event-driven semantic state machine for one input batch.
 
 The engine is the sole writer of RuntimeState, entity indexes, and the fact
 queue. Pure outcome and phase decisions live in ``transitions.py``; physical
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import AbstractSet, Mapping, TypeAlias, assert_never
+from typing import AbstractSet, Iterator, Mapping, TypeAlias, assert_never
 
 from .._model import (
     CallRef,
@@ -55,7 +55,7 @@ from .._protocol import (
     WorkerReport,
 )
 from ..recovery import RecoveryAction, RecoveryPolicy
-from .dispatch import DispatchBatch, DispatchState, GrainSnapshot
+from .dispatch import ExecutionMicrobatch, DispatchState, GrainSnapshot
 from .state import (
     CommitError,
     EntityParent,
@@ -86,8 +86,23 @@ class _PreparedGrainSuccess:
     expansion_commits: tuple[_ExpandedOutputCommit, ...]
 
 
+@dataclass(slots=True)
+class _ReduceProgress:
+    """Rebuildable summary of immutable facts for one unfinished Reduce."""
+
+    pending_members: int
+    first_failed_member: int | None = None
+    next_value_index: int = 0
+
+    def accept_member(self, ordinal: int, outcome: ItemOutcome) -> None:
+        self.pending_members -= 1
+        if outcome in {ItemOutcome.FAILED, ItemOutcome.SUPPRESSED}:
+            if self.first_failed_member is None or ordinal < self.first_failed_member:
+                self.first_failed_member = ordinal
+
+
 class _SuppressionBarrierIndex:
-    """Microbatch-local index of monotonic ``(Call, parent anchor)`` barriers."""
+    """InputBatch-local index of monotonic ``(Call, parent anchor)`` barriers."""
 
     def __init__(self) -> None:
         self._causes_by_call: dict[
@@ -117,8 +132,8 @@ class _SuppressionBarrierIndex:
 _FactEvent: TypeAlias = ItemRef | ExpansionRef | EntityRef
 
 
-class MicrobatchEngine:
-    """Own every semantic fact and mutation for one source microbatch.
+class InputBatchEngine:
+    """Own every semantic fact and mutation for one source input batch.
 
     A useful reading order is source admission and ``advance``, Worker report
     commit, the publication gateways, and finally the structural Effect
@@ -131,6 +146,7 @@ class MicrobatchEngine:
         self._dispatch = DispatchState()
         self._suppression_barriers = _SuppressionBarrierIndex()
         self._fact_queue: deque[_FactEvent] = deque()
+        self._reduce_progress: dict[ItemRef, _ReduceProgress] = {}
         self._entities_by_domain: dict[
             DomainRef, dict[EntityRef, None]
         ] = defaultdict(dict)
@@ -146,19 +162,19 @@ class MicrobatchEngine:
 
     @property
     def entity_count(self) -> int:
-        """Return the number of Entities created in this microbatch."""
+        """Return the number of Entities created in this input batch."""
 
         return sum(len(entities) for entities in self._entities_by_domain.values())
 
     @property
     def item_count(self) -> int:
-        """Return the number of terminal Items in this microbatch."""
+        """Return the number of terminal Items in this input batch."""
 
         return len(self._state.items)
 
     @property
     def expansion_count(self) -> int:
-        """Return the number of terminal Expansions in this microbatch."""
+        """Return the number of terminal Expansions in this input batch."""
 
         return len(self._state.expansions)
 
@@ -188,7 +204,7 @@ class MicrobatchEngine:
         call: CallRef,
         *,
         max_size: int,
-    ) -> DispatchBatch | None:
+    ) -> ExecutionMicrobatch | None:
         """Reserve visible READY work and publish lazy parent suppression."""
 
         batch, suppressed = self._dispatch.reserve_with_barriers(
@@ -204,7 +220,7 @@ class MicrobatchEngine:
         return batch
 
     def close_admission(self) -> None:
-        """Declare that this microbatch will accept no more source rows."""
+        """Declare that this input batch will accept no more source rows."""
 
         self._admission_closed = True
 
@@ -216,7 +232,7 @@ class MicrobatchEngine:
         if (
             self._fact_queue
             or self._state.pending_grains
-            or not self._dispatch.is_idle
+            or not self._dispatch.queues_empty
         ):
             return False
         if not self._dispatch.all_sealed:
@@ -300,6 +316,23 @@ class MicrobatchEngine:
 
         return self._state.items[item].outcome
 
+    def item_cause(self, item: ItemRef) -> object | None:
+        """Follow the selected provenance to its cause without mutating facts."""
+
+        cause = self._state.items[item].cause
+        seen: set[ItemRef | ExpansionRef] = set()
+        while isinstance(cause, (ItemRef, ExpansionRef)):
+            if cause in seen:
+                raise CommitError("cyclic result cause")
+            seen.add(cause)
+            record = (
+                self._state.items[cause]
+                if isinstance(cause, ItemRef)
+                else self._state.expansions[cause]
+            )
+            cause = record.cause
+        return cause
+
     def value_binding(self, item: ItemRef) -> ValueBinding:
         """Read a PRESENT Item's binding without exposing mutation authority."""
 
@@ -331,7 +364,7 @@ class MicrobatchEngine:
         """Release physical bindings after completion while retaining semantics."""
 
         if not self.is_complete():
-            raise CommitError("cannot release values before microbatch completion")
+            raise CommitError("cannot release values before input batch completion")
         released = len(self._state.values)
         self._state.values.clear()
         return released
@@ -435,12 +468,12 @@ class MicrobatchEngine:
 
     def commit_reports(
         self,
-        dispatch_batch: DispatchBatch,
+        execution_microbatch: ExecutionMicrobatch,
         reports: tuple[WorkerReport, ...],
     ) -> None:
-        """Preflight all reports for one DispatchBatch before ordered publication."""
+        """Preflight all reports for one ExecutionMicrobatch before ordered publication."""
 
-        if len(reports) != len(dispatch_batch.grains):
+        if len(reports) != len(execution_microbatch.grains):
             raise CommitError("Worker reports must exactly cover the dispatch batch")
         by_grain: dict[GrainRef, WorkerReport] = {}
         for report in reports:
@@ -449,15 +482,15 @@ class MicrobatchEngine:
             if report.grain in by_grain:
                 raise CommitError("duplicate Grain report")
             by_grain[report.grain] = report
-        if set(by_grain) != set(dispatch_batch.grains):
+        if set(by_grain) != set(execution_microbatch.grains):
             raise CommitError("Worker reports must exactly cover the dispatch batch")
 
-        ordered = tuple(by_grain[grain] for grain in dispatch_batch.grains)
+        ordered = tuple(by_grain[grain] for grain in execution_microbatch.grains)
         for report in ordered:
             self._dispatch.validate_in_flight(report.grain, report.generation)
 
         # Discover every new barrier before preparing any success. Stable
-        # DispatchBatch order, not report tuple order, chooses the canonical cause.
+        # ExecutionMicrobatch order, not report tuple order, chooses the canonical cause.
         pending_barriers: dict[tuple[CallRef, EntityRef], object] = {}
         for report in ordered:
             if isinstance(report, GrainFailureReport) and report.suppress_siblings:
@@ -696,25 +729,27 @@ class MicrobatchEngine:
 
     def apply_udf_recovery(
         self,
-        dispatch_batch: DispatchBatch,
-        action: RecoveryAction,
+        execution_microbatch: ExecutionMicrobatch,
+        policy: RecoveryPolicy,
         cause: object,
-    ) -> int:
-        """Suppress barriered peers, then apply one action to the exact live subset."""
+    ) -> int | None:
+        """Partition once, decide, and apply recovery to the exact live subset.
 
-        live, barriered = self._partition_in_flight(dispatch_batch)
-        if action is RecoveryAction.ABORT:
-            raise CommitError("ABORT is terminal and cannot mutate a microbatch")
+        Return requeued Grain count, or None to abort without changing state.
+        An entirely barriered batch completes without consulting the UDF policy.
+        """
+
+        live, barriered = self._partition_in_flight(execution_microbatch)
         if live is None:
             self._seal_and_publish_suppressed(barriered)
             self.advance()
             return 0
-        if action is RecoveryAction.FAIL_SINGLETON and len(live.grains) != 1:
-            raise CommitError("FAIL_SINGLETON requires one live Grain")
-        if action is RecoveryAction.SPLIT_TAIL and (
-            live.udf_retries == 0 or len(live.grains) <= 1
-        ):
-            raise CommitError("split requires one failed live recovery batch")
+        action = policy.decide_udf(
+            completed_retries=live.udf_retries,
+            grain_count=len(live.grains),
+        )
+        if action is RecoveryAction.ABORT:
+            return None
 
         self._seal_and_publish_suppressed(barriered)
 
@@ -734,37 +769,20 @@ class MicrobatchEngine:
             self.advance()
         return retried
 
-    def live_recovery_batch(
-        self,
-        dispatch_batch: DispatchBatch,
-    ) -> DispatchBatch | None:
-        """Return the current live subset for a pure RecoveryPolicy decision."""
-
-        live, _ = self._partition_in_flight(dispatch_batch)
-        return live
-
-    def suppress_barriered_batch(self, dispatch_batch: DispatchBatch) -> None:
-        """Suppress an in-flight batch whose every Grain is behind a barrier."""
-
-        live, barriered = self._partition_in_flight(dispatch_batch)
-        if live is not None:
-            raise CommitError("dispatch still contains live Grains")
-        self._seal_and_publish_suppressed(barriered)
-        self.advance()
-
     def retry_infrastructure_dispatch(
         self,
-        dispatch_batch: DispatchBatch,
+        execution_microbatch: ExecutionMicrobatch,
         policy: RecoveryPolicy,
     ) -> int | None:
         """Return retried live Grains, or None when the live budget is exhausted."""
 
-        live, barriered = self._partition_in_flight(dispatch_batch)
+        live, barriered = self._partition_in_flight(execution_microbatch)
         if live is not None:
             failures = self._dispatch.infrastructure_failures(live)
             if not policy.allows_infrastructure_retry(failures):
                 return None
-            self._seal_and_publish_suppressed(barriered)
+
+        self._seal_and_publish_suppressed(barriered)
         retried = (
             0 if live is None else self._dispatch.recover_infrastructure(live)
         )
@@ -774,11 +792,11 @@ class MicrobatchEngine:
 
     def _partition_in_flight(
         self,
-        dispatch_batch: DispatchBatch,
-    ) -> tuple[DispatchBatch | None, tuple[GrainRef, ...]]:
+        execution_microbatch: ExecutionMicrobatch,
+    ) -> tuple[ExecutionMicrobatch | None, tuple[GrainRef, ...]]:
         return self._dispatch.partition_in_flight(
-            dispatch_batch,
-            self._suppression_barriers.anchors_for(dispatch_batch.grains[0].call),
+            execution_microbatch,
+            self._suppression_barriers.anchors_for(execution_microbatch.grains[0].call),
         )
 
     def _seal_and_publish_suppressed(
@@ -828,6 +846,9 @@ class MicrobatchEngine:
         self._state.items[item] = record
         if binding is not None:
             self._state.values[item] = binding
+        # Summaries must see the whole committed batch before its events run.
+        # Idempotent replays return above, so each member is counted only once.
+        self._update_reduce_progress(item, outcome)
         self._fact_queue.append(item)
 
     def _publish_expansion(
@@ -996,6 +1017,38 @@ class MicrobatchEngine:
             cause=cause_item if cause is None else cause,
         )
 
+    def _update_reduce_progress(self, item: ItemRef, outcome: ItemOutcome) -> None:
+        origin = self._state.entity_lineage.get(item.entity)
+        if origin is None:
+            return
+        for effect in self.plan.item_effects_by_source.get(item.port, ()):
+            if isinstance(effect, ReduceEffect) and item.port == effect.members_port:
+                target = ItemRef(effect.target_port, origin.parent_entity)
+                progress = self._reduce_progress.get(target)
+                if progress is not None:
+                    progress.accept_member(origin.ordinal, outcome)
+
+    def _reduce_values(
+        self,
+        effect: ReduceEffect,
+        children: tuple[EntityRef, ...],
+        progress: _ReduceProgress,
+    ) -> Iterator[tuple[int, ItemOutcome | None]]:
+        """Resume at the first unchecked value; never revisit a settled prefix.
+
+        The transition consumes this iterator only after membership settles,
+        and stops at the first missing or unsuccessful survivor value.
+        """
+
+        while progress.next_value_index < len(children):
+            index = progress.next_value_index
+            child = children[index]
+            member = self._state.items[ItemRef(effect.members_port, child)]
+            if member.outcome is ItemOutcome.PRESENT:
+                value = self._state.items.get(ItemRef(effect.value_port, child))
+                yield index, None if value is None else value.outcome
+            progress.next_value_index += 1
+
     def _try_reduce(self, effect: ReduceEffect, parent: EntityRef) -> None:
         """Restore one parent nested-group value after its facts settle."""
 
@@ -1007,66 +1060,62 @@ class MicrobatchEngine:
         if expansion is None:
             return
         children = () if expansion.children is None else expansion.children
-        member_items = tuple(
-            ItemRef(effect.members_port, child) for child in children
-        )
-        value_items = tuple(
-            ItemRef(effect.value_port, child) for child in children
-        )
+        progress = self._reduce_progress.get(target)
+        if progress is None:
+            progress = _ReduceProgress(len(children))
+            for index, child in enumerate(children):
+                member = self._state.items.get(ItemRef(effect.members_port, child))
+                if member is not None:
+                    progress.accept_member(index, member.outcome)
+            self._reduce_progress[target] = progress
         decision = reduce_transition(
             expansion.outcome,
-            tuple(
-                None if item not in self._state.items else self._state.items[item].outcome
-                for item in member_items
-            ),
-            tuple(
-                None if item not in self._state.items else self._state.items[item].outcome
-                for item in value_items
-            ),
+            pending_members=progress.pending_members,
+            first_failed_member=progress.first_failed_member,
+            values=self._reduce_values(effect, children, progress),
         )
         if decision.outcome is None:
             return
+        del self._reduce_progress[target]
         if decision.outcome is not ItemOutcome.PRESENT:
             cause: object = (
                 expansion_ref if expansion.cause is None else expansion.cause
             )
             if decision.cause is ReduceCause.MEMBER:
                 assert decision.cause_index is not None
-                cause = member_items[decision.cause_index]
+                cause = ItemRef(effect.members_port, children[decision.cause_index])
             elif decision.cause is ReduceCause.VALUE:
                 assert decision.cause_index is not None
-                cause = value_items[decision.cause_index]
+                cause = ItemRef(effect.value_port, children[decision.cause_index])
             self._publish_item(target, decision.outcome, cause=cause)
             return
 
-        # Membership determines eligibility; values only provide payload for
-        # survivors selected by the pure reduce transition.
-        survivor_items = tuple(value_items[index] for index in decision.survivors)
+        # Build the output once; pending groups retain no per-child copy.
+        survivor_items = tuple(
+            ItemRef(effect.value_port, child)
+            for child in children
+            if self._state.items[ItemRef(effect.members_port, child)].outcome
+            is ItemOutcome.PRESENT
+        )
 
         bindings = tuple(self._state.values[item] for item in survivor_items)
-        # A one-level reduce collects rows. Nested reductions concatenate child
-        # layouts into one canonical CSR layout plus a flat leaf-reference list.
-        value_depth = effect.value_depth
-        if not bindings and value_depth > 0:
-            group_layout = NestedGroupLayout.nest((), child_depth=value_depth)
-            flat_items = ()
-        elif not bindings or all(isinstance(value, RowBinding) for value in bindings):
-            group_layout = NestedGroupLayout.one_level(len(bindings))
-            flat_items = survivor_items
-        elif all(isinstance(value, NestedGroupBinding) for value in bindings):
+        # The plan supplies the same shape contract for empty and nonempty groups.
+        if effect.value_depth > 0:
+            if not all(isinstance(value, NestedGroupBinding) for value in bindings):
+                raise CommitError("Reduce expected grouped values from its compiled shape")
             groups = tuple(value for value in bindings if isinstance(value, NestedGroupBinding))
-            depth = groups[0].layout.depth if groups else effect.value_depth
             group_layout = NestedGroupLayout.nest(
                 tuple(group.layout for group in groups),
-                child_depth=depth,
+                child_depth=effect.value_depth,
             )
             flat_items = tuple(
                 item for group in groups for item in group.flat_items
             )
         else:
-            raise CommitError(
-                "nested-group values mix scalar and grouped realizations"
-            )
+            if not all(isinstance(value, RowBinding) for value in bindings):
+                raise CommitError("Reduce expected row values from its compiled shape")
+            group_layout = NestedGroupLayout.one_level(len(bindings))
+            flat_items = survivor_items
 
         self._publish_item(
             target,
@@ -1079,12 +1128,45 @@ class MicrobatchEngine:
         effect: BroadcastEffect,
         source_item: ItemRef,
     ) -> None:
-        for entity in self._entities_by_domain.get(effect.target_domain, ()):
-            if (
-                self._ancestor_entity(entity, effect.source_domain)
-                == source_item.entity
-            ):
-                self._try_broadcast_to_entity(effect, entity)
+        for entity in self._broadcast_descendants(effect, source_item.entity):
+            self._try_broadcast_to_entity(effect, entity)
+
+    def _broadcast_descendants(
+        self,
+        effect: BroadcastEffect,
+        source_entity: EntityRef,
+    ) -> Iterator[EntityRef]:
+        """Walk existing Expansion facts with O(depth) auxiliary space.
+
+        Keep one child iterator per level, never a collection of all descendants.
+        Missing expansions need no waiter: later target Entity events read the
+        already-published source. Worker commits publish their complete expansion
+        and lineage facts before the event loop runs.
+        """
+
+        path = []
+        domain = effect.target_domain
+        while domain != effect.source_domain:
+            path.append(domain)
+            parent = self.plan.domain(domain).parent
+            if parent is None:
+                raise CommitError("broadcast target Domain has no source ancestor")
+            domain = parent
+        path.reverse()
+
+        stack = [iter((source_entity,))]
+        while stack:
+            entity = next(stack[-1], None)
+            if entity is None:
+                stack.pop()
+                continue
+            depth = len(stack) - 1
+            if depth == len(path):
+                yield entity
+                continue
+            expansion = self._state.expansions.get(ExpansionRef(path[depth], entity))
+            if expansion is not None and expansion.children:
+                stack.append(iter(expansion.children))
 
     def _try_broadcast_to_entity(
         self,
@@ -1179,4 +1261,4 @@ class MicrobatchEngine:
         return total * (total + 1) // 2 + right
 
 
-__all__ = ["MicrobatchEngine", "CommitError"]
+__all__ = ["InputBatchEngine", "CommitError"]
