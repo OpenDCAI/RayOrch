@@ -73,13 +73,6 @@ class GrainRef:
     entity: EntityRef
 
 
-class InputMode(Enum):
-    """Propagation policy when a Call input is not PRESENT."""
-
-    REQUIRED = auto()
-    OPTIONAL = auto()
-
-
 class ItemOutcome(Enum):
     """Mutually exclusive terminal Item states; only PRESENT carries a value."""
 
@@ -105,26 +98,14 @@ class ExpansionOutcome(Enum):
     FAILED = auto()
 
 
-class _Missing:
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "MISSING"
-
-
-MISSING = _Missing()
-
-
 __all__ = [
     "CallRef",
     "DomainRef",
     "EntityRef",
     "GrainPhase",
     "GrainRef",
-    "InputMode",
     "ItemOutcome",
     "ItemRef",
-    "MISSING",
     "PortRef",
     "ExpansionOutcome",
 ]

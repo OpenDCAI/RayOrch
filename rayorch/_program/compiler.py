@@ -1,7 +1,7 @@
 """Fixed, Ray-free static compiler pipeline.
 
 This is not a pluggable pass manager. The only supported order is:
-verify logical -> analyze -> optional canonicalize -> lower -> verify plan.
+verify logical -> analyze -> configurable canonicalize -> lower -> verify plan.
 Disabling canonicalization retains the same analysis, lowering, and final
 verification phases.
 """

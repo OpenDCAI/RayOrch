@@ -63,12 +63,7 @@ class NestedGroupInput:
     offsets_by_level: tuple[tuple[int, ...], ...]
 
 
-@dataclass(frozen=True, slots=True)
-class MissingInput:
-    """Optional+DROPPED input reconstructed as the singleton MISSING value."""
-
-
-GrainInput = RowBinding | NestedGroupInput | MissingInput
+GrainInput = RowBinding | NestedGroupInput
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,7 +167,6 @@ __all__ = [
     "CallInputLayout",
     "GrainInput",
     "GrainInvocation",
-    "MissingInput",
     "CallOutputLayout",
     "PortOutputReport",
     "RowBinding",

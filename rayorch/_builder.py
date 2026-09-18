@@ -7,13 +7,12 @@ import inspect
 import itertools
 from typing import Any
 
-from ._model import CallRef, DomainRef, InputMode, PortRef
-from .api import OptionalInput, Pipeline, Port, RayModule
+from ._model import CallRef, DomainRef, PortRef
+from .api import Pipeline, Port, RayModule
 from .errors import CompileError
 from ._program.compiler import compile_logical
 from ._program.logical import (
     BroadcastOrigin,
-    CallInputSpec,
     CallOutputOrigin,
     CallSpec,
     DomainSpec,
@@ -79,15 +78,13 @@ class ProgramBuilder:
             raise CompileError("RayModule requires at least one Port input")
 
         positional_inputs = [
-            CallInputSpec(*self._input(value, f"arg_{index}"))
-            for index, value in enumerate(args)
+            self._input(value, f"arg_{index}") for index, value in enumerate(args)
         ]
         keyword_inputs = [
-            (name, CallInputSpec(*self._input(value, name)))
-            for name, value in kwargs.items()
+            (name, self._input(value, name)) for name, value in kwargs.items()
         ]
         inputs = (*positional_inputs, *(item for _, item in keyword_inputs))
-        domains = {self.ports[item.port].domain for item in inputs}
+        domains = {self.ports[port].domain for port in inputs}
         if len(domains) != 1:
             raise CompileError(
                 "RayModule inputs belong to different Domains; use explicit "
@@ -250,13 +247,10 @@ class ProgramBuilder:
             raise CompileError(f"{label} requires at least one Port")
         return tuple(self.spec(port, label) for port in ports)
 
-    def _input(self, value: Any, name: str) -> tuple[PortRef, InputMode]:
-        if isinstance(value, OptionalInput):
-            self.spec(value.port, f"input {name}")
-            return value.port.ref, InputMode.OPTIONAL
+    def _input(self, value: Any, name: str) -> PortRef:
         if isinstance(value, Port):
             self.spec(value, f"input {name}")
-            return value.ref, InputMode.REQUIRED
+            return value.ref
         raise CompileError(f"RayModule input {name!r} must be a Port")
 
     def _is_ancestor(self, ancestor: DomainRef, child: DomainRef) -> bool:

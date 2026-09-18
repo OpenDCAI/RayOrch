@@ -51,8 +51,8 @@ def analyze(logical: LogicalProgram) -> ProgramAnalysis:
     expansion_sources: dict[DomainRef, list[PortRef]] = {}
 
     for call, spec in logical.calls.items():
-        for index, input_ in enumerate(spec.ordered_inputs):
-            consumers.setdefault(input_.port, []).append(CallUse(call, index))
+        for index, port in enumerate(spec.ordered_inputs):
+            consumers.setdefault(port, []).append(CallUse(call, index))
 
     for port, semantic in semantics.items():
         for input_ in semantic.inputs:

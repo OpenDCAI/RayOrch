@@ -27,13 +27,6 @@ class Port:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class OptionalInput:
-    """Port wrapper that changes input policy without creating another Port."""
-
-    port: Port
-
-
 class RayModule:
     """Declarative UDF recipe; actor handles exist only in the execution layer."""
 
@@ -62,7 +55,13 @@ class RayModule:
         return self
 
     def ray_options(self, **options: Any) -> Self:
-        """Record physical execution options and return this recipe."""
+        """Record physical execution options and return this recipe.
+
+        RayOrch consumes ``replicas``, ``batch_size``, and ``recovery``.
+        Every other option is passed unchanged to ``ray.remote(...).options``.
+        In particular, ``runtime_env={"conda": "environment-name"}`` runs
+        this stage's persistent actors in that Conda environment.
+        """
 
         if "num_outputs" in options:
             raise ValueError("use RayModule.returns(...) for logical outputs")
@@ -116,4 +115,4 @@ class Pipeline:
         return compile_pipeline(self, optimize=optimize)
 
 
-__all__ = ["OptionalInput", "Pipeline", "Port", "RayModule", "function"]
+__all__ = ["Pipeline", "Port", "RayModule", "function"]

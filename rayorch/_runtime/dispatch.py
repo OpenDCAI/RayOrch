@@ -56,7 +56,7 @@ class DispatchState:
     """Own runnable queues and every mutable Grain execution record.
 
     A Grain enters its Call's READY queue as soon as the engine observes all
-    required inputs. Reserving directly from these queues makes dispatch
+    inputs as PRESENT. Reserving directly from these queues makes dispatch
     completion-driven: downstream work need not wait for an upstream stage or
     input domain to finish globally.
     """

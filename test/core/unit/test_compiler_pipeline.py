@@ -118,7 +118,6 @@ def test_root_public_api_is_deliberately_small():
         "F",
         "GroupFailure",
         "ItemOutcome",
-        "MISSING",
         "OutputIssue",
         "Pipeline",
         "Port",
@@ -132,6 +131,8 @@ def test_root_public_api_is_deliberately_small():
         "run",
         "version_info",
     }
+    assert not hasattr(ro, "MISSING")
+    assert not hasattr(ro.F, "optional")
 
 
 def test_experimental_runtime_name_is_not_a_public_namespace():

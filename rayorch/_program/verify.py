@@ -57,10 +57,10 @@ def verify_logical(logical: LogicalProgram) -> None:
     for call, spec in logical.calls.items():
         if spec.execution_domain not in logical.domains:
             raise CompileError(f"Call {call} has an unknown execution Domain")
-        for input_ in spec.ordered_inputs:
-            if input_.port not in logical.ports:
+        for port in spec.ordered_inputs:
+            if port not in logical.ports:
                 raise CompileError(f"Call {call} references an unknown input Port")
-            if logical.port(input_.port).domain != spec.execution_domain:
+            if logical.port(port).domain != spec.execution_domain:
                 raise CompileError(f"Call {call} input Domain mismatch")
 
     # ── Source admission contract ────────────────────────────────────────
@@ -180,8 +180,7 @@ def _verify_acyclic(
             if semantic.producing_call not in logical.calls:
                 raise CompileError("CallOutput references an unknown Call")
             dependencies.extend(
-                input_.port
-                for input_ in logical.call(semantic.producing_call).ordered_inputs
+                logical.call(semantic.producing_call).ordered_inputs
             )
         for dependency in dependencies:
             if dependency not in semantics:
@@ -291,9 +290,9 @@ def verify_runtime_plan(
         )
         if plan.input_layouts_by_call[call] != expected_layout:
             raise CompileError("RuntimePlan Worker input layout does not match CallSpec")
-        for index, input_ in enumerate(spec.ordered_inputs):
+        for index, port in enumerate(spec.ordered_inputs):
             if CallInputEffect(call, index) not in plan.item_effects_by_source.get(
-                input_.port, ()
+                port, ()
             ):
                 raise CompileError("RuntimePlan omitted a Call input Effect")
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Iterable
 
-from .._model import GrainPhase, InputMode, ItemOutcome, ExpansionOutcome
+from .._model import GrainPhase, ItemOutcome, ExpansionOutcome
 
 
 class InvalidTransition(ValueError):
@@ -89,21 +89,20 @@ class CallTransition:
 
 
 def call_transition(
-    modes: tuple[InputMode, ...],
     outcomes: tuple[ItemOutcome | None, ...],
 ) -> CallTransition:
-    """Classify a Call with failure > unresolved > required-drop precedence."""
+    """Classify a Call with failure > unresolved > drop precedence."""
 
-    if not modes or len(modes) != len(outcomes):
-        raise InvalidTransition("Call modes/outcomes must be non-empty and aligned")
+    if not outcomes:
+        raise InvalidTransition("Call outcomes must be non-empty")
 
     for index, outcome in enumerate(outcomes):
         if outcome in {ItemOutcome.FAILED, ItemOutcome.SUPPRESSED}:
             return CallTransition(CallAction.SUPPRESS_OUTPUTS, index)
     if any(outcome is None for outcome in outcomes):
         return CallTransition(CallAction.WAIT)
-    for index, (mode, outcome) in enumerate(zip(modes, outcomes)):
-        if mode is InputMode.REQUIRED and outcome is ItemOutcome.DROPPED:
+    for index, outcome in enumerate(outcomes):
+        if outcome is ItemOutcome.DROPPED:
             return CallTransition(CallAction.DROP_OUTPUTS, index)
     return CallTransition(CallAction.READY)
 

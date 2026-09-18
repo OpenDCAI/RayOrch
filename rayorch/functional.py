@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from ._builder import active_builder
-from .api import OptionalInput, Port
-from .errors import CompileError
+from .api import Port
 
 
 def expand(port: Port) -> Port:
@@ -46,20 +45,11 @@ def filter(port: Port, mask: Port) -> Port:
     return active_builder().filter(port, mask)
 
 
-def optional(port: Port) -> OptionalInput:
-    """Mark a Port as an optional Call input without creating a graph node."""
-
-    if not isinstance(port, Port):
-        raise CompileError("optional requires a Port")
-    return OptionalInput(port)
-
-
 __all__ = [
     "broadcast",
     "expand",
     "expand_aligned",
     "filter",
-    "optional",
     "reduce",
     "reduce_aligned",
 ]

@@ -103,3 +103,17 @@ def test_program_phase_exports_are_deliberate() -> None:
     assert not hasattr(compiler, "verify_runtime_plan")
     assert verify.__all__ == ["verify_logical", "verify_runtime_plan"]
     assert lowering.__all__ == []
+
+
+def test_benchmark_workloads_use_public_rayorch_apis() -> None:
+    """Example workloads must not teach users to depend on private internals."""
+
+    violations = []
+    for path in (PACKAGE / "benchmarks").rglob("*.py"):
+        for target in _local_imports(path):
+            if target and target[0].startswith("_"):
+                violations.append(
+                    f"{path.relative_to(PACKAGE)} -> {'.'.join(target)}"
+                )
+
+    assert not violations, "\n".join(violations)

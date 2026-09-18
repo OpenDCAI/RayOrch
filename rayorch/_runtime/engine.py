@@ -17,7 +17,6 @@ from .._model import (
     DomainRef,
     EntityRef,
     GrainRef,
-    InputMode,
     ItemOutcome,
     ItemRef,
     PortRef,
@@ -49,7 +48,6 @@ from .._protocol import (
     GrainReport,
     NestedGroupInput,
     GrainInvocation,
-    MissingInput,
     PortOutputReport,
     RowBinding,
     WorkerReport,
@@ -268,15 +266,10 @@ class InputBatchEngine:
 
         call = self.plan.call(grain.call)
         inputs = []
-        for input_spec in call.ordered_inputs:
-            item = ItemRef(input_spec.port, grain.entity)
-            receipt = self._state.items[item]
-            if (
-                input_spec.mode is InputMode.OPTIONAL
-                and receipt.outcome is ItemOutcome.DROPPED
-            ):
-                inputs.append(MissingInput())
-                continue
+        for input_port in call.ordered_inputs:
+            item = ItemRef(input_port, grain.entity)
+            if self._state.items[item].outcome is not ItemOutcome.PRESENT:
+                raise CommitError("runnable Grain inputs must be PRESENT")
             binding = self._state.values[item]
             if isinstance(binding, RowBinding):
                 inputs.append(binding)
@@ -906,7 +899,6 @@ class InputBatchEngine:
     ) -> bool:
         """Classify a Grain from input facts and report whether it left WAITING."""
 
-        call = self.plan.call(grain.call)
         parent_anchor = self._parent_anchor(grain.entity)
         if self._suppression_barriers.is_barriered(grain.call, parent_anchor):
             self._dispatch.inputs_terminal(grain)
@@ -920,10 +912,7 @@ class InputBatchEngine:
             None if item is None else self._state.items[item].outcome
             for item in inputs
         )
-        decision = call_transition(
-            tuple(input_.mode for input_ in call.ordered_inputs),
-            outcomes,
-        )
+        decision = call_transition(outcomes)
         if decision.action is CallAction.WAIT:
             return False
         if decision.action is CallAction.READY:

@@ -2,7 +2,7 @@
 
 from . import benchmark, functional as F
 from ._execution.executor import Executor
-from ._model import ItemOutcome, MISSING
+from ._model import ItemOutcome
 from .api import Pipeline, Port, RayModule, function
 from .errors import CompileError, ExecutionError
 from .failures import GroupFailure, RecordFailure
@@ -18,7 +18,6 @@ __all__ = [
     "F",
     "GroupFailure",
     "ItemOutcome",
-    "MISSING",
     "OutputIssue",
     "Pipeline",
     "Port",

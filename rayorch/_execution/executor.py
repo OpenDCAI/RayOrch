@@ -225,9 +225,13 @@ class Executor:
 
                 if len(completed) == len(slices):
                     break
-                if not pending_rpcs and next_input_batch < len(slices):
-                    # Completed input batches freed admission credit for the next
-                    # source slice; the following turn can make progress.
+                if (
+                    not pending_rpcs
+                    and next_input_batch < len(slices)
+                    and len(active) < max_active_input_batches
+                ):
+                    # Retirement freed admission credit for a remaining source
+                    # slice, so the following turn can make progress.
                     continue
                 if not pending_rpcs and made_progress:
                     # A cleanup-only reservation can publish SUPPRESSED facts

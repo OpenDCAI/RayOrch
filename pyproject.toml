@@ -28,10 +28,6 @@ dynamic = ["version", "dependencies"]
 Github = "https://github.com/OpenDCAI/RayOrch"
 "Bug Reports" = "https://github.com/OpenDCAI/RayOrch/issues"
 
-[project.scripts]
-rayorch-mineru-job = "rayorch.benchmark.mineru.job:main"
-
-
 [tool.setuptools]
 include-package-data = true
 
@@ -39,7 +35,13 @@ include-package-data = true
 include = ["rayorch*"]
 
 [tool.setuptools.package-data]
-"rayorch.benchmark.mineru" = ["runtime_env.json"]
+"rayorch.benchmarks.mineru" = ["env.json", "README.md"]
+"rayorch.benchmarks.document_topology" = ["env.json", "README.md"]
+"rayorch.benchmarks.dual_vllm" = ["env.json", "README.md"]
+"rayorch.benchmarks.sglang_vllm" = ["env.json", "README.md"]
+"rayorch.benchmarks.video_caption" = ["env.json", "README.md"]
+"rayorch.benchmarks.video_multimodal" = ["env.json", "README.md"]
+"rayorch.benchmarks.yolo_sam" = ["env.json", "README.md"]
 
 
 [tool.setuptools.dynamic]

@@ -1,24 +1,51 @@
-"""Lazy benchmark namespace; importing it never imports workload dependencies."""
+"""Lazy Benchmark API; importing it never imports workload dependencies."""
 
 from __future__ import annotations
 
-from importlib import import_module
 from typing import Any
 
-from .registry import available, get_plugin, register_plugin
+from .execution import benchmark_config, run_benchmark
+from .report import BenchmarkReport
+from .submission import (
+    BenchmarkRun,
+    LocalSource,
+    submit_benchmark,
+)
+from .registry import (
+    available,
+    load,
+    public_names,
+    register,
+)
 
-__all__ = ["available", "get_plugin", "register_plugin"]
+__all__ = [
+    "BenchmarkReport",
+    "BenchmarkRun",
+    "DocumentTopologyBench",
+    "DualVllmBench",
+    "LocalSource",
+    "MinerUBench",
+    "SglangVllmBench",
+    "VideoCaptionTopologyBench",
+    "VideoMultimodalTopologyBench",
+    "YoloSamBench",
+    "available",
+    "benchmark_config",
+    "load",
+    "register",
+    "run_benchmark",
+    "submit_benchmark",
+]
 
 
 def __getattr__(name: str) -> Any:
-    try:
-        plugin = get_plugin(name)
-    except KeyError as exc:
-        raise AttributeError(name) from exc
-    module = import_module(plugin.runtime_package)
-    globals()[name] = module
-    return module
+    benchmark_name = public_names().get(name)
+    if benchmark_name is None:
+        raise AttributeError(name)
+    benchmark = load(benchmark_name)
+    globals()[name] = benchmark
+    return benchmark
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(__all__) | set(available()))
+    return sorted(set(globals()) | set(__all__) | set(public_names()))

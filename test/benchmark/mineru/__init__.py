@@ -1,1 +1,0 @@
-"""MinerU benchmark tests."""

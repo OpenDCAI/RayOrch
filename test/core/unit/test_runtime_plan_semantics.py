@@ -327,11 +327,11 @@ def test_keyword_only_input_preserves_default_without_identity_driver():
     assert tuple(name for name, _ in spec.kwargs) == ("masks",)
     assert spec.ordered_inputs == (
         *spec.args,
-        *(input_ for _, input_ in spec.kwargs),
+        *(port for _, port in spec.kwargs),
     )
     assert not hasattr(spec, "inputs")
-    assert all(not hasattr(input_, "name") for input_ in spec.ordered_inputs)
-    assert all(not hasattr(input_, "keyword") for input_ in spec.ordered_inputs)
+    assert all(isinstance(port, PortRef) for port in spec.ordered_inputs)
+    assert all(not hasattr(port, "mode") for port in spec.ordered_inputs)
     assert compiled.plan.input_layouts_by_call[call].positional_count == 1
     assert compiled.plan.input_layouts_by_call[call].keyword_names == ("masks",)
 
@@ -361,38 +361,31 @@ def test_reordered_keyword_inputs_keep_python_binding_semantics():
     )
 
 
-def test_all_optional_call_runs_with_missing_values_and_no_driver():
-    class MissingAware:
-        def run(self, left, right):
-            return [
-                -1 if lhs is ro.MISSING and rhs is ro.MISSING else lhs + rhs
-                for lhs, rhs in zip(left, right)
-            ]
+def test_none_remains_an_ordinary_call_value():
+    class Preserve:
+        def run(self, values):
+            return list(values)
 
-    class AllOptional(ro.Pipeline):
+    class PreservePipeline(ro.Pipeline):
         def __init__(self) -> None:
-            self.call = ro.RayModule(MissingAware)
+            self.call = ro.RayModule(Preserve)
 
-        def forward(self, left, right, masks):
-            selected_left = ro.F.filter(left, masks)
-            selected_right = ro.F.filter(right, masks)
-            return self.call(
-                ro.F.optional(selected_left),
-                ro.F.optional(selected_right),
-            )
+        def forward(self, values):
+            return self.call(values)
 
-    outputs, _compiled, _arena = run_sync(
-        AllOptional(),
-        [10, 20],
-        [1, 2],
-        [False, True],
+    outputs, _compiled, _engine = run_sync(
+        PreservePipeline(),
+        [None, 1],
     )
-    assert outputs == [-1, 22]
+    assert outputs == [None, 1]
 
 
-def test_required_drop_is_symmetric_across_call_inputs():
+def test_dropped_input_prevents_call_independent_of_position():
+    calls = []
+
     class Add:
         def run(self, left, right):
+            calls.append((tuple(left), tuple(right)))
             return [lhs + rhs for lhs, rhs in zip(left, right)]
 
     class SymmetricDrop(ro.Pipeline):
@@ -413,6 +406,7 @@ def test_required_drop_is_symmetric_across_call_inputs():
         [True, False],
     )
     assert outputs == [ro.OutputIssue(ItemOutcome.DROPPED), ro.OutputIssue(ItemOutcome.DROPPED)]
+    assert calls == []
 
 
 def test_call_failure_dominates_required_drop_independent_of_arrival_order():

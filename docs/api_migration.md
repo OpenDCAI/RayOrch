@@ -62,6 +62,23 @@ fields use the same units as their corresponding public metrics.
 `pre_init()`, `Item`, `Grain`, their identity references, and failure names remain
 unchanged.
 
+## Required Call inputs
+
+The pre-release `F.optional(port)` and `MISSING` input sentinel have been removed.
+They had no benchmark or production adapter using them and added a second Call
+input policy throughout the compiler, runtime state machine, and Worker ABI.
+
+All Call inputs now follow one rule:
+
+- all inputs are `PRESENT`: execute the Grain;
+- any input is `DROPPED`: do not execute it and publish `DROPPED` outputs;
+- any input is `FAILED` or `SUPPRESSED`: do not execute it and publish
+  `SUPPRESSED` outputs.
+
+`None` remains an ordinary business value and is not treated as missing. Sparse
+branch combination is not a structural primitive in this release; applications
+can keep a tagged optional value inside one ordinary business Item when needed.
+
 ## Output results
 
 Non-present final outputs now return `rayorch.OutputIssue` instead of a bare
@@ -71,7 +88,7 @@ no new runtime states or recovery actions are introduced.
 | Outcome | Meaning | Final representation |
 | --- | --- | --- |
 | `PRESENT` | A value exists, including a valid `None` or empty list | The original business value |
-| `DROPPED` | Filtered out, or missing a required input because it was filtered | `OutputIssue(ItemOutcome.DROPPED)` |
+| `DROPPED` | Filtered out, or downstream of an input that was filtered | `OutputIssue(ItemOutcome.DROPPED)` |
 | `FAILED` | A failed value, including one inherited through a transparent view | `OutputIssue(ItemOutcome.FAILED, cause)` |
 | `SUPPRESSED` | A result unavailable or discarded because of another failure or dependency outcome | `OutputIssue(ItemOutcome.SUPPRESSED, cause)` |
 
@@ -141,3 +158,45 @@ Existing RPC, Grain dispatch/requeue, execution batch-size, actor-instance,
 input-batch, and timing metrics retain their definitions. RPC dispatch counts
 are not a substitute for the removed count of batches actually received by a
 Worker. Scheduling, recovery, and final output semantics are unchanged.
+
+## Benchmark API
+
+The pre-release `rayorch-mineru-job` launcher and
+`rayorch.benchmark.mineru.job` module have been removed. They inferred a source
+checkout from an installed package and always built transport wheels, so the
+installed CLI contract was not reliable.
+
+Benchmark framework code now lives in `rayorch.benchmark`; built-in workload
+implementations live separately in `rayorch.benchmarks`. The supported public
+import remains unchanged:
+
+Use the lazy Python API instead:
+
+```python
+from rayorch.benchmark import MinerUBench
+
+bench = MinerUBench(
+    input_path="/shared/pdfs",
+    input_limit=368,
+    model="/shared/models/mineru",
+    output_dir="/shared/results",
+    num_gpus=8,
+    batch_size=64,
+)
+
+report = bench.run(ray_address="auto")
+```
+
+There is no replacement workload-specific CLI. Python is the single public
+entrypoint, avoiding a duplicate parameter surface.
+
+Remote submission uses Ray Jobs through `MinerUBench.submit()`:
+
+- omit `source` when RayOrch and workload dependencies are already installed;
+- pass `source=LocalSource(project_root, modules=...)` for Ray-managed source
+  upload and dependency installation;
+- set `install_dependencies=False` only for an already prepared environment.
+
+Wheel construction is no longer required, and no source root is inferred from
+`site-packages`. Input, model, output, and artifact paths used remotely must be
+visible from the cluster.

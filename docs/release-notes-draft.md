@@ -1,6 +1,6 @@
 # Release notes — draft
 
-Unreleased. Updated: 2026-09-16. Release version and date are not yet assigned.
+Unreleased. Updated: 2026-09-18. Release version and date are not yet assigned.
 Completed changes below refer to the working tree; planned changes are explicitly
 marked and must be verified before being announced as shipped.
 
@@ -28,6 +28,45 @@ marked and must be verified before being announced as shipped.
   failure classification, error wrapping, actor/RPC ownership and metrics.
   Retry budgets, batch boundaries and isolation policies are unchanged; no
   additional RPC, queue or persistent cache is introduced by this refactor.
+- Removed the unused pre-release `F.optional` / `MISSING` input mechanism.
+  Calls now have one input rule: all inputs must be present to execute; dropped
+  inputs propagate dropped outputs, while failed or suppressed inputs propagate
+  suppression. This also removes the optional-mode wrapper and Worker sentinel
+  branch rather than retaining compatibility aliases.
+- Fixed Executor deadlock detection when active InputBatch capacity is full and
+  later source slices have not entered. Remaining input now postpones the
+  deadlock check only when the next loop can actually admit another batch;
+  cleanup-only semantic progress and pending RPC behavior are unchanged.
+- Replaced the MinerU wheel-building Job launcher with a lazy `MinerUBench`
+  Python API. Input count, GPU count, batching, model, and paths are explicit
+  configuration; `run()` returns a persisted `BenchmarkReport` with scheduling,
+  throughput, RSS, and driver-visible GPU metrics. `submit()` uses Ray Jobs with
+  either the installed cluster environment or explicit `LocalSource` upload, so
+  wheel construction is unnecessary and source roots are never inferred from
+  an installed package.
+- Separated reusable Benchmark infrastructure (`rayorch.benchmark`) from
+  built-in workload implementations (`rayorch.benchmarks`). The public import
+  remains `from rayorch.benchmark import MinerUBench`.
+- Reduced the built-in workload contract to four meaningful files:
+  `udfs.py`, `pipeline.py`, `env.json`, and a thin `benchmark.py`.
+  Workload-specific plugin, CLI, runner, validation, profile, and submission
+  files are not part of the authoring model.
+- Promoted the historical Docling-shaped, video-caption, and dual-modality
+  graph regressions into three dependency-free reference Benchmarks under
+  `rayorch.benchmarks`. They use deterministic synthetic UDFs and the same
+  four-file workload layout, so they are runnable examples rather than hidden
+  test-only Pipelines. They do not claim to ship the old production model
+  adapters.
+- Ported the original YOLO -> SAM and dual-vLLM examples to the current
+  declarative Pipeline and Benchmark APIs. The old `EnvRegistry`, eager actor
+  construction, custom dispatch, downloader, and workload-owned Ray lifecycle
+  are not restored. Every built-in case now includes a dedicated README.
+- Made per-stage execution environments an explicit public feature through
+  Ray's native `RayModule.ray_options(runtime_env=...)` contract. Added a
+  minimal SGLang -> vLLM Benchmark whose model actors run in separate Conda
+  environments, plus an opt-in cross-Conda integration test. Heavy dependency
+  validation now happens inside the configured actor instead of incorrectly
+  requiring model libraries in the driver environment.
 
 ## Recovery overhead
 

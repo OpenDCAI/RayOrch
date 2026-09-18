@@ -36,37 +36,96 @@ truth value: `if port`, `bool(port)`, and other truth checks raise `TypeError`.
 Use `F.filter` for data filtering or put per-item conditions inside a UDF.
 Ordinary configuration booleans may still choose graph branches in `forward()`.
 
-## Lazy benchmark plugins
+## Lazy Benchmarks
 
-Benchmark workloads live below `rayorch.benchmark` and are imported only when
-used. Each UDF group owns one Ray `runtime_env` file, while its business UDFs,
-pipeline, registration metadata, and launcher remain separate. For example,
-`import rayorch` does not import Ray, vLLM, or Flash-MinerU; importing the
-MinerU pipeline still does not load those heavy runtime packages.
+Benchmarks are registered lazily and expose a typed Python API. Importing
+`rayorch` or `rayorch.benchmark` does not import Ray, vLLM, Flash-MinerU, or
+other workload dependencies. Constructing a Benchmark only stores validated
+configuration; dependencies and models are loaded when `run()` actually starts.
 
-The MinerU Ray Jobs launcher builds small source wheels in a temporary staging
-directory and submits them with the group's shared environment:
+```python
+from rayorch.benchmark import MinerUBench
 
-```bash
-rayorch-mineru-job \
-  --address http://RAY_DASHBOARD:8265 \
-  --flash-repo /path/to/Flash-mineru \
-  -- \
-  --model /path/to/MinerU-model \
-  --input-manifest /path/to/pdfs.json \
-  --golden-corpus-sha256 EXPECTED_DIGEST \
-  --replicas 4 \
-  --output-dir /shared/output \
-  --artifact-dir /shared/artifacts \
-  --result-jsonl /shared/results.jsonl
+bench = MinerUBench(
+    input_path="/shared/data/pdfs",
+    input_limit=368,
+    model="/shared/models/MinerU2.5",
+    output_dir="/shared/output",
+    num_gpus=8,
+    batch_size=64,
+    input_batch_size=24,
+    max_active_input_batches=3,
+    # Optional advanced overrides for individual Pipeline stages:
+    stage_options={
+        "ocr": {"batch_size": 32},
+        "assemble": {"replicas": 4},
+    },
+)
+
+report = bench.run(ray_address="auto")
+report.print_summary()
 ```
 
-The historical 368-document performance gate is evaluated only when the
-observed input digest and the expected 7,072-page shape both match. Other runs
-still report timing and batching metrics, but are not labeled comparable.
+The report contains input/output counts, wall time, throughput, per-UDF
+actor/RPC/Grain/batching metrics, driver RSS, and best-effort GPUs visible to
+the driver. Artifacts default to
+`OUTPUT_DIR/.rayorch-benchmark/RUN_ID/`.
 
-See [benchmark plugin layout](docs/benchmark_plugins.md) for extension and
-runtime-environment details.
+Use `submit()` to run the same configuration as a Ray Job:
+
+```python
+from rayorch.benchmark import LocalSource
+
+# Stable cluster image: no source argument is needed.
+run = bench.submit("http://RAY_DASHBOARD:8265")
+
+# Development: Ray uploads source and installs the workload dependencies.
+run = bench.submit(
+    "http://RAY_DASHBOARD:8265",
+    source=LocalSource(
+        project_root="/path/to/RayOrch",
+        modules=("/path/to/Flash-mineru/flash_mineru",),
+    ),
+)
+
+report = run.wait()
+```
+
+Input, model, output, and artifact paths used by a Ray Job must be visible from
+the cluster. Wheel construction and a workload-specific CLI are not part of the
+Benchmark contract.
+
+Framework code is under `rayorch/benchmark/`; built-in workloads that can be
+copied as examples are under `rayorch/benchmarks/`. See
+[benchmark framework and workloads](docs/benchmarks.md) for the short
+authoring flow, multi-node contract, submission, and runtime-environment details.
+
+Three dependency-free reference Benchmarks make the historical graph test
+cases directly runnable:
+
+```python
+from rayorch.benchmark import (
+    DocumentTopologyBench,
+    VideoCaptionTopologyBench,
+    VideoMultimodalTopologyBench,
+)
+
+report = VideoCaptionTopologyBench(
+    output_dir="./results",
+    video_count=8,
+    frames_per_video=16,
+    workers=4,
+).run()
+```
+
+They demonstrate nested fan-out/reduction, video frame fan-out, and sibling
+audio/vision relations. Their UDFs are synthetic; MinerU remains the included
+real-model Benchmark. The original YOLO -> SAM and dual-vLLM examples are also
+available as `YoloSamBench` and `DualVllmBench`. `SglangVllmBench` is the
+minimal cross-environment example: its SGLang and vLLM stages use separate
+Ray-native Conda `runtime_env` settings. Every built-in Benchmark directory
+contains a dedicated README with its topology, setup, run command, resource
+requirements, and result format.
 
 ## Minimal Example
 
@@ -104,9 +163,12 @@ state. A Call groups its ready Grains into an `ExecutionMicrobatch` for one Work
 RPC, bounded by `ray_options(batch_size=...)`. It never mixes input batches.
 
 Use `Executor` directly when several runs should reuse the same persistent actor
-pools. A UDF may return `RecordFailure` or `GroupFailure`, and receives `MISSING`
-for a missing input declared with `F.optional`; these values are also available
+pools. A UDF may return `RecordFailure` or `GroupFailure`; both are available
 from the package root.
+
+Calls execute only when every input Item is `PRESENT`. A filtered (`DROPPED`)
+input propagates `DROPPED` outputs without invoking the UDF; `None` remains an
+ordinary business value.
 
 Final outputs keep successful business values unchanged, including `None` and
 empty lists. A value that is dropped, failed, or suppressed is represented by

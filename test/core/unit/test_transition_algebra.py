@@ -9,7 +9,6 @@ import pytest
 
 from rayorch._model import (
     GrainPhase,
-    InputMode,
     ItemOutcome,
     ExpansionOutcome,
 )
@@ -93,33 +92,21 @@ def test_item_and_expansion_terminal_publications_are_monotonic():
 
 
 def test_call_input_cartesian_product_is_order_independent():
-    for modes in itertools.product(InputMode, repeat=2):
-        for outcomes in itertools.product(TERMINAL_OR_PENDING, repeat=2):
-            if any(
-                outcome in {ItemOutcome.FAILED, ItemOutcome.SUPPRESSED}
-                for outcome in outcomes
-            ):
-                expected = CallAction.SUPPRESS_OUTPUTS
-            elif None in outcomes:
-                expected = CallAction.WAIT
-            elif any(
-                mode is InputMode.REQUIRED and outcome is ItemOutcome.DROPPED
-                for mode, outcome in zip(modes, outcomes)
-            ):
-                expected = CallAction.DROP_OUTPUTS
-            else:
-                expected = CallAction.READY
+    for outcomes in itertools.product(TERMINAL_OR_PENDING, repeat=2):
+        if any(
+            outcome in {ItemOutcome.FAILED, ItemOutcome.SUPPRESSED}
+            for outcome in outcomes
+        ):
+            expected = CallAction.SUPPRESS_OUTPUTS
+        elif None in outcomes:
+            expected = CallAction.WAIT
+        elif ItemOutcome.DROPPED in outcomes:
+            expected = CallAction.DROP_OUTPUTS
+        else:
+            expected = CallAction.READY
 
-            assert call_transition(modes, outcomes).action is expected
-            assert call_transition(modes[::-1], outcomes[::-1]).action is expected
-
-
-def test_all_optional_dropped_inputs_are_ready_without_identity_driver():
-    decision = call_transition(
-        (InputMode.OPTIONAL, InputMode.OPTIONAL),
-        (ItemOutcome.DROPPED, ItemOutcome.DROPPED),
-    )
-    assert decision.action is CallAction.READY
+        assert call_transition(outcomes).action is expected
+        assert call_transition(outcomes[::-1]).action is expected
 
 
 def test_filter_source_mask_control_cartesian_product_is_closed():

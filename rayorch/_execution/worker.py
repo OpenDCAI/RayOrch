@@ -5,7 +5,6 @@ from __future__ import annotations
 import traceback
 from typing import Any, Protocol
 
-from .._model import MISSING
 from ..failures import GroupFailure, RecordFailure
 from .._protocol import (
     BlockRef,
@@ -17,7 +16,6 @@ from .._protocol import (
     NestedGroupInput,
     CallInputLayout,
     GrainInvocation,
-    MissingInput,
     CallOutputLayout,
     PortOutputReport,
     RowBinding,
@@ -175,10 +173,6 @@ class Worker:
             for index, value in enumerate(values):
                 if failures[index] is not None:
                     continue
-                if value is MISSING:
-                    raise WorkerContractError(
-                        f"output {layout.port!r} cannot contain MISSING"
-                    )
                 reports[index][layout.port] = PortOutputReport(
                     layout.port,
                     scalar=RowBinding(block, index),
@@ -232,9 +226,7 @@ class Worker:
         columns: list[list[Any]] = [[] for _ in range(width)]
         for invocation in invocations:
             for index, grain_input in enumerate(invocation.inputs):
-                if isinstance(grain_input, MissingInput):
-                    columns[index].append(MISSING)
-                elif isinstance(grain_input, RowBinding):
+                if isinstance(grain_input, RowBinding):
                     columns[index].append(store.get(grain_input))
                 elif isinstance(grain_input, NestedGroupInput):
                     leaves = [

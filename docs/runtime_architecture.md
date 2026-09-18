@@ -13,8 +13,14 @@ The package root exports authoring (`Pipeline`, `RayModule`, `Port`, `F.*`),
 execution (`Executor`, `run`, `RunResult`), and recovery (`RecoveryPolicy`).
 Internal identity and worker-protocol types stay private so their representation
 can evolve without expanding the compatibility surface. The UDF-facing
-`MISSING`, `RecordFailure`, and `GroupFailure` values remain available from the
-package root; failure values can also be imported from `rayorch.failures`.
+`RecordFailure` and `GroupFailure` values remain available from the package root
+and can also be imported from `rayorch.failures`.
+
+Every Call input follows one propagation rule. The Grain becomes runnable only
+when all inputs are `PRESENT`; a `DROPPED` input drops its outputs, while a
+`FAILED` or `SUPPRESSED` input suppresses them. The Worker ABI therefore carries
+only stored scalar or nested-group values and has no missing-value sentinel.
+`None` remains an ordinary stored business value.
 
 Structural primitives describe relationships and never create actors. Calling a
 `RayModule` while tracing creates a static Call; runtime Entities give rise to

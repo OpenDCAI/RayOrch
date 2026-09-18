@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, TypeAlias
 
-from .._model import CallRef, DomainRef, InputMode, PortRef
+from .._model import CallRef, DomainRef, PortRef
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,20 +80,12 @@ class UdfSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class CallInputSpec:
-    """Value portion of one positional or keyword logical argument binding."""
-
-    port: PortRef
-    mode: InputMode = InputMode.REQUIRED
-
-
-@dataclass(frozen=True, slots=True)
 class CallSpec:
     ref: CallRef
     udf: UdfSpec
     execution_domain: DomainRef
-    args: tuple[CallInputSpec, ...] = ()
-    kwargs: tuple[tuple[str, CallInputSpec], ...] = ()
+    args: tuple[PortRef, ...] = ()
+    kwargs: tuple[tuple[str, PortRef], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.ordered_inputs:
@@ -105,7 +97,7 @@ class CallSpec:
             raise ValueError("CallSpec keyword input names must be unique")
 
     @property
-    def ordered_inputs(self) -> tuple[CallInputSpec, ...]:
+    def ordered_inputs(self) -> tuple[PortRef, ...]:
         """Return dense inputs in Python invocation order."""
 
         return self.args + tuple(input_ for _, input_ in self.kwargs)
@@ -144,7 +136,6 @@ __all__ = [
     "DomainSpec",
     "ExpandOrigin",
     "FilterOrigin",
-    "CallInputSpec",
     "LogicalProgram",
     "PortOrigin",
     "PortSpec",
