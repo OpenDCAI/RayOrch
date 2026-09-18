@@ -160,7 +160,15 @@ def test_local_source_is_prepared_by_ray_without_building_a_wheel(tmp_path: Path
         dict(environment),
         **working_dir_options,
     )
-    prepared = upload_py_modules_if_needed(prepared, upload_fn=capture)
+    py_module_options = {"upload_fn": capture}
+    if "include_gitignore" in inspect.signature(
+        upload_py_modules_if_needed
+    ).parameters:
+        py_module_options["include_gitignore"] = True
+    prepared = upload_py_modules_if_needed(
+        prepared,
+        **py_module_options,
+    )
 
     assert prepared["working_dir"].startswith("gcs://")
     assert prepared["py_modules"][0].startswith("gcs://")
