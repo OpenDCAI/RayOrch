@@ -134,6 +134,8 @@ def test_submit_uses_ray_jobs_without_building_wheels(tmp_path: Path, monkeypatc
 
 
 def test_local_source_is_prepared_by_ray_without_building_a_wheel(tmp_path: Path):
+    import inspect
+
     from ray._private.runtime_env.py_modules import upload_py_modules_if_needed
     from ray._private.runtime_env.working_dir import upload_working_dir_if_needed
 
@@ -149,9 +151,14 @@ def test_local_source_is_prepared_by_ray_without_building_a_wheel(tmp_path: Path
     def capture(*args, **kwargs):
         uploaded.append((args, kwargs))
 
+    working_dir_options = {"upload_fn": capture}
+    if "include_gitignore" in inspect.signature(
+        upload_working_dir_if_needed
+    ).parameters:
+        working_dir_options["include_gitignore"] = True
     prepared = upload_working_dir_if_needed(
         dict(environment),
-        upload_fn=capture,
+        **working_dir_options,
     )
     prepared = upload_py_modules_if_needed(prepared, upload_fn=capture)
 
