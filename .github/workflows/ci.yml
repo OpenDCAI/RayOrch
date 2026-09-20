@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+  RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO: "0"
+
+jobs:
+  test:
+    name: Test Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      - name: Test
+        run: python -m pytest -q
+
+  package:
+    name: Package and installed-wheel smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements.txt
+
+      - name: Install build tools and runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt build twine
+
+      - name: Build and check distributions
+        run: |
+          python -m build
+          python -m twine check dist/*
+
+      - name: Check distribution contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          from zipfile import ZipFile
+
+          cases = (
+              "document_topology",
+              "dual_vllm",
+              "mineru",
+              "sglang_vllm",
+              "video_caption",
+              "video_multimodal",
+              "yolo_sam",
+          )
+          required = {
+              "rayorch/benchmark/__init__.py",
+              "rayorch/benchmark/execution.py",
+              "rayorch/benchmark/registry.py",
+              "rayorch/benchmark/report.py",
+              "rayorch/benchmark/submission.py",
+          }
+          for case in cases:
+              required.update(
+                  {
+                      f"rayorch/benchmarks/{case}/README.md",
+                      f"rayorch/benchmarks/{case}/benchmark.py",
+                      f"rayorch/benchmarks/{case}/env.json",
+                      f"rayorch/benchmarks/{case}/pipeline.py",
+                      f"rayorch/benchmarks/{case}/udfs.py",
+                  }
+              )
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              wheel_names = set(archive.namelist())
+          missing = required - wheel_names
+          assert not missing, f"wheel is missing: {sorted(missing)}"
+
+          forbidden = {
+              "rayorch/benchmark/plugin.py",
+              "rayorch/benchmark/runtime.py",
+          }
+          assert not (forbidden & wheel_names)
+          assert not any(
+              name.startswith(("test/", "rayorch/benchmark/mineru/"))
+              or "__pycache__" in name
+              or name.endswith((".pyc", ".pyo"))
+              for name in wheel_names
+          )
+
+          sdist = next(Path("dist").glob("*.tar.gz"))
+          with tarfile.open(sdist) as archive:
+              sdist_names = {
+                  name.split("/", 1)[1]
+                  for name in archive.getnames()
+                  if "/" in name
+              }
+          missing = required - sdist_names
+          assert not missing, f"sdist is missing: {sorted(missing)}"
+          PY
+
+      - name: Install wheel outside the source tree
+        run: |
+          python -m venv --system-site-packages "$RUNNER_TEMP/rayorch-wheel"
+          "$RUNNER_TEMP/rayorch-wheel/bin/python" -m pip install \
+            --no-deps --force-reinstall dist/*.whl
+
+      - name: Verify installed API and run a Benchmark
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/rayorch-wheel/bin/python" - <<'PY'
+          import json
+          import sys
+          from importlib import resources
+          from pathlib import Path
+
+          import rayorch
+          import rayorch.benchmark as benchmark
+
+          assert Path(rayorch.__file__).is_relative_to(Path(sys.prefix))
+          assert "ray" not in sys.modules
+          assert "torch" not in sys.modules
+          assert "vllm" not in sys.modules
+          assert "sglang" not in sys.modules
+
+          class AddOne:
+              def run(self, values):
+                  return [value + 1 for value in values]
+
+          class SmokePipeline(rayorch.Pipeline):
+              def __init__(self):
+                  self.add_one = rayorch.RayModule(AddOne).ray_options(num_cpus=0)
+
+              def forward(self, values):
+                  return self.add_one(values)
+
+          result = SmokePipeline().run([1, 2, 3], input_batch_size=2)
+          assert result.outputs == [2, 3, 4]
+
+          expected = {
+              "DocumentTopologyBench",
+              "DualVllmBench",
+              "MinerUBench",
+              "SglangVllmBench",
+              "VideoCaptionTopologyBench",
+              "VideoMultimodalTopologyBench",
+              "YoloSamBench",
+          }
+          assert expected <= set(dir(benchmark))
+          for public_name in expected:
+              assert isinstance(getattr(benchmark, public_name), type)
+
+          readme = resources.files("rayorch.benchmarks.mineru").joinpath(
+              "README.md"
+          )
+          assert readme.is_file()
+
+          output_dir = Path("rayorch-wheel-smoke")
+          report = benchmark.VideoCaptionTopologyBench(
+              output_dir=output_dir,
+              video_count=2,
+              frames_per_video=3,
+              workers=2,
+              batch_size=2,
+              input_batch_size=1,
+              max_active_input_batches=2,
+          ).run(
+              ray_init_kwargs={
+                  "include_dashboard": False,
+                  "num_cpus": 4,
+                  "num_gpus": 0,
+              },
+              profile=False,
+              run_id="installed-wheel",
+          )
+
+          summary = json.loads(
+              Path(report.artifacts["summary"]).read_text(encoding="utf-8")
+          )
+          assert summary["metrics"]["input_rows"] == 2
+          assert summary["metrics"]["output_rows"] == 2
+          assert summary["metrics"]["frames"] == 6
+          assert len(report.outputs) == 2
+          PY

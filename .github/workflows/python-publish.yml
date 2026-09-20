@@ -20,9 +20,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -32,7 +32,42 @@ jobs:
           pip install -r requirements.txt
           pip install build twine
           python -m build --sdist --wheel
-          
+
+      - name: Verify release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          from email.parser import Parser
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          from rayorch.version import __version__
+
+          tag = os.environ["RELEASE_TAG"]
+          expected = f"v{__version__}"
+          if tag != expected:
+              raise SystemExit(
+                  f"release tag {tag!r} does not match package version {expected!r}"
+              )
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              metadata_name = next(
+                  name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+              )
+              metadata = Parser().parsestr(
+                  archive.read(metadata_name).decode("utf-8")
+              )
+          if metadata["Version"] != __version__:
+              raise SystemExit(
+                  f"wheel version {metadata['Version']!r} does not match "
+                  f"source version {__version__!r}"
+              )
+          print(f"release tag, source, and wheel version match: {tag}")
+          PY
+
       - name: Verify distribution
         run: |
           twine check dist/*

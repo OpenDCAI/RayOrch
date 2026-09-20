@@ -1,4 +1,1 @@
 ray
-
-numpy>=1.26,<2.0
-loguru

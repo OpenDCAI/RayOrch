@@ -3,6 +3,8 @@
 **/.ipynb_checkpoints/
 *.egg
 *.egg-info  
+/build/
+/dist/
 
 .DS_Store
 test/example

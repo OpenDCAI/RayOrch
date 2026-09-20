@@ -1,20 +1,11 @@
-# 明确指定源码文件
 recursive-include rayorch *.py
 recursive-include rayorch *.json
-recursive-include rayorch *.yaml
-recursive-include rayorch *.sh
-recursive-include rayorch *.txt
+recursive-include rayorch/benchmarks README.md
 
-# 包含样例文件夹下所有类型的文件
-# 样例文件夹路径为rayorch/exaple
-recursive-include rayorch/example */
-
-# 包含顶层文档文件
 include README.md
 include requirements.txt
 include LICENSE
 
-# 排除无用缓存文件
 global-exclude *.py[cod]
 global-exclude __pycache__/
 global-exclude *.so
