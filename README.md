@@ -1,133 +1,169 @@
+<div align="center">
+  <img src="https://raw.githubusercontent.com/OpenDCAI/RayOrch-doc/main/docs/.vuepress/public/rayorch-mark.svg" width="104" alt="RayOrch logo" />
+
 # RayOrch
 
-RayOrch is a cardinality-aware dataflow runtime for Ray. It models map,
-one-to-many expansion, filtering, broadcast, and ordered reduction while
-dispatching each downstream grain as soon as its own dependencies are ready.
+**Run every stage as soon as its data is ready.**
 
-## Install
+Completion-driven dataflow orchestration for multi-stage, multi-model AI workloads on Ray.
 
-```bash
-pip install rayorch
+[![GitHub Stars](https://img.shields.io/github/stars/OpenDCAI/RayOrch?style=social)](https://github.com/OpenDCAI/RayOrch)
+[![CI](https://img.shields.io/github/actions/workflow/status/OpenDCAI/RayOrch/ci.yml?label=CI)](https://github.com/OpenDCAI/RayOrch/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/rayorch)](https://pypi.org/project/rayorch/)
+[![Python](https://img.shields.io/pypi/pyversions/rayorch)](https://pypi.org/project/rayorch/)
+[![License](https://img.shields.io/github/license/OpenDCAI/RayOrch)](LICENSE)
+[![Documentation](https://img.shields.io/badge/docs-English-5b5bd6)](https://opendcai.github.io/RayOrch-doc/en/)
+[![中文文档](https://img.shields.io/badge/docs-中文-28a745)](https://opendcai.github.io/RayOrch-doc/zh/)
+
+[Documentation](https://opendcai.github.io/RayOrch-doc/en/) · [Quickstart](https://opendcai.github.io/RayOrch-doc/en/guide/first-pipeline.html) · [API Reference](https://opendcai.github.io/RayOrch-doc/en/api/) · [Benchmarks](https://opendcai.github.io/RayOrch-doc/en/benchmarks/)
+
+[English](README.md) | [简体中文](README-zh.md)
+
+</div>
+
+---
+
+## 📰 0. News
+
+- **[2026-09] RayOrch `0.1` preview is ready.** The public API now centers on `Pipeline`, `RayModule`, `Executor`, and `RunResult`, with lazy Benchmarks and Ray Job submission.
+- **[2026-09] Flash-MinerU and DataFlow integrations are available.** Applications can depend on the installed `rayorch` package instead of carrying a private runtime copy.
+
+## 🔍 1. What is RayOrch?
+
+**RayOrch is a dataflow orchestration framework for large-scale, model-hosted multimodal processing.** It provides a small and explicit programming model for building pipeline-parallel workloads and complex inference DAGs, then efficiently schedules their heterogeneous stages across Ray CPU and GPU clusters.
+
+Typical workloads include PDF understanding, video processing, multi-model vision, and multi-stage LLM inference. Their common structure is `1 → M → 1`: one input expands into independently executable children, models process those children in shared batches, and the results return to their parent in deterministic order.
+
+```mermaid
+flowchart TB
+    subgraph PDFCase["Document understanding · 1 PDF → M pages → 1 document"]
+        direction LR
+        PDF["PDF"] --> P0["Page 0"]
+        PDF --> P1["Page 1"]
+        PDF -.-> PX["..."]
+        PDF --> PN["Page N"]
+        P0 --> OCR["Page model<br/>shared actor pool"]
+        P1 --> OCR
+        PX -.-> OCR
+        PN --> OCR
+        OCR --> PDFReduce["Ordered reduce<br/>0 · 1 · ... · N"]
+        PDFReduce --> Markdown["Markdown + layout"]
+    end
+
+    subgraph VideoCase["Video caption · 1 video → M frames → 1 summary"]
+        direction LR
+        Video["Video"] --> F0["Frame 0"]
+        Video --> F1["Frame 1"]
+        Video -.-> FX["..."]
+        Video --> FN["Frame N"]
+        F0 --> Caption["Caption model<br/>cross-video batching"]
+        F1 --> Caption
+        FX -.-> Caption
+        FN --> Caption
+        Caption --> FrameReduce["Ordered reduce<br/>0 · 1 · ... · N"]
+        FrameReduce --> Summary["Video summary"]
+    end
+
+    subgraph NestedCase["Nested document · document → pages → table jobs → document"]
+        direction LR
+        Document["Document"] --> Pages["Page 0 · Page 1 · ... · Page N"]
+        Pages --> T0["Table 0"]
+        Pages --> T1["Table 1"]
+        Pages -.-> TX["..."]
+        Pages --> TM["Table M"]
+        T0 --> TableModel["Table model"]
+        T1 --> TableModel
+        TX -.-> TableModel
+        TM --> TableModel
+        TableModel --> NestedReduce["Ordered table reduce<br/>then ordered page reduce"]
+        NestedReduce --> DocumentResult["Document result"]
+    end
+
+    subgraph MultimodalCase["Multimodal video · two independent 1:M branches"]
+        direction LR
+        MultiVideo["Video"] --> Audio["Audio 0 · Audio 1 · ... · Audio M"]
+        MultiVideo --> Vision["Frame 0 · Frame 1 · ... · Frame N"]
+        Audio --> ASR["ASR actors"]
+        Vision --> VLM["VLM actors"]
+        ASR --> AudioReduce["Ordered audio reduce"]
+        VLM --> VisionReduce["Ordered frame reduce"]
+        AudioReduce --> Merge["Merge by source video"]
+        VisionReduce --> Merge
+        Merge --> MultiResult["Video result"]
+    end
+
+    PDFCase ~~~ VideoCase
+    VideoCase ~~~ NestedCase
+    NestedCase ~~~ MultimodalCase
 ```
 
-For development:
+Ray provides distributed compute primitives; RayOrch provides the pipeline semantics above them: dependencies, fan-out and fan-in, lineage, readiness, persistent model actors, and ordered result reconstruction.
 
-```bash
-pip install -r requirements-dev.txt
+```mermaid
+flowchart LR
+    UDF["Batched Python UDFs"] --> Pipeline["Declarative Pipeline"]
+    Pipeline --> Compile["Lineage-aware compilation"]
+    Compile --> Runtime["Completion-driven runtime"]
+    Runtime --> Actors["Persistent Ray actor pools"]
+    Actors --> Result["Ordered RunResult + metrics"]
 ```
 
-## Core Concepts
+## ✨ 2. Why RayOrch?
 
-- `Pipeline` traces a declarative graph without constructing UDF instances.
-- `RayModule` declares a UDF and its configuration. Each use in the graph creates
-  a Call with its own persistent actor pool.
-- `F.expand`, `F.filter`, `F.broadcast`, and `F.reduce` express cardinality and
-  lineage without creating structural actors.
-- `Executor` runs overlapping input batches through completion-driven per-Call
-  READY queues. A downstream stage can start before its upstream stage drains.
-- Recovery, failure attribution, and output reconstruction operate on stable
-  logical Grain and Entity identities.
+The difficult part of a model-hosted multimodal pipeline is not merely starting Ray actors. The system must keep CPU preprocessing and GPU inference running in parallel, batch ready items from different inputs for utilization, and still preserve ownership and order as every input progresses independently. The PDF case captures this problem:
 
-Compiler, scheduler, and Ray actor internals live in private modules. Application
-and benchmark code should import only from `rayorch` and `rayorch.benchmark`.
+```mermaid
+sequenceDiagram
+    participant L as RayOrch lineage
+    participant Q as READY queue
+    participant S as Scheduler
+    participant W as Persistent OCR actors
+    participant R as Result reconstruction
+    participant D as Downstream assembly
 
-`forward()` builds a static graph using symbolic Ports. A Port has no Python
-truth value: `if port`, `bool(port)`, and other truth checks raise `TypeError`.
-Use `F.filter` for data filtering or put per-item conditions inside a UDF.
-Ordinary configuration booleans may still choose graph branches in `forward()`.
-
-## Lazy Benchmarks
-
-Benchmarks are registered lazily and expose a typed Python API. Importing
-`rayorch` or `rayorch.benchmark` does not import Ray, vLLM, Flash-MinerU, or
-other workload dependencies. Constructing a Benchmark only stores validated
-configuration; dependencies and models are loaded when `run()` actually starts.
-
-```python
-from rayorch.benchmark import MinerUBench
-
-bench = MinerUBench(
-    input_path="/shared/data/pdfs",
-    input_limit=368,
-    model="/shared/models/MinerU2.5",
-    output_dir="/shared/output",
-    num_gpus=8,
-    batch_size=64,
-    input_batch_size=24,
-    max_active_input_batches=3,
-    # Optional advanced overrides for individual Pipeline stages:
-    stage_options={
-        "ocr": {"batch_size": 32},
-        "assemble": {"replicas": 4},
-    },
-)
-
-report = bench.run(ray_address="auto")
-report.print_summary()
+    L->>Q: A/0, A/1, A/2, B/0, B/1
+    Note over L,Q: Each task retains parent PDF and page index
+    S->>Q: Reserve ready tasks
+    Q-->>S: Batch [A/0, B/0, A/1]
+    S->>W: Dispatch cross-PDF microbatch
+    W-->>R: Results return B/0, A/1, A/0
+    R->>R: Route by parent and restore page order
+    Note over R,D: A waits only for A/2; B waits only for B/1
+    S->>Q: Reserve [B/1, A/2]
+    S->>W: Dispatch next microbatch
+    W-->>R: A/2 finishes
+    R->>D: A complete → assemble A immediately
+    W-->>R: B/1 finishes later
+    R->>D: B complete → assemble B
 ```
 
-The report contains input/output counts, wall time, throughput, per-UDF
-actor/RPC/Grain/batching metrics, driver RSS, and best-effort GPUs visible to
-the driver. Artifacts default to
-`OUTPUT_DIR/.rayorch-benchmark/RUN_ID/`.
+RayOrch represents each schedulable task as business data plus stable lineage—here, the parent PDF and page index. The scheduler continuously reserves READY tasks and forms cross-PDF microbatches for persistent actors; physical completion may be out of order, but reconstruction routes every result to its parent and restores logical order. Consequently, A enters its downstream assembly as soon as A is complete, while B waits only for B's missing task rather than blocking the whole pipeline.
 
-Use `submit()` to run the same configuration as a Ray Job:
+| Capability | Concrete case | RayOrch behavior |
+| --- | --- | --- |
+| Completion-driven scheduling | PDF A finishes before PDF B | Assemble A as soon as A's pages are complete |
+| Explicit fan-out and fan-in | PDF → pages → document | Track child ownership and reduce in source order |
+| Cross-input batching | Pages from several PDFs are ready together | Batch them on one OCR actor without losing lineage |
+| Persistent actor pools | MinerU, YOLO, SAM, vLLM, or SGLang is expensive to load | Keep one UDF/model instance alive in every actor |
+| Per-stage resources | Rendering needs CPUs while OCR needs GPUs | Configure replicas, batching, CPUs, GPUs, and custom resources per stage |
+| Cross-environment stages | SGLang and vLLM need separate dependency stacks | Assign a Ray `runtime_env` or Conda environment to each stage |
+| Structured execution results | Some items are filtered, fail, or are suppressed by an upstream failure | Preserve ordinary successful values while reporting non-success outcomes explicitly |
+| Reproducible experiments | The same workload must run locally and through Ray Jobs | Reuse one typed Benchmark configuration and collect standard reports |
 
-```python
-from rayorch.benchmark import LocalSource
+## 🧠 3. Programming Model
 
-# Stable cluster image: no source argument is needed.
-run = bench.submit("http://RAY_DASHBOARD:8265")
+RayOrch deliberately keeps the public model small:
 
-# Development: Ray uploads source and installs the workload dependencies.
-run = bench.submit(
-    "http://RAY_DASHBOARD:8265",
-    source=LocalSource(
-        project_root="/path/to/RayOrch",
-        modules=("/path/to/Flash-mineru/flash_mineru",),
-    ),
-)
+| Object | Responsibility |
+| --- | --- |
+| UDF | Ordinary Python class or function that processes a batch |
+| `RayModule` | UDF construction, replicas, batch size, recovery, and Ray actor options |
+| `Pipeline` | Static topology connecting compute stages |
+| `rayorch.F` | Explicit expansion, filtering, broadcast, and reduction |
+| `Executor` | Persistent actor ownership and execution lifecycle |
+| `RunResult` | Ordered outputs plus immutable timing, actor, RPC, Grain, and batching metrics |
 
-report = run.wait()
-```
-
-Input, model, output, and artifact paths used by a Ray Job must be visible from
-the cluster. Wheel construction and a workload-specific CLI are not part of the
-Benchmark contract.
-
-Framework code is under `rayorch/benchmark/`; built-in workloads that can be
-copied as examples are under `rayorch/benchmarks/`. See
-[benchmark framework and workloads](docs/benchmarks.md) for the short
-authoring flow, multi-node contract, submission, and runtime-environment details.
-
-Three dependency-free reference Benchmarks make the historical graph test
-cases directly runnable:
-
-```python
-from rayorch.benchmark import (
-    DocumentTopologyBench,
-    VideoCaptionTopologyBench,
-    VideoMultimodalTopologyBench,
-)
-
-report = VideoCaptionTopologyBench(
-    output_dir="./results",
-    video_count=8,
-    frames_per_video=16,
-    workers=4,
-).run()
-```
-
-They demonstrate nested fan-out/reduction, video frame fan-out, and sibling
-audio/vision relations. Their UDFs are synthetic; MinerU remains the included
-real-model Benchmark. The original YOLO -> SAM and dual-vLLM examples are also
-available as `YoloSamBench` and `DualVllmBench`. `SglangVllmBench` is the
-minimal cross-environment example: its SGLang and vLLM stages use separate
-Ray-native Conda `runtime_env` settings. Every built-in Benchmark directory
-contains a dedicated README with its topology, setup, run command, resource
-requirements, and result format.
-
-## Minimal Example
+A minimal Pipeline is ordinary Python:
 
 ```python
 import rayorch as ro
@@ -138,17 +174,17 @@ class AddOne:
         return [value + 1 for value in values]
 
 
-class Pipe(ro.Pipeline):
+class MyPipeline(ro.Pipeline):
     def __init__(self):
-        self.a = ro.RayModule(AddOne).ray_options(replicas=1, batch_size=8)
-        self.b = ro.RayModule(AddOne).ray_options(replicas=1, batch_size=8)
+        self.first = ro.RayModule(AddOne).ray_options(replicas=2, batch_size=8)
+        self.second = ro.RayModule(AddOne).ray_options(replicas=2, batch_size=8)
 
     def forward(self, values):
-        return self.b(self.a(values))
+        return self.second(self.first(values))
 
 
 result = ro.run(
-    Pipe(),
+    MyPipeline(),
     [1, 2, 3],
     input_batch_size=2,
     max_active_input_batches=2,
@@ -157,45 +193,305 @@ result = ro.run(
 print(result.outputs)  # [3, 4, 5]
 ```
 
-`input_batch_size` counts aligned source rows; `max_active_input_batches` limits
-how many input batches can overlap. Each input batch owns its derived work and
-state. A Call groups its ready Grains into an `ExecutionMicrobatch` for one Worker
-RPC, bounded by `ray_options(batch_size=...)`. It never mixes input batches.
+Read it as: **write batched UDFs → connect them in a Pipeline → assign resources → run**. `Pipeline.forward()` is traced once with symbolic values to build a static graph; it does not execute the UDFs or load their models.
 
-Use `Executor` directly when several runs should reuse the same persistent actor
-pools. A UDF may return `RecordFailure` or `GroupFailure`; both are available
-from the package root.
+### 3.1 `rayorch.F`: explicit shape transformations
 
-Calls execute only when every input Item is `PRESENT`. A filtered (`DROPPED`)
-input propagates `DROPPED` outputs without invoking the UDF; `None` remains an
-ordinary business value.
+Structural relationships are explicit rather than hidden in framework conventions. In the table below, `A:[a0, a1]` is one ordered group attached to parent A, while `A/a0` is one independently schedulable child that retains both parent A and ordinal 0.
 
-Final outputs keep successful business values unchanged, including `None` and
-empty lists. A value that is dropped, failed, or suppressed is represented by
-`OutputIssue(outcome, cause)`. Use the public `ItemOutcome` enum for decisions;
-`cause` is optional text for diagnostics:
+| API | Shape before | Shape after | Cardinality | Meaning |
+| --- | --- | --- | --- | --- |
+| `F.expand(groups)` | `A:[a0, a1]`<br>`B:[b0]` | `A/a0`, `A/a1`<br>`B/b0` | `1 group → M children` | Enter a new child Domain so pages, frames, or other group members can be scheduled independently |
+| `F.expand_aligned(xs, ys)` | `xs = A:[x0, x1]`<br>`ys = A:[y0, y1]` | `xs = A/x0, A/x1`<br>`ys = A/y0, A/y1` | `K × 1 group → K × M children` | Expand multiple position-aligned outputs of the same producer into one shared child Domain; corresponding values remain separate Ports on the same child entities |
+| `F.filter(values, mask)` | `values = A/x0, A/x1, A/x2`<br>`mask = T, F, T` | `A/x0`, `A/x2`<br>`A/x1 = DROPPED` | `M children → K survivors` | Select members without changing their Domain, parent lineage, or relative order |
+| `F.broadcast(meta, like=pages)` | ancestor `A/meta`<br>descendants `A/p0`, `A/p1` | `A/p0:meta`<br>`A/p1:meta` | `1 ancestor value → M descendant views` | Project ancestor context into an existing descendant Domain, such as making PDF metadata available to every page |
+| `F.reduce(values, members=...)` | `A/p0`, `A/p1`<br>`B/p0` | `A:[p0, p1]`<br>`B:[p0]` | `M children → 1 ordered group` | Return one child Port to its parent Domain; `members` optionally defines which child entities belong to the group |
+| `F.reduce_aligned(xs, ys, members=...)` | `xs = A/x0, A/x1`<br>`ys = A/y0, A/y1` | `xs = A:[x0, x1]`<br>`ys = A:[y0, y1]` | `K × M children → K × 1 group` | Reduce several Ports together using one membership set and order, as MinerU does for page results and page metadata |
+
+These `F` operations are compile-time structural declarations: they create Domains and lineage relationships, but do not create Ray actors or execute business logic.
+
+For repeated calls, keep an `Executor` alive so its actors and models remain warm:
 
 ```python
-for output in result.outputs:
-    if isinstance(output, ro.OutputIssue):
-        print(output.outcome.name, output.cause)
-    else:
-        consume(output)
+from rayorch import Executor
+
+with Executor(MyPipeline()) as executor:
+    first = executor.run([1, 2, 3])
+    second = executor.run([4, 5, 6])
 ```
 
-`RecordFailure` and `GroupFailure` remain UDF return signals. `OutputIssue` is
-reserved for final framework results, not ordinary business output values.
-See the [result contract](docs/api_migration.md#output-results) for all outcomes
-and cause rules.
+RayOrch owns logical dataflow semantics while Ray owns physical distributed execution:
 
-Execution metrics come from the driver's existing counters. `run()` does not
-issue diagnostic RPCs or call UDF audit methods after processing completes.
-Use Ray Dashboard for process/resource observation; per-Worker snapshots are
-not part of `RunResult`.
+| Layer | Responsibility |
+| --- | --- |
+| Your workload | UDF logic, Pipeline topology, and resource choices |
+| RayOrch | Dependencies, cardinality, lineage, readiness, recovery, and output reconstruction |
+| Ray | Nodes, placement, actors, RPC, resources, and object storage |
+| Compute backend | Python, PyTorch, vLLM, SGLang, or another library |
 
-See the [preview API migration guide](docs/api_migration.md) for the explicit
-batch, retry-limit, and metric names introduced during the pre-release review.
+See [Framework Design](https://opendcai.github.io/RayOrch-doc/en/architecture/) for the compiler, runtime, and source-code path.
 
-## License
+## 🧩 4. Workloads and Integrations
 
-Apache-2.0. See `LICENSE`.
+### 4.1 MinerU 2.5: `MinerUBench` and Flash-MinerU
+
+The built-in `MinerUBench` integrates the MinerU 2.5 implementation from [Flash-MinerU](https://github.com/OpenDCAI/Flash-MinerU) as an explicit page-level RayOrch workload. A PDF first expands into a variable number of page records, page images are processed by a persistent GPU actor pool, and the page-level model outputs are reduced in the original order before Markdown, layout JSON, and extracted images are written. The workload is irregular because PDFs have different page counts, rendering and assembly are CPU-oriented while inference is GPU-oriented, and ready pages from different PDFs should share model batches without losing their document ownership.
+
+```mermaid
+flowchart LR
+    PDFs["PDF paths<br/>root Domain: one item per PDF"] --> Render["MinerUPdfToPages<br/>CPU actor pool"]
+    PDFs --> Metadata["PdfMetadata<br/>PDF path → stem"]
+
+    Render --> PageGroups["list[PageRecord]<br/>one ordered group per PDF"]
+    PageGroups --> Expand["F.expand<br/>1 PDF → N pages"]
+    Expand --> ReadyPages["Independent PageRecords<br/>page Domain"]
+    ReadyPages --> OCRBatch["Cross-PDF page microbatches"]
+    OCRBatch --> OCR["MinerUVlmOcrPage<br/>persistent MinerU 2.5 + vLLM GPU actors"]
+    OCR --> Contents["Per-page extraction results"]
+
+    Contents --> Reduce["F.reduce_aligned<br/>ordered N → 1 by PDF"]
+    ReadyPages --> Reduce
+    Reduce --> ContentGroups["Ordered content groups"]
+    Reduce --> OrderedPages["Matching ordered PageRecord groups"]
+
+    ContentGroups --> Assemble["MinerUAssembleDoc<br/>CPU actor pool"]
+    OrderedPages --> Assemble
+    Metadata --> Assemble
+    Assemble --> Files["Markdown + layout.json + images"]
+    Assemble --> Summary["{pdf, md_path, chars, pages}"]
+```
+
+The important intermediate values are deliberately ordinary Python values; RayOrch adds lineage and cardinality outside the business payload instead of requiring framework-specific wrapper objects:
+
+| Pipeline point | Logical level | Python value |
+| --- | --- | --- |
+| Input | PDF | `str` path |
+| `render(pdfs)` | PDF | `list[PageRecord]` for each PDF |
+| `F.expand(...)` | Page | one `PageRecord` containing `pdf_path`, `page_id`, `img_pil`, `scale`, `page_width`, `page_height`, and `pdf_len` |
+| `ocr(pages)` | Page | one MinerU 2.5 extraction result per page |
+| `F.reduce_aligned(...)` | PDF | an ordered content list plus the matching ordered `PageRecord` list |
+| `assemble(...)` | PDF | `{pdf, md_path, chars, pages}` plus Markdown, layout JSON, and extracted image files |
+
+The core RayOrch topology in the built-in `MinerUBench` is small because model code remains inside the UDFs and dataflow relationships remain inside `forward()`:
+
+```python
+from typing import cast
+import rayorch as ro
+
+from rayorch.benchmarks.mineru.udfs import (
+    MinerUAssembleDoc,
+    MinerUPdfToPages,
+    MinerUVlmOcrPage,
+    PdfMetadata,
+)
+
+
+class MinerUPipeline(ro.Pipeline):
+    def __init__(self, *, model, output_dir, num_gpus=1, batch_size=64):
+        self.render = (
+            ro.RayModule(MinerUPdfToPages)
+            .pre_init(dpi=200)
+            .ray_options(replicas=num_gpus, batch_size=1, num_cpus=1)
+        )
+        self.ocr = (
+            ro.RayModule(MinerUVlmOcrPage)
+            .pre_init(model=model, gpu_memory_utilization=0.8)
+            .ray_options(
+                replicas=num_gpus,
+                batch_size=batch_size,
+                num_gpus=1,
+                num_cpus=1,
+            )
+        )
+        self.metadata = ro.RayModule(PdfMetadata).ray_options(
+            replicas=1,
+            batch_size=32,
+            num_cpus=1,
+        )
+        self.assemble = (
+            ro.RayModule(MinerUAssembleDoc)
+            .pre_init(output_dir=output_dir)
+            .ray_options(replicas=num_gpus, batch_size=4, num_cpus=1)
+        )
+
+    def forward(self, pdfs):
+        pages = ro.F.expand(cast(ro.Port, self.render(pdfs)))
+        contents = cast(ro.Port, self.ocr(pages))
+        stems = cast(ro.Port, self.metadata(pdfs))
+        content_groups, ordered_page_groups = ro.F.reduce_aligned(
+            contents,
+            pages,
+            members=contents,
+        )
+        return self.assemble(content_groups, ordered_page_groups, stems)
+```
+
+`F.expand` makes every rendered page independently schedulable, so one OCR microbatch may contain pages from several PDFs. `F.reduce_aligned` uses the OCR output as the member set and returns both model outputs and matching page metadata to the PDF Domain in original page order, while the separate metadata branch provides the PDF stem without forwarding PDF bytes through the GPU stage. The model is constructed once per OCR actor and remains loaded across batches and repeated executor runs. Each completed PDF is written under `output_dir/<pdf-stem>/vlm/`, including `<pdf-stem>.md`, `layout.json`, and extracted images.
+
+Most users do not need to assemble MinerU UDFs themselves. The built-in Benchmark exposes the explicit page-level topology for experiments, while the separately packaged Flash-MinerU integration preserves its small application-facing API and uses the installed RayOrch runtime:
+
+```bash
+pip install "flash-mineru[vllm]"
+```
+
+```python
+from flash_mineru import MineruEngine
+
+engine = MineruEngine(
+    model="/path/to/MinerU2.5",
+    save_dir="./outputs",
+    batch_size=8,
+    replicas=2,
+    num_gpus_per_replica=1,
+)
+result = engine.run(["document-a.pdf", "document-b.pdf"])
+engine.close()
+```
+
+For a configurable experiment with standard profiling and artifacts, use `MinerUBench` through the Benchmark API described below.
+
+### 4.2 DataFlow
+
+[DataFlow](https://github.com/OpenDCAI/DataFlow) demonstrates incremental adoption: a compatible row-independent operator can be wrapped by `RayAcceleratedOperator` without changing its normal storage-facing interface, while RayOrch creates persistent replicas and distributes DataFrame chunks behind the wrapper.
+
+```python
+from dataflow.rayorch import RayAcceleratedOperator
+
+parallel_op = RayAcceleratedOperator(
+    MyOperator,
+    replicas=4,
+    num_gpus_per_replica=1,
+).op_cls_init(...)
+```
+
+Operators that require global cross-row state should keep their original execution path rather than being forced into data parallelism.
+
+### 4.3 Built-in Benchmarks
+
+| Benchmark | Topology | What it demonstrates |
+| --- | --- | --- |
+| `MinerUBench` | PDF → pages → MinerU → document | Real-model fan-out, cross-document batching, multi-GPU inference, and ordered assembly |
+| `YoloSamBench` | image → YOLO → SAM → output | Two expensive models in separate persistent actor pools |
+| `DualVllmBench` | prompt → vLLM A → vLLM B | Two independently configured LLM engines in one graph |
+| `SglangVllmBench` | prompt → SGLang → vLLM | One Pipeline whose model stages run in different Conda environments |
+| `DocumentTopologyBench` | document → pages → tables → document | Nested expansion, empty child groups, and nested ordered reduction |
+| `VideoCaptionTopologyBench` | video → frames → captions → video | Variable fan-out, cross-video batching, and ordered fan-in |
+| `VideoMultimodalTopologyBench` | video → audio/vision branches → merge | Sibling domains with different cardinalities joining at one parent |
+
+Every built-in case lives under `rayorch/benchmarks/<name>/` and keeps its `udfs.py`, `pipeline.py`, `benchmark.py`, `env.json`, and case-specific `README.md` together so users can understand or copy one complete workload without navigating framework internals.
+
+## 📊 5. Benchmark API
+
+A Benchmark is a thin, typed experiment entry point around a Pipeline: configure inputs and resources, run locally or submit through Ray Jobs, then receive one report containing outputs, throughput, actor/RPC/batch metrics, and best-effort GPU profile samples.
+
+```text
+configure → run or submit → collect metrics → write artifacts
+```
+
+```python
+from rayorch.benchmark import MinerUBench
+
+bench = MinerUBench(
+    input_path="/shared/data/pdfs",
+    model="/shared/models/MinerU2.5",
+    output_dir="/shared/output",
+    input_limit=100,
+    num_gpus=8,
+    batch_size=64,
+    input_batch_size=24,
+    max_active_input_batches=3,
+)
+
+report = bench.run(ray_address="auto")
+report.print_summary()
+```
+
+The same configuration can be submitted as a Ray Job without introducing a separate workload CLI:
+
+```python
+run = bench.submit("http://RAY_DASHBOARD:8265")
+report = run.wait(timeout_s=3600)
+```
+
+Workloads are registered lazily, so importing `rayorch` does not import optional backends such as vLLM, SGLang, or Flash-MinerU. Reports use a standard artifact layout:
+
+```text
+.rayorch-benchmark/<run-id>/
+  config.json
+  summary.json
+  gpu_samples.jsonl
+```
+
+See [Run a Benchmark](https://opendcai.github.io/RayOrch-doc/en/benchmarks/run.html), [Write a Benchmark](https://opendcai.github.io/RayOrch-doc/en/benchmarks/write.html), and [Built-in Workloads](https://opendcai.github.io/RayOrch-doc/en/benchmarks/built-ins.html).
+
+## ⚡ 6. Quick Start
+
+RayOrch requires Python 3.11 or newer:
+
+```bash
+pip install rayorch
+```
+
+`ro.run()` starts a local Ray runtime when no address is supplied, while the same Pipeline connects to an existing cluster with `address="auto"`:
+
+```python
+local_result = ro.run(MyPipeline(), values)
+cluster_result = ro.run(MyPipeline(), values, address="auto")
+```
+
+Resources and environments are configured on the stage that actually needs them. In the following case, four persistent model actors each reserve one GPU and start inside the `model-serving` Conda environment:
+
+```python
+self.model = ro.RayModule(ModelWorker).ray_options(
+    replicas=4,
+    batch_size=16,
+    num_gpus=1,
+    runtime_env={"conda": "model-serving"},
+)
+```
+
+For multi-node runs, every eligible node must be able to access the configured model, input, output, and Benchmark artifact paths. RayOrch schedules computation; it does not copy large datasets or model weights between nodes.
+
+For local development:
+
+```bash
+git clone https://github.com/OpenDCAI/RayOrch.git
+cd RayOrch
+pip install -r requirements-dev.txt
+pip install -e .
+pytest -q
+```
+
+Recommended path: [Installation](https://opendcai.github.io/RayOrch-doc/en/guide/installation.html) → [Your First Pipeline](https://opendcai.github.io/RayOrch-doc/en/guide/first-pipeline.html) → [Fan-out and Ordered Reduction](https://opendcai.github.io/RayOrch-doc/en/guide/fan-out-and-reduce.html) → [Multi-node and Multi-GPU](https://opendcai.github.io/RayOrch-doc/en/guide/multi-node.html) → [Cross-environment Stages](https://opendcai.github.io/RayOrch-doc/en/distributed/cross-environment.html).
+
+## ✅ 7. When should you use RayOrch?
+
+Use RayOrch when a workload has multiple stateful CPU/GPU stages, records expand or merge during execution, stages require different resources or environments, expensive models should stay loaded, or the same experiment must run locally, on a Ray cluster, and through Ray Jobs. Flash-MinerU, YOLO → SAM, dual-vLLM, and multimodal video processing are representative cases.
+
+Plain Python or native Ray Tasks/Actors may be simpler for one function or one model request. RayOrch is not a dataset/storage engine, model server, unbounded streaming system, replacement for Ray, or dynamic workflow engine for arbitrary runtime graph mutation. See [Capabilities and Boundaries](https://opendcai.github.io/RayOrch-doc/en/guide/boundaries.html).
+
+## 📖 8. Documentation
+
+| Topic | English | 中文 |
+| --- | --- | --- |
+| Introduction | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/) |
+| Framework design | [Read](https://opendcai.github.io/RayOrch-doc/en/architecture/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/architecture/) |
+| First Pipeline | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/first-pipeline.html) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/first-pipeline.html) |
+| Distributed execution | [Read](https://opendcai.github.io/RayOrch-doc/en/distributed/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/distributed/) |
+| Benchmarks | [Read](https://opendcai.github.io/RayOrch-doc/en/benchmarks/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/benchmarks/) |
+| API reference | [Read](https://opendcai.github.io/RayOrch-doc/en/api/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/api/) |
+| Paper and reproduction | [Read](https://opendcai.github.io/RayOrch-doc/en/paper/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/paper/) |
+
+Repository references: [Runtime architecture](docs/runtime_architecture.md) · [Benchmark authoring](docs/benchmarks.md) · [0.1 API migration](docs/api_migration.md)
+
+## 🗺️ 9. Project Status
+
+RayOrch is currently an alpha project. The `0.1` line focuses on a small public authoring API, multi-node and cross-environment execution, repeatable Benchmarks and Ray Job submission, Flash-MinerU and DataFlow integration validation, and clean package installation. Compatibility may still evolve before `1.0`; users of `0.0.1` should read the [migration guide](docs/api_migration.md).
+
+## 🤝 10. Community
+
+Use [GitHub Issues](https://github.com/OpenDCAI/RayOrch/issues) for bugs, feature requests, and design discussions, and [GitHub Pull Requests](https://github.com/OpenDCAI/RayOrch/pulls) for fixes, documentation, integrations, and new Benchmark cases. A useful Benchmark should remain easy to inspect: UDFs, a Pipeline, an environment declaration, a typed configuration, and a README explaining its topology, run method, and result.
+
+## 📜 11. License
+
+RayOrch is released under the [Apache License 2.0](LICENSE).
