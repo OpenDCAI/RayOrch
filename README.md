@@ -113,28 +113,28 @@ flowchart LR
 The difficult part of a model-hosted multimodal pipeline is not merely starting Ray actors. The system must keep CPU preprocessing and GPU inference running in parallel, batch ready items from different inputs for utilization, and still preserve ownership and order as every input progresses independently. The PDF case captures this problem:
 
 ```mermaid
-sequenceDiagram
-    participant L as RayOrch lineage
-    participant Q as READY queue
-    participant S as Scheduler
-    participant W as Persistent OCR actors
-    participant R as Result reconstruction
-    participant D as Downstream assembly
+flowchart LR
+    subgraph Lineage["Stable lineage"]
+        A0["A / page 0"]
+        A1["A / page 1"]
+        A2["A / page 2"]
+        B0["B / page 0"]
+        B1["B / page 1"]
+    end
 
-    L->>Q: A/0, A/1, A/2, B/0, B/1
-    Note over L,Q: Each task retains parent PDF and page index
-    S->>Q: Reserve ready tasks
-    Q-->>S: Batch [A/0, B/0, A/1]
-    S->>W: Dispatch cross-PDF microbatch
-    W-->>R: Results return B/0, A/1, A/0
-    R->>R: Route by parent and restore page order
-    Note over R,D: A waits only for A/2; B waits only for B/1
-    S->>Q: Reserve [B/1, A/2]
-    S->>W: Dispatch next microbatch
-    W-->>R: A/2 finishes
-    R->>D: A complete → assemble A immediately
-    W-->>R: B/1 finishes later
-    R->>D: B complete → assemble B
+    A0 --> Ready["READY queue"]
+    A1 --> Ready
+    A2 --> Ready
+    B0 --> Ready
+    B1 --> Ready
+    Ready --> Batch1["Microbatch 1<br/>A/0 + B/0 + A/1"]
+    Ready --> Batch2["Microbatch 2<br/>B/1 + A/2"]
+    Batch1 --> Actors["Persistent OCR actor pool"]
+    Batch2 --> Actors
+    Actors --> Returned["Physical completion<br/>B/0 · A/1 · A/0 · A/2 · B/1"]
+    Returned --> Rebuild["Route by parent<br/>restore page order"]
+    Rebuild --> DoneA["A complete<br/>assemble immediately"]
+    Rebuild --> DoneB["B complete later<br/>assemble independently"]
 ```
 
 RayOrch represents each schedulable task as business data plus stable lineage—here, the parent PDF and page index. The scheduler continuously reserves READY tasks and forms cross-PDF microbatches for persistent actors; physical completion may be out of order, but reconstruction routes every result to its parent and restores logical order. Consequently, A enters its downstream assembly as soon as A is complete, while B waits only for B's missing task rather than blocking the whole pipeline.

@@ -113,28 +113,28 @@ flowchart LR
 模型托管的多模态流水线，难点不只是启动若干 Ray Actor，而是让 CPU 预处理与 GPU 推理持续并行，让不同输入中已经就绪的数据共享模型批次，同时在每个输入独立推进时仍然维持正确的归属和顺序。PDF 案例可以直接说明这个问题：
 
 ```mermaid
-sequenceDiagram
-    participant L as RayOrch 血缘
-    participant Q as READY 队列
-    participant S as 调度器
-    participant W as 持久化 OCR Actor
-    participant R as 结果重建
-    participant D as 下游组装
+flowchart LR
+    subgraph Lineage["稳定血缘"]
+        A0["A / 第 0 页"]
+        A1["A / 第 1 页"]
+        A2["A / 第 2 页"]
+        B0["B / 第 0 页"]
+        B1["B / 第 1 页"]
+    end
 
-    L->>Q: A/0、A/1、A/2、B/0、B/1
-    Note over L,Q: 每个任务都保留父 PDF 和页码
-    S->>Q: 获取已经就绪的任务
-    Q-->>S: 批次 [A/0, B/0, A/1]
-    S->>W: 分发跨 PDF 执行批次
-    W-->>R: 结果按 B/0、A/1、A/0 返回
-    R->>R: 按父项路由并恢复页面顺序
-    Note over R,D: A 只等待 A/2；B 只等待 B/1
-    S->>Q: 获取 [B/1, A/2]
-    S->>W: 分发下一个执行批次
-    W-->>R: A/2 先完成
-    R->>D: A 已完整 → 立即组装 A
-    W-->>R: B/1 稍后完成
-    R->>D: B 已完整 → 组装 B
+    A0 --> Ready["READY 队列"]
+    A1 --> Ready
+    A2 --> Ready
+    B0 --> Ready
+    B1 --> Ready
+    Ready --> Batch1["微批次 1<br/>A/0 + B/0 + A/1"]
+    Ready --> Batch2["微批次 2<br/>B/1 + A/2"]
+    Batch1 --> Actors["持久化 OCR Actor 池"]
+    Batch2 --> Actors
+    Actors --> Returned["物理完成顺序<br/>B/0 · A/1 · A/0 · A/2 · B/1"]
+    Returned --> Rebuild["按父项路由<br/>恢复页面顺序"]
+    Rebuild --> DoneA["A 已完整<br/>立即独立组装"]
+    Rebuild --> DoneB["B 稍后完整<br/>再独立组装"]
 ```
 
 RayOrch 将每个可调度任务表示为业务数据加稳定血缘，在这个案例中就是父 PDF 和页码。调度器持续获取 READY 任务，并把不同 PDF 的页面组成批次送入持久化 Actor；物理执行可以乱序完成，但结果重建会将每个结果路由回父项并恢复逻辑顺序。因此 A 完整后可以立即进入下游组装，而 B 只等待自己的缺失任务，不会阻塞整条流水线。
