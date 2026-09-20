@@ -28,7 +28,22 @@ Completion-driven dataflow orchestration for multi-stage, multi-model AI workloa
 - **[2026-09] RayOrch `0.1` preview is ready.** The public API now centers on `Pipeline`, `RayModule`, `Executor`, and `RunResult`, with lazy Benchmarks and Ray Job submission.
 - **[2026-09] Flash-MinerU and DataFlow integrations are available.** Applications can depend on the installed `rayorch` package instead of carrying a private runtime copy.
 
-## 🔍 1. What is RayOrch?
+## 📖 1. Documentation
+
+| Topic | English | 中文 |
+| --- | --- | --- |
+| Introduction | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/) |
+| Installation | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/installation.html) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/installation.html) |
+| First Pipeline | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/first-pipeline.html) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/first-pipeline.html) |
+| Framework design | [Read](https://opendcai.github.io/RayOrch-doc/en/architecture/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/architecture/) |
+| Distributed execution | [Read](https://opendcai.github.io/RayOrch-doc/en/distributed/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/distributed/) |
+| Benchmarks | [Read](https://opendcai.github.io/RayOrch-doc/en/benchmarks/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/benchmarks/) |
+| API reference | [Read](https://opendcai.github.io/RayOrch-doc/en/api/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/api/) |
+| Paper and reproduction | [Read](https://opendcai.github.io/RayOrch-doc/en/paper/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/paper/) |
+
+Repository references: [Runtime architecture](docs/runtime_architecture.md) · [Benchmark authoring](docs/benchmarks.md) · [0.1 API migration](docs/api_migration.md)
+
+## 🔍 2. What is RayOrch?
 
 **RayOrch is a dataflow orchestration framework for large-scale, model-hosted multimodal processing.** It provides a small and explicit programming model for building pipeline-parallel workloads and complex inference DAGs, then efficiently schedules their heterogeneous stages across Ray CPU and GPU clusters.
 
@@ -108,7 +123,7 @@ flowchart LR
     Actors --> Result["Ordered RunResult + metrics"]
 ```
 
-## ✨ 2. Why RayOrch?
+## ✨ 3. Why RayOrch?
 
 The difficult part of a model-hosted multimodal pipeline is not merely starting Ray actors. The system must keep CPU preprocessing and GPU inference running in parallel, batch ready items from different inputs for utilization, and still preserve ownership and order as every input progresses independently. The PDF case captures this problem:
 
@@ -150,7 +165,7 @@ RayOrch represents each schedulable task as business data plus stable lineage—
 | Structured execution results | Some items are filtered, fail, or are suppressed by an upstream failure | Preserve ordinary successful values while reporting non-success outcomes explicitly |
 | Reproducible experiments | The same workload must run locally and through Ray Jobs | Reuse one typed Benchmark configuration and collect standard reports |
 
-## 🧠 3. Programming Model
+## 🧠 4. Programming Model
 
 RayOrch deliberately keeps the public model small:
 
@@ -237,7 +252,7 @@ RayOrch owns logical dataflow semantics while Ray owns physical distributed exec
 
 See [Framework Design](https://opendcai.github.io/RayOrch-doc/en/architecture/) for the compiler, runtime, and source-code path.
 
-## 🧩 4. Workloads and Integrations
+## 🧩 5. Workloads and Integrations
 
 ### 4.1 MinerU 2.5: `MinerUBench` and Flash-MinerU
 
@@ -396,7 +411,7 @@ Operators that require global cross-row state should keep their original executi
 
 Every built-in case lives under `rayorch/benchmarks/<name>/` and keeps its `udfs.py`, `pipeline.py`, `benchmark.py`, `env.json`, and case-specific `README.md` together so users can understand or copy one complete workload without navigating framework internals.
 
-## 📊 5. Benchmark API
+## 📊 6. Benchmark API
 
 A Benchmark is a thin, typed experiment entry point around a Pipeline: configure inputs and resources, run locally or submit through Ray Jobs, then receive one report containing outputs, throughput, actor/RPC/batch metrics, and best-effort GPU profile samples.
 
@@ -443,7 +458,7 @@ Workloads are registered lazily, so importing `rayorch` does not import optional
 
 See [Run a Benchmark](https://opendcai.github.io/RayOrch-doc/en/benchmarks/run.html), [Write a Benchmark](https://opendcai.github.io/RayOrch-doc/en/benchmarks/write.html), and [Built-in Workloads](https://opendcai.github.io/RayOrch-doc/en/benchmarks/built-ins.html).
 
-## ⚡ 6. Quick Start
+## ⚡ 7. Quick Start
 
 RayOrch requires Python 3.11 or newer:
 
@@ -486,34 +501,28 @@ pytest -q
 
 Recommended path: [Installation](https://opendcai.github.io/RayOrch-doc/en/guide/installation.html) → [Your First Pipeline](https://opendcai.github.io/RayOrch-doc/en/guide/first-pipeline.html) → [Fan-out and Ordered Reduction](https://opendcai.github.io/RayOrch-doc/en/guide/fan-out-and-reduce.html) → [Multi-node and Multi-GPU](https://opendcai.github.io/RayOrch-doc/en/guide/multi-node.html) → [Cross-environment Stages](https://opendcai.github.io/RayOrch-doc/en/distributed/cross-environment.html).
 
-## ✅ 7. When should you use RayOrch?
+## ✅ 8. When should you use RayOrch?
 
 Use RayOrch when a workload has multiple stateful CPU/GPU stages, records expand or merge during execution, stages require different resources or environments, expensive models should stay loaded, or the same experiment must run locally, on a Ray cluster, and through Ray Jobs. Flash-MinerU, YOLO → SAM, dual-vLLM, and multimodal video processing are representative cases.
 
 Plain Python or native Ray Tasks/Actors may be simpler for one function or one model request. RayOrch is not a dataset/storage engine, model server, unbounded streaming system, replacement for Ray, or dynamic workflow engine for arbitrary runtime graph mutation. See [Capabilities and Boundaries](https://opendcai.github.io/RayOrch-doc/en/guide/boundaries.html).
 
-## 📖 8. Documentation
-
-| Topic | English | 中文 |
-| --- | --- | --- |
-| Introduction | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/) |
-| Framework design | [Read](https://opendcai.github.io/RayOrch-doc/en/architecture/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/architecture/) |
-| First Pipeline | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/first-pipeline.html) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/first-pipeline.html) |
-| Distributed execution | [Read](https://opendcai.github.io/RayOrch-doc/en/distributed/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/distributed/) |
-| Benchmarks | [Read](https://opendcai.github.io/RayOrch-doc/en/benchmarks/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/benchmarks/) |
-| API reference | [Read](https://opendcai.github.io/RayOrch-doc/en/api/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/api/) |
-| Paper and reproduction | [Read](https://opendcai.github.io/RayOrch-doc/en/paper/) | [阅读](https://opendcai.github.io/RayOrch-doc/zh/paper/) |
-
-Repository references: [Runtime architecture](docs/runtime_architecture.md) · [Benchmark authoring](docs/benchmarks.md) · [0.1 API migration](docs/api_migration.md)
-
-## 🗺️ 9. Project Status
-
-RayOrch is currently an alpha project. The `0.1` line focuses on a small public authoring API, multi-node and cross-environment execution, repeatable Benchmarks and Ray Job submission, Flash-MinerU and DataFlow integration validation, and clean package installation. Compatibility may still evolve before `1.0`; users of `0.0.1` should read the [migration guide](docs/api_migration.md).
-
-## 🤝 10. Community
-
-Use [GitHub Issues](https://github.com/OpenDCAI/RayOrch/issues) for bugs, feature requests, and design discussions, and [GitHub Pull Requests](https://github.com/OpenDCAI/RayOrch/pulls) for fixes, documentation, integrations, and new Benchmark cases. A useful Benchmark should remain easy to inspect: UDFs, a Pipeline, an environment declaration, a typed configuration, and a README explaining its topology, run method, and result.
-
-## 📜 11. License
+## 📜 9. License
 
 RayOrch is released under the [Apache License 2.0](LICENSE).
+
+## 📝 10. Cite RayOrch
+
+If RayOrch helps your research, please cite the [RayOrch paper](https://arxiv.org/abs/2609.18703):
+
+```bibtex
+@misc{ma2026rayorchprogrammingexecutinglineagecontrolled,
+  title={RayOrch: Programming and Executing Lineage-Controlled Multi-Grain Dataflows for Foundation-Model Data Preparation},
+  author={Xiaochen Ma and Zimo Meng and Junzhu Liang and Youhe Jiang and Yue Cheng and Hao Liang and Bohan Zeng and Dengchun Li and Lu Ma and Zhengyang Zhao and Zhen Hao Wong and Runming He and Meiyi Qiang and Jiangtao Guan and Binhang Yuan and Wentao Zhang},
+  year={2026},
+  eprint={2609.18703},
+  archivePrefix={arXiv},
+  primaryClass={cs.DC},
+  url={https://arxiv.org/abs/2609.18703},
+}
+```

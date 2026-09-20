@@ -28,7 +28,22 @@
 - **[2026-09] RayOrch `0.1` 预览版已准备就绪。** 公开 API 现在以 `Pipeline`、`RayModule`、`Executor` 和 `RunResult` 为核心，同时提供 Benchmark 懒加载和 Ray Job 提交能力。
 - **[2026-09] 已完成 Flash-MinerU 与 DataFlow 集成。** 应用可以直接依赖安装好的 `rayorch` 包，无须再在自己的仓库中复制一份运行时源码。
 
-## 🔍 1. RayOrch 是什么？
+## 📖 1. 文档
+
+| 主题 | 中文 | English |
+| --- | --- | --- |
+| 项目介绍 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/) | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/) |
+| 安装 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/installation.html) | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/installation.html) |
+| 第一条 Pipeline | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/first-pipeline.html) | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/first-pipeline.html) |
+| 框架设计 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/architecture/) | [Read](https://opendcai.github.io/RayOrch-doc/en/architecture/) |
+| 分布式执行 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/distributed/) | [Read](https://opendcai.github.io/RayOrch-doc/en/distributed/) |
+| Benchmarks | [阅读](https://opendcai.github.io/RayOrch-doc/zh/benchmarks/) | [Read](https://opendcai.github.io/RayOrch-doc/en/benchmarks/) |
+| API 参考 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/api/) | [Read](https://opendcai.github.io/RayOrch-doc/en/api/) |
+| 论文与实验复现 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/paper/) | [Read](https://opendcai.github.io/RayOrch-doc/en/paper/) |
+
+仓库内参考资料：[运行时架构](docs/runtime_architecture.md) · [Benchmark 编写指南](docs/benchmarks.md) · [`0.1` API 迁移指南](docs/api_migration.md)
+
+## 🔍 2. RayOrch 是什么？
 
 **RayOrch 是一个面向大规模、多模态、模型托管（model-hosted）数据处理的数据流编排框架。** 它提供清晰且精简的编程模型，让用户可以用普通 Python 表达流水线并行和复杂推理 DAG，并将其中异构的计算阶段高效调度到 Ray CPU/GPU 集群上执行。
 
@@ -108,7 +123,7 @@ flowchart LR
     Actors --> Result["有序 RunResult + 执行指标"]
 ```
 
-## ✨ 2. 为什么使用 RayOrch？
+## ✨ 3. 为什么使用 RayOrch？
 
 模型托管的多模态流水线，难点不只是启动若干 Ray Actor，而是让 CPU 预处理与 GPU 推理持续并行，让不同输入中已经就绪的数据共享模型批次，同时在每个输入独立推进时仍然维持正确的归属和顺序。PDF 案例可以直接说明这个问题：
 
@@ -150,7 +165,7 @@ RayOrch 将每个可调度任务表示为业务数据加稳定血缘，在这个
 | 结构化执行结果 | 某些数据被过滤、失败或因上游失败被抑制 | 成功结果仍是普通业务值，非成功结果显式报告 |
 | 可复现实验 | 同一负载需要本地运行和 Ray Job 提交 | 复用一份类型化 Benchmark 配置并生成标准报告 |
 
-## 🧠 3. 编程模型
+## 🧠 4. 编程模型
 
 RayOrch 有意保持精简的公开编程模型：
 
@@ -237,7 +252,7 @@ RayOrch 负责逻辑数据流语义，Ray 负责物理分布式执行：
 
 编译器、运行时和源码执行路径请参阅[框架设计](https://opendcai.github.io/RayOrch-doc/zh/architecture/)。
 
-## 🧩 4. 真实负载与集成
+## 🧩 5. 真实负载与集成
 
 ### 4.1 MinerU 2.5：`MinerUBench` 与 Flash-MinerU
 
@@ -396,7 +411,7 @@ parallel_op = RayAcceleratedOperator(
 
 每个内置案例都位于 `rayorch/benchmarks/<name>/`，并将 `udfs.py`、`pipeline.py`、`benchmark.py`、`env.json` 和案例 README 放在一起，让用户无须进入框架内部就能理解或复制一条完整负载。
 
-## 📊 5. Benchmark API
+## 📊 6. Benchmark API
 
 Benchmark 是围绕 Pipeline 的轻量类型化实验入口：配置输入和资源，在本地运行或通过 Ray Jobs 提交，然后获得包含输出、吞吐、Actor/RPC/批处理指标以及尽力采集的 GPU Profile 的统一报告。
 
@@ -443,7 +458,7 @@ report = run.wait(timeout_s=3600)
 
 进一步阅读：[运行 Benchmark](https://opendcai.github.io/RayOrch-doc/zh/benchmarks/run.html)、[编写 Benchmark](https://opendcai.github.io/RayOrch-doc/zh/benchmarks/write.html)和[内置负载](https://opendcai.github.io/RayOrch-doc/zh/benchmarks/built-ins.html)。
 
-## ⚡ 6. 快速上手
+## ⚡ 7. 快速上手
 
 RayOrch 需要 Python 3.11 或更高版本：
 
@@ -486,34 +501,28 @@ pytest -q
 
 推荐阅读路径：[安装](https://opendcai.github.io/RayOrch-doc/zh/guide/installation.html) → [第一条 Pipeline](https://opendcai.github.io/RayOrch-doc/zh/guide/first-pipeline.html) → [展开与有序归并](https://opendcai.github.io/RayOrch-doc/zh/guide/fan-out-and-reduce.html) → [多机与多 GPU](https://opendcai.github.io/RayOrch-doc/zh/guide/multi-node.html) → [跨环境阶段](https://opendcai.github.io/RayOrch-doc/zh/distributed/cross-environment.html)。
 
-## ✅ 7. 什么时候应该使用 RayOrch？
+## ✅ 8. 什么时候应该使用 RayOrch？
 
 当一条负载包含多个有状态 CPU/GPU 阶段、数据会在执行中展开或归并、不同阶段需要不同资源或环境、昂贵模型需要持续驻留，或者同一实验需要在本地、Ray 集群和 Ray Jobs 中运行时，可以使用 RayOrch；Flash-MinerU、YOLO → SAM、双 vLLM 和多模态视频处理都是典型案例。
 
 如果只有一个函数或一次模型调用，普通 Python 或 Ray 原生 Task/Actor 可能更加简单。RayOrch 不是数据集/存储引擎、模型服务、无边界流式系统、Ray 的替代品，也不是支持任意运行时图变更的动态工作流引擎，详见[能力与边界](https://opendcai.github.io/RayOrch-doc/zh/guide/boundaries.html)。
 
-## 📖 8. 文档
-
-| 主题 | 中文 | English |
-| --- | --- | --- |
-| 项目介绍 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/) | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/) |
-| 框架设计 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/architecture/) | [Read](https://opendcai.github.io/RayOrch-doc/en/architecture/) |
-| 第一条 Pipeline | [阅读](https://opendcai.github.io/RayOrch-doc/zh/guide/first-pipeline.html) | [Read](https://opendcai.github.io/RayOrch-doc/en/guide/first-pipeline.html) |
-| 分布式执行 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/distributed/) | [Read](https://opendcai.github.io/RayOrch-doc/en/distributed/) |
-| Benchmarks | [阅读](https://opendcai.github.io/RayOrch-doc/zh/benchmarks/) | [Read](https://opendcai.github.io/RayOrch-doc/en/benchmarks/) |
-| API 参考 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/api/) | [Read](https://opendcai.github.io/RayOrch-doc/en/api/) |
-| 论文与实验复现 | [阅读](https://opendcai.github.io/RayOrch-doc/zh/paper/) | [Read](https://opendcai.github.io/RayOrch-doc/en/paper/) |
-
-仓库内参考资料：[运行时架构](docs/runtime_architecture.md) · [Benchmark 编写指南](docs/benchmarks.md) · [`0.1` API 迁移指南](docs/api_migration.md)
-
-## 🗺️ 9. 项目状态
-
-RayOrch 目前处于 Alpha 阶段。`0.1` 版本线重点关注精简的公开编写 API、多机与跨环境执行、可复现 Benchmark 和 Ray Job 提交、Flash-MinerU 与 DataFlow 集成验证以及干净的软件包安装；在稳定的 `1.0` 发布前兼容性仍可能继续演进，使用 `0.0.1` 的用户请阅读[迁移指南](docs/api_migration.md)。
-
-## 🤝 10. 社区
-
-使用 [GitHub Issues](https://github.com/OpenDCAI/RayOrch/issues) 报告缺陷、提出功能需求和讨论设计，使用 [GitHub Pull Requests](https://github.com/OpenDCAI/RayOrch/pulls) 提交修复、文档、集成和新的 Benchmark 案例。一个好的 Benchmark 应当易于检查：UDF、Pipeline、环境声明、类型化配置，以及一份说明拓扑、运行方式和结果的 README。
-
-## 📜 11. 开源协议
+## 📜 9. 开源协议
 
 RayOrch 基于 [Apache License 2.0](LICENSE) 开源。
+
+## 📝 10. 引用 RayOrch
+
+如果 RayOrch 对你的研究有所帮助，请引用 [RayOrch 论文](https://arxiv.org/abs/2609.18703)：
+
+```bibtex
+@misc{ma2026rayorchprogrammingexecutinglineagecontrolled,
+  title={RayOrch: Programming and Executing Lineage-Controlled Multi-Grain Dataflows for Foundation-Model Data Preparation},
+  author={Xiaochen Ma and Zimo Meng and Junzhu Liang and Youhe Jiang and Yue Cheng and Hao Liang and Bohan Zeng and Dengchun Li and Lu Ma and Zhengyang Zhao and Zhen Hao Wong and Runming He and Meiyi Qiang and Jiangtao Guan and Binhang Yuan and Wentao Zhang},
+  year={2026},
+  eprint={2609.18703},
+  archivePrefix={arXiv},
+  primaryClass={cs.DC},
+  url={https://arxiv.org/abs/2609.18703},
+}
+```
