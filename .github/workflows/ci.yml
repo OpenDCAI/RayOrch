@@ -158,6 +158,20 @@ jobs:
           assert "vllm" not in sys.modules
           assert "sglang" not in sys.modules
 
+          class AddOne:
+              def run(self, values):
+                  return [value + 1 for value in values]
+
+          class SmokePipeline(rayorch.Pipeline):
+              def __init__(self):
+                  self.add_one = rayorch.RayModule(AddOne).ray_options(num_cpus=0)
+
+              def forward(self, values):
+                  return self.add_one(values)
+
+          result = SmokePipeline().run([1, 2, 3], input_batch_size=2)
+          assert result.outputs == [2, 3, 4]
+
           expected = {
               "DocumentTopologyBench",
               "DualVllmBench",

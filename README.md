@@ -158,7 +158,7 @@ RayOrch deliberately keeps the public model small:
 | --- | --- |
 | UDF | Ordinary Python class or function that processes a batch |
 | `RayModule` | UDF construction, replicas, batch size, recovery, and Ray actor options |
-| `Pipeline` | Static topology connecting compute stages |
+| `Pipeline` | Static topology connecting compute stages, plus the concise one-shot `pipeline.run(...)` entry point |
 | `rayorch.F` | Explicit expansion, filtering, broadcast, and reduction |
 | `Executor` | Persistent actor ownership and execution lifecycle |
 | `RunResult` | Ordered outputs plus immutable timing, actor, RPC, Grain, and batching metrics |
@@ -170,30 +170,35 @@ import rayorch as ro
 
 
 class AddOne:
+    # A UDF receives one runtime batch and returns one result per input item.
     def run(self, values):
         return [value + 1 for value in values]
 
 
 class MyPipeline(ro.Pipeline):
     def __init__(self):
+        # Each RayModule owns a persistent actor pool; models loaded by the UDF stay warm across batches.
         self.first = ro.RayModule(AddOne).ray_options(replicas=2, batch_size=8)
         self.second = ro.RayModule(AddOne).ray_options(replicas=2, batch_size=8)
 
     def forward(self, values):
+        # forward() declares data dependencies; it does not execute the UDFs.
         return self.second(self.first(values))
 
 
-result = ro.run(
-    MyPipeline(),
+pipeline = MyPipeline()
+result = pipeline.run(
     [1, 2, 3],
-    input_batch_size=2,
-    max_active_input_batches=2,
+    input_batch_size=2,           # Admit two source items as one input batch.
+    max_active_input_batches=2,  # Allow two input batches to overlap.
 )
 
 print(result.outputs)  # [3, 4, 5]
 ```
 
 Read it as: **write batched UDFs → connect them in a Pipeline → assign resources → run**. `Pipeline.forward()` is traced once with symbolic values to build a static graph; it does not execute the UDFs or load their models.
+
+Use `pipeline.run(...)` for one finite execution. It creates an `Executor`, returns the `RunResult`, and closes the temporary actor pools; use `Executor(pipeline)` when several calls should reuse the same actors and loaded models. The functional form `ro.run(pipeline, ...)` remains equivalent to `pipeline.run(...)`.
 
 ### 3.1 `rayorch.F`: explicit shape transformations
 
@@ -215,6 +220,7 @@ For repeated calls, keep an `Executor` alive so its actors and models remain war
 ```python
 from rayorch import Executor
 
+# Reuse one Executor when repeated calls should share already-started actors.
 with Executor(MyPipeline()) as executor:
     first = executor.run([1, 2, 3])
     second = executor.run([4, 5, 6])
@@ -288,11 +294,13 @@ from rayorch.benchmarks.mineru.udfs import (
 
 class MinerUPipeline(ro.Pipeline):
     def __init__(self, *, model, output_dir, num_gpus=1, batch_size=64):
+        # CPU actors render each PDF into an ordered list of PageRecords.
         self.render = (
             ro.RayModule(MinerUPdfToPages)
             .pre_init(dpi=200)
             .ray_options(replicas=num_gpus, batch_size=1, num_cpus=1)
         )
+        # Each OCR replica keeps one MinerU/vLLM model resident on one GPU.
         self.ocr = (
             ro.RayModule(MinerUVlmOcrPage)
             .pre_init(model=model, gpu_memory_utilization=0.8)
@@ -303,11 +311,13 @@ class MinerUPipeline(ro.Pipeline):
                 num_cpus=1,
             )
         )
+        # This lightweight branch remains in the parent PDF Domain.
         self.metadata = ro.RayModule(PdfMetadata).ray_options(
             replicas=1,
             batch_size=32,
             num_cpus=1,
         )
+        # Assembly receives ordered page groups and writes document artifacts.
         self.assemble = (
             ro.RayModule(MinerUAssembleDoc)
             .pre_init(output_dir=output_dir)
@@ -315,9 +325,13 @@ class MinerUPipeline(ro.Pipeline):
         )
 
     def forward(self, pdfs):
+        # PDF:[page0, page1, ...] -> independently schedulable PDF/page items.
         pages = ro.F.expand(cast(ro.Port, self.render(pdfs)))
+        # READY pages from different PDFs may share the same OCR batch.
         contents = cast(ro.Port, self.ocr(pages))
         stems = cast(ro.Port, self.metadata(pdfs))
+        # Return both Ports to the PDF Domain with identical membership/order.
+        # Failed or filtered `contents` also define which pages survive.
         content_groups, ordered_page_groups = ro.F.reduce_aligned(
             contents,
             pages,
@@ -338,12 +352,13 @@ pip install "flash-mineru[vllm]"
 from flash_mineru import MineruEngine
 
 engine = MineruEngine(
-    model="/path/to/MinerU2.5",
-    save_dir="./outputs",
-    batch_size=8,
-    replicas=2,
-    num_gpus_per_replica=1,
+    model="/path/to/MinerU2.5",  # Local path visible to every Ray node.
+    save_dir="./outputs",        # Markdown, layout JSON, and extracted images.
+    batch_size=8,                # Maximum pages in one model call.
+    replicas=2,                  # Two persistent MinerU actors.
+    num_gpus_per_replica=1,      # One GPU reserved by each actor.
 )
+# The public Flash-MinerU API stays unchanged; RayOrch is internal.
 result = engine.run(["document-a.pdf", "document-b.pdf"])
 engine.close()
 ```
@@ -357,10 +372,11 @@ For a configurable experiment with standard profiling and artifacts, use `MinerU
 ```python
 from dataflow.rayorch import RayAcceleratedOperator
 
+# Keep DataFlow's operator API while executing MyOperator through RayOrch actors.
 parallel_op = RayAcceleratedOperator(
     MyOperator,
-    replicas=4,
-    num_gpus_per_replica=1,
+    replicas=4,              # Four persistent model workers.
+    num_gpus_per_replica=1,  # One GPU for each worker.
 ).op_cls_init(...)
 ```
 
@@ -392,16 +408,17 @@ configure → run or submit → collect metrics → write artifacts
 from rayorch.benchmark import MinerUBench
 
 bench = MinerUBench(
-    input_path="/shared/data/pdfs",
-    model="/shared/models/MinerU2.5",
-    output_dir="/shared/output",
-    input_limit=100,
-    num_gpus=8,
-    batch_size=64,
-    input_batch_size=24,
-    max_active_input_batches=3,
+    input_path="/shared/data/pdfs",     # One PDF or a directory of PDFs.
+    model="/shared/models/MinerU2.5",   # Must be visible on eligible nodes.
+    output_dir="/shared/output",        # Business outputs and run reports.
+    input_limit=100,                    # Cap the experiment input size.
+    num_gpus=8,                         # Create eight one-GPU OCR replicas.
+    batch_size=64,                      # Maximum pages per OCR RPC.
+    input_batch_size=24,                # Admit 24 PDFs per input lifecycle.
+    max_active_input_batches=3,         # Let up to three lifecycles overlap.
 )
 
+# Connect to the existing Ray cluster and emit a standard BenchmarkReport.
 report = bench.run(ray_address="auto")
 report.print_summary()
 ```
@@ -409,7 +426,9 @@ report.print_summary()
 The same configuration can be submitted as a Ray Job without introducing a separate workload CLI:
 
 ```python
+# Submit the same typed configuration through the Ray Jobs API.
 run = bench.submit("http://RAY_DASHBOARD:8265")
+# wait() reconstructs the same BenchmarkReport returned by local run().
 report = run.wait(timeout_s=3600)
 ```
 
@@ -432,21 +451,24 @@ RayOrch requires Python 3.11 or newer:
 pip install rayorch
 ```
 
-`ro.run()` starts a local Ray runtime when no address is supplied, while the same Pipeline connects to an existing cluster with `address="auto"`:
+`Pipeline.run()` starts a local Ray runtime when no address is supplied, while the same Pipeline connects to an existing cluster with `address="auto"`:
 
 ```python
-local_result = ro.run(MyPipeline(), values)
-cluster_result = ro.run(MyPipeline(), values, address="auto")
+pipeline = MyPipeline()
+local_result = pipeline.run(values)                    # Start local Ray.
+cluster_result = pipeline.run(values, address="auto")  # Join a cluster.
 ```
+
+The equivalent functional form, `ro.run(pipeline, values, ...)`, remains available when it fits application composition better.
 
 Resources and environments are configured on the stage that actually needs them. In the following case, four persistent model actors each reserve one GPU and start inside the `model-serving` Conda environment:
 
 ```python
 self.model = ro.RayModule(ModelWorker).ray_options(
-    replicas=4,
-    batch_size=16,
-    num_gpus=1,
-    runtime_env={"conda": "model-serving"},
+    replicas=4,                              # Four persistent actor replicas.
+    batch_size=16,                           # Up to 16 ready items per RPC.
+    num_gpus=1,                              # Reserve one GPU per replica.
+    runtime_env={"conda": "model-serving"},  # Run this stage in its own env.
 )
 ```
 

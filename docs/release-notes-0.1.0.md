@@ -1,8 +1,22 @@
-# Release notes — draft
+# RayOrch 0.1.0 release notes
 
-Unreleased. Updated: 2026-09-18. Release version and date are not yet assigned.
-Completed changes below refer to the working tree; planned changes are explicitly
-marked and must be verified before being announced as shipped.
+Release date: 2026-09-20.
+
+## Highlights
+
+- Added `Pipeline.run(...)` as the primary concise API for one finite execution.
+  It delegates to the same execution path as `rayorch.run(...)`, returns a
+  `RunResult`, and closes its temporary `Executor`. Applications that repeatedly
+  run the same Pipeline should keep using `Executor.run(...)` to reuse persistent
+  actors and loaded models.
+- Kept `rayorch.run(pipeline, ...)` as an equivalent functional API for
+  compatibility and composition.
+- Validated the installed-wheel boundary independently of the source checkout,
+  including a real local-Ray `Pipeline.run()` execution.
+- Migrated Flash-MinerU away from its copied RayOrch runtime to the installed
+  `rayorch==0.1.0` package while preserving its public `MineruEngine` API.
+- Migrated DataFlow's optional Ray acceleration path to `rayorch==0.1.0` while
+  preserving its storage-facing operator API and persistent warm-worker behavior.
 
 ## Completed changes
 
@@ -81,7 +95,7 @@ and RPC counts; real Ray tests also check retry/isolation RPC counts and batch s
 
 ## Broadcast: memory and traversal tradeoff
 
-**Status: implemented and regression-tested in the working tree; unreleased.**
+**Status: included in 0.1.0 and regression-tested.**
 When a source Item arrives, Broadcast traverses existing `ExpansionRecord.children`
 along the relevant Domain path, visiting descendants of that source. Newly
 created targets continue to use the existing Entity-event path to read available
@@ -122,17 +136,24 @@ source-triggered traversal, including intermediate nodes.
   `input_batch_size` bounds source rows, not expanded descendants;
   `max_active_input_batches` bounds overlapping batches, not bytes.
 
-Validation covers five arrival orders, all Item outcomes, empty/failed expansions,
-multiple sources and rules, unrelated Domain branches, and 1,200-level traversal
-without Python recursion. Dense/sparse operation counts and a traversal-only
-allocation check cover the time/space tradeoff. The complete Ray regression suite
-passed (206 tests); detailed measurements are in QA-08 of the release review.
-These checks do not establish end-to-end throughput or total driver memory limits.
-Sum work across Broadcast rules and account for all active batches when evaluating
-memory.
+Validation covers five arrival orders, all Item outcomes, empty/failed expansions, multiple sources and rules, unrelated Domain branches, and 1,200-level traversal without Python recursion. Dense/sparse operation counts and a traversal-only allocation check cover the time/space tradeoff. The default local release suite passed 234 tests with two opt-in cross-Conda tests skipped; those two tests were then enabled explicitly and passed. Detailed measurements for the original optimization review are in QA-08 of the release review. These checks do not establish end-to-end throughput or total driver memory limits. Sum work across Broadcast rules and account for all active batches when evaluating memory.
 
-## Release preparation
+## Compatibility
 
-Implementation decisions and validation records are maintained in the
-[release review](release-review_2026-09-16_105922.md). Resolve pending statuses and
-assign the release version/date before publishing these notes.
+- `Pipeline.run(...)` is additive. `rayorch.run(pipeline, ...)` remains supported, and repeated workloads should continue to use a persistent `Executor`.
+- Flash-MinerU keeps its documented `MineruEngine(...).run(...)` and `close()` API. The bundled `flash_mineru.ray_utils` runtime copy and its re-exported implementation symbols were removed; code importing those undocumented internals must migrate to the public `rayorch` package.
+- DataFlow keeps its storage-facing operator API. Its optional Ray acceleration path now imports `rayorch==0.1.0` lazily and retains a persistent Executor across warm calls.
+- RayOrch 0.1.0 requires Python 3.11 or newer. Flash-MinerU therefore raises its minimum supported Python version from 3.10 to 3.11.
+
+## Validation
+
+Implementation decisions and validation records are maintained in the [release review](release-review_2026-09-16_105922.md). Release validation includes the Python 3.11/3.12 CI matrix, package-content checks, installation from the built wheel outside the source tree, and a real local-Ray `Pipeline.run()` smoke test.
+
+- RayOrch default suite: `234 passed, 2 skipped`.
+- Opt-in cross-Conda SGLang/vLLM execution: `2 passed`.
+- Two-node Ray `Cluster` integration test: `1 passed`. This creates two Ray nodes on one host; a physical multi-host acceptance run remains environment-dependent.
+- Built wheel and source distribution: `twine check` passed, and a clean temporary environment installed the wheel and completed a real local-Ray `Pipeline.run()` with ordered output.
+- DataFlow: `9 passed`; its standalone CPU parallel check completed in 1.01 seconds versus 4.00 seconds serial in the validation environment, and an installed-wheel boundary smoke confirmed correct output plus Executor reuse and shutdown.
+- Flash-MinerU: an installed-RayOrch-wheel run completed against the MinerU2.5 model on one NVIDIA H20, followed by a two-replica/two-H20 run over two PDFs. Both produced Markdown artifacts and the two-GPU run preserved input order.
+
+The GPU results validate the tested model, inputs, software environment, and hardware; they are acceptance evidence rather than portable performance guarantees.

@@ -76,6 +76,18 @@ def test_run_convenience_manages_one_executor_lifetime():
     assert result.actor_count == 1
 
 
+def test_pipeline_run_convenience_manages_one_executor_lifetime():
+    result = IdentityPipeline().run(
+        [1, 2, 3],
+        input_batch_size=2,
+        max_active_input_batches=2,
+    )
+
+    assert [value for value, _ in result.outputs] == [1, 2, 3]
+    assert result.actor_count == 1
+    assert result.peak_active_input_batches == 2
+
+
 def test_nested_filtered_groups_reach_downstream_worker_with_empty_parents():
     class Identity:
         def run(self, values):

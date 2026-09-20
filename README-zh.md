@@ -158,7 +158,7 @@ RayOrch 有意保持精简的公开编程模型：
 | --- | --- |
 | UDF | 对一个批次执行普通 Python 计算的类或函数 |
 | `RayModule` | 声明 UDF 构造方式、副本数、批大小、恢复策略和 Ray Actor 选项 |
-| `Pipeline` | 连接计算阶段并形成静态拓扑 |
+| `Pipeline` | 连接计算阶段形成静态拓扑，并提供精简的一次性入口 `pipeline.run(...)` |
 | `rayorch.F` | 显式声明展开、过滤、广播和归并 |
 | `Executor` | 管理持久化 Actor 和执行生命周期 |
 | `RunResult` | 返回有序输出以及不可变的耗时、Actor、RPC、Grain 和批处理指标 |
@@ -170,30 +170,35 @@ import rayorch as ro
 
 
 class AddOne:
+    # UDF 每次接收一个运行时批次，并为每个输入返回一个结果。
     def run(self, values):
         return [value + 1 for value in values]
 
 
 class MyPipeline(ro.Pipeline):
     def __init__(self):
+        # 每个 RayModule 管理一组持久化 Actor；UDF 加载的模型可以跨批次复用。
         self.first = ro.RayModule(AddOne).ray_options(replicas=2, batch_size=8)
         self.second = ro.RayModule(AddOne).ray_options(replicas=2, batch_size=8)
 
     def forward(self, values):
+        # forward() 只声明数据依赖，不会在这里真正执行 UDF。
         return self.second(self.first(values))
 
 
-result = ro.run(
-    MyPipeline(),
+pipeline = MyPipeline()
+result = pipeline.run(
     [1, 2, 3],
-    input_batch_size=2,
-    max_active_input_batches=2,
+    input_batch_size=2,           # 每个输入批次接纳 2 个源数据。
+    max_active_input_batches=2,  # 最多允许 2 个输入批次重叠推进。
 )
 
 print(result.outputs)  # [3, 4, 5]
 ```
 
 可以把它理解为：**编写批处理 UDF → 在 Pipeline 中连接 → 分配资源 → 运行**。`Pipeline.forward()` 只会使用符号值追踪一次以构建静态图，不会真正执行 UDF，也不会在编译时加载模型。
+
+一次有限输入直接使用 `pipeline.run(...)`：它会创建一个 `Executor`、返回 `RunResult`，然后关闭临时 Actor 池；如果多次调用需要复用同一批 Actor 和已加载模型，则使用 `Executor(pipeline)`。函数式写法 `ro.run(pipeline, ...)` 仍与 `pipeline.run(...)` 完全等价。
 
 ### 3.1 `rayorch.F`：显式的数据形态变换
 
@@ -215,6 +220,7 @@ print(result.outputs)  # [3, 4, 5]
 ```python
 from rayorch import Executor
 
+# 连续调用时复用同一个 Executor，避免重复启动 Actor 和加载模型。
 with Executor(MyPipeline()) as executor:
     first = executor.run([1, 2, 3])
     second = executor.run([4, 5, 6])
@@ -288,11 +294,13 @@ from rayorch.benchmarks.mineru.udfs import (
 
 class MinerUPipeline(ro.Pipeline):
     def __init__(self, *, model, output_dir, num_gpus=1, batch_size=64):
+        # CPU Actor 将每个 PDF 渲染为有序的 PageRecord 列表。
         self.render = (
             ro.RayModule(MinerUPdfToPages)
             .pre_init(dpi=200)
             .ray_options(replicas=num_gpus, batch_size=1, num_cpus=1)
         )
+        # 每个 OCR 副本在一张 GPU 上常驻一个 MinerU/vLLM 模型。
         self.ocr = (
             ro.RayModule(MinerUVlmOcrPage)
             .pre_init(model=model, gpu_memory_utilization=0.8)
@@ -303,11 +311,13 @@ class MinerUPipeline(ro.Pipeline):
                 num_cpus=1,
             )
         )
+        # 这条轻量分支始终保留在父级 PDF Domain。
         self.metadata = ro.RayModule(PdfMetadata).ray_options(
             replicas=1,
             batch_size=32,
             num_cpus=1,
         )
+        # 组装阶段接收有序页面分组，并写出最终文档产物。
         self.assemble = (
             ro.RayModule(MinerUAssembleDoc)
             .pre_init(output_dir=output_dir)
@@ -315,9 +325,13 @@ class MinerUPipeline(ro.Pipeline):
         )
 
     def forward(self, pdfs):
+        # PDF:[page0, page1, ...] → 可独立调度的 PDF/page 子项。
         pages = ro.F.expand(cast(ro.Port, self.render(pdfs)))
+        # 来自不同 PDF 的 READY 页面可以进入同一个 OCR 批次。
         contents = cast(ro.Port, self.ocr(pages))
         stems = cast(ro.Port, self.metadata(pdfs))
+        # 将两个 Port 按相同成员集合和页序归并回 PDF Domain。
+        # 失败或被过滤的 contents 同时决定哪些页面能够保留。
         content_groups, ordered_page_groups = ro.F.reduce_aligned(
             contents,
             pages,
@@ -338,12 +352,13 @@ pip install "flash-mineru[vllm]"
 from flash_mineru import MineruEngine
 
 engine = MineruEngine(
-    model="/path/to/MinerU2.5",
-    save_dir="./outputs",
-    batch_size=8,
-    replicas=2,
-    num_gpus_per_replica=1,
+    model="/path/to/MinerU2.5",  # 所有 Ray 节点都可见的本地模型路径。
+    save_dir="./outputs",        # Markdown、版面 JSON 和提取图片目录。
+    batch_size=8,                # 单次模型调用最多处理 8 页。
+    replicas=2,                  # 创建 2 个常驻 MinerU Actor。
+    num_gpus_per_replica=1,      # 每个 Actor 预留 1 张 GPU。
 )
+# Flash-MinerU 的公开 API 保持不变，RayOrch 位于其内部。
 result = engine.run(["document-a.pdf", "document-b.pdf"])
 engine.close()
 ```
@@ -357,10 +372,11 @@ engine.close()
 ```python
 from dataflow.rayorch import RayAcceleratedOperator
 
+# 保持 DataFlow Operator API，同时通过 RayOrch Actor 执行 MyOperator。
 parallel_op = RayAcceleratedOperator(
     MyOperator,
-    replicas=4,
-    num_gpus_per_replica=1,
+    replicas=4,              # 4 个持久化模型 Worker。
+    num_gpus_per_replica=1,  # 每个 Worker 使用 1 张 GPU。
 ).op_cls_init(...)
 ```
 
@@ -392,16 +408,17 @@ Benchmark 是围绕 Pipeline 的轻量类型化实验入口：配置输入和资
 from rayorch.benchmark import MinerUBench
 
 bench = MinerUBench(
-    input_path="/shared/data/pdfs",
-    model="/shared/models/MinerU2.5",
-    output_dir="/shared/output",
-    input_limit=100,
-    num_gpus=8,
-    batch_size=64,
-    input_batch_size=24,
-    max_active_input_batches=3,
+    input_path="/shared/data/pdfs",     # 单个 PDF 或 PDF 目录。
+    model="/shared/models/MinerU2.5",   # 所有候选节点都必须能访问。
+    output_dir="/shared/output",        # 业务结果和 Benchmark 报告目录。
+    input_limit=100,                    # 限制本次实验的输入数量。
+    num_gpus=8,                         # 创建 8 个单卡 OCR 副本。
+    batch_size=64,                      # 每次 OCR RPC 最多处理 64 页。
+    input_batch_size=24,                # 每个输入生命周期接纳 24 个 PDF。
+    max_active_input_batches=3,         # 最多让 3 个生命周期重叠推进。
 )
 
+# 连接已有 Ray 集群，并返回统一的 BenchmarkReport。
 report = bench.run(ray_address="auto")
 report.print_summary()
 ```
@@ -409,7 +426,9 @@ report.print_summary()
 同一份配置可以直接作为 Ray Job 提交，无须再为负载设计一套 CLI：
 
 ```python
+# 通过 Ray Jobs API 提交完全相同的类型化配置。
 run = bench.submit("http://RAY_DASHBOARD:8265")
+# wait() 会还原与本地 run() 相同结构的 BenchmarkReport。
 report = run.wait(timeout_s=3600)
 ```
 
@@ -432,21 +451,24 @@ RayOrch 需要 Python 3.11 或更高版本：
 pip install rayorch
 ```
 
-未提供地址时，`ro.run()` 会启动本地 Ray；同一条 Pipeline 只需传入 `address="auto"` 就可以连接已有集群：
+未提供地址时，`Pipeline.run()` 会启动本地 Ray；同一条 Pipeline 只需传入 `address="auto"` 就可以连接已有集群：
 
 ```python
-local_result = ro.run(MyPipeline(), values)
-cluster_result = ro.run(MyPipeline(), values, address="auto")
+pipeline = MyPipeline()
+local_result = pipeline.run(values)                    # 启动本地 Ray。
+cluster_result = pipeline.run(values, address="auto")  # 接入已有集群。
 ```
+
+如果函数式写法更适合应用组合，也仍然可以使用完全等价的 `ro.run(pipeline, values, ...)`。
 
 资源和环境直接配置在真正需要它们的阶段。下面的案例会创建四个持久化模型 Actor，每个 Actor 预留一张 GPU，并在 `model-serving` Conda 环境中启动：
 
 ```python
 self.model = ro.RayModule(ModelWorker).ray_options(
-    replicas=4,
-    batch_size=16,
-    num_gpus=1,
-    runtime_env={"conda": "model-serving"},
+    replicas=4,                              # 创建 4 个持久化 Actor 副本。
+    batch_size=16,                           # 每次 RPC 最多接收 16 个就绪项。
+    num_gpus=1,                              # 每个副本预留 1 张 GPU。
+    runtime_env={"conda": "model-serving"},  # 仅该阶段进入指定环境。
 )
 ```
 

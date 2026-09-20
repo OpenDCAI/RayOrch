@@ -116,7 +116,7 @@ target-Domain creation order for that event. READY insertion remains FIFO;
 simultaneously released work may have different execution microbatch boundaries.
 Waiting tables or automatic strategy selection remain deferred until concrete
 user reports justify the additional mechanism. See the
-[release notes draft](release-notes-draft.md) for the tradeoff and validation.
+[RayOrch 0.1.0 release notes](release-notes-0.1.0.md) for the tradeoff and validation.
 
 ## Final output issues
 

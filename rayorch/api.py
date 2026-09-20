@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Self, overload
 
@@ -9,6 +10,7 @@ from ._model import PortRef
 
 if TYPE_CHECKING:
     from ._program.plan import CompiledProgram
+    from .result import RunResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +108,31 @@ class Pipeline:
         """Declare a graph by composing RayModules and structural Port operations."""
 
         raise NotImplementedError
+
+    def run(
+        self,
+        *source_columns: Sequence[Any],
+        input_batch_size: int | None = None,
+        max_active_input_batches: int = 1,
+        address: str | None = None,
+        ray_init_kwargs: dict[str, Any] | None = None,
+    ) -> RunResult:
+        """Execute one finite input and close the temporary Executor afterward.
+
+        Use :class:`rayorch.Executor` directly when repeated runs should reuse
+        the same persistent actor pools.
+        """
+
+        from .runner import run
+
+        return run(
+            self,
+            *source_columns,
+            input_batch_size=input_batch_size,
+            max_active_input_batches=max_active_input_batches,
+            address=address,
+            ray_init_kwargs=ray_init_kwargs,
+        )
 
     def compile(self, *, optimize: bool = True) -> CompiledProgram:
         """Trace ``forward`` and compile it into an immutable RuntimePlan."""
