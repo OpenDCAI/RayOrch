@@ -25,6 +25,7 @@ __all__ = [
     "DualVllmBench",
     "LocalSource",
     "MinerUBench",
+    "MinerUScaleBench",
     "SglangVllmBench",
     "VideoCaptionTopologyBench",
     "VideoMultimodalTopologyBench",

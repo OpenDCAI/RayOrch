@@ -27,6 +27,12 @@ _SPECS = {
         "rayorch.benchmarks.mineru",
         "env.json",
     ),
+    "mineru_scale": (
+        "MinerUScaleBench",
+        "rayorch.benchmarks.mineru_scale.benchmark:MinerUScaleBench",
+        "rayorch.benchmarks.mineru_scale",
+        "env.json",
+    ),
     "sglang_vllm": (
         "SglangVllmBench",
         "rayorch.benchmarks.sglang_vllm.benchmark:SglangVllmBench",

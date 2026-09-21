@@ -19,6 +19,8 @@ from rayorch.benchmark import MinerUBench
 The built-ins currently include:
 
 - `MinerUBench`: the real MinerU PDF workload;
+- `MinerUScaleBench`: the production-hardened local/HDFS MinerU workload with
+  the completed 64-GPU experiment's resource defaults;
 - `YoloSamBench`: the original real YOLO -> SAM image workload;
 - `DualVllmBench`: the original real two-model vLLM workflow;
 - `SglangVllmBench`: SGLang -> vLLM with one Conda environment per model stage;

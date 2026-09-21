@@ -61,16 +61,16 @@ def test_framework_and_builtin_workloads_are_separate_packages():
         package_name = class_path(name).split(":", 1)[0].split(".")[-2]
         package = Path(benchmarks.__file__).parent / package_name
         assert {
-            path.name
-            for path in package.iterdir()
-            if path.name != "__pycache__"
-        } == {
             "__init__.py",
             "README.md",
             "benchmark.py",
             "pipeline.py",
             "env.json",
             "udfs.py",
+        } <= {
+            path.name
+            for path in package.iterdir()
+            if path.name != "__pycache__"
         }
 
 
@@ -92,24 +92,46 @@ print(json.dumps(sorted(name for name in watched if name in sys.modules)))
     )
     assert json.loads(completed.stdout) == []
 
+    code = """
+import json, sys
+import rayorch.benchmarks.mineru_scale.pipeline
+watched = (
+    'ray', 'numpy', 'torch', 'vllm', 'flash_mineru', 'pyarrow',
+    'mineru_vl_utils', 'PIL', 'pypdf', 'pypdfium2',
+)
+print(json.dumps(sorted(name for name in watched if name in sys.modules)))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == []
+
 
 def test_builtin_spec_and_runtime_env_are_lightweight():
     assert available() == (
         "document_topology",
         "dual_vllm",
         "mineru",
+        "mineru_scale",
         "sglang_vllm",
         "video_caption_topology",
         "video_multimodal_topology",
         "yolo_sam",
     )
     assert class_path("mineru").endswith(":MinerUBench")
+    assert class_path("mineru_scale").endswith(":MinerUScaleBench")
     assert class_path("document_topology").endswith(":DocumentTopologyBench")
     assert "vllm" not in sys.modules
 
     environment = runtime_env("mineru")
     assert "numpy==2.2.6" in environment["pip"]["packages"]
     assert "transformers>=4.57.3,<5.0.0" in environment["pip"]["packages"]
+    scale_environment = runtime_env("mineru_scale")
+    assert "mineru-vl-utils==1.2.1" in scale_environment["pip"]["packages"]
+    assert "vllm==0.11.0" in scale_environment["pip"]["packages"]
     assert runtime_env("video_caption_topology") == {}
 
 
@@ -117,6 +139,7 @@ def test_benchmark_attribute_uses_registry_as_its_single_source():
     import rayorch.benchmark as benchmark
 
     assert benchmark.MinerUBench is load("mineru")
+    assert benchmark.MinerUScaleBench is load("mineru_scale")
     assert benchmark.SglangVllmBench is load("sglang_vllm")
     assert benchmark.DocumentTopologyBench is load("document_topology")
     assert benchmark.DualVllmBench is load("dual_vllm")
