@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "rayorch_experiment_commit": "30e88593cf1efdb764a22371c54dc2cc586d1e36",
+    "historical_udf_sha256": "7776b4d95d0fcab266fc2f4df0dece5ed3f1225eb2c44368d746e095beef607e",
+    "flash_mineru_commit": "7246a353554cee35674d7ef82f2c061db2f43003",
+    "reference_run_id": "rayorch_v36_multigrain_scaling_8x8_20260825_1910",
+    "reference_source_digest": "97ae7115e1c952052379411f123cf57a55b99762503cdf11ac747e6dfb9635a0"
+  },
+  "reference_result": {
+    "status": "completed",
+    "pdfs": 3690,
+    "pages": 174744,
+    "failed_documents": 1,
+    "pages_per_second": 48.1738
+  },
+  "resources": {
+    "workers": 8,
+    "gpus_per_worker": 8,
+    "gpu_total": 64,
+    "gpu_type": "H20",
+    "render_replicas": 256,
+    "ocr_replicas": 128,
+    "gpus_per_ocr_actor": 0.5,
+    "assemble_replicas": 64
+  },
+  "execution": {
+    "batch_size": 64,
+    "input_batch_size": 24,
+    "max_active_input_batches": 24,
+    "gpu_memory_utilization": 0.32,
+    "render_dpi": 200
+  },
+  "environment": {
+    "ray": "2.51.1",
+    "vllm": "0.11.0",
+    "torch": "2.8.0+cu128",
+    "pyarrow": "19.0.1",
+    "mineru_vl_utils": "1.2.1"
+  }
+}

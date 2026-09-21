@@ -36,6 +36,14 @@ include = ["rayorch*"]
 
 [tool.setuptools.package-data]
 "rayorch.benchmarks.mineru" = ["env.json", "README.md"]
+"rayorch.benchmarks.mineru_scale" = [
+    "env.json",
+    "success_contract.json",
+    "README.md",
+    "skills/mineru-scale-tuning/SKILL.md",
+    "skills/mineru-scale-tuning/references/*.md",
+    "skills/mineru-scale-tuning/scripts/*.py",
+]
 "rayorch.benchmarks.document_topology" = ["env.json", "README.md"]
 "rayorch.benchmarks.dual_vllm" = ["env.json", "README.md"]
 "rayorch.benchmarks.sglang_vllm" = ["env.json", "README.md"]
