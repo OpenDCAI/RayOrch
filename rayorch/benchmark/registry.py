@@ -27,15 +27,9 @@ _SPECS = {
         "rayorch.benchmarks.mineru",
         "env.json",
     ),
-    "mineru_scale": (
-        "MinerUScaleBench",
-        "rayorch.benchmarks.mineru_scale.benchmark:MinerUScaleBench",
-        "rayorch.benchmarks.mineru_scale",
-        "env.json",
-    ),
-    "video_panda70m": (
-        "VideoPanda70MBench",
-        "rayorch.benchmarks.panda70m.benchmark:VideoPanda70MBench",
+    "panda70m": (
+        "Panda70MBench",
+        "rayorch.benchmarks.panda70m.benchmark:Panda70MBench",
         "rayorch.benchmarks.panda70m",
         "env.json",
     ),

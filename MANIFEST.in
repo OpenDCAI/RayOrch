@@ -1,7 +1,6 @@
 recursive-include rayorch *.py
 recursive-include rayorch *.json
 recursive-include rayorch/benchmarks README.md
-recursive-include rayorch/benchmarks/mineru_scale/skills *.md
 
 include README.md
 include requirements.txt
