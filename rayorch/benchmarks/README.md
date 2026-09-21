@@ -19,6 +19,7 @@ from rayorch.benchmark import MinerUBench
 The built-ins currently include:
 
 - `MinerUBench`: the real MinerU PDF workload;
+- `VideoPanda70MBench`: Panda-70M video decoding and Qwen caption workload;
 - `YoloSamBench`: the original real YOLO -> SAM image workload;
 - `DualVllmBench`: the original real two-model vLLM workflow;
 - `SglangVllmBench`: SGLang -> vLLM with one Conda environment per model stage;
