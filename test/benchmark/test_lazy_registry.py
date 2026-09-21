@@ -119,6 +119,7 @@ def test_builtin_spec_and_runtime_env_are_lightweight():
         "sglang_vllm",
         "video_caption_topology",
         "video_multimodal_topology",
+        "video_panda70m",
         "yolo_sam",
     )
     assert class_path("mineru").endswith(":MinerUBench")
@@ -143,6 +144,7 @@ def test_benchmark_attribute_uses_registry_as_its_single_source():
     assert benchmark.SglangVllmBench is load("sglang_vllm")
     assert benchmark.DocumentTopologyBench is load("document_topology")
     assert benchmark.DualVllmBench is load("dual_vllm")
+    assert benchmark.VideoPanda70MBench is load("video_panda70m")
     assert benchmark.VideoCaptionTopologyBench is load("video_caption_topology")
     assert benchmark.VideoMultimodalTopologyBench is load(
         "video_multimodal_topology"

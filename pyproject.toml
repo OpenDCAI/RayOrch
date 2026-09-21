@@ -44,6 +44,7 @@ include = ["rayorch*"]
     "skills/mineru-scale-tuning/references/*.md",
     "skills/mineru-scale-tuning/scripts/*.py",
 ]
+"rayorch.benchmarks.panda70m" = ["env.json", "README.md"]
 "rayorch.benchmarks.document_topology" = ["env.json", "README.md"]
 "rayorch.benchmarks.dual_vllm" = ["env.json", "README.md"]
 "rayorch.benchmarks.sglang_vllm" = ["env.json", "README.md"]
