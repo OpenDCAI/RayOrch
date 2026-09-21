@@ -116,10 +116,10 @@ def test_builtin_spec_and_runtime_env_are_lightweight():
         "dual_vllm",
         "mineru",
         "mineru_scale",
-        "video_panda70m",
         "sglang_vllm",
         "video_caption_topology",
         "video_multimodal_topology",
+        "video_panda70m",
         "yolo_sam",
     )
     assert class_path("mineru").endswith(":MinerUBench")
