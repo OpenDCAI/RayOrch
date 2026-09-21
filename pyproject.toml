@@ -36,6 +36,7 @@ include = ["rayorch*"]
 
 [tool.setuptools.package-data]
 "rayorch.benchmarks.mineru" = ["env.json", "README.md"]
+"rayorch.benchmarks.panda70m" = ["env.json", "README.md"]
 "rayorch.benchmarks.document_topology" = ["env.json", "README.md"]
 "rayorch.benchmarks.dual_vllm" = ["env.json", "README.md"]
 "rayorch.benchmarks.sglang_vllm" = ["env.json", "README.md"]

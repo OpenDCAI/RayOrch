@@ -64,6 +64,7 @@ The earliest RayOrch examples are also preserved as real workload adapters:
 | Benchmark | Topology | Optional dependencies |
 | --- | --- | --- |
 | `YoloSamBench` | Image -> YOLO -> SAM -> Overlay | Ultralytics, Segment Anything, Torch |
+| `Panda70MBench` | Panda source -> clips -> fused Qwen caption teachers -> source | OpenCV or PyAV, PyArrow, vLLM |
 | `DualVllmBench` | Prompt -> Model A -> refinement -> Model B | vLLM, CUDA |
 | `SglangVllmBench` | Prompt -> SGLang -> handoff -> vLLM | SGLang and vLLM in separate Conda environments |
 

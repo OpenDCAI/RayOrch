@@ -27,6 +27,12 @@ _SPECS = {
         "rayorch.benchmarks.mineru",
         "env.json",
     ),
+    "panda70m": (
+        "Panda70MBench",
+        "rayorch.benchmarks.panda70m.benchmark:Panda70MBench",
+        "rayorch.benchmarks.panda70m",
+        "env.json",
+    ),
     "sglang_vllm": (
         "SglangVllmBench",
         "rayorch.benchmarks.sglang_vllm.benchmark:SglangVllmBench",
