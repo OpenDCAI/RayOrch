@@ -21,7 +21,7 @@ from .udfs import DEFAULT_MODEL
 
 
 @dataclass(frozen=True, slots=True)
-class Panda70MBench:
+class VideoPanda70MBench:
     manifest: str | Path
     output_dir: str | Path
     model: str = DEFAULT_MODEL
@@ -90,7 +90,7 @@ class Panda70MBench:
             sample_multiplier=self.sample_multiplier,
         )
         return run_benchmark(
-            name="panda70m",
+            name="video_panda70m",
             pipeline=self._pipeline(),
             source_columns=(sources,),
             config=benchmark_config(self),
@@ -115,7 +115,7 @@ class Panda70MBench:
         run_id: str | None = None,
     ) -> BenchmarkRun:
         return submit_benchmark(
-            benchmark="panda70m",
+            benchmark="video_panda70m",
             config=benchmark_config(self),
             artifact_root=Path(self.output_dir) / ".rayorch-benchmark",
             target=target,
@@ -228,4 +228,4 @@ def _mean(values: Any) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-__all__ = ["Panda70MBench", "load_panda_sources"]
+__all__ = ["VideoPanda70MBench", "load_panda_sources"]

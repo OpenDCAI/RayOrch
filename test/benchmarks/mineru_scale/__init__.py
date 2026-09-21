@@ -1,0 +1,1 @@
+"""MinerU scale Benchmark tests."""
