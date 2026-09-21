@@ -10,11 +10,11 @@ _execution/  Ray actors, RPC lifecycle, and worker ABI
 ```
 
 The package root exports authoring (`Pipeline`, `RayModule`, `Port`, `F.*`),
-execution (`Executor`, `run`, `RunResult`), and recovery (`RecoveryPolicy`).
-Internal identity and worker-protocol types stay private so their representation
-can evolve without expanding the compatibility surface. The UDF-facing
-`RecordFailure` and `GroupFailure` values remain available from the package root
-and can also be imported from `rayorch.failures`.
+execution (`Executor`, `run`, `RunResult`), and recovery
+(`RecoveryPolicy`). Internal identity and worker-protocol types stay private so
+their representation can evolve without expanding the compatibility surface.
+The UDF-facing `RecordFailure` and `GroupFailure` values remain available from
+the package root and can also be imported from `rayorch.failures`.
 
 Every Call input follows one propagation rule. The Grain becomes runnable only
 when all inputs are `PRESENT`; a `DROPPED` input drops its outputs, while a
@@ -38,6 +38,48 @@ the Call's `batch_size`. `input_batch_size` instead counts source rows, while
 `max_active_input_batches` limits overlapping input batch lifecycles. Parent
 identity remains part of runtime state only for lineage and `GroupFailure`
 isolation, not as a batching policy.
+
+## Calls and shared actor pools
+
+One `RayModule` object describes one initialized stateful compute resource.
+Calling that object more than once creates distinct logical Calls that
+automatically share its actors:
+
+```python
+model = (
+    RayModule(ModelStack)
+    .pre_init(model_path)
+    .ray_options(replicas=4, num_gpus=1, batch_size=16)
+)
+layout = model(pages, stage="layout")
+recognize = model(layout, stage="recognize")
+```
+
+`pages` and `layout` are dynamic `Port` inputs. Ordinary keyword values such as
+`stage="layout"` are static Call arguments forwarded to `run()` with every
+Worker batch. Static positional arguments and symbolic Ports nested inside
+static containers are intentionally unsupported, so data dependencies remain
+visually explicit.
+
+Calls retain distinct `CallRef`s, READY queues, Worker layouts, recovery state,
+metrics, and lineage. Calls created from the same `RayModule` map to one private
+`PoolRef`; calls created from different `RayModule` objects map to different
+pools even when they use the same UDF class. This object-identity rule is the
+whole public contract—physical pool types remain implementation details. The
+module's batching and recovery options apply to all its Calls.
+
+Pool scheduling is round-robin across runnable Calls; after choosing a Call,
+its existing immediate-retry/READY/deferred-recovery priority and input-batch
+order apply. Each actor executes one microbatch to completion before another
+Call can use it, so this is stage multiplexing at RPC boundaries rather than
+preemption.
+
+Shared actors may hold stable model state, but request data must flow through
+DAG Ports. A UDF must not synchronously wait for a downstream Call using the
+same module, and the runtime does not provide lineage-to-replica affinity for
+hidden actor-local request state. An infrastructure failure requeues only the
+failed Call's microbatch, replaces that physical replica, waits for its
+initialization to complete, and then returns it to scheduling.
 
 ## Group shape
 

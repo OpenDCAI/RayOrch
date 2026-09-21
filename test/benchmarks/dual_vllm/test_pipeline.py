@@ -19,7 +19,9 @@ def test_dual_vllm_pipeline_has_two_independent_model_calls():
         stage_options={"model_b": {"batch_size": 4}},
     ).compile()
     targets = [spec.udf.target for spec in compiled.logical.calls.values()]
-    pools = list(compiled.plan.actor_pools_by_call.values())
+    calls = list(compiled.logical.calls)
+    pools = [compiled.plan.pool(call) for call in calls]
+    dispatches = [compiled.plan.dispatch(call) for call in calls]
 
     assert targets == [
         VllmGenerate,
@@ -29,5 +31,5 @@ def test_dual_vllm_pipeline_has_two_independent_model_calls():
     ]
     assert dict(pools[0].ray_options)["num_gpus"] == 2.0
     assert dict(pools[2].ray_options)["num_gpus"] == 2.0
-    assert pools[0].batch_size == 8
-    assert pools[2].batch_size == 4
+    assert dispatches[0].batch_size == 8
+    assert dispatches[2].batch_size == 4

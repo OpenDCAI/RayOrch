@@ -153,7 +153,7 @@ RayOrch deliberately keeps the public model small:
 | Object | Responsibility |
 | --- | --- |
 | UDF | Ordinary Python class or function that processes a batch |
-| `RayModule` | UDF construction, replicas, batch size, recovery, and Ray actor options |
+| `RayModule` | UDF construction, replicas, batch size, recovery, Ray actor options, and automatic actor reuse when the same object is called more than once |
 | `Pipeline` | Static topology connecting compute stages, plus the concise one-shot `pipeline.run(...)` entry point |
 | `rayorch.F` | Explicit expansion, filtering, broadcast, and reduction |
 | `Executor` | Persistent actor ownership and execution lifecycle |
@@ -195,6 +195,39 @@ print(result.outputs)  # [3, 4, 5]
 Read it as: **write batched UDFs → connect them in a Pipeline → assign resources → run**. `Pipeline.forward()` is traced once with symbolic values to build a static graph; it does not execute the UDFs or load their models.
 
 Use `pipeline.run(...)` for one finite execution. It creates an `Executor`, returns the `RunResult`, and closes the temporary actor pools; use `Executor(pipeline)` when several calls should reuse the same actors and loaded models. The functional form `ro.run(pipeline, ...)` remains equivalent to `pipeline.run(...)`.
+
+When several DAG stages use the same model stack, keep one `RayModule` object and select the operation through an ordinary keyword argument to `run()`:
+
+```python
+class ModelStack:
+    def __init__(self, model_path):
+        self.model = load_model(model_path)
+
+    def run(self, values, *, stage):
+        if stage == "layout":
+            return self.model.layout(values)
+        if stage == "recognize":
+            return self.model.recognize(values)
+        raise ValueError(stage)
+
+
+class DocumentPipeline(ro.Pipeline):
+    def __init__(self, model_path):
+        # This one RayModule describes one initialized model stack.
+        self.model = (
+            ro.RayModule(ModelStack)
+            .pre_init(model_path)
+            .ray_options(replicas=4, num_gpus=1, batch_size=16)
+        )
+
+    def forward(self, pages):
+        # Each invocation is an independent DAG Call, while both Calls reuse
+        # the actors and model state owned by the same RayModule object.
+        layouts = self.model(pages, stage="layout")
+        return self.model(layouts, stage="recognize")
+```
+
+Here `stage` is a static per-Call argument, while `pages` and `layouts` are symbolic `Port` inputs whose lineage is tracked by RayOrch. The two Calls retain independent dependencies, READY queues, recovery, and metrics; actor sharing is inferred from the `RayModule` object's identity and introduces no additional public pool abstraction. Calls sharing one `RayModule` currently also share its `batch_size` and recovery policy.
 
 ### 3.1 `rayorch.F`: explicit shape transformations
 

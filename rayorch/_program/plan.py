@@ -5,13 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, TypeAlias
 
-from .._model import CallRef, DomainRef, PortRef
+from .._model import CallRef, DomainRef, PoolRef, PortRef
 from .._protocol import CallInputLayout, CallOutputLayout
 from ..recovery import DEFAULT_RECOVERY_POLICY, RecoveryPolicy
 
 if TYPE_CHECKING:
     from .analysis import ProgramAnalysis
-    from .logical import CallSpec, DomainSpec, LogicalProgram
+    from .logical import CallSpec, DomainSpec, LogicalProgram, UdfSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,16 +59,31 @@ class ExpandEffect:
 
 @dataclass(frozen=True, slots=True)
 class ActorPoolSpec:
-    """The immutable execution contract for one Call's actor pool."""
+    """The immutable construction and Ray resource contract for one actor pool."""
 
+    ref: PoolRef
+    udf: UdfSpec
     replicas: int = 1
-    batch_size: int = 1
-    recovery: RecoveryPolicy = DEFAULT_RECOVERY_POLICY
     ray_options: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.replicas) is not int or self.replicas <= 0:
             raise ValueError("replicas must be a positive integer")
+        if not isinstance(self.ref, PoolRef):
+            raise TypeError("ref must be a PoolRef")
+
+
+@dataclass(frozen=True, slots=True)
+class CallDispatchSpec:
+    """One logical Call's scheduling contract on a physical actor pool."""
+
+    pool: PoolRef
+    batch_size: int = 1
+    recovery: RecoveryPolicy = DEFAULT_RECOVERY_POLICY
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pool, PoolRef):
+            raise TypeError("pool must be a PoolRef")
         if type(self.batch_size) is not int or self.batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
         if not isinstance(self.recovery, RecoveryPolicy):
@@ -157,7 +172,13 @@ class RuntimePlan:
     ] = field(
         repr=False, default_factory=dict
     )
-    actor_pools_by_call: Mapping[CallRef, ActorPoolSpec] = field(
+    actor_pools: Mapping[PoolRef, ActorPoolSpec] = field(
+        repr=False, default_factory=dict
+    )
+    dispatch_by_call: Mapping[CallRef, CallDispatchSpec] = field(
+        repr=False, default_factory=dict
+    )
+    calls_by_pool: Mapping[PoolRef, tuple[CallRef, ...]] = field(
         repr=False, default_factory=dict
     )
     output_layouts_by_call: Mapping[CallRef, tuple[CallOutputLayout, ...]] = field(
@@ -177,9 +198,14 @@ class RuntimePlan:
         return self.port_domains[ref]
 
     def pool(self, call: CallRef) -> ActorPoolSpec:
-        """Return the sole physical actor-pool contract for a Call."""
+        """Return the physical actor pool used by one logical Call."""
 
-        return self.actor_pools_by_call[call]
+        return self.actor_pools[self.dispatch_by_call[call].pool]
+
+    def dispatch(self, call: CallRef) -> CallDispatchSpec:
+        """Return one logical Call's batching and recovery contract."""
+
+        return self.dispatch_by_call[call]
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +223,7 @@ __all__ = [
     "BroadcastEffect",
     "CallInputEffect",
     "CanonicalRewrite",
+    "CallDispatchSpec",
     "CompiledProgram",
     "ExpandEffect",
     "ProgramExplanation",

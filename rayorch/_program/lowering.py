@@ -10,16 +10,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, assert_never, cast
 
-from .._model import CallRef, DomainRef, PortRef
+from .._model import CallRef, DomainRef, PoolRef, PortRef
 from .._protocol import CallInputLayout, CallOutputLayout
 from ..errors import CompileError
 from ..recovery import DEFAULT_RECOVERY_POLICY
 from .analysis import CallUse, PrimitiveUse, ProgramAnalysis
-from .logical import CallSpec, LogicalProgram, freeze_mapping
+from .logical import CallSpec, LogicalProgram, UdfSpec, freeze_mapping
 from .plan import (
     ActorPoolSpec,
     BroadcastEffect,
     CallInputEffect,
+    CallDispatchSpec,
     CanonicalRewrite,
     ExpandEffect,
     FilterEffect,
@@ -93,6 +94,9 @@ def _lower(
     analysis: ProgramAnalysis,
     canonical: _CanonicalForm,
     call_options: Mapping[CallRef, tuple[tuple[str, object], ...]],
+    call_pools: Mapping[CallRef, PoolRef],
+    pool_udfs: Mapping[PoolRef, UdfSpec],
+    pool_options: Mapping[PoolRef, tuple[tuple[str, object], ...]],
 ) -> tuple[RuntimePlan, ProgramExplanation]:
     """Lower one verified logical graph into immutable runtime wiring."""
 
@@ -199,10 +203,24 @@ def _lower(
             add_item_effect(effect.source_port, effect)
 
     # ── Phase 3: physical Call pools and Worker ABI ──────────────────────
-    actor_pools_by_call = {
-        call: _compile_pool_spec(call_options.get(call, ()))
+    actor_pools = {
+        pool: _compile_pool_spec(
+            pool_options.get(pool, ()),
+            pool=pool,
+            udf=pool_udfs[pool],
+        )
+        for pool in pool_udfs
+    }
+    dispatch_by_call = {
+        call: _compile_dispatch_spec(
+            call_options.get(call, ()),
+            pool=call_pools[call],
+        )
         for call in logical.calls
     }
+    calls_by_pool: dict[PoolRef, list[CallRef]] = {}
+    for call, pool in call_pools.items():
+        calls_by_pool.setdefault(pool, []).append(call)
 
     layouts = {}
     input_layouts = {}
@@ -251,7 +269,11 @@ def _lower(
                 for domain, effects in broadcasts_by_domain.items()
             }
         ),
-        actor_pools_by_call=freeze_mapping(actor_pools_by_call),
+        actor_pools=freeze_mapping(actor_pools),
+        dispatch_by_call=freeze_mapping(dispatch_by_call),
+        calls_by_pool=freeze_mapping(
+            {pool: tuple(calls) for pool, calls in calls_by_pool.items()}
+        ),
         output_layouts_by_call=freeze_mapping(layouts),
         input_layouts_by_call=freeze_mapping(input_layouts),
     )
@@ -280,9 +302,34 @@ def _lower(
 
 
 def _compile_pool_spec(
-    options: tuple[tuple[str, object], ...],
+    pool_options: tuple[tuple[str, object], ...],
+    *,
+    pool: PoolRef,
+    udf: UdfSpec,
 ) -> ActorPoolSpec:
-    """Normalize authoring options into one typed physical Call contract."""
+    """Normalize one physical actor-pool contract."""
+
+    raw = dict(pool_options)
+    if len(raw) != len(pool_options):
+        raise CompileError("RayModule pool options must have unique names")
+
+    try:
+        return ActorPoolSpec(
+            ref=pool,
+            udf=udf,
+            replicas=cast(Any, raw.pop("replicas", 1)),
+            ray_options=tuple(raw.items()),
+        )
+    except (TypeError, ValueError) as error:
+        raise CompileError(str(error)) from error
+
+
+def _compile_dispatch_spec(
+    options: tuple[tuple[str, object], ...],
+    *,
+    pool: PoolRef,
+) -> CallDispatchSpec:
+    """Normalize one Call's batching and recovery contract."""
 
     raw = dict(options)
     if len(raw) != len(options):
@@ -298,13 +345,13 @@ def _compile_pool_spec(
             f"{option} is not supported; RayOrch always batches currently "
             "READY grains across parent boundaries"
         )
-
+    if set(raw) - {"batch_size", "recovery"}:
+        raise CompileError("physical Ray option leaked into Call dispatch lowering")
     try:
-        return ActorPoolSpec(
-            replicas=cast(Any, raw.pop("replicas", 1)),
+        return CallDispatchSpec(
+            pool=pool,
             batch_size=cast(Any, raw.pop("batch_size", 1)),
             recovery=cast(Any, raw.pop("recovery", DEFAULT_RECOVERY_POLICY)),
-            ray_options=tuple(raw.items()),
         )
     except (TypeError, ValueError) as error:
         raise CompileError(str(error)) from error
@@ -316,6 +363,7 @@ def _compile_input_layout(spec: CallSpec) -> CallInputLayout:
     return CallInputLayout(
         len(spec.args),
         tuple(name for name, _ in spec.kwargs),
+        spec.static_kwargs,
     )
 
 

@@ -114,13 +114,16 @@ class CallInputLayout:
 
     positional_count: int
     keyword_names: tuple[str, ...] = ()
+    static_kwargs: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if self.positional_count < 0:
             raise ValueError("positional_count must be non-negative")
-        if any(not name for name in self.keyword_names):
+        static_names = tuple(name for name, _ in self.static_kwargs)
+        names = (*self.keyword_names, *static_names)
+        if any(not name for name in names):
             raise ValueError("keyword input names must be non-empty")
-        if len(set(self.keyword_names)) != len(self.keyword_names):
+        if len(set(names)) != len(names):
             raise ValueError("keyword input names must be unique")
 
     @property

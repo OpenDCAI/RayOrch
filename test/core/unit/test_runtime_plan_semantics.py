@@ -74,11 +74,12 @@ def _execute_one(worker_target, store: MemoryStore) -> DispatchFailure:
         0,
         (RowBinding(block, 0),),
     )
-    worker = Worker(worker_target, input_layout=CallInputLayout(1))
+    worker = Worker(worker_target)
     result = worker.execute(
         (invocation,),
         (CallOutputLayout(PortRef(0)),),
         store,
+        input_layout=CallInputLayout(1),
     )
     assert isinstance(result, DispatchFailure)
     return result
@@ -136,13 +137,14 @@ def test_worker_group_failure_dominates_record_failure_per_grain():
         )
         for index in range(2)
     )
-    result = Worker(MixedFailures, input_layout=CallInputLayout(1)).execute(
+    result = Worker(MixedFailures).execute(
         plans,
         (
             CallOutputLayout(PortRef(0)),
             CallOutputLayout(PortRef(1)),
         ),
         store,
+        input_layout=CallInputLayout(1),
     )
 
     assert not isinstance(result, DispatchFailure)
@@ -202,7 +204,6 @@ def run_sync(pipeline: ro.Pipeline, *columns, optimize: bool = True):
             spec.udf.target,
             spec.udf.init_args,
             spec.udf.init_kwargs,
-            input_layout=plan.input_layouts_by_call[call],
         )
         for call, spec in plan.calls.items()
     }
@@ -224,6 +225,7 @@ def run_sync(pipeline: ro.Pipeline, *columns, optimize: bool = True):
             invocations,
             plan.output_layouts_by_call[call],
             store,
+            input_layout=plan.input_layouts_by_call[call],
         )
         assert not isinstance(reports, DispatchFailure)
         engine.commit_reports(selection, reports)

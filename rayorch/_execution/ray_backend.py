@@ -55,7 +55,6 @@ class _RayWorkerActor:
         target: Any,
         init_args: tuple[Any, ...],
         init_kwargs: tuple[tuple[str, Any], ...],
-        input_layout: CallInputLayout,
     ) -> None:
         import ray  # pyright: ignore[reportMissingImports]
 
@@ -64,7 +63,6 @@ class _RayWorkerActor:
             target,
             init_args,
             init_kwargs,
-            input_layout=input_layout,
         )
 
     def ready(self) -> bool:
@@ -76,12 +74,18 @@ class _RayWorkerActor:
         self,
         invocations: tuple[GrainInvocation, ...],
         layouts: tuple[CallOutputLayout, ...],
+        input_layout: CallInputLayout,
     ):
         """Execute one batch without reading Program or RuntimeState."""
 
         self._store.clear_cache()
         try:
-            return self._worker.execute(invocations, layouts, self._store)
+            return self._worker.execute(
+                invocations,
+                layouts,
+                self._store,
+                input_layout=input_layout,
+            )
         finally:
             # Input blocks must not leak across actor RPCs. Output bindings are
             # returned to the driver and then owned by an input batch lifecycle.

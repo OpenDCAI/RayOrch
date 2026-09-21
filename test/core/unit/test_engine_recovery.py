@@ -50,9 +50,10 @@ def driver(policy, count=5):
     )
     engine.close_admission()
     (call,) = plan.calls
+    pool = plan.dispatch(call).pool
     rpc_batches = []
 
-    def remote(invocations, layouts):
+    def remote(invocations, layouts, input_layout):
         rpc_batches.append(
             tuple((inv.grain.entity.value, inv.generation) for inv in invocations)
         )
@@ -61,11 +62,13 @@ def driver(policy, count=5):
     executor = object.__new__(Executor)
     executor.plan = plan
     executor._actors = {
-        call: [
-            _ActorSlot(call, SimpleNamespace(execute=SimpleNamespace(remote=remote)))
+        pool: [
+            _ActorSlot(pool, SimpleNamespace(execute=SimpleNamespace(remote=remote)))
         ]
     }
-    executor._counters = {call: _CallCounters(actor_instances=1)}
+    executor._calls_by_pool = {pool: (call,)}
+    executor._pool_cursor = {pool: 0}
+    executor._counters = {call: _CallCounters()}
     return executor, engine, {0: _InputBatchSlot(0, engine)}, rpc_batches, call
 
 

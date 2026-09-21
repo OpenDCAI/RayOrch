@@ -86,11 +86,12 @@ class CallSpec:
     execution_domain: DomainRef
     args: tuple[PortRef, ...] = ()
     kwargs: tuple[tuple[str, PortRef], ...] = ()
+    static_kwargs: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.ordered_inputs:
             raise ValueError("CallSpec requires at least one input")
-        names = tuple(name for name, _ in self.kwargs)
+        names = tuple(name for name, _ in (*self.kwargs, *self.static_kwargs))
         if any(not name for name in names):
             raise ValueError("CallSpec keyword input names must be non-empty")
         if len(set(names)) != len(names):

@@ -20,6 +20,17 @@ class CallRef:
 
 
 @dataclass(frozen=True, slots=True, order=True)
+class PoolRef:
+    """Identity of one physical actor pool inside a compiled Program."""
+
+    value: int
+
+    def __post_init__(self) -> None:
+        if self.value < 0:
+            raise ValueError("PoolRef must be non-negative")
+
+
+@dataclass(frozen=True, slots=True, order=True)
 class PortRef:
     """Compact identity of one logical data Port in a static Program."""
 
@@ -100,6 +111,7 @@ class ExpansionOutcome(Enum):
 
 __all__ = [
     "CallRef",
+    "PoolRef",
     "DomainRef",
     "EntityRef",
     "GrainPhase",

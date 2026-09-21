@@ -22,7 +22,8 @@ def test_sglang_vllm_pipeline_assigns_one_runtime_environment_per_backend():
         stage_options={"vllm": {"batch_size": 3}},
     ).compile()
     targets = [spec.udf.target for spec in compiled.logical.calls.values()]
-    pools = list(compiled.plan.actor_pools_by_call.values())
+    calls = list(compiled.logical.calls)
+    pools = [compiled.plan.pool(call) for call in calls]
 
     assert targets == [
         SglangGenerate,
@@ -37,7 +38,7 @@ def test_sglang_vllm_pipeline_assigns_one_runtime_environment_per_backend():
     assert "runtime_env" not in dict(pools[1].ray_options)
     assert dict(pools[2].ray_options)["runtime_env"] == {"conda": "vllm-env"}
     assert dict(pools[2].ray_options)["num_gpus"] == 4.0
-    assert pools[2].batch_size == 3
+    assert compiled.plan.dispatch(calls[2]).batch_size == 3
 
 
 def test_stage_options_can_replace_default_runtime_environment():
@@ -49,7 +50,8 @@ def test_stage_options_can_replace_default_runtime_environment():
             "sglang": {"runtime_env": {"conda": "custom-sglang"}},
         },
     ).compile()
-    first_pool = next(iter(compiled.plan.actor_pools_by_call.values()))
+    first_call = next(iter(compiled.logical.calls))
+    first_pool = compiled.plan.pool(first_call)
 
     assert dict(first_pool.ray_options)["runtime_env"] == {
         "conda": "custom-sglang"
