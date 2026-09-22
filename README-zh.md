@@ -153,7 +153,7 @@ RayOrch 有意保持精简的公开编程模型：
 | 对象 | 职责 |
 | --- | --- |
 | UDF | 对一个批次执行普通 Python 计算的类或函数 |
-| `RayModule` | 声明 UDF 构造方式、副本数、批大小、恢复策略和 Ray Actor 选项 |
+| `RayModule` | 声明 UDF 构造方式、副本数、批大小、恢复策略和 Ray Actor 选项；同一对象被多次调用时自动复用 Actor |
 | `Pipeline` | 连接计算阶段形成静态拓扑，并提供精简的一次性入口 `pipeline.run(...)` |
 | `rayorch.F` | 显式声明展开、过滤、广播和归并 |
 | `Executor` | 管理持久化 Actor 和执行生命周期 |
@@ -195,6 +195,39 @@ print(result.outputs)  # [3, 4, 5]
 可以把它理解为：**编写批处理 UDF → 在 Pipeline 中连接 → 分配资源 → 运行**。`Pipeline.forward()` 只会使用符号值追踪一次以构建静态图，不会真正执行 UDF，也不会在编译时加载模型。
 
 一次有限输入直接使用 `pipeline.run(...)`：它会创建一个 `Executor`、返回 `RunResult`，然后关闭临时 Actor 池；如果多次调用需要复用同一批 Actor 和已加载模型，则使用 `Executor(pipeline)`。函数式写法 `ro.run(pipeline, ...)` 仍与 `pipeline.run(...)` 完全等价。
+
+如果 DAG 中多个阶段使用同一个模型栈，只需保留一个 `RayModule` 对象，并通过 `run()` 的普通关键字参数选择操作：
+
+```python
+class ModelStack:
+    def __init__(self, model_path):
+        self.model = load_model(model_path)
+
+    def run(self, values, *, stage):
+        if stage == "layout":
+            return self.model.layout(values)
+        if stage == "recognize":
+            return self.model.recognize(values)
+        raise ValueError(stage)
+
+
+class DocumentPipeline(ro.Pipeline):
+    def __init__(self, model_path):
+        # 这一个 RayModule 描述一份完成初始化的模型栈。
+        self.model = (
+            ro.RayModule(ModelStack)
+            .pre_init(model_path)
+            .ray_options(replicas=4, num_gpus=1, batch_size=16)
+        )
+
+    def forward(self, pages):
+        # 每次调用都是独立 DAG Call，但会复用同一 RayModule 所拥有的
+        # Actor 和模型状态。
+        layouts = self.model(pages, stage="layout")
+        return self.model(layouts, stage="recognize")
+```
+
+这里的 `stage` 是每个 Call 的静态参数，`pages` 和 `layouts` 则是由 RayOrch 追踪血缘的符号 `Port` 输入。两个 Call 仍然拥有独立的数据依赖、READY 队列、恢复过程和指标；Actor 复用由 `RayModule` 对象身份自然推导，不增加额外的公开 Pool 抽象。目前共享同一 `RayModule` 的 Calls 也共享该模块的 `batch_size` 和恢复策略。
 
 ### 3.1 `rayorch.F`：显式的数据形态变换
 

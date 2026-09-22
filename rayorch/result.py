@@ -59,14 +59,11 @@ class RunResult:
     calls: tuple[CallMetrics, ...]
     input_batches: tuple[InputBatchMetrics, ...]
     peak_active_input_batches: int
+    actor_count: int
 
     @property
     def rpc_count(self) -> int:
         return sum(metrics.rpcs for metrics in self.calls)
-
-    @property
-    def actor_count(self) -> int:
-        return sum(metrics.actor_instances for metrics in self.calls)
 
     @property
     def released_values(self) -> int:

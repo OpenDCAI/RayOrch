@@ -36,10 +36,10 @@ def test_mineru_pipeline_has_four_calls_and_no_structural_pools():
         PdfMetadata,
         MinerUAssembleDoc,
     ]
-    assert len(compiled.plan.actor_pools_by_call) == 4
+    assert len(compiled.plan.actor_pools) == 4
     assert all(
         "runtime_env" not in dict(pool.ray_options)
-        for pool in compiled.plan.actor_pools_by_call.values()
+        for pool in compiled.plan.actor_pools.values()
     )
     assert len(compiled.logical.domains) == 2
     assert sum(
@@ -64,23 +64,25 @@ def test_stage_options_override_only_selected_ray_options():
             "assemble": {"replicas": 1},
         },
     ).compile()
-    pools = list(compiled.plan.actor_pools_by_call.values())
+    calls = list(compiled.logical.calls)
+    pools = [compiled.plan.pool(call) for call in calls]
+    dispatches = [compiled.plan.dispatch(call) for call in calls]
 
     assert pools[0].replicas == 2
-    assert pools[0].batch_size == 1
+    assert dispatches[0].batch_size == 1
     assert dict(pools[0].ray_options) == {"num_cpus": 3}
     assert pools[1].replicas == 4
-    assert pools[1].batch_size == 16
+    assert dispatches[1].batch_size == 16
     assert dict(pools[1].ray_options) == {
         "num_gpus": 1.0,
         "num_cpus": 1,
         "resources": {"accelerator": 1},
     }
     assert pools[2].replicas == 1
-    assert pools[2].batch_size == 32
+    assert dispatches[2].batch_size == 32
     assert dict(pools[2].ray_options) == {"num_cpus": 1}
     assert pools[3].replicas == 1
-    assert pools[3].batch_size == 4
+    assert dispatches[3].batch_size == 4
     assert dict(pools[3].ray_options) == {"num_cpus": 1}
 
 

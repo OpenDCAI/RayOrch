@@ -30,6 +30,7 @@ def test_remaining_input_does_not_hide_deadlock_when_admission_is_full():
     executor.plan = SimpleNamespace(source_ports=(object(),), calls=())
     executor.store = SimpleNamespace(clear_cache=lambda: None)
     executor._actors = {}
+    executor._calls_by_pool = {}
     executor._admit_input_batch = lambda columns: engine
     executor._dispatch_ready = lambda active, pending: False
     executor.close = lambda: None

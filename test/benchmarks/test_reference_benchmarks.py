@@ -79,7 +79,7 @@ def _assert_topology(
 
     assert [spec.udf.target for spec in compiled.logical.calls.values()] == targets
     assert len(compiled.logical.domains) == domains
-    assert len(compiled.plan.actor_pools_by_call) == len(targets)
+    assert len(compiled.plan.actor_pools) == len(targets)
     assert (
         sum(
             isinstance(spec.origin, ExpandOrigin)

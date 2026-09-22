@@ -320,7 +320,7 @@ def test_manual_logical_port_cycle_is_rejected_before_lowering():
     )
 
     with pytest.raises(CompileError, match="dependency cycle"):
-        compile_logical(logical, {}, optimize=False)
+        compile_logical(logical, {}, {}, {}, {}, optimize=False)
 
 
 def test_unoptimized_path_and_broadcast_chain_rewrite_are_explainable():
@@ -444,12 +444,14 @@ def test_pool_options_compile_to_one_typed_physical_contract():
     baseline = Configured().compile(optimize=False)
     call = next(iter(optimized.logical.calls))
     pool = optimized.plan.pool(call)
+    dispatch = optimized.plan.dispatch(call)
 
-    assert optimized.plan.actor_pools_by_call == baseline.plan.actor_pools_by_call
-    assert set(optimized.plan.actor_pools_by_call) == {call}
+    assert optimized.plan.actor_pools == baseline.plan.actor_pools
+    assert optimized.plan.dispatch_by_call == baseline.plan.dispatch_by_call
+    assert len(optimized.plan.actor_pools) == 1
     assert pool.replicas == 3
-    assert pool.batch_size == 7
-    assert pool.recovery is recovery
+    assert dispatch.batch_size == 7
+    assert dispatch.recovery is recovery
     assert pool.ray_options == (("num_cpus", 0.25),)
 
 

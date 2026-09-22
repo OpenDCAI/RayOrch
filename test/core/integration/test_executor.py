@@ -88,6 +88,51 @@ def test_pipeline_run_convenience_manages_one_executor_lifetime():
     assert result.peak_active_input_batches == 2
 
 
+class SharedStatefulStages:
+    def __init__(self) -> None:
+        self.identity = os.getpid()
+
+    def run(self, values, *, stage):
+        if stage == "prepare":
+            return [(value + 1, self.identity) for value in values]
+        if stage == "finish":
+            return [
+                (value * 2, producer, self.identity)
+                for value, producer in values
+            ]
+        raise ValueError(f"unknown stage: {stage}")
+
+
+class SharedActorPipeline(ro.Pipeline):
+    def __init__(self) -> None:
+        self.stages = ro.RayModule(SharedStatefulStages).ray_options(
+            replicas=1,
+            num_cpus=0,
+            batch_size=7,
+        )
+
+    def forward(self, values):
+        prepared = self.stages(values, stage="prepare")
+        return self.stages(prepared, stage="finish")
+
+
+def test_two_dag_stages_share_one_stateful_actor_without_losing_lineage():
+    with Executor(SharedActorPipeline()) as executor:
+        result = executor.run(
+            range(40),
+            input_batch_size=8,
+            max_active_input_batches=4,
+        )
+
+    assert [value for value, _, _ in result.outputs] == [
+        (value + 1) * 2 for value in range(40)
+    ]
+    assert all(producer == consumer for _, producer, consumer in result.outputs)
+    assert result.actor_count == 1
+    assert len(result.calls) == 2
+    assert all(metrics.rpcs > 0 for metrics in result.calls)
+
+
 def test_nested_filtered_groups_reach_downstream_worker_with_empty_parents():
     class Identity:
         def run(self, values):
@@ -285,6 +330,57 @@ def test_actor_crash_replaces_actor_and_replays_same_grains(tmp_path):
     assert metrics.actor_instances == 2
     assert metrics.grain_requeues == 4
     assert metrics.rpcs == 2
+
+
+class SharedCrashOnce:
+    def __init__(self, marker: str) -> None:
+        self.marker = Path(marker)
+
+    def run(self, values, *, stage):
+        if stage == "prepare":
+            if not self.marker.exists():
+                self.marker.write_text("crashed", encoding="utf-8")
+                os._exit(19)
+            return [value + 1 for value in values]
+        if stage == "finish":
+            return [value * 2 for value in values]
+        raise ValueError(f"unknown stage: {stage}")
+
+
+class SharedCrashPipeline(ro.Pipeline):
+    def __init__(self, marker: str) -> None:
+        self.stages = (
+            ro.RayModule(SharedCrashOnce)
+            .pre_init(marker)
+            .ray_options(
+                replicas=1,
+                batch_size=4,
+                recovery=ro.RecoveryPolicy.abort(infra_retries=1),
+                num_cpus=0,
+                max_restarts=0,
+            )
+        )
+
+    def forward(self, values):
+        prepared = self.stages(values, stage="prepare")
+        return self.stages(prepared, stage="finish")
+
+
+def test_shared_actor_crash_rebuilds_pool_replica_and_retries_only_failed_call(
+    tmp_path,
+):
+    marker = tmp_path / "shared-crash-once"
+    with Executor(SharedCrashPipeline(str(marker))) as executor:
+        result = executor.run(range(4), input_batch_size=4)
+
+    prepare, finish = result.calls
+    assert result.outputs == [2, 4, 6, 8]
+    assert result.actor_count == 2
+    assert prepare.actor_instances == finish.actor_instances == 2
+    assert prepare.grain_requeues == 4
+    assert finish.grain_requeues == 0
+    assert prepare.rpcs == 2
+    assert finish.rpcs == 1
 
 
 class Render:

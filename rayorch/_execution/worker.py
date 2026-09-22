@@ -51,23 +51,27 @@ class Worker:
         target: Any,
         init_args: tuple[Any, ...] = (),
         init_kwargs: tuple[tuple[str, Any], ...] = (),
-        *,
-        input_layout: CallInputLayout,
     ) -> None:
         kwargs = dict(init_kwargs)
         self.udf = target(*init_args, **kwargs) if isinstance(target, type) else target
-        self.input_layout = input_layout
 
     def execute(
         self,
         invocations: tuple[GrainInvocation, ...],
         layouts: tuple[CallOutputLayout, ...],
         store: BlockStore,
+        *,
+        input_layout: CallInputLayout,
     ) -> WorkerDispatchResult:
         """Execute one Grain batch while keeping business failures row-local."""
 
         try:
-            return self._execute(invocations, layouts, store)
+            return self._execute(
+                invocations,
+                layouts,
+                store,
+                input_layout=input_layout,
+            )
         except WorkerContractError as error:
             return self._dispatch_failure(
                 DispatchFailureKind.CONTRACT_ERROR,
@@ -79,13 +83,15 @@ class Worker:
         invocations: tuple[GrainInvocation, ...],
         layouts: tuple[CallOutputLayout, ...],
         store: BlockStore,
+        *,
+        input_layout: CallInputLayout,
     ) -> WorkerDispatchResult:
         """Execute after the public boundary has installed contract capture."""
 
         if not invocations:
             return ()
         columns = self._input_columns(invocations, store)
-        layout = self.input_layout
+        layout = input_layout
         if layout.input_count != len(columns):
             raise WorkerContractError(
                 "input layout expected "
@@ -94,6 +100,7 @@ class Worker:
         positional = columns[: layout.positional_count]
         keyword_columns = columns[layout.positional_count :]
         keywords = dict(zip(layout.keyword_names, keyword_columns))
+        keywords.update(layout.static_kwargs)
         try:
             raw = getattr(self.udf, "run", self.udf)(*positional, **keywords)
         except Exception as error:

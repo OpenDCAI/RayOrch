@@ -25,9 +25,11 @@ def test_scale_pipeline_compiles_with_reference_64_gpu_shape():
         MinerUScalePdfMetadata,
         MinerUScaleAssembleDoc,
     ]
-    pools = list(compiled.plan.actor_pools_by_call.values())
+    calls = list(compiled.logical.calls)
+    pools = [compiled.plan.pool(call) for call in calls]
+    dispatches = [compiled.plan.dispatch(call) for call in calls]
     assert [pool.replicas for pool in pools] == [256, 128, 1, 64]
-    assert [pool.batch_size for pool in pools] == [1, 64, 32, 4]
+    assert [dispatch.batch_size for dispatch in dispatches] == [1, 64, 32, 4]
     assert dict(pools[1].ray_options)["num_gpus"] == 0.5
     assert pools[1].replicas * dict(pools[1].ray_options)["num_gpus"] == 64
 
@@ -42,8 +44,10 @@ def test_scale_pipeline_allows_explicit_small_smoke_shape():
         gpus_per_ocr_actor=1,
         stage_options={"ocr": {"batch_size": 8}},
     ).compile()
-    pools = list(compiled.plan.actor_pools_by_call.values())
+    calls = list(compiled.logical.calls)
+    pools = [compiled.plan.pool(call) for call in calls]
+    dispatches = [compiled.plan.dispatch(call) for call in calls]
 
     assert [pool.replicas for pool in pools] == [2, 1, 1, 1]
-    assert pools[1].batch_size == 8
+    assert dispatches[1].batch_size == 8
     assert dict(pools[1].ray_options)["num_gpus"] == 1

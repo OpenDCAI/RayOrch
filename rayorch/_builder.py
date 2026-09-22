@@ -5,9 +5,10 @@ from __future__ import annotations
 import contextvars
 import inspect
 import itertools
+from dataclasses import dataclass
 from typing import Any
 
-from ._model import CallRef, DomainRef, PortRef
+from ._model import CallRef, DomainRef, PoolRef, PortRef
 from .api import Pipeline, Port, RayModule
 from .errors import CompileError
 from ._program.compiler import compile_logical
@@ -36,6 +37,16 @@ _ACTIVE_TRACE: contextvars.ContextVar[ProgramBuilder | None] = contextvars.Conte
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutionBinding:
+    """One traced Call's physical pool assignment and execution options."""
+
+    pool: PoolRef
+    udf: UdfSpec
+    call_options: tuple[tuple[str, Any], ...]
+    pool_options: tuple[tuple[str, Any], ...]
+
+
 class ProgramBuilder:
     """Capture authoring operations without deriving runtime facts or Effects."""
 
@@ -43,6 +54,7 @@ class ProgramBuilder:
         self.owner = next(_TRACE_IDS)
         self.next_port = 0
         self.next_call = 0
+        self.next_pool = 0
         self.next_domain = 1
         self.calls: dict[CallRef, CallSpec] = {}
         self.ports: dict[PortRef, PortSpec] = {}
@@ -50,6 +62,10 @@ class ProgramBuilder:
             DomainRef(0): DomainSpec(DomainRef(0), debug_name="root")
         }
         self.call_options: dict[CallRef, tuple[tuple[str, Any], ...]] = {}
+        self.call_pools: dict[CallRef, PoolRef] = {}
+        self.pool_udfs: dict[PoolRef, UdfSpec] = {}
+        self.pool_options: dict[PoolRef, tuple[tuple[str, Any], ...]] = {}
+        self._module_bindings: list[tuple[RayModule, _ExecutionBinding]] = []
         self._view_intern: dict[tuple[Any, ...], tuple[PortRef, ...]] = {}
 
         self.source_ports = tuple(
@@ -74,16 +90,24 @@ class ProgramBuilder:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Port | tuple[Port, ...]:
-        if not args and not kwargs:
-            raise CompileError("RayModule requires at least one Port input")
-
         positional_inputs = [
             self._input(value, f"arg_{index}") for index, value in enumerate(args)
         ]
-        keyword_inputs = [
-            (name, self._input(value, name)) for name, value in kwargs.items()
-        ]
+        keyword_inputs = []
+        static_kwargs = []
+        for name, value in kwargs.items():
+            if isinstance(value, Port):
+                keyword_inputs.append((name, self._input(value, name)))
+            else:
+                if self._contains_port(value):
+                    raise CompileError(
+                        f"static keyword argument {name!r} contains a Port; "
+                        "pass each dynamic dependency as a direct argument"
+                    )
+                static_kwargs.append((name, value))
         inputs = (*positional_inputs, *(item for _, item in keyword_inputs))
+        if not inputs:
+            raise CompileError("RayModule requires at least one Port input")
         domains = {self.ports[port].domain for port in inputs}
         if len(domains) != 1:
             raise CompileError(
@@ -94,14 +118,17 @@ class ProgramBuilder:
 
         call = CallRef(self.next_call)
         self.next_call += 1
+        binding = self._execution_binding(module)
         self.calls[call] = CallSpec(
             call,
-            UdfSpec(module.udf, module.init_args, tuple(module.init_kwargs.items())),
+            binding.udf,
             execution_domain,
             tuple(positional_inputs),
             tuple(keyword_inputs),
+            tuple(static_kwargs),
         )
-        self.call_options[call] = tuple(module.options.items())
+        self.call_options[call] = binding.call_options
+        self.call_pools[call] = binding.pool
         outputs = tuple(
             self._new_port(execution_domain, CallOutputOrigin(call, output_index))
             for output_index in range(module.num_outputs)
@@ -233,8 +260,57 @@ class ProgramBuilder:
         return compile_logical(
             logical,
             freeze_mapping(self.call_options),
+            freeze_mapping(self.call_pools),
+            freeze_mapping(self.pool_udfs),
+            freeze_mapping(self.pool_options),
             optimize=optimize,
         )
+
+    def _execution_binding(self, module: RayModule) -> _ExecutionBinding:
+        """Resolve one module invocation to a Call contract and actor pool."""
+
+        for bound_module, binding in self._module_bindings:
+            if bound_module is module:
+                return binding
+
+        dispatch_names = {
+            "batch_size",
+            "recovery",
+            "max_retries",
+            "batch_scope",
+            "batching_policy",
+        }
+        call_options = tuple(
+            (name, value)
+            for name, value in module.options.items()
+            if name in dispatch_names
+        )
+        pool_options = tuple(
+            (name, value)
+            for name, value in module.options.items()
+            if name not in dispatch_names
+        )
+        udf = UdfSpec(
+            module.udf,
+            tuple(module.init_args),
+            tuple(module.init_kwargs.items()),
+        )
+        binding = _ExecutionBinding(
+            self._new_pool(),
+            udf,
+            call_options,
+            pool_options,
+        )
+        self._module_bindings.append((module, binding))
+
+        self.pool_udfs[binding.pool] = binding.udf
+        self.pool_options[binding.pool] = binding.pool_options
+        return binding
+
+    def _new_pool(self) -> PoolRef:
+        pool = PoolRef(self.next_pool)
+        self.next_pool += 1
+        return pool
 
     def _new_port(self, domain: DomainRef, origin: PortOrigin) -> PortRef:
         ref = PortRef(self.next_port)
@@ -252,6 +328,22 @@ class ProgramBuilder:
             self.spec(value, f"input {name}")
             return value.ref
         raise CompileError(f"RayModule input {name!r} must be a Port")
+
+    @classmethod
+    def _contains_port(cls, value: Any) -> bool:
+        """Reject symbolic dependencies hidden inside ordinary containers."""
+
+        if isinstance(value, Port):
+            return True
+        if isinstance(value, dict):
+            return any(
+                cls._contains_port(item)
+                for pair in value.items()
+                for item in pair
+            )
+        if isinstance(value, (tuple, list, set, frozenset)):
+            return any(cls._contains_port(item) for item in value)
+        return False
 
     def _is_ancestor(self, ancestor: DomainRef, child: DomainRef) -> bool:
         cursor: DomainRef | None = child

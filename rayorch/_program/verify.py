@@ -207,12 +207,49 @@ def verify_runtime_plan(
         raise CompileError("RuntimePlan Port domain table is incomplete")
     if set(plan.outputs_by_call) != set(logical.calls):
         raise CompileError("RuntimePlan Call output table is incomplete")
-    if set(plan.actor_pools_by_call) != set(logical.calls):
-        raise CompileError("RuntimePlan requires exactly one pool per Call")
+    if set(plan.dispatch_by_call) != set(logical.calls):
+        raise CompileError("RuntimePlan Call dispatch table is incomplete")
+    if set(plan.actor_pools) != set(plan.calls_by_pool):
+        raise CompileError("RuntimePlan actor-pool indexes disagree")
+    if set(plan.actor_pools) != {
+        dispatch.pool for dispatch in plan.dispatch_by_call.values()
+    }:
+        raise CompileError("RuntimePlan has an unreferenced or missing actor pool")
+    indexed_calls = tuple(
+        call
+        for calls in plan.calls_by_pool.values()
+        for call in calls
+    )
+    if len(indexed_calls) != len(set(indexed_calls)):
+        raise CompileError("RuntimePlan indexes one Call into multiple actor pools")
+    if set(indexed_calls) != set(logical.calls):
+        raise CompileError("RuntimePlan actor-pool Call index is incomplete")
     if set(plan.output_layouts_by_call) != set(logical.calls):
         raise CompileError("RuntimePlan Worker layouts are incomplete")
     if set(plan.input_layouts_by_call) != set(logical.calls):
         raise CompileError("RuntimePlan Worker input layouts are incomplete")
+
+    for pool, calls in plan.calls_by_pool.items():
+        if not calls:
+            raise CompileError("RuntimePlan actor pool must serve at least one Call")
+        actor_pool = plan.actor_pools[pool]
+        for call in calls:
+            if plan.dispatch(call).pool != pool:
+                raise CompileError("RuntimePlan Call maps to conflicting actor pools")
+            udf = logical.call(call).udf
+            if (
+                udf.target != actor_pool.udf.target
+                or udf.init_args != actor_pool.udf.init_args
+                or udf.init_kwargs != actor_pool.udf.init_kwargs
+            ):
+                raise CompileError(
+                    "Calls sharing one actor pool must use its target and "
+                    "constructor arguments"
+                )
+        if actor_pool.ref != pool:
+            raise CompileError(
+                "RuntimePlan actor-pool mapping key does not match its spec"
+            )
 
     expected_structural = {
         port
@@ -287,6 +324,7 @@ def verify_runtime_plan(
         expected_layout = CallInputLayout(
             len(spec.args),
             tuple(name for name, _ in spec.kwargs),
+            spec.static_kwargs,
         )
         if plan.input_layouts_by_call[call] != expected_layout:
             raise CompileError("RuntimePlan Worker input layout does not match CallSpec")

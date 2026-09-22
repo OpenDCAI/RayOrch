@@ -2,8 +2,8 @@
 
 The logical program, semantic engine, and Worker ABI are Ray-free. This module
 alone owns actor handles and pending RPC ObjectRefs. Actor capacity is shared
-across input batches, but a single RPC never mixes Grains from different
-input batches.
+across input batches and may be shared by several logical Calls, but one RPC
+never mixes Calls or input batches.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from typing import Any, cast
 
 from ..api import Pipeline
 from .._runtime.materialize import materialize_tree
-from .._model import CallRef
-from .._program.plan import ActorPoolSpec, CompiledProgram
+from .._model import CallRef, PoolRef
+from .._program.plan import CallDispatchSpec, CompiledProgram
 from .._protocol import (
     DispatchFailure,
     DispatchFailureKind,
@@ -35,7 +35,6 @@ from ..result import CallMetrics, InputBatchMetrics, RunResult
 class _CallCounters:
     """Mutable per-Call counters owned by one ``Executor.run``."""
 
-    actor_instances: int = 0
     rpcs: int = 0
     grain_dispatches: int = 0
     grain_requeues: int = 0
@@ -46,7 +45,7 @@ class _CallCounters:
 class _ActorSlot:
     """A driver-owned actor-capacity token."""
 
-    call: CallRef
+    pool: PoolRef
     handle: Any
     busy: bool = False
 
@@ -64,12 +63,13 @@ class _PendingRpc:
     """One pending worker RPC and the state needed to finalize it exactly once."""
 
     input_batch_index: int
+    call: CallRef
     actor: _ActorSlot
     execution_microbatch: ExecutionMicrobatch
 
 
 class Executor:
-    """Drive persistent per-Call actor pools across overlapping input batches.
+    """Drive persistent actor pools across overlapping input batches.
 
     The executor owns actor capacity, pending RPCs, and run-local counters.
     Logical propagation, entity lineage, and Grain lifecycle state remain in
@@ -100,16 +100,20 @@ class Executor:
             ray.init(**init_kwargs)
 
         self.store = _RayBlockStore(ray)
-        self._actors: dict[CallRef, list[_ActorSlot]] = {}
+        self._actors: dict[PoolRef, list[_ActorSlot]] = {}
+        self._calls_by_pool = dict(self.plan.calls_by_pool)
+        self._pool_cursor: dict[PoolRef, int] = {
+            pool: 0 for pool in self._calls_by_pool
+        }
         self._counters: dict[CallRef, _CallCounters] = {}
         self._closed = False
         try:
             self._actor_class = ray.remote(_RayWorkerActor)
             # Register cleanup ownership before actor creation. If construction
             # fails partway through a pool, close() still sees every prior handle.
-            for call in self.plan.calls:
-                self._actors[call] = []
-                self._create_pool(call)
+            for pool in self._calls_by_pool:
+                self._actors[pool] = []
+                self._create_pool(pool)
             # Exclude UDF and model initialization from run-time measurements.
             startup_refs = [
                 actor.handle.ready.remote()
@@ -158,9 +162,11 @@ class Executor:
 
         # Actor pools persist across runs; mutable counters do not.
         self.store.clear_cache()
-        self._counters = {
-            call: _CallCounters(actor_instances=len(self._actors[call]))
-            for call in self.plan.calls
+        self._pool_cursor = {pool: 0 for pool in self._calls_by_pool}
+        self._counters = {call: _CallCounters() for call in self.plan.calls}
+        self._actor_instances_by_pool = {
+            pool: len(actors)
+            for pool, actors in self._actors.items()
         }
         metrics_by_input_batch: list[InputBatchMetrics | None] = [None] * len(slices)
         active: dict[int, _InputBatchSlot] = {}
@@ -270,6 +276,7 @@ class Executor:
                 calls,
                 cast(tuple[InputBatchMetrics, ...], tuple(metrics_by_input_batch)),
                 high_watermark,
+                actor_count=sum(self._actor_instances_by_pool.values()),
             )
         except BaseException:
             # Ray Data uses the same execution-level fail-stop contract: once an
@@ -309,11 +316,12 @@ class Executor:
         for call in sorted(self.plan.calls, key=lambda ref: ref.value):
             counters = self._counters[call]
             target = self.plan.call(call).udf.target
+            pool = self._dispatch(call).pool
             snapshots.append(
                 CallMetrics(
                     call_index=call.value,
                     udf_name=self._udf_name(target),
-                    actor_instances=counters.actor_instances,
+                    actor_instances=self._actor_instances_by_pool[pool],
                     rpcs=counters.rpcs,
                     grain_dispatches=counters.grain_dispatches,
                     grain_requeues=counters.grain_requeues,
@@ -375,25 +383,21 @@ class Executor:
         """Assign READY Grains to idle actors without mixing input batches."""
 
         made_progress = False
-        for call, actors in self._actors.items():
+        for pool, actors in self._actors.items():
             for actor in actors:
                 if actor.busy:
                     continue
-                candidates = [
-                    (priority, index, slot)
-                    for index, slot in active.items()
-                    if (priority := slot.engine.dispatch_priority(call)) is not None
-                ]
-                if not candidates:
+                selected = self._select_pool_work(pool, active)
+                if selected is None:
                     break
-                _, _, candidate = min(candidates, key=lambda item: item[:2])
-                pool = self._pool(call)
+                call, candidate = selected
+                dispatch = self._dispatch(call)
                 # Dispatch visible work immediately when an actor is idle. This
                 # completion-driven path is what lets a downstream stage start
                 # before the upstream stage or input domain has fully drained.
                 batch = candidate.engine.reserve_dispatch(
                     call,
-                    max_size=pool.batch_size,
+                    max_size=dispatch.batch_size,
                 )
                 if batch is None:
                     made_progress = True
@@ -403,10 +407,15 @@ class Executor:
                     for grain in batch.grains
                 )
                 layouts = self.plan.output_layouts_by_call[call]
-                result_ref = actor.handle.execute.remote(invocations, layouts)
+                result_ref = actor.handle.execute.remote(
+                    invocations,
+                    layouts,
+                    self.plan.input_layouts_by_call[call],
+                )
                 actor.busy = True
                 pending_rpcs[result_ref] = _PendingRpc(
                     candidate.index,
+                    call,
                     actor,
                     batch,
                 )
@@ -416,6 +425,36 @@ class Executor:
                 counters.batch_sizes.append(len(batch.grains))
                 made_progress = True
         return made_progress
+
+    def _select_pool_work(
+        self,
+        pool: PoolRef,
+        active: dict[int, _InputBatchSlot],
+    ) -> tuple[CallRef, _InputBatchSlot] | None:
+        """Choose one Call fairly while retaining queue/recovery priority.
+
+        Calls sharing a pool are considered in rotating order. Queue priority
+        remains immediate retry, fresh READY work, then deferred recovery.
+        Input batches of the selected Call retain admission order.
+        """
+
+        calls = self._calls_by_pool[pool]
+        cursor = self._pool_cursor[pool]
+        for offset in range(len(calls)):
+            call = calls[(cursor + offset) % len(calls)]
+            candidates: list[tuple[int, int, _InputBatchSlot]] = []
+            for index, slot in active.items():
+                priority = slot.engine.dispatch_priority(call)
+                if priority is not None:
+                    candidates.append((priority, index, slot))
+            if candidates:
+                _, _, slot = min(
+                    candidates,
+                    key=lambda candidate: candidate[:2],
+                )
+                self._pool_cursor[pool] = (cursor + offset + 1) % len(calls)
+                return call, slot
+        return None
 
     # ── Typed failure classification and recovery handoff ───────────────
 
@@ -433,7 +472,7 @@ class Executor:
             raise AssertionError(
                 f"unsupported DispatchFailureKind: {failure.kind!r}"
             )
-        policy = self._pool(pending_rpc.actor.call).recovery
+        policy = self._dispatch(pending_rpc.call).recovery
         requeued = engine.apply_udf_recovery(
             pending_rpc.execution_microbatch,
             policy,
@@ -441,7 +480,7 @@ class Executor:
         )
         if requeued is None:
             raise self._execution_error(engine, pending_rpc, failure)
-        self._counters[pending_rpc.actor.call].grain_requeues += requeued
+        self._counters[pending_rpc.call].grain_requeues += requeued
 
     def _handle_infrastructure_failure(
         self,
@@ -451,7 +490,7 @@ class Executor:
     ) -> None:
         """Replace an untrusted actor and retry without data-failure fiction."""
 
-        policy = self._pool(pending_rpc.actor.call).recovery
+        policy = self._dispatch(pending_rpc.call).recovery
         retried = engine.retry_infrastructure_dispatch(
             pending_rpc.execution_microbatch,
             policy,
@@ -459,7 +498,7 @@ class Executor:
         if retried is None:
             raise self._execution_error(engine, pending_rpc, error) from error
         self._replace_actor(pending_rpc.actor)
-        self._counters[pending_rpc.actor.call].grain_requeues += retried
+        self._counters[pending_rpc.call].grain_requeues += retried
 
     def _replace_actor(self, actor: _ActorSlot) -> None:
         """Discard one untrusted handle and install a fresh actor instance."""
@@ -468,8 +507,17 @@ class Executor:
             self.ray.kill(actor.handle, no_restart=True)
         except Exception:
             pass
-        actor.handle = self._create_actor(actor.call)
-        self._counters[actor.call].actor_instances += 1
+        replacement = self._create_actor(actor.pool)
+        try:
+            self.ray.get(replacement.ready.remote())
+        except BaseException:
+            try:
+                self.ray.kill(replacement, no_restart=True)
+            except Exception:
+                pass
+            raise
+        actor.handle = replacement
+        self._actor_instances_by_pool[actor.pool] += 1
 
     def _execution_error(
         self,
@@ -479,7 +527,7 @@ class Executor:
     ) -> ExecutionError:
         """Join wire details with Call and generation context owned by driver."""
 
-        call = pending_rpc.actor.call
+        call = pending_rpc.call
         target = self.plan.call(call).udf.target
         name = self._udf_name(target)
         grains = ", ".join(
@@ -499,26 +547,24 @@ class Executor:
 
     # ── Actor-pool lifecycle and small pure helpers ─────────────────────
 
-    def _create_pool(self, call: CallRef) -> None:
-        """Create actors only for Calls; structural Ports have no workers."""
+    def _create_pool(self, pool: PoolRef) -> None:
+        """Create one actor set for a physical pool."""
 
-        replicas = self._pool(call).replicas
-        for _ in range(replicas):
-            self._actors[call].append(
-                _ActorSlot(call, self._create_actor(call))
+        for _ in range(self.plan.actor_pools[pool].replicas):
+            self._actors[pool].append(
+                _ActorSlot(pool, self._create_actor(pool))
             )
 
-    def _create_actor(self, call: CallRef) -> Any:
-        """Create a persistent actor handle for one Call."""
+    def _create_actor(self, pool: PoolRef) -> Any:
+        """Create one persistent actor replica for a physical pool."""
 
-        spec = self.plan.call(call)
-        actor_options = dict(self._pool(call).ray_options)
+        spec = self.plan.actor_pools[pool]
+        actor_options = dict(spec.ray_options)
         actor_class = self._actor_class.options(**actor_options)
         handle = actor_class.remote(
             spec.udf.target,
             spec.udf.init_args,
             spec.udf.init_kwargs,
-            self.plan.input_layouts_by_call[call],
         )
         return handle
 
@@ -532,10 +578,10 @@ class Executor:
             getattr(target, "__name__", repr(target)),
         )
 
-    def _pool(self, call: CallRef) -> ActorPoolSpec:
-        """Return the one typed physical execution contract for a Call."""
+    def _dispatch(self, call: CallRef) -> CallDispatchSpec:
+        """Return the logical scheduling contract for a Call."""
 
-        return self.plan.pool(call)
+        return self.plan.dispatch(call)
 
     @classmethod
     def _merge_outputs(cls, outputs: list[object]) -> object:

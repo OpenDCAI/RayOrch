@@ -30,7 +30,12 @@ class Port:
 
 
 class RayModule:
-    """Declarative UDF recipe; actor handles exist only in the execution layer."""
+    """Declarative UDF recipe backed by one compiled actor pool.
+
+    Reusing the same ``RayModule`` object creates distinct logical Calls that
+    automatically share its initialized actors. Static keyword arguments such
+    as ``stage="layout"`` are forwarded to ``run()`` on every execution batch.
+    """
 
     def __init__(self, udf: Any, *, num_outputs: int = 1) -> None:
         if num_outputs <= 0:
