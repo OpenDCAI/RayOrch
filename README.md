@@ -268,9 +268,9 @@ See [Framework Design](https://opendcai.github.io/RayOrch-doc/en/architecture/) 
 
 ## 🧩 4. Workloads and Integrations
 
-### 4.1 MinerU 2.5 and Flash-MinerU
+### 4.1 MinerU and Flash-MinerU
 
-The MinerU integration connects the MinerU 2.5 implementation from [Flash-MinerU](https://github.com/OpenDCAI/Flash-MinerU) as an explicit page-level RayOrch workload. A PDF first expands into a variable number of page records, page images are processed by a persistent GPU actor pool, and the page-level model outputs are reduced in the original order before Markdown, layout JSON, and extracted images are written. The workload is irregular because PDFs have different page counts, rendering and assembly are CPU-oriented while inference is GPU-oriented, and ready pages from different PDFs should share model batches without losing their document ownership.
+The following MinerU 2.5 integration connects the implementation from [Flash-MinerU](https://github.com/OpenDCAI/Flash-MinerU) as an explicit page-level RayOrch workload. A PDF first expands into a variable number of page records, page images are processed by a persistent GPU actor pool, and the page-level model outputs are reduced in the original order before Markdown, layout JSON, and extracted images are written. The workload is irregular because PDFs have different page counts, rendering and assembly are CPU-oriented while inference is GPU-oriented, and ready pages from different PDFs should share model batches without losing their document ownership.
 
 ```mermaid
 flowchart LR
@@ -310,7 +310,6 @@ The important intermediate values are deliberately ordinary Python values; RayOr
 The core RayOrch topology is small because model code remains inside the UDFs and dataflow relationships remain inside `forward()`:
 
 ```python
-from typing import cast
 import rayorch as ro
 
 from rayorch.benchmarks.mineru.udfs import (
@@ -355,10 +354,10 @@ class MinerUPipeline(ro.Pipeline):
 
     def forward(self, pdfs):
         # PDF:[page0, page1, ...] -> independently schedulable PDF/page items.
-        pages = ro.F.expand(cast(ro.Port, self.render(pdfs)))
+        pages = ro.F.expand(self.render(pdfs))
         # READY pages from different PDFs may share the same OCR batch.
-        contents = cast(ro.Port, self.ocr(pages))
-        stems = cast(ro.Port, self.metadata(pdfs))
+        contents = self.ocr(pages)
+        stems = self.metadata(pdfs)
         # Return both Ports to the PDF Domain with identical membership/order.
         # Failed or filtered `contents` also define which pages survive.
         content_groups, ordered_page_groups = ro.F.reduce_aligned(
@@ -371,28 +370,28 @@ class MinerUPipeline(ro.Pipeline):
 
 `F.expand` makes every rendered page independently schedulable, so one OCR microbatch may contain pages from several PDFs. `F.reduce_aligned` uses the OCR output as the member set and returns both model outputs and matching page metadata to the PDF Domain in original page order, while the separate metadata branch provides the PDF stem without forwarding PDF bytes through the GPU stage. The model is constructed once per OCR actor and remains loaded across batches and repeated executor runs. Each completed PDF is written under `output_dir/<pdf-stem>/vlm/`, including `<pdf-stem>.md`, `layout.json`, and extracted images.
 
-Most users do not need to assemble MinerU UDFs themselves. The separately packaged Flash-MinerU integration preserves its small application-facing API and uses the installed RayOrch runtime:
+Most users do not need to assemble MinerU UDFs themselves. Flash-MinerU 1.1.0 packages the same pattern behind a small API and the installed RayOrch runtime, with nine versioned pipelines covering MinerU 2.5, 2.5 Pro, and MinerU 4. The versioned layout isolates upstream runtime changes, while `v4-advanced-shared` also demonstrates separate DAG stages reusing one resident model Actor Pool.
 
 ```bash
-pip install "flash-mineru[vllm]"
+pip install "flash-mineru[mineru25]==1.1.0"
 ```
 
 ```python
 from flash_mineru import MineruEngine
 
-engine = MineruEngine(
-    model="/path/to/MinerU2.5",  # Local path visible to every Ray node.
-    save_dir="./outputs",        # Markdown, layout JSON, and extracted images.
-    batch_size=8,                # Maximum pages in one model call.
-    replicas=2,                  # Two persistent MinerU actors.
-    num_gpus_per_replica=1,      # One GPU reserved by each actor.
-)
-# The public Flash-MinerU API stays unchanged; RayOrch is internal.
-result = engine.run(["document-a.pdf", "document-b.pdf"])
-engine.close()
+with MineruEngine(
+    pipeline_version="v2.5",      # Select one bundled, versioned pipeline.
+    model="/path/to/MinerU2.5",   # Local path visible to every Ray node.
+    save_dir="./outputs",         # Markdown, layout JSON, and extracted images.
+    batch_size=8,                 # Compatibility grouping for returned paths.
+    ocr_batch_size=128,           # Ready pages collected into a model call.
+    replicas=2,                   # Two persistent MinerU actors.
+    num_gpus_per_replica=1,       # One GPU reserved by each actor.
+) as engine:
+    result = engine.run(["document-a.pdf", "document-b.pdf"])
 ```
 
-For reproducible experiments and standard profiling artifacts, see the [MinerU Benchmark guide](https://opendcai.github.io/RayOrch-doc/en/benchmarks/mineru.html).
+Choose another `pipeline_version` and its matching installation extra to run the other supported MinerU generations; MinerU 2.5 and MinerU 4 should remain in separate environments. See the [Flash-MinerU pipeline guide](https://github.com/OpenDCAI/Flash-MinerU/blob/main/docs/PIPELINES.md) for runnable configurations, or the [RayOrch MinerU Benchmark guide](https://opendcai.github.io/RayOrch-doc/en/benchmarks/mineru.html) for reproducible experiments and profiling artifacts.
 
 ### 4.2 DataFlow
 
