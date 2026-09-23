@@ -268,9 +268,9 @@ RayOrch 负责逻辑数据流语义，Ray 负责物理分布式执行：
 
 ## 🧩 4. 真实负载与集成
 
-### 4.1 MinerU 2.5 与 Flash-MinerU
+### 4.1 MinerU 与 Flash-MinerU
 
-[Flash-MinerU](https://github.com/OpenDCAI/Flash-MinerU) 中的 MinerU 2.5 实现通过 RayOrch 表达为一条显式的页面级负载。一个 PDF 首先展开为数量不固定的页面记录，页面图像交给持久化 GPU Actor 池推理，随后按原始页序归并页面级模型结果，并写出 Markdown、版面 JSON 和抽取图片。这个负载具有明显的不规则性：不同 PDF 的页数不同，渲染和组装主要使用 CPU、模型推理使用 GPU，而且来自不同 PDF 的就绪页面应当共享模型批次，同时不能丢失所属文档。
+下面以 [Flash-MinerU](https://github.com/OpenDCAI/Flash-MinerU) 中的 MinerU 2.5 实现为例，将其通过 RayOrch 表达为一条显式的页面级负载。一个 PDF 首先展开为数量不固定的页面记录，页面图像交给持久化 GPU Actor 池推理，随后按原始页序归并页面级模型结果，并写出 Markdown、版面 JSON 和抽取图片。这个负载具有明显的不规则性：不同 PDF 的页数不同，渲染和组装主要使用 CPU、模型推理使用 GPU，而且来自不同 PDF 的就绪页面应当共享模型批次，同时不能丢失所属文档。
 
 ```mermaid
 flowchart LR
@@ -310,7 +310,6 @@ flowchart LR
 这条负载的 RayOrch 核心拓扑很小，因为模型逻辑留在 UDF 内，数据流关系集中写在 `forward()` 中：
 
 ```python
-from typing import cast
 import rayorch as ro
 
 from rayorch.benchmarks.mineru.udfs import (
@@ -355,10 +354,10 @@ class MinerUPipeline(ro.Pipeline):
 
     def forward(self, pdfs):
         # PDF:[page0, page1, ...] → 可独立调度的 PDF/page 子项。
-        pages = ro.F.expand(cast(ro.Port, self.render(pdfs)))
+        pages = ro.F.expand(self.render(pdfs))
         # 来自不同 PDF 的 READY 页面可以进入同一个 OCR 批次。
-        contents = cast(ro.Port, self.ocr(pages))
-        stems = cast(ro.Port, self.metadata(pdfs))
+        contents = self.ocr(pages)
+        stems = self.metadata(pdfs)
         # 将两个 Port 按相同成员集合和页序归并回 PDF Domain。
         # 失败或被过滤的 contents 同时决定哪些页面能够保留。
         content_groups, ordered_page_groups = ro.F.reduce_aligned(
@@ -371,28 +370,28 @@ class MinerUPipeline(ro.Pipeline):
 
 `F.expand` 让每个渲染后的页面成为可独立调度的数据，因此一次 OCR 执行批次可以包含多个 PDF 的页面；`F.reduce_aligned` 使用 OCR 输出定义成员集合，并按原始页序将模型结果与对应页面元数据一起归并回 PDF Domain。独立的 metadata 分支只传递 PDF 文件名，避免把 PDF 字节绕经 GPU 阶段。MinerU 2.5 模型在每个 OCR Actor 中只构造一次，并在不同批次和多次 Executor 调用之间持续驻留。每个完成的 PDF 会写入 `output_dir/<pdf-stem>/vlm/`，其中包含 `<pdf-stem>.md`、`layout.json` 和抽取图片。
 
-大多数用户不需要亲自组装 MinerU UDF。独立发布的 Flash-MinerU 集成保留精简的应用层 API，并使用安装好的 RayOrch 运行时：
+大多数用户不需要亲自组装 MinerU UDF。Flash-MinerU 1.1.0 将这一模式封装在精简 API 和安装好的 RayOrch 运行时之后，并提供覆盖 MinerU 2.5、2.5 Pro 与 MinerU 4 的九条版本化管线。版本化目录可以隔离上游运行时变化，`v4-advanced-shared` 还展示了多个 DAG 阶段复用同一个常驻模型 Actor Pool。
 
 ```bash
-pip install "flash-mineru[vllm]"
+pip install "flash-mineru[mineru25]==1.1.0"
 ```
 
 ```python
 from flash_mineru import MineruEngine
 
-engine = MineruEngine(
-    model="/path/to/MinerU2.5",  # 所有 Ray 节点都可见的本地模型路径。
-    save_dir="./outputs",        # Markdown、版面 JSON 和提取图片目录。
-    batch_size=8,                # 单次模型调用最多处理 8 页。
-    replicas=2,                  # 创建 2 个常驻 MinerU Actor。
-    num_gpus_per_replica=1,      # 每个 Actor 预留 1 张 GPU。
-)
-# Flash-MinerU 的公开 API 保持不变，RayOrch 位于其内部。
-result = engine.run(["document-a.pdf", "document-b.pdf"])
-engine.close()
+with MineruEngine(
+    pipeline_version="v2.5",      # 选择一条内置的版本化管线。
+    model="/path/to/MinerU2.5",   # 所有 Ray 节点都可见的本地模型路径。
+    save_dir="./outputs",         # Markdown、版面 JSON 和提取图片目录。
+    batch_size=8,                 # 为兼容旧 API，对返回路径进行分组。
+    ocr_batch_size=128,           # 单次模型调用聚合的就绪页面数。
+    replicas=2,                   # 创建 2 个常驻 MinerU Actor。
+    num_gpus_per_replica=1,       # 每个 Actor 预留 1 张 GPU。
+) as engine:
+    result = engine.run(["document-a.pdf", "document-b.pdf"])
 ```
 
-如果需要可配置实验、标准 Profile 和统一产物，请参阅 [MinerU Benchmark 指南](https://opendcai.github.io/RayOrch-doc/zh/benchmarks/mineru.html)。
+通过切换 `pipeline_version` 和对应的安装 extra，可以运行其他受支持的 MinerU 版本；MinerU 2.5 与 MinerU 4 应放在独立环境中。可运行配置见 [Flash-MinerU 管线指南](https://github.com/OpenDCAI/Flash-MinerU/blob/main/docs/PIPELINES.zh.md)，可复现实验、标准 Profile 和统一产物见 [RayOrch MinerU Benchmark 指南](https://opendcai.github.io/RayOrch-doc/zh/benchmarks/mineru.html)。
 
 ### 4.2 DataFlow
 
