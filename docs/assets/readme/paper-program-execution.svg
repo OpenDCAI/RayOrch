@@ -4,7 +4,7 @@
   <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#52606d"/></marker><filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#102a43" flood-opacity="0.12"/></filter></defs>
   <rect width="1200" height="560" rx="18" fill="#f7f9fc"/>
   <text x="48" y="48" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="26" font-weight="700" fill="#102a43">Write a pipeline like a program; execute it like a dataflow</text>
-  <text x="48" y="78" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="17" fill="#52606d">The user declares structure once. RayOrch keeps that structure stable while Ray supplies actors, resources, and placement.</text>
+  <text x="48" y="78" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="17" textLength="1090" lengthAdjust="spacingAndGlyphs" fill="#52606d">The user declares structure once. RayOrch keeps that structure stable while Ray supplies actors, resources, and placement.</text>
   <g font-family="Inter,Segoe UI,Arial,sans-serif">
     <rect x="42" y="112" width="1116" height="118" rx="14" fill="#fff" stroke="#bcccdc" stroke-width="2" filter="url(#shadow)"/>
     <text x="64" y="145" font-size="20" font-weight="700" fill="#243b53">1. Python program</text>
