@@ -210,14 +210,11 @@ Users upgrading from `0.0.1` should read the [API Migration Guide](https://githu
 If RayOrch is useful in your work, please cite:
 
 ```bibtex
-@misc{ma2026rayorchprogrammingexecutinglineagecontrolled,
+@article{ma2026rayorch,
       title={RayOrch: Programming and Executing Lineage-Controlled Multi-Grain Dataflows for Foundation-Model Data Preparation},
-      author={Xiaochen Ma and Zimo Meng and Junzhu Liang and Youhe Jiang and Yue Cheng and Hao Liang and Bohan Zeng and Dengchun Li and Lu Ma and Zhengyang Zhao and Zhen Hao Wong and Runming He and Meiyi Qiang and Jiangtao Guan and Binhang Yuan and Wentao Zhang},
-      year={2026},
-      eprint={2609.18703},
-      archivePrefix={arXiv},
-      primaryClass={cs.DC},
-      url={https://arxiv.org/abs/2609.18703},
+      author={Ma, Xiaochen and Meng, Zimo and Liang, Junzhu and Jiang, Youhe and Cheng, Yue and Liang, Hao and Zeng, Bohan and Li, Dengchun and Ma, Lu and Zhao, Zhengyang and others},
+      journal={arXiv preprint arXiv:2609.18703},
+      year={2026}
 }
 ```
 
