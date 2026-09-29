@@ -96,6 +96,62 @@ print(result.outputs)  # [3, 4, 5]
   <img src="docs/assets/readme/paper-program-execution.svg" width="100%" alt="A RayOrch program lowered into structural lineage and per-Call actor execution" />
 </p>
 
+Read the diagram from left to right through this concrete PDF parsing pipeline:
+
+```python
+import rayorch as ro
+from rayorch import F
+from rayorch.benchmarks.mineru.udfs import (
+    MinerUAssembleDoc,
+    MinerUPdfToPages,
+    MinerUVlmOcrPage,
+    PdfMetadata,
+)
+
+
+class PdfPipeline(ro.Pipeline):
+    def __init__(self, model_path, output_dir):
+        # Python program: declare the stages and their physical policies.
+        self.render = (
+            ro.RayModule(MinerUPdfToPages)
+            .pre_init(dpi=200)
+            .ray_options(replicas=2, batch_size=1, num_cpus=1)
+        )
+        self.ocr = (
+            ro.RayModule(MinerUVlmOcrPage)
+            .pre_init(model=model_path, gpu_memory_utilization=0.8)
+            .ray_options(replicas=2, batch_size=32, num_gpus=1, num_cpus=1)
+        )
+        self.metadata = ro.RayModule(PdfMetadata).ray_options(
+            replicas=1, batch_size=32, num_cpus=1
+        )
+        self.assemble = (
+            ro.RayModule(MinerUAssembleDoc)
+            .pre_init(output_dir=output_dir)
+            .ray_options(replicas=2, batch_size=4, num_cpus=1)
+        )
+
+    def forward(self, pdfs):
+        # Structural control plane: PDF -> ordered page Entities (1:M).
+        pages = F.expand(self.render(pdfs))
+        contents = self.ocr(pages)       # Physical work is page-level (M).
+        stems = self.metadata(pdfs)      # Metadata stays at document scope.
+
+        # Structural control plane: pages -> ordered documents (M:1).
+        grouped_contents, grouped_pages = F.reduce_aligned(
+            contents, pages, members=contents
+        )
+        return self.assemble(grouped_contents, grouped_pages, stems)
+```
+
+The three layers in the figure correspond to this code:
+
+1. **Python program.** `forward()` composes ordinary `RayModule` calls and `F` operations. It is traced once; the UDFs do not run while the graph is being built.
+2. **Structural control plane.** `F.expand` records each PDF's ordered page membership. `F.reduce_aligned` records how page outputs and page records close back into the same document. These symbolic Ports carry lineage, order, and readiness; they do not create actors.
+3. **Physical execution plane.** The `ray_options(...)` values create the actor pools. At runtime, ready page `Grain`s from different PDFs can share one execution microbatch on the OCR actors. The physical batch may change, while the control-plane lineage keeps each document's pages separate and ordered.
+
+The complete UDF implementations live in [`rayorch/benchmarks/mineru/udfs.py`](rayorch/benchmarks/mineru/udfs.py); the full configurable pipeline is [`rayorch/benchmarks/mineru/pipeline.py`](rayorch/benchmarks/mineru/pipeline.py).
+
 The public model has six pieces:
 
 | Object | Meaning |

@@ -96,6 +96,62 @@ forward() 只会被追踪一次，用来构建静态图，不会在这里执行 
   <img src="docs/assets/readme/paper-program-execution.svg" width="100%" alt="RayOrch 程序被编译为结构血缘和按 Call 管理的 Actor 执行" />
 </p>
 
+可以把图从左到右对应到下面这段 PDF 解析管线：
+
+```python
+import rayorch as ro
+from rayorch import F
+from rayorch.benchmarks.mineru.udfs import (
+    MinerUAssembleDoc,
+    MinerUPdfToPages,
+    MinerUVlmOcrPage,
+    PdfMetadata,
+)
+
+
+class PdfPipeline(ro.Pipeline):
+    def __init__(self, model_path, output_dir):
+        # Python 程序：声明阶段以及各阶段的物理执行策略。
+        self.render = (
+            ro.RayModule(MinerUPdfToPages)
+            .pre_init(dpi=200)
+            .ray_options(replicas=2, batch_size=1, num_cpus=1)
+        )
+        self.ocr = (
+            ro.RayModule(MinerUVlmOcrPage)
+            .pre_init(model=model_path, gpu_memory_utilization=0.8)
+            .ray_options(replicas=2, batch_size=32, num_gpus=1, num_cpus=1)
+        )
+        self.metadata = ro.RayModule(PdfMetadata).ray_options(
+            replicas=1, batch_size=32, num_cpus=1
+        )
+        self.assemble = (
+            ro.RayModule(MinerUAssembleDoc)
+            .pre_init(output_dir=output_dir)
+            .ray_options(replicas=2, batch_size=4, num_cpus=1)
+        )
+
+    def forward(self, pdfs):
+        # 结构控制面：PDF -> 有序页面 Entity（1:M）。
+        pages = F.expand(self.render(pdfs))
+        contents = self.ocr(pages)       # 物理工作在页面粒度执行（M）。
+        stems = self.metadata(pdfs)      # 元数据保持在文档粒度。
+
+        # 结构控制面：页面 -> 有序文档（M:1）。
+        grouped_contents, grouped_pages = F.reduce_aligned(
+            contents, pages, members=contents
+        )
+        return self.assemble(grouped_contents, grouped_pages, stems)
+```
+
+图中的三层与代码对应如下：
+
+1. **Python 程序。** `forward()` 组合普通的 `RayModule` 调用和 `F` 结构操作。它只会被追踪一次；构图期间不会执行 UDF。
+2. **结构控制面。** `F.expand` 记录每份 PDF 的有序页面成员关系；`F.reduce_aligned` 记录页面结果和页面记录如何回收到同一份文档。这些符号化 Port 携带血缘、顺序和就绪关系，但不会创建 Actor。
+3. **物理执行面。** `ray_options(...)` 配置 Actor 池。运行时，不同 PDF 中已经就绪的页面 `Grain` 可以在 OCR Actor 上共享一个执行微批次。物理批次可以变化，但控制面的血缘会保证每份文档的页面仍然独立且有序。
+
+完整的 UDF 实现在 [`rayorch/benchmarks/mineru/udfs.py`](rayorch/benchmarks/mineru/udfs.py) 中；完整的可配置管线见 [`rayorch/benchmarks/mineru/pipeline.py`](rayorch/benchmarks/mineru/pipeline.py)。
+
 公开模型由六部分组成：
 
 | 对象 | 含义 |
